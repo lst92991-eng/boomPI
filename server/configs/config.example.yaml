@@ -1,0 +1,30 @@
+# boomPI server configuration.
+# Copy this file to config.yaml and edit only non-secret settings.
+# API credentials are read only from the environment:
+#   DASHSCOPE_API_KEY
+#   DASHSCOPE_WORKSPACE_ID (optional)
+# P1 accepts flat key/value scalars only; nested YAML is rejected deliberately.
+# Quote free-form text when it contains YAML comment syntax.
+
+listen_address: "0.0.0.0"
+wss_port: 17806
+discovery_port: 17807
+log_level: "info"
+
+provider: "qwen"
+region: "singapore"
+model: "qwen3.5-omni-plus-realtime"
+search_mode: "auto"
+system_prompt: "You are boomPI, a concise and helpful voice assistant. Reply in Simplified Chinese unless the user asks for another language."
+persona: "Natural, young, friendly, and not overly cute."
+
+heartbeat_interval: "10s"
+connection_timeout: "30s"
+first_response_warning: "15s"
+first_response_timeout: "30s"
+session_idle_timeout: "30m"
+max_turns: 20
+max_context_tokens: 24000
+
+pairing_code_ttl: "2m"
+pairing_max_attempts: 5

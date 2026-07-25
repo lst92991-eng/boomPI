@@ -1,0 +1,79 @@
+# CMake and native build output
+/build*/
+/cmake-build-*/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/CTestTestfile.cmake
+**/Testing/
+**/compile_commands.json
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.elf
+*.bin
+*.hex
+*.map
+*.pdb
+*.ilk
+*.exe
+
+# Go output and coverage
+/server/boompi-server
+/server/boompi-server.exe
+/server/coverage.out
+*.test
+*.prof
+
+# Python helper cache
+**/__pycache__/
+*.py[cod]
+
+# Runtime configuration and secrets
+.env
+.env.*
+!.env.example
+/server/config.yaml
+/server/configs/config.yaml
+/server/configs/*.local.yaml
+/server/data/
+**/secrets/
+**/certs/
+*.key
+*.pem
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# Runtime and diagnostic data
+**/logs/
+**/recordings/
+**/debug-audio/
+*.log
+*.core
+core
+core.*
+
+# Vendor/model payloads are installed externally until redistribution is cleared
+/third_party/snowboy/runtime/
+/third_party/snowboy/models/
+/third_party/rockchip/bin/
+/third_party/rockchip/lib/
+
+# Editor and operating-system state
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+*.swp
+*.tmp
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini

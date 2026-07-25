@@ -1,0 +1,101 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "host-base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "BOOMPI_BUILD_TESTS": "ON",
+        "BOOMPI_STRICT_WARNINGS": "ON",
+        "BOOMPI_TARGET_RV1106": "OFF",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "host-debug",
+      "inherits": "host-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "host-release",
+      "inherits": "host-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "rv1106-base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "${sourceDir}/client/cmake/toolchains/rv1106.cmake",
+      "cacheVariables": {
+        "BOOMPI_BUILD_TESTS": "OFF",
+        "BOOMPI_STRICT_WARNINGS": "OFF",
+        "BOOMPI_TARGET_RV1106": "ON",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "rv1106-debug",
+      "inherits": "rv1106-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "rv1106-release",
+      "inherits": "rv1106-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "host-debug",
+      "configurePreset": "host-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "host-release",
+      "configurePreset": "host-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "rv1106-debug",
+      "configurePreset": "rv1106-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "rv1106-release",
+      "configurePreset": "rv1106-release",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "host-debug",
+      "configurePreset": "host-debug",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "host-release",
+      "configurePreset": "host-release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

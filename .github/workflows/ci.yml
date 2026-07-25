@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host:
+    name: host-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+    env:
+      CGO_ENABLED: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache: false
+
+      - name: Report tool versions
+        run: |
+          cmake --version
+          python --version
+          go version
+
+      - name: Validate protocol fixtures
+        run: python scripts/verify_protocol_fixtures.py
+
+      - name: Configure C++ host build
+        run: cmake --preset host-debug
+
+      - name: Build C++ host targets (single-config)
+        if: runner.os != 'Windows'
+        run: cmake --build --preset host-debug --parallel
+
+      - name: Build C++ host targets (Windows multi-config)
+        if: runner.os == 'Windows'
+        run: cmake --build --preset host-debug --parallel --config Debug
+
+      - name: Run C++ host tests (single-config)
+        if: runner.os != 'Windows'
+        run: ctest --preset host-debug --output-on-failure
+
+      - name: Run C++ host tests (Windows multi-config)
+        if: runner.os == 'Windows'
+        run: ctest --preset host-debug --output-on-failure -C Debug
+
+      - name: Run Go tests
+        working-directory: server
+        run: go test ./...
+
+      - name: Run Go vet
+        working-directory: server
+        run: go vet ./...
+
+      - name: Build Go server
+        working-directory: server
+        run: go build -trimpath ./cmd/boompi-server
