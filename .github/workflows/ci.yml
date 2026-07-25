@@ -51,6 +51,12 @@ jobs:
       - name: Validate protocol fixtures
         run: python scripts/verify_protocol_fixtures.py
 
+      - name: Validate POSIX P0 probes
+        if: runner.os != 'Windows'
+        run: |
+          sh -n scripts/probes/rv1106_p0_probe.sh
+          python -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
       - name: Configure C++ host build
         run: cmake --preset host-debug
 

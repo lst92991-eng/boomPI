@@ -2,7 +2,7 @@
 
 boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端负责连接 Qwen 新加坡区，板端不保存云端 API Key。
 
-> 当前处于 **P1 工程骨架阶段**。仓库正在建立可重复的 host 构建、测试、配置和协议边界；端到端语音对话、AEC、Snowboy、WSS 配对、Wi-Fi 二维码配网和 A/B 更新尚未实现。本文不会把硬件单项测试或接口骨架描述成完整产品能力。
+> **P1 工程骨架已完成，P0 可行性闸门正在补证。** Host 构建、测试、配置和协议边界已经建立；匹配 BSP 的 RV1106 交叉构建、Rockchip 3A ABI 和 Snowboy 加 OpenBLAS 的链接候选已验证。真实板端执行、四通道 AEC、WSS 配对、Wi-Fi 二维码配网和 A/B 更新尚未完成。本文不会把硬件单项测试或接口骨架描述成完整产品能力。
 
 ## 系统形态
 
@@ -33,14 +33,14 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 以上结果不代表以下事项已经通过：
 
 - 48 kHz 全双工与 Codec Mode1 四通道回采。
-- Rockchip 3A 的头文件、ABI、实际通道契约和 16 kHz 实时率。
-- Snowboy 旧 ARM 预编译库与当前 Buildroot/libc 的兼容性。
+- Rockchip 3A 的板端加载、实际通道契约和 16 kHz 实时率；SDK ABI 候选已核对。
+- Snowboy 的板端模型加载、准确率和实时率；旧 ARM 库的交叉链接候选已核对。
 - 最终壳体下的 AEC、波束形成、双讲、远场和最大音量表现。
 - WSS 配对、断网恢复、端到端 Qwen 会话、长期稳定性和 A/B 回滚。
 
 ### 软件阶段
 
-P1 只建立模块边界、构建入口、配置校验、测试支撑和协议 fixture。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
+P1 已建立模块边界、构建入口、配置校验、测试支撑和协议 fixture，Windows/Linux/macOS CI 已通过。P0 的当前证据与阻断见 [2026-07-25 可行性报告](docs/test/p0-feasibility-report-20260725.md)。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
 
 ## 仓库结构
 
@@ -71,6 +71,13 @@ cmake --preset host-debug
 cmake --build --preset host-debug --parallel
 ctest --preset host-debug --output-on-failure
 python scripts/verify_protocol_fixtures.py
+```
+
+Linux/macOS 还会运行 P0 探针的离线脱敏回归：
+
+```text
+sh -n scripts/probes/rv1106_p0_probe.sh
+python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 ```
 
 Windows 使用支持所选编译器的 PowerShell/Developer PowerShell；Linux 和 macOS 使用系统 C++ 工具链。CI 会在 Windows、Linux 和 macOS 上执行同一组 host 检查。
@@ -137,7 +144,16 @@ cmake --preset rv1106-release
 cmake --build --preset rv1106-release --parallel
 ```
 
-这些命令目前是工程入口，不代表本机已经具备 RV1106 SDK，也不代表产物已经在板端运行。具体闸门见 [docs/test/rv1106-validation-gates.md](docs/test/rv1106-validation-gates.md)。刷镜像、改分区、设备树或启动项前必须单独取得用户授权。
+2026-07-25 已使用与 BSP 匹配的 GCC 8.3.0 Buildroot wrapper 和 uClibc sysroot 成功构建 RV1106 Release 产物，并验证 ELF32 ARM EABI5 hard-float 与 loader；因当时板端管理通道不可用，产物尚未在板端执行。具体证据见 [P0 可行性报告](docs/test/p0-feasibility-report-20260725.md)，完整闸门见 [docs/test/rv1106-validation-gates.md](docs/test/rv1106-validation-gates.md)。刷镜像、改分区、设备树或启动项前必须单独取得用户授权。
+
+恢复板端 SSH 后，可运行不会打开 PCM 或修改系统的脱敏探针：
+
+```powershell
+Get-Content -Raw scripts/probes/rv1106_p0_probe.sh | ssh <board-host> "sh -s"
+```
+
+发布前使用 `scripts/probes/verify_rv1106_elf.py` 检查 strip 后的目标 ELF，拒绝
+错误 ARM ABI、glibc、过高 GLIBCXX、RPATH/RUNPATH 和开发机绝对路径。
 
 ## 协议与隐私
 
@@ -149,8 +165,8 @@ cmake --build --preset rv1106-release --parallel
 
 ## 路线图
 
-1. **P0 可行性闸门**：工具链、Snowboy、Rockchip 3A、四通道参考、WSS、Wi-Fi AP 和 UI backend 探测。
-2. **P1 工程骨架**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
+1. **P0 可行性闸门（进行中）**：工具链、Snowboy、Rockchip 3A、四通道参考、WSS、Wi-Fi AP 和 UI backend 探测。
+2. **P1 工程骨架（已完成）**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
 3. **P2 本地音频**：48/16 kHz 链路、AEC/BF/VAD、Snowboy、播放和打断。
 4. **P3 服务端**：discovery、pairing、Qwen adapter、Session Actor 和 ToolRegistry。
 5. **P4 端到端对话**：流式文字/音频、取消、上下文、断网和延迟测量。

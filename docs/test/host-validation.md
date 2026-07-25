@@ -22,6 +22,13 @@ ctest --preset host-debug --output-on-failure
 python scripts/verify_protocol_fixtures.py
 ```
 
+Linux/macOS 还需校验只读 P0 探针：
+
+```text
+sh -n scripts/probes/rv1106_p0_probe.sh
+python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+```
+
 Windows 如果使用 Visual Studio 多配置生成器，将 build/test 两条命令改为：
 
 ```text

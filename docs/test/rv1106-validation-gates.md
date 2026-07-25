@@ -2,12 +2,14 @@
 
 本文列出进入真实功能开发前必须完成的板端检查。除非测试记录明确给出板卡、镜像、日期和命令输出，否则状态均为“未验证”。
 
+当前分项证据和阻断见 [2026-07-25 P0 可行性报告](p0-feasibility-report-20260725.md)。
+
 ## P0 环境与 ABI
 
 - [ ] 记录 CPU ISA、float ABI、动态加载器、libc、libstdc++ 和内核版本。
-- [ ] 确认交叉编译器与目标 sysroot 匹配，并运行最小 C++ smoke executable。
-- [ ] 确认 ALSA、TLS、pthread 和所需系统调用在目标镜像可用。
-- [ ] 对 Rockchip/Snowboy 动态库执行 `file`、`readelf` 和依赖/符号检查。
+- [ ] 确认交叉编译器与目标 sysroot 匹配，并运行最小 C++ smoke executable。交叉构建与 ELF 检查已通过，真机执行待补。
+- [ ] 确认 ALSA、TLS、pthread 和所需系统调用在目标镜像可用。sysroot 链接已通过，当前板端运行待补。
+- [x] 对 Rockchip/Snowboy 运行库执行 `file`、`readelf` 和依赖/符号检查。功能与性能仍分别保留在下方闸门。
 
 ## 音频
 
