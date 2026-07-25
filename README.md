@@ -40,7 +40,7 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 ### 软件阶段
 
-P1 已建立模块边界、构建入口、配置校验、测试支撑和协议 fixture，Windows/Linux/macOS CI 已通过。P0 的当前证据与阻断见 [2026-07-25 可行性报告](docs/test/p0-feasibility-report-20260725.md)。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
+P1 已建立模块边界、构建入口、配置校验、测试支撑和协议 fixture，Windows/Linux/macOS CI 已通过。P0 的当前证据与阻断见 [2026-07-25 可行性报告](docs/test/p0-feasibility-report-20260725.md)。P2 已开始实现固定音频帧、预分配 SPSC lease、sequence/discontinuity 和连续性门禁；具体边界见 [音频运行时文档](docs/architecture/audio-runtime.md)，尚未连接 ALSA、3A 或 Snowboy。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
 
 ## 仓库结构
 
@@ -167,7 +167,7 @@ Get-Content -Raw scripts/probes/rv1106_p0_probe.sh | ssh <board-host> "sh -s"
 
 1. **P0 可行性闸门（进行中）**：工具链、Snowboy、Rockchip 3A、四通道参考、WSS、Wi-Fi AP 和 UI backend 探测。
 2. **P1 工程骨架（已完成）**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
-3. **P2 本地音频**：48/16 kHz 链路、AEC/BF/VAD、Snowboy、播放和打断。
+3. **P2 本地音频（进行中）**：48/16 kHz 链路、AEC/BF/VAD、Snowboy、播放和打断。
 4. **P3 服务端**：discovery、pairing、Qwen adapter、Session Actor 和 ToolRegistry。
 5. **P4 端到端对话**：流式文字/音频、取消、上下文、断网和延迟测量。
 6. **P5 UI 与配网**：表情、字幕、触摸、二维码和网络优先级。

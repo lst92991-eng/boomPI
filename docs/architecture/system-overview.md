@@ -35,6 +35,9 @@ UI/touch <- UI model                              Qwen Singapore
 
 跨线程 PCM 使用预分配有界队列；控制消息使用有界 EventBus。业务状态只能由 application actor 修改。实时音频路径不做文件或网络 I/O，不允许每帧动态分配或无界等待。
 
+帧槽、SPSC lease、sequence/discontinuity 和 consumer gate 的具体 ownership 见
+[音频运行时边界](audio-runtime.md)。
+
 ## 音频边界
 
 目标硬件链路是 Codec/ALSA 48 kHz 全双工，候选四通道采集为双麦加双路数字播放参考。Rockchip 3A 按 16 kHz adapter 接入，处理后的 16 kHz mono 同时供 Snowboy、VAD 和服务端上行使用。Qwen 下行默认按 24 kHz mono 标记，板端转为 48 kHz 后再执行音量、提示音混合和限幅。
@@ -47,6 +50,10 @@ UI/touch <- UI model                              Qwen Singapore
 - Snowboy 与目标 libc/libstdc++/ARM ABI 的兼容性。
 
 Mode1 失败时只能进入有记录的软件参考方案评审，不能同时混用硬件和软件 reference。
+
+P2 当前仅实现 48 kHz capture/16 kHz mono 的固定帧契约、预分配 SPSC ownership、
+producer sequence 和 consumer continuity gate。它们已通过 host 测试与 RV1106
+交叉编译，但尚未连接 ALSA 或任何真实 DSP backend。
 
 ## 状态与取消
 

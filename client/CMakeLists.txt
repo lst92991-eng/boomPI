@@ -36,7 +36,9 @@ boompi_add_library(boompi_config
 target_link_libraries(boompi_config PUBLIC boompi_event)
 
 boompi_add_library(boompi_audio_core
-  src/audio/audio_format.cpp)
+  src/audio/audio_format.cpp
+  src/audio/audio_frame.cpp
+  src/audio/frame_continuity_gate.cpp)
 target_link_libraries(boompi_audio_core PUBLIC boompi_event)
 
 boompi_add_library(boompi_protocol
@@ -121,5 +123,33 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_host_tests
     COMMAND boompi_host_tests
       ${PROJECT_SOURCE_DIR}/protocol/fixtures/protocol-v1-golden.json)
-  set_tests_properties(boompi_host_tests PROPERTIES TIMEOUT 10)
+
+  add_executable(boompi_audio_queue_tests
+    tests/unit/audio_queue_tests.cpp)
+  boompi_configure_target(boompi_audio_queue_tests)
+  target_link_libraries(boompi_audio_queue_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support
+      Threads::Threads)
+  add_test(
+    NAME boompi_audio_queue_tests
+    COMMAND boompi_audio_queue_tests)
+
+  add_executable(boompi_audio_continuity_tests
+    tests/unit/audio_continuity_tests.cpp)
+  boompi_configure_target(boompi_audio_continuity_tests)
+  target_link_libraries(boompi_audio_continuity_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_continuity_tests
+    COMMAND boompi_audio_continuity_tests)
+
+  set_tests_properties(
+    boompi_host_tests
+    boompi_audio_queue_tests
+    boompi_audio_continuity_tests
+    PROPERTIES TIMEOUT 20)
 endif()

@@ -29,6 +29,36 @@ sh -n scripts/probes/rv1106_p0_probe.sh
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 ```
 
+Linux 上修改实时队列或 PCM 边界后，还需运行 sanitizer 构建。以下目录都是忽略的
+本地构建产物：
+
+```text
+cmake -S . -B build/host-asan-ubsan \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DBOOMPI_BUILD_TESTS=ON \
+  -DBOOMPI_STRICT_WARNINGS=ON \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+cmake --build build/host-asan-ubsan --parallel
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+ctest --test-dir build/host-asan-ubsan --output-on-failure
+
+cmake -S . -B build/host-tsan \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DBOOMPI_BUILD_TESTS=ON \
+  -DBOOMPI_STRICT_WARNINGS=ON \
+  -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+cmake --build build/host-tsan --parallel
+TSAN_OPTIONS=halt_on_error=1 build/host-tsan/client/boompi_audio_queue_tests
+```
+
+若 GCC ThreadSanitizer 在启用 PIE/ASLR 的虚拟机中仅报
+`unexpected memory mapping`，可只对该测试进程使用
+`setarch "$(uname -m)" -R` 后重试。不得据此忽略真实 race 报告，也不得把关闭
+ASLR 的设置带入产品运行环境。
+
 Windows 如果使用 Visual Studio 多配置生成器，将 build/test 两条命令改为：
 
 ```text
