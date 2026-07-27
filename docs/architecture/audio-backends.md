@@ -9,7 +9,9 @@ playback adapter 继续保留，但暂停增加新抽象或 runtime 组成。它
 
 下一项实现直接面向匹配 BSP 的 `rk_mpi_ai`/`rk_mpi_ao`、ALSA PCM、Rockchip
 VQE 和 `libaec_bf_process.so` 探针。详细只读证据见
-[P0 vendor 音频证据基线](../test/p0-vendor-audio-inventory-20260727.md)。
+[P0 vendor 音频证据基线](../test/p0-vendor-audio-inventory-20260727.md)；MPI 头文件、依赖和
+21 个入口的交叉链接证据见
+[Rockchip MPI 音频交叉链接验证记录](../test/p0-rockchip-mpi-link-validation-20260727.md)。
 
 真实状态必须区分为三层：
 
@@ -109,6 +111,31 @@ engine 由一个 DSP worker 独占并串行执行：
 从不输出未经处理的麦克风 PCM。`FakeAudioDspEngine` 只编入测试 target；它用于验证
 编排、generation 和错误恢复，不实现 AEC/NS/BF/AGC，也不得进入发布产物。
 
+## Rockchip MPI raw AI/AO 候选与链接边界
+
+匹配 BSP 的真实交叉链接已关闭最小 raw 生命周期的编译和动态符号解析：一次
+`SYS_Init/Exit`；AI 的 `SetPubAttr`、`Enable`、`SetChnParam`、`EnableChn`、`GetFrame`、
+`ReleaseFrame`、`DisableChn`、`Disable`；AO 的 `SetPubAttr`、`Enable`、`SetChnParams`、
+`EnableChn`、`SendFrame`、`WaitEos`、`DisableChn`、`Disable`；以及 AO caller buffer 与
+AI capture frame 访问所需的 `SYS_CreateMB`、`MB_Handle2VirAddr` 和 `MB_ReleaseMB`。`WaitEos` 只服务有限播放
+探针的有界 drain。
+
+这个最小面故意不含 `SYS_Bind/UnBind`、VQE、resample、AMIX/mixer、volume/mute/track、
+AENC/ADEC 或声音检测接口。raw AI/AO 由 CPU 侧 `GetFrame/SendFrame` 闭合，不建立编码媒体图；
+VQE、采样率转换和 mixer 只能在独立 HIL 证明需要后显式加入，不能因为 vendor 样例调用过就
+扩大生产依赖。
+
+`librockit.so` 的链接闭包为 `librockchip_mpp.so.1`、`librga.so`、libstdc++、libgcc 和
+uClibc。CMake 的 MPP/RGA 哈希固定 `media/out/lib` 中的未 strip 链接候选；OEM 中经过
+strip、哈希不同的副本不能作为 CMake 输入。最终 link-check 是 ELF32 ARM EABI5
+hard-float/uClibc，保留 Rockit/MPP/RGA `NEEDED` 与 21 个 `UND`，无 `RPATH/RUNPATH`；
+它不安装、不自动运行，也不证明板端 loader、PCM、全双工或通道布局。完整证据和哈希边界见
+[2026-07-27 MPI 音频交叉链接验证记录](../test/p0-rockchip-mpi-link-validation-20260727.md)。
+
+同轮板端 schema v2 只读探针仅看到一个 capture PCM、一个 playback PCM、Rockit、AI/AO
+test 和直接 3A 库存在，并看到 VQE JSON 缺失。探针未打开 PCM 或调用 vendor API；随后
+物理链路断开，因此 adapter 与 HIL 状态仍是“未完成”。
+
 ## Rockchip 3A 候选与未决契约
 
 匹配 BSP 已确认 `rkaudio_preprocess_init`、`rkaudio_preprocess_short` 和拼写如此的
@@ -162,8 +189,9 @@ invalid frame，永远不报告 silence、activity 或 detection。`FakeWakeWord
 
 ## 外部依赖闸门
 
-`BOOMPI_ENABLE_ROCKCHIP_3A` 和 `BOOMPI_ENABLE_SNOWBOY` 默认均为 `OFF`。默认 host、
-CI 和 RV1106 核心构建不读取私人 SDK 路径，也不会下载或链接 vendor 二进制。仅把
+`BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO`、`BOOMPI_ENABLE_ROCKCHIP_3A` 和
+`BOOMPI_ENABLE_SNOWBOY` 默认均为 `OFF`。默认 host、CI 和 RV1106 核心构建不读取
+私人 SDK 路径，也不会下载或链接 vendor 二进制。仅把
 `BOOMPI_TARGET_RV1106` 设为 `ON` 不足以越过闸门；CMake 还会核对真实 cross compile、
 Linux/ARM target、固定 RV1106 GNU compiler 和包含 uClibc loader 的显式 sysroot。
 
@@ -172,24 +200,29 @@ Linux/ARM target、固定 RV1106 GNU compiler 和包含 uClibc loader 的显式 
 - Rockchip：`BOOMPI_ROCKCHIP_3A_INCLUDE_DIR`、
   `BOOMPI_ROCKCHIP_3A_AEC_LIBRARY`、`BOOMPI_ROCKCHIP_3A_COMMON_LIBRARY`、
   `BOOMPI_ROCKCHIP_3A_DETECT_LIBRARY`、`BOOMPI_ROCKCHIP_3A_CONFIG_FILE`。
+- Rockchip MPI：`BOOMPI_ROCKCHIP_MPI_INCLUDE_DIR`、
+  `BOOMPI_ROCKCHIP_MPI_ROCKIT_LIBRARY`、`BOOMPI_ROCKCHIP_MPI_MPP_LIBRARY` 和
+  `BOOMPI_ROCKCHIP_MPI_RGA_LIBRARY`。
 - Snowboy：`BOOMPI_SNOWBOY_INCLUDE_DIR`、`BOOMPI_SNOWBOY_LIBRARY`、
   `BOOMPI_SNOWBOY_RESOURCE_FILE`、`BOOMPI_SNOWBOY_MODEL_FILE` 和
   `BOOMPI_OPENBLAS_LIBRARY`。
 
 CMake 对每个输入执行存在性、文件类型和固定 SHA-256 检查，任一缺失或不匹配立即
 停止 configure。固定值来自 [P0 可行性报告](../test/p0-feasibility-report-20260725.md)
-中的审计基线，但它们只是可行性候选，不是发布批准。必须显式设置
+和 [vendor 音频证据基线](../test/p0-vendor-audio-inventory-20260727.md)中的审计输入，但它们
+只是可行性候选，不是发布批准。必须显式设置
 `BOOMPI_ALLOW_FEASIBILITY_AUDIO_VENDOR_INPUTS=ON`，并把生成器限制为 Debug-only，
 才会创建 imported targets；Release/RelWithDebInfo/MinSizeRel
 和包含其他 configuration 的多配置生成器都会被拒绝。通过该闸门不等于 adapter 已经
 实现、模型可以加载或板端实时率已经通过。
 
 显式启用 Rockchip feasibility 输入时，tests-off 默认 ALL 会构建不安装、不自动执行的
-`boompi_rockchip_3a_link_check`。它以匹配 header 的函数类型引用 init/process/destroy，
-交叉链接产物已保留 AEC/common `NEEDED` 和三个 `UND`，不会被 `--as-needed` 变成空链接；
-target 关闭 build RPATH，私有 BSP 路径不进入公共接口。该结果仍不证明板端 loader、初始化、
-音频处理或实时率，证据见
-[3A 交叉链接验证记录](../test/p0-rockchip-3a-link-validation-20260727.md)。
+`boompi_rockchip_3a_link_check` 或 `boompi_rockchip_mpi_audio_link_check`。3A target 以匹配
+header 的函数类型引用 init/process/destroy；MPI target 引用上述 21 个 raw 生命周期入口，
+并显式建模 Rockit→MPP/RGA 依赖。两者在同一 tests-off 默认 ALL 构建中共存通过。target
+均关闭 build RPATH，私有 BSP 路径不进入公共接口；结果仍不证明板端 loader、初始化、音频
+处理或实时率，证据见 [3A 交叉链接验证记录](../test/p0-rockchip-3a-link-validation-20260727.md)
+与 [MPI 音频交叉链接验证记录](../test/p0-rockchip-mpi-link-validation-20260727.md)。
 
 当前 OpenBLAS archive 含多线程实现，只完成了 ABI/link 候选验证。发布接入前必须按
 单线程配置重建、记录来源与许可、生成新的 SHA-256，并替换本模块 pin；不得用
@@ -207,7 +240,8 @@ Snowboy 候选静态库使用旧 libstdc++ 字符串 ABI。未来只能由一个
 
 ## 后续验证顺序
 
-1. 先完成 rk_mpi/ALSA 48 kHz 全双工和通道相关性 HIL，确定真实麦克风/reference 输入。
+1. rk_mpi 最小生命周期的真实交叉链接已通过；下一步完成 rk_mpi/ALSA 48 kHz 全双工和
+   通道相关性 HIL，确定真实麦克风/reference 输入。
 2. 直接 3A 符号 link-check 已通过；下一步在板端关闭物理 slot 映射、错误恢复、
    mono 输出、算法延迟、CPU/RSS 和实时率。
 3. 实现私有 Snowboy legacy bridge、启动期模型/格式校验和单线程 wake worker。

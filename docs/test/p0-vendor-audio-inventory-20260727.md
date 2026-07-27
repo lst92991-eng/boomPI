@@ -6,6 +6,12 @@
 > [交叉链接与符号检查](p0-rockchip-3a-link-validation-20260727.md)。该结果只证明
 > `libaec_bf_process.so`/common 与三个公开入口可由目标 linker 解析；没有运行板端 ELF，
 > 不改变本文对 PCM、物理 slot、3A 效果和实时率“未验证”的结论。
+>
+> 2026-07-27 21:12:34 +08:00 又完成 Rockchip MPI 音频的 tests-off 默认 ALL
+> [交叉链接与 21 个 raw 生命周期符号检查](p0-rockchip-mpi-link-validation-20260727.md)。
+> 同轮 schema v2 板端只读探针仅确认一个 capture PCM、一个 playback PCM、Rockit、AI/AO
+> test 与直接 3A 库存在，且 VQE JSON 缺失；没有打开 PCM 或执行 vendor。板端时钟错误地
+> 停留在 2021 年，故以 host 时间为准。随后物理链路断开，未进行 HIL。
 
 ## 结论
 
@@ -13,9 +19,10 @@
 `rk_mpi_ai`/`rk_mpi_ao`、直接 ALSA PCM、Rockchip VQE/`libaec_bf_process.so`。当前证据足够
 开始制作板端探针，但不够宣称 48 kHz 全双工、四通道回采或 AEC 已经可用。
 
-本轮只读取 SDK、已装配 rootfs/OEM、DTB、头文件、样例和 ELF；没有连接开发板，没有
-打开 PCM、修改 mixer、录音、播放或写入镜像。SDK 基线 commit 为 `994243753789`，工作树
-有用户已有改动，本轮没有修改。下文用 `<BSP_ROOT>` 代替开发机绝对路径。
+20:27 的原始盘点只读取 SDK、已装配 rootfs/OEM、DTB、头文件、样例和 ELF，没有连接
+开发板。21:12 的后续只读探针连接了当前板/镜像，但仍没有打开 PCM、修改 mixer、录音、
+播放、执行 vendor test 或写入镜像。SDK 基线 commit 为 `994243753789`，工作树有用户已有
+改动，盘点过程没有修改。下文用 `<BSP_ROOT>` 代替开发机绝对路径。
 
 | 项目 | 当前结论 | 不能外推的事项 |
 | --- | --- | --- |
@@ -70,6 +77,11 @@ libstdc++.so.6
 libgcc_s.so.1
 libc.so.0
 ```
+
+CMake link-check 使用 `media/out/lib/librockit.so` 的同哈希副本，并显式固定
+`media/out/lib/librockchip_mpp.so.0` 与 `media/out/lib/librga.so`。后两者是未 strip 链接
+候选；OEM 中经过 strip、哈希不同的 MPP/RGA 副本不能替代这些 CMake 输入。MPP 的真实
+文件名虽为 `.so.0`，其 `SONAME` 和运行时所需名称为 `librockchip_mpp.so.1`。
 
 当前 OEM 已装配 `librockit.so` 及依赖，并包含 `rk_mpi_ai_test`、`rk_mpi_ao_test` 和
 stress sample。raw AI/AO 不要求 VQE JSON，但需要驱动、设备节点和板级 mixer 初始化。
@@ -144,7 +156,14 @@ AINR 和 wakeup，因此不需要 AINR/wakeup `.rknn` 才能表达这份配置�
 | `rk_mpi_ai.h` | `5eb52c01056bdf6cdb4948a2a39d58172460dbcf7700e279774942f507b011cd` |
 | `rk_mpi_ao.h` | `e297104409a67f5d794bc111f900faae91b453f7255a0ed858f163a21201d618` |
 | `rk_comm_aio.h` | `95a76ae4d8dbd29563094c2e33ed5e200aeeef8ef6bc4426ff0ab34239d91867` |
+| `rk_mpi_sys.h` | `0b7d08b59d437acfb2bbbdabfbb39b77631b34cd904b2ebd041ba34c98fcbac9` |
+| `rk_mpi_mb.h` | `0c54ef75e4904096165e6229469e75bb981ebb535ee8cd1699b6bb27857375cf` |
+| `rk_comm_mb.h` | `7ba6b839615f7c62340562d93db2d01e2cf5d3e47f90d6f7b68e0b685a4ddd39` |
+| `rk_common.h` | `ef3da84bf65e727de587be7665f29dbdb135326549736dbed0c1366d53e2b418` |
+| `rk_type.h` | `1ca5eabff89c39034a5be31185a13709da0f697f3f9cac7637e41ea59bed924f` |
 | `librockit.so` | `3f92f8c41ffe9ad72e407b68750906fcff89ea06758f14a3fc2a3d87061e3d0f` |
+| `media/out/lib/librockchip_mpp.so.0` | `e8183339fff1dd466adc9567be5c4c98239c567157eaebefe4a2fe50f793fec8` |
+| `media/out/lib/librga.so` | `13cf7d10210cdf43a998a07a9bf0033821dfec61b31d9c50195848c0480010c7` |
 | `rk_mpi_ai_test` | `633dede4ac9dda4d17d3d7d185067fa89c09f88e64af3d3b4aab5468b4b6265e` |
 | `rk_mpi_ao_test` | `2a77b02a6371c15124909c3bf84b7922614bac899aaffab98ae6da3ede6738a6` |
 | `config_aivqe.json` | `1d160fde184935cf43a49feae7be0dfd24efdc82ff9de2ea8b35aba6318074f9` |
@@ -152,11 +171,12 @@ AINR 和 wakeup，因此不需要 AINR/wakeup `.rknn` 才能表达这份配置�
 | `libaec_bf_process.so` | `5abbcf518ffa39900dd78352547ebf5feab83d2f9b30a82c1e2dc1dc44b25e07` |
 | `librkaudio_common.so` | `4f4c9d78028a592174c3e959e35d231317d0ed2a864a1ed230f8adab42960246` |
 
-## 下一项板端闭环
+## 板端闭环进度与下一项
 
 严格按以下顺序推进，每一步单独记录当前板卡、镜像、命令、返回值和 dmesg：
 
-1. 运行 schema v2 只读探针，记录 ALSA 节点以及 MPI、Rockit、3A 库和 VQE 资源是否存在。
+1. **只读资源盘点已完成**：schema v2 记录了 ALSA 节点以及 MPI、Rockit、3A 库和 VQE
+   资源存在性；这一步没有打开 PCM 或执行 vendor，不能记为功能通过。
 2. 记录 direct-hw 参数和测试前 dmesg，确认无其他进程占用 PCM，逐控件保存 mixer；
    先保持模拟 DAC Off，以有限时长数字静音让 48 kHz S16_LE 2ch capture/playback 明确
    重叠，验收所有 PID/exit code、录音字节数和测试后新增 xrun，并恢复/回读 mixer。

@@ -2,6 +2,8 @@ include_guard(GLOBAL)
 
 option(BOOMPI_ENABLE_ROCKCHIP_3A
   "Enable the pinned Rockchip RV1106 3A feasibility dependency" OFF)
+option(BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO
+  "Enable the pinned Rockchip RV1106 MPI audio feasibility dependency" OFF)
 option(BOOMPI_ENABLE_SNOWBOY
   "Enable the pinned Snowboy wake-word feasibility dependency" OFF)
 option(BOOMPI_ALLOW_FEASIBILITY_AUDIO_VENDOR_INPUTS
@@ -17,6 +19,15 @@ set(BOOMPI_ROCKCHIP_3A_DETECT_LIBRARY "" CACHE FILEPATH
   "Pinned Rockchip audio detection shared library")
 set(BOOMPI_ROCKCHIP_3A_CONFIG_FILE "" CACHE FILEPATH
   "Pinned Rockchip 3A runtime configuration")
+
+set(BOOMPI_ROCKCHIP_MPI_INCLUDE_DIR "" CACHE PATH
+  "Directory containing the pinned Rockchip MPI audio headers")
+set(BOOMPI_ROCKCHIP_MPI_ROCKIT_LIBRARY "" CACHE FILEPATH
+  "Pinned Rockchip Rockit shared library")
+set(BOOMPI_ROCKCHIP_MPI_MPP_LIBRARY "" CACHE FILEPATH
+  "Pinned Rockchip MPP shared library")
+set(BOOMPI_ROCKCHIP_MPI_RGA_LIBRARY "" CACHE FILEPATH
+  "Pinned Rockchip RGA shared library")
 
 set(BOOMPI_SNOWBOY_INCLUDE_DIR "" CACHE PATH
   "Directory containing the pinned Snowboy header")
@@ -41,6 +52,29 @@ set(_BOOMPI_ROCKCHIP_3A_DETECT_SHA256
   "f84b66a2d1d561fbb3c36e288a57f1e9ef50990974d9be9accbb0aaebcbae396")
 set(_BOOMPI_ROCKCHIP_3A_CONFIG_SHA256
   "1d160fde184935cf43a49feae7be0dfd24efdc82ff9de2ea8b35aba6318074f9")
+
+set(_BOOMPI_ROCKCHIP_MPI_AI_HEADER_SHA256
+  "5eb52c01056bdf6cdb4948a2a39d58172460dbcf7700e279774942f507b011cd")
+set(_BOOMPI_ROCKCHIP_MPI_AO_HEADER_SHA256
+  "e297104409a67f5d794bc111f900faae91b453f7255a0ed858f163a21201d618")
+set(_BOOMPI_ROCKCHIP_MPI_AIO_HEADER_SHA256
+  "95a76ae4d8dbd29563094c2e33ed5e200aeeef8ef6bc4426ff0ab34239d91867")
+set(_BOOMPI_ROCKCHIP_MPI_SYS_HEADER_SHA256
+  "0b7d08b59d437acfb2bbbdabfbb39b77631b34cd904b2ebd041ba34c98fcbac9")
+set(_BOOMPI_ROCKCHIP_MPI_MB_HEADER_SHA256
+  "0c54ef75e4904096165e6229469e75bb981ebb535ee8cd1699b6bb27857375cf")
+set(_BOOMPI_ROCKCHIP_MPI_COMM_MB_HEADER_SHA256
+  "7ba6b839615f7c62340562d93db2d01e2cf5d3e47f90d6f7b68e0b685a4ddd39")
+set(_BOOMPI_ROCKCHIP_MPI_COMMON_HEADER_SHA256
+  "ef3da84bf65e727de587be7665f29dbdb135326549736dbed0c1366d53e2b418")
+set(_BOOMPI_ROCKCHIP_MPI_TYPE_HEADER_SHA256
+  "1ca5eabff89c39034a5be31185a13709da0f697f3f9cac7637e41ea59bed924f")
+set(_BOOMPI_ROCKCHIP_MPI_ROCKIT_SHA256
+  "3f92f8c41ffe9ad72e407b68750906fcff89ea06758f14a3fc2a3d87061e3d0f")
+set(_BOOMPI_ROCKCHIP_MPI_MPP_SHA256
+  "e8183339fff1dd466adc9567be5c4c98239c567157eaebefe4a2fe50f793fec8")
+set(_BOOMPI_ROCKCHIP_MPI_RGA_SHA256
+  "13cf7d10210cdf43a998a07a9bf0033821dfec61b31d9c50195848c0480010c7")
 
 set(_BOOMPI_SNOWBOY_HEADER_SHA256
   "f203e88bccd3782b9fdfaa5f02ea2fab402671f415c9eae3609b67c1e622a363")
@@ -278,6 +312,136 @@ function(_boompi_configure_rockchip_3a_dependency)
     BOOMPI_AUDIO_VENDOR_ROCKCHIP_3A_CONFIGURED TRUE)
 endfunction()
 
+function(_boompi_configure_rockchip_mpi_audio_dependency)
+  get_property(_already_configured GLOBAL PROPERTY
+    BOOMPI_AUDIO_VENDOR_ROCKCHIP_MPI_AUDIO_CONFIGURED)
+  if(_already_configured)
+    return()
+  endif()
+
+  _boompi_audio_vendor_require_directory(
+    "BOOMPI_ROCKCHIP_MPI_INCLUDE_DIR"
+    "${BOOMPI_ROCKCHIP_MPI_INCLUDE_DIR}"
+    _include_dir)
+  boompi_audio_vendor_require_pinned_file(
+    "BOOMPI_ROCKCHIP_MPI_INCLUDE_DIR/rk_mpi_ai.h"
+    "${_include_dir}/rk_mpi_ai.h"
+    "${_BOOMPI_ROCKCHIP_MPI_AI_HEADER_SHA256}"
+    _ai_header)
+  boompi_audio_vendor_require_pinned_file(
+    "BOOMPI_ROCKCHIP_MPI_INCLUDE_DIR/rk_mpi_ao.h"
+    "${_include_dir}/rk_mpi_ao.h"
+    "${_BOOMPI_ROCKCHIP_MPI_AO_HEADER_SHA256}"
+    _ao_header)
+  boompi_audio_vendor_require_pinned_file(
+    "BOOMPI_ROCKCHIP_MPI_INCLUDE_DIR/rk_comm_aio.h"
+    "${_include_dir}/rk_comm_aio.h"
+    "${_BOOMPI_ROCKCHIP_MPI_AIO_HEADER_SHA256}"
+    _aio_header)
+  boompi_audio_vendor_require_pinned_file(
+    "BOOMPI_ROCKCHIP_MPI_INCLUDE_DIR/rk_mpi_sys.h"
+    "${_include_dir}/rk_mpi_sys.h"
+    "${_BOOMPI_ROCKCHIP_MPI_SYS_HEADER_SHA256}"
+    _sys_header)
+  boompi_audio_vendor_require_pinned_file(
+    "BOOMPI_ROCKCHIP_MPI_INCLUDE_DIR/rk_mpi_mb.h"
+    "${_include_dir}/rk_mpi_mb.h"
+    "${_BOOMPI_ROCKCHIP_MPI_MB_HEADER_SHA256}"
+    _mb_header)
+  boompi_audio_vendor_require_pinned_file(
+    "BOOMPI_ROCKCHIP_MPI_INCLUDE_DIR/rk_comm_mb.h"
+    "${_include_dir}/rk_comm_mb.h"
+    "${_BOOMPI_ROCKCHIP_MPI_COMM_MB_HEADER_SHA256}"
+    _comm_mb_header)
+  boompi_audio_vendor_require_pinned_file(
+    "BOOMPI_ROCKCHIP_MPI_INCLUDE_DIR/rk_common.h"
+    "${_include_dir}/rk_common.h"
+    "${_BOOMPI_ROCKCHIP_MPI_COMMON_HEADER_SHA256}"
+    _common_header)
+  boompi_audio_vendor_require_pinned_file(
+    "BOOMPI_ROCKCHIP_MPI_INCLUDE_DIR/rk_type.h"
+    "${_include_dir}/rk_type.h"
+    "${_BOOMPI_ROCKCHIP_MPI_TYPE_HEADER_SHA256}"
+    _type_header)
+  boompi_audio_vendor_require_pinned_file(
+    "BOOMPI_ROCKCHIP_MPI_ROCKIT_LIBRARY"
+    "${BOOMPI_ROCKCHIP_MPI_ROCKIT_LIBRARY}"
+    "${_BOOMPI_ROCKCHIP_MPI_ROCKIT_SHA256}"
+    _rockit_library)
+  boompi_audio_vendor_require_pinned_file(
+    "BOOMPI_ROCKCHIP_MPI_MPP_LIBRARY"
+    "${BOOMPI_ROCKCHIP_MPI_MPP_LIBRARY}"
+    "${_BOOMPI_ROCKCHIP_MPI_MPP_SHA256}"
+    _mpp_library)
+  boompi_audio_vendor_require_pinned_file(
+    "BOOMPI_ROCKCHIP_MPI_RGA_LIBRARY"
+    "${BOOMPI_ROCKCHIP_MPI_RGA_LIBRARY}"
+    "${_BOOMPI_ROCKCHIP_MPI_RGA_SHA256}"
+    _rga_library)
+
+  foreach(_target IN ITEMS
+      boompi_vendor_rockchip_mpp
+      boompi_vendor_rockchip_rga
+      boompi_vendor_rockchip_rockit
+      boompi_vendor::rockchip_mpp
+      boompi_vendor::rockchip_rga
+      boompi_vendor::rockchip_rockit
+      boompi_rockchip_mpi_audio_link_check)
+    if(TARGET ${_target})
+      message(FATAL_ERROR "Rockchip MPI audio imported target name collision")
+    endif()
+  endforeach()
+
+  add_library(boompi_vendor_rockchip_mpp SHARED IMPORTED GLOBAL)
+  set_target_properties(boompi_vendor_rockchip_mpp PROPERTIES
+    IMPORTED_LOCATION "${_mpp_library}"
+    IMPORTED_SONAME "librockchip_mpp.so.1")
+  add_library(boompi_vendor::rockchip_mpp ALIAS
+    boompi_vendor_rockchip_mpp)
+
+  add_library(boompi_vendor_rockchip_rga SHARED IMPORTED GLOBAL)
+  set_target_properties(boompi_vendor_rockchip_rga PROPERTIES
+    IMPORTED_LOCATION "${_rga_library}"
+    IMPORTED_SONAME "librga.so")
+  add_library(boompi_vendor::rockchip_rga ALIAS
+    boompi_vendor_rockchip_rga)
+
+  add_library(boompi_vendor_rockchip_rockit SHARED IMPORTED GLOBAL)
+  set_target_properties(boompi_vendor_rockchip_rockit PROPERTIES
+    IMPORTED_LOCATION "${_rockit_library}"
+    IMPORTED_SONAME "librockit.so"
+    INTERFACE_LINK_LIBRARIES
+      "boompi_vendor::rockchip_mpp;boompi_vendor::rockchip_rga")
+  add_library(boompi_vendor::rockchip_rockit ALIAS
+    boompi_vendor_rockchip_rockit)
+
+  # This executable is part of ALL whenever the feasibility-only Rockchip MPI
+  # audio dependency is enabled. It is never installed or run automatically;
+  # it only checks the pinned headers' types and forces the target linker to
+  # resolve the raw SYS/MB, AI, and AO entry points.
+  add_executable(boompi_rockchip_mpi_audio_link_check
+    "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../tests/link/rockchip_mpi_audio_link_check.cpp")
+  target_compile_features(boompi_rockchip_mpi_audio_link_check PRIVATE
+    cxx_std_17)
+  target_include_directories(boompi_rockchip_mpi_audio_link_check PRIVATE
+    "${_include_dir}")
+  target_link_libraries(boompi_rockchip_mpi_audio_link_check PRIVATE
+    boompi_vendor::rockchip_rockit)
+  set_target_properties(boompi_rockchip_mpi_audio_link_check PROPERTIES
+    SKIP_BUILD_RPATH TRUE)
+
+  unset(_ai_header)
+  unset(_ao_header)
+  unset(_aio_header)
+  unset(_sys_header)
+  unset(_mb_header)
+  unset(_comm_mb_header)
+  unset(_common_header)
+  unset(_type_header)
+  set_property(GLOBAL PROPERTY
+    BOOMPI_AUDIO_VENDOR_ROCKCHIP_MPI_AUDIO_CONFIGURED TRUE)
+endfunction()
+
 function(_boompi_configure_snowboy_dependency)
   get_property(_already_configured GLOBAL PROPERTY
     BOOMPI_AUDIO_VENDOR_SNOWBOY_CONFIGURED)
@@ -346,7 +510,9 @@ function(_boompi_configure_snowboy_dependency)
 endfunction()
 
 function(boompi_configure_audio_vendor_dependencies)
-  if(NOT BOOMPI_ENABLE_ROCKCHIP_3A AND NOT BOOMPI_ENABLE_SNOWBOY)
+  if(NOT BOOMPI_ENABLE_ROCKCHIP_3A AND
+      NOT BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO AND
+      NOT BOOMPI_ENABLE_SNOWBOY)
     return()
   endif()
 
@@ -355,6 +521,9 @@ function(boompi_configure_audio_vendor_dependencies)
 
   if(BOOMPI_ENABLE_ROCKCHIP_3A)
     _boompi_configure_rockchip_3a_dependency()
+  endif()
+  if(BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO)
+    _boompi_configure_rockchip_mpi_audio_dependency()
   endif()
   if(BOOMPI_ENABLE_SNOWBOY)
     _boompi_configure_snowboy_dependency()

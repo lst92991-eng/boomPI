@@ -48,14 +48,18 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 P1 已建立 CMake/Go 构建、配置校验、协议 fixture 和跨平台 CI。P0 已确认匹配 BSP 的
 GCC 8.3/uClibc 工具链；Rockchip 3A 的 tests-off 默认 ALL 交叉链接和三个入口符号解析
-已通过，Snowboy/OpenBLAS 仍是 ABI/链接候选；板端
-能力仍是部分通过。当前 SDK 已找到 `librockit.so`、AI/AO 头文件与样例、预构建
-`rk_mpi_ai_test`/`rk_mpi_ao_test`，但 raw PCM 的实际参数、AI+AO 同时运行、VQE 资源
-安装和 3A 实时率尚未在当前镜像闭环验证。
+已通过；Rockchip MPI 音频的 tests-off 默认 ALL 交叉链接也已解析 21 个 raw
+SYS/MB/AI/AO 生命周期符号及 Rockit→MPP/RGA 依赖。Snowboy/OpenBLAS 仍是 ABI/链接候选；
+板端能力仍是部分通过。当前镜像的只读探针只确认 `librockit.so`、AI/AO test、一个
+capture PCM、一个 playback PCM 和直接 3A 库存在，同时确认 VQE JSON 缺失；探针没有
+打开 PCM 或执行 vendor API。raw PCM 的实际参数、AI+AO 同时运行、VQE 资源安装和 3A
+实时率尚未在当前镜像闭环验证。
 具体路径、哈希、两个 Mode 的区别和 HIL 顺序见
 [2026-07-27 vendor 音频证据基线](docs/test/p0-vendor-audio-inventory-20260727.md)。
 3A 交叉链接的命令、ELF 结果和严格边界另见
 [2026-07-27 Rockchip 3A 交叉链接验证记录](docs/test/p0-rockchip-3a-link-validation-20260727.md)。
+MPI 音频的八个头文件 pin、21 个 `UND`、MPP/RGA SONAME 与未运行边界见
+[2026-07-27 Rockchip MPI 音频交叉链接验证记录](docs/test/p0-rockchip-mpi-link-validation-20260727.md)。
 
 已有 playback renderer/committer/worker/ALSA adapter 及其 host、Linux `null`、RV1106
 交叉链接结果不会删除，详细证据保留在
@@ -162,7 +166,7 @@ Qwen 凭据只能通过当前进程环境提供：
 1. 与目标镜像匹配的 RV1106 交叉编译器和 sysroot。
 2. 已确认的 CPU ISA、hard/soft-float ABI、动态加载器、libc 和 libstdc++ 版本。
 3. ALSA 开发头文件/库，以及经板端确认的声卡、PCM 和 mixer 参数。
-4. Rockchip 3A 的匹配头文件与二进制库；不得只从板端 `.so` 名称猜 API。
+4. Rockchip MPI/3A 的匹配头文件与二进制库；不得只从板端 `.so` 名称猜 API。
 5. Snowboy runtime/model 的兼容性和再分发许可结论。
 6. 工具链文件要求的 SDK/sysroot 环境变量或 CMake cache 参数；不得把个人绝对路径写入 preset。
 
@@ -172,12 +176,14 @@ Qwen 凭据只能通过当前进程环境提供：
 - `BOOMPI_RV1106_TOOLCHAIN_PREFIX`：可选；当前默认值为 `arm-rockchip830-linux-uclibcgnueabihf`，必须与实际 SDK 一致。
 - `BOOMPI_RV1106_SYSROOT`：接入目标系统库时必须指向与镜像匹配的 sysroot。
 
-`BOOMPI_ENABLE_ROCKCHIP_3A` 和 `BOOMPI_ENABLE_SNOWBOY` 默认均为 `OFF`。当前 pins
+`BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO`、`BOOMPI_ENABLE_ROCKCHIP_3A` 和
+`BOOMPI_ENABLE_SNOWBOY` 默认均为 `OFF`。当前 pins
 只用于可行性探针：必须同时核对 Linux/ARM 交叉编译、固定 RV1106 GNU compiler 和
 uClibc sysroot，并显式设置 `BOOMPI_ALLOW_FEASIBILITY_AUDIO_VENDOR_INPUTS=ON`；仅
-Debug-only 配置可继续逐项校验绝对路径和 SHA-256，Release 配置一律拒绝。启用 Rockchip
-3A 后，tests-off 默认 ALL 会链接一个不安装、不自动执行的符号检查 target；它不会自动
-搜索相邻 SDK、下载依赖或生成生产 adapter。详细 cache 输入及安全边界见
+Debug-only 配置可继续逐项校验绝对路径和 SHA-256，Release 配置一律拒绝。启用任一
+Rockchip 候选后，tests-off 默认 ALL 会链接对应的不安装、不自动执行的符号检查 target；
+它不会自动搜索相邻 SDK、下载依赖或生成生产 adapter。MPI 的 MPP/RGA pins 对应
+`media/out/lib` 未 strip 链接候选，不能用 OEM stripped 副本替代。详细 cache 输入及安全边界见
 [音频后端契约与依赖闸门](docs/architecture/audio-backends.md)。
 
 准备完成后使用：
@@ -193,6 +199,11 @@ cmake --build --preset rv1106-release --parallel
 交叉链接：最终 ELF 保留 AEC/common `NEEDED` 与三个入口 `UND`。该目标没有运行或安装，
 不代表板端 PCM、通道布局或 3A 效果通过；详见
 [3A 交叉链接验证记录](docs/test/p0-rockchip-3a-link-validation-20260727.md)。
+
+同日还完成 Rockchip MPI 音频 Debug/tests-off 默认 ALL 交叉链接：ELF32 ARM
+hard-float/uClibc 产物保留 Rockit/MPP/RGA `NEEDED`、21 个 raw 生命周期 `UND`，且没有
+`RPATH`/`RUNPATH`。该目标同样没有安装或执行；板端只读存在性也不等于全双工功能通过。
+详见 [MPI 音频交叉链接验证记录](docs/test/p0-rockchip-mpi-link-validation-20260727.md)。
 
 恢复板端 SSH 后，可运行不会打开 PCM 或修改系统的脱敏探针：
 

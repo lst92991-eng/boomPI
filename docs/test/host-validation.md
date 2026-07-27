@@ -86,6 +86,10 @@ go vet ./...
 go build -trimpath ./cmd/boompi-server
 ```
 
+2026-07-27 21:12:34 +08:00 的最终树已在 clean 临时目录通过 16 个 CTest、31 个
+Python/script 测试，以及 Go 1.26.5 的 `go test ./...` 和 `go vet ./...`。这些是离线
+host/构建回归，不包含付费 provider 请求，也不替代 RV1106 HIL。
+
 自动测试必须离线运行，不读取真实 `DASHSCOPE_API_KEY`，也不得发起付费 provider 请求。需要真实 Qwen 的测试必须使用单独的显式开关，并在测试报告中记录区域、模型和费用风险。
 
 ## P1 最低检查项
@@ -197,21 +201,28 @@ go build -trimpath ./cmd/boompi-server
 - unavailable wake engine 对合法 16 kHz mono frame 返回 backend unavailable，对非法
   格式返回 invalid frame，永不报告 detection。确定性 wake fake 只进入测试 target，
   不能成为生产 fallback；Snowboy `-2` 不作为 VAD 测试结论。
-- vendor CMake 夹具验证两个 enable 选项确实默认关闭，并用全部十个不存在路径确认
-  OFF 时零访问、零路径泄漏；host 即使伪造 `BOOMPI_TARGET_RV1106=ON` 也不能越过
-  cross Linux/ARM、固定 compiler 和 uClibc sysroot 检查。当前 pins 还要求显式
+- vendor CMake 夹具验证 MPI、3A 和 Snowboy 三个 enable 选项默认关闭，并以不存在的显式
+  输入确认 OFF 时零访问、零路径泄漏；host 即使伪造 `BOOMPI_TARGET_RV1106=ON` 也不能
+  越过 cross Linux/ARM、固定 compiler 和 uClibc sysroot 检查。当前 pins 还要求显式
   feasibility opt-in 和 Debug-only 配置；Release 被拒绝。绝对路径、文件类型、缺失和
-  SHA-256 不符均在 configure 阶段失败。该夹具在 Windows/Linux/macOS CI 运行，默认
-  测试不加载 Rockchip 库、Snowboy 模型或 OpenBLAS。
-- Linux 专用的合成 shared-object 夹具会在 `BOOMPI_BUILD_TESTS=OFF` 下执行默认 ALL，
+  SHA-256 不符均在 configure 阶段失败。默认测试不加载 Rockchip 库、Snowboy 模型或
+  OpenBLAS。
+- Linux 专用的 3A 合成 shared-object 夹具会在 `BOOMPI_BUILD_TESTS=OFF` 下执行默认 ALL，
   确认 link-check target 确实生成且动态段无 `RPATH`/`RUNPATH`；分别删除 init、process、
-  destroy 任一入口时，链接必须失败。合成库只验证 CMake 回归，不能替代下一条真实 RV1106
-  交叉链接证据；Windows/macOS 明确跳过这两个 `.so` 链接用例。
+  destroy 任一入口时，链接必须失败。独立 MPI 夹具同样验证 tests-off 默认 ALL、无
+  `RPATH`/`RUNPATH`，并分别删除代表性的 SYS、MB、AI、AO 入口确认链接失败。合成库只验证
+  CMake 回归，不能替代真实 RV1106 交叉链接证据；非 Linux host 明确跳过 `.so` 链接用例。
 - 独立的 RV1106 Debug/tests-off feasibility 构建已真实链接
   `boompi_rockchip_3a_link_check`。最终 ELF 保留 `libaec_bf_process.so`、
   `librkaudio_common.so` 的 `NEEDED` 和三个 `rkaudio_preprocess_*` `UND`；这只证明匹配
   header、库和目标 linker 的符号兼容，不是 host 测试，也没有运行或安装该 ELF。详见
   [2026-07-27 Rockchip 3A 交叉链接验证记录](p0-rockchip-3a-link-validation-20260727.md)。
+- 独立的 RV1106 Debug/tests-off feasibility 构建也已真实链接
+  `boompi_rockchip_mpi_audio_link_check`。最终 ELF 为 ARM EABI5 hard-float/uClibc，保留
+  Rockit/MPP/RGA `NEEDED`、21 个 raw SYS/MB/AI/AO `UND`，且无 `RPATH`/`RUNPATH`；临时
+  strip-debug 副本通过完整 ELF verifier。该 ELF 没有安装或执行；同一构建同时启用 MPI
+  与 3A 也只证明两套 CMake 依赖可共存。详见
+  [2026-07-27 Rockchip MPI 音频交叉链接验证记录](p0-rockchip-mpi-link-validation-20260727.md)。
 - Host DSP 测试只能证明算法和内存边界；实际通道顺序、CPU 实时率和声音质量仍按
   HIL 闸门验证。
 
