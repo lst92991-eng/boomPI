@@ -52,9 +52,10 @@ UI/touch <- UI model                              Qwen Singapore
 Mode1 失败时只能进入有记录的软件参考方案评审，不能同时混用硬件和软件 reference。
 
 P2 当前已实现 48 kHz capture/16 kHz mono 的固定帧契约、预分配 SPSC ownership、
-producer sequence、consumer continuity gate、可配置四通道解交织/极性和四路
-48→16 kHz FIR。它们已通过 host 测试与 RV1106 交叉编译，但尚未连接 ALSA、
-Rockchip 3A、Snowboy 或任何真实 DSP backend；Mode1 slot 顺序和实时率仍需 HIL。
+producer sequence、consumer continuity gate、可配置四通道解交织/极性、四路
+48→16 kHz FIR 和 generation-safe 采集前端编排。它们已通过 host 测试与 RV1106
+交叉编译，但尚未连接 ALSA、Rockchip 3A、Snowboy 或任何真实 DSP backend；
+Mode1 slot 顺序和实时率仍需 HIL。
 
 ## 状态与取消
 

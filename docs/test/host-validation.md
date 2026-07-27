@@ -94,6 +94,9 @@ go build -trimpath ./cmd/boompi-server
 - 四路流式 48→16 kHz 结果与独立参考卷积一致；跨 20 ms 帧的历史、Reset、
   正负 half-LSB 舍入和 S16 饱和均有确定性测试。
 - 频响测试输入使用固定非零相位，避免抽取后的正弦恰好落在零点而造成阻带假阳性。
+- 采集前端与独立 primitive 的输出 bit-exact 一致；空输出重试、跨帧历史、新旧
+  generation、旧帧隔离、continuity/transform fault 锁存和新 generation 恢复均有
+  确定性测试。
 - Host DSP 测试只能证明算法和内存边界；实际通道顺序、CPU 实时率和声音质量仍按
   HIL 闸门验证。
 

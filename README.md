@@ -40,7 +40,7 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 ### 软件阶段
 
-P1 已建立模块边界、构建入口、配置校验、测试支撑和协议 fixture，Windows/Linux/macOS CI 已通过。P0 的当前证据与板端待办见 [2026-07-25 可行性报告](docs/test/p0-feasibility-report-20260725.md)。P2 已实现固定音频帧、预分配 SPSC lease、sequence/discontinuity、连续性门禁、可配置四通道解交织/极性和四路 48→16 kHz FIR；具体边界见 [音频运行时文档](docs/architecture/audio-runtime.md)。这些 DSP 原语尚未连接 ALSA、3A 或 Snowboy，真实 Mode1 通道顺序也仍需板端确认。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
+P1 已建立模块边界、构建入口、配置校验、测试支撑和协议 fixture，Windows/Linux/macOS CI 已通过。P0 的当前证据与板端待办见 [2026-07-25 可行性报告](docs/test/p0-feasibility-report-20260725.md)。P2 已实现固定音频帧、预分配 SPSC lease、sequence/discontinuity、连续性门禁、可配置四通道解交织/极性、四路 48→16 kHz FIR 和 generation-safe 采集前端编排；具体边界见 [音频运行时文档](docs/architecture/audio-runtime.md)。这些 DSP 组件尚未连接 ALSA、3A 或 Snowboy，真实 Mode1 通道顺序也仍需板端确认。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
 
 ## 仓库结构
 
