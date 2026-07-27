@@ -97,6 +97,12 @@ go build -trimpath ./cmd/boompi-server
 - 采集前端与独立 primitive 的输出 bit-exact 一致；空输出重试、跨帧历史、新旧
   generation、旧帧隔离、continuity/transform fault 锁存和新 generation 恢复均有
   确定性测试。
+- TTS 短帧只有在 EOS 且未使用尾部全零时有效；完整 reference 的格式、时间戳来源、
+  1.5 秒排队上限以及 `ResetHeader` 不清 PCM 均有边界测试。
+- playback gate 覆盖 fence epoch 授权、epoch→stream→turn 的 stale 隔离、精确 retire、
+  迟到 cancel 和最近身份防复用；fence 覆盖非零严格递增、耗尽及 release/acquire。
+- 软件 drain 覆盖空、部分、满 64 帧和 held producer lease 晚发布；触及迭代上限不被
+  当作“已清空”，也不把软件队列结果描述为 ALSA 已 drop 或扬声器已经静音。
 - Host DSP 测试只能证明算法和内存边界；实际通道顺序、CPU 实时率和声音质量仍按
   HIL 闸门验证。
 

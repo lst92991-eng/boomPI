@@ -53,9 +53,11 @@ Mode1 失败时只能进入有记录的软件参考方案评审，不能同时�
 
 P2 当前已实现 48 kHz capture/16 kHz mono 的固定帧契约、预分配 SPSC ownership、
 producer sequence、consumer continuity gate、可配置四通道解交织/极性、四路
-48→16 kHz FIR 和 generation-safe 采集前端编排。它们已通过 host 测试与 RV1106
-交叉编译，但尚未连接 ALSA、Rockchip 3A、Snowboy 或任何真实 DSP backend；
-Mode1 slot 顺序和实时率仍需 HIL。
+48→16 kHz FIR、generation-safe 采集前端，以及 24 kHz TTS/48 kHz reference 固定帧、
+actor 授权的 playback epoch fence/代际门禁和有界软件 drain。它们已通过 host 测试与
+RV1106 交叉编译，但尚未连接 ALSA、Rockchip 3A、Snowboy 或任何真实 DSP backend；
+partial ALSA reference、Arm/Cancel ACK、driver drop 和确认播放进度仍属于后续集成，
+Mode1 slot 顺序和实时率也仍需 HIL。
 
 ## 状态与取消
 

@@ -4,8 +4,9 @@
 
 本文记录 P2 音频运行时的已实现基础契约。当前完成了 host 可验证的固定帧、
 预分配 SPSC 队列、生产 sequence、消费连续性门禁、四通道解交织/极性映射、
-四路 48→16 kHz FIR 和 generation-safe 采集前端编排；ALSA、Rockchip 3A、
-Snowboy、播放和打断尚未接入。
+四路 48→16 kHz FIR、generation-safe 采集前端编排，以及播放固定帧、代际门禁、
+epoch fence 和有界软件队列清理；ALSA、Rockchip 3A、Snowboy、实际播放和打断
+闭环尚未接入。
 Host 测试和交叉编译不能替代真机全双工、Mode1、AEC 或声学验收。
 
 ## 帧契约
@@ -76,6 +77,41 @@ CaptureFrame
 - worker 只把首次锁存 fault 通过有界控制通道报告给 application actor；本对象不
   直接调用 mutex/deque `EventBus`。真实实时率和 Mode1 行为仍必须 HIL。
 
+## 播放帧、代际与软件缓冲
+
+- `TtsPcmFrame24k` 固定为 24 kHz、20 ms、S16_LE、mono，正常帧携带 480 samples。
+  provider 的最后一帧可以是 `1..479` samples，但必须同时标记 EOS，并把未使用尾部
+  清零；这样复用的队列槽不会把旧 PCM 当成新回答播放。活跃 TTS 帧的 `epoch`、
+  `turn_id` 和 `stream_id` 均非零。
+- `RenderReferenceFrame48k` 固定为 48 kHz、20 ms、每通道 960 samples，允许 mono
+  或 stereo；内容定义为重采样、音量、duck、混音和 limiter 之后的最终数字 PCM，
+  不能用收到的原始 TTS 包代替。metadata 时间戳表示首样本预计到达 DAC 的本地
+  单调时刻，必须不早于 render 完成时刻；排队延迟上限为 1.5 秒。
+- 完整 reference frame 只能在对应完整 20 ms PCM 已被未来 ALSA 层接受后发布。
+  当前固定帧类型不能表示 partial write 后紧接 cancel 的已接受前缀；P2f 必须增加
+  独立的有界 `AcceptedRenderChunk48k` 契约并只发布 accepted prefix。不得把 partial
+  prefix 填充或伪装成完整 reference，也不得声称本阶段已经接通软件 AEC reference。
+- `PlaybackGenerationGate` 只由 playback worker 操作。激活必须同时携带 actor
+  授权的非零 `(epoch, turn_id, stream_id)` 和从 `PlaybackEpochFence` 观察到的相同
+  epoch；网络输入不能自行激活代际。活动代际必须先精确退役，迟到的旧 cancel 不能
+  退役新代际；身份比较按 epoch、stream、turn 顺序进行，stale 帧不改变活动状态。
+- application actor 是 `PlaybackEpochFence` 的唯一写者，playback worker 是唯一
+  读者。fence 使用 lock-free 32-bit release/acquire atomic，只允许严格递增的非零
+  epoch；回绕前必须静止并重建运行时。它只是低延迟失效信号，不是 wake、Arm/Cancel
+  ACK，也不证明 ALSA、DMA、Codec 或扬声器中的旧 PCM 已经停止。
+- gate 只保留当前和最近退役的 `(epoch, stream_id)`；actor 必须保证整个 session 内
+  不复用历史身份，并在允许网络 producer 发布新代际前等待未来 playback Arm ACK。
+  这是明确的控制面责任，不能依赖网络包到达顺序碰巧正确。
+- TTS ingress 固定 64 帧，即 1.28 秒；软件 reference 队列固定 16 帧，即 320 ms。
+  `DrainPublishedTtsFrames` 只能由 consumer 调用，每次最多丢弃 64 个已发布帧，避免
+  持续生产者饿死控制处理。触及上限不代表队列已空，producer 已持有但尚未发布的
+  lease 也不可见；它以后即使发布，仍须在 ALSA commit 前再次通过 generation gate。
+- 软件队列 drain 与 ALSA `snd_pcm_drain()` 完全不同。未来取消必须停止旧代际写入、
+  丢弃未提交 chunk、调用 `snd_pcm_drop()`/`prepare()`、使旧 reference 断代并等待
+  playback ACK。当前原语不执行这些动作，也不把 submitted samples 当成已经听到。
+- TTS 队列满时的集成策略是停止 credit 并取消 response，禁止丢一帧后继续播放；
+  `size_approx()` 只供诊断，不能计算 credit。该 actor/network/playback 握手留在 P2f。
+
 ## SPSC ownership
 
 每个 `SpscAudioFrameQueue<Frame, Capacity>` 同时拥有固定帧槽和队列位置：
@@ -124,7 +160,8 @@ single producer
 
 Host CTest 覆盖固定格式、非法 metadata、FIFO、满队列、槽复用、lease move/RAII、
 丢帧传播、sequence 回绕、fault 锁存、100,000 帧双线程 FIFO、声道置换/极性/
-饱和、跨帧 FIR、独立参考卷积、频响、舍入、重置，以及完整前端的 generation
-切换、旧帧隔离和错误恢复。ASan/UBSan 用于边界和生命周期检查，ThreadSanitizer
+饱和、跨帧 FIR、独立参考卷积、频响、舍入、重置、完整采集前端的 generation
+切换、旧帧隔离和错误恢复，以及播放帧、fence、gate、held lease 和有界 drain。
+ASan/UBSan 用于边界和生命周期检查，ThreadSanitizer
 用于 SPSC race 检查；RV1106 preset 只证明目标工具链可编译。
 真实 ALSA/DSP 行为仍按 [RV1106 验证闸门](../test/rv1106-validation-gates.md)执行。
