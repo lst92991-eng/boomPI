@@ -17,7 +17,7 @@
 ## 音频
 
 - [x] 记录真实 ALSA card/device、支持格式、period/buffer 和 mixer 控件。2026-07-27 已记录 card 0 `rv1106-acodec`、显式 `hw:0,0`、本次格式和两端实际 buffer；只读 mixer 值未被修改。
-- [x] 验证 48 kHz capture/playback 全双工，不用串行播放与录音冒充。2026-07-27 的静音 smoke 同时完成 4 通道 capture 与 2 通道 playback 50 个周期，失败 0；不证明可听播放或采集内容正确，迁移后的主线 committer 组合尚未板端重跑。
+- [x] 验证 48 kHz capture/playback 全双工，不用串行播放与录音冒充。2026-07-27 的静音 smoke 同时完成 4 通道 capture 与 2 通道 playback 50 个周期，失败 0；19:35 的迁移后复测又在真实 `PlaybackCommitter -> PcmPlaybackSink48k -> ALSA` 组合中取得 48,063 个 accepted frames、唯一 EOS 和退出码 0，前后 mixer 一致。该结果不证明可听播放、采集内容、Mode1、通道极性、DAC reference 或 AEC。
 - [ ] 用真实 ALSA adapter 验证 partial write、would-block/interrupted、xrun/suspend、
   device loss、`drop`/`prepare` 和重新建链；不得重复写出已经 accepted 的 prefix。
 - [ ] 对 adapter 故障注入验证 control aggregate `{}` 失败关闭；malformed positive count
