@@ -9,10 +9,14 @@
 namespace boompi::audio {
 
 constexpr std::uint32_t kTtsIngressQueueCapacity = 64U;
+constexpr std::uint32_t kAcceptedRenderQueueCapacity = 64U;
 constexpr std::uint32_t kRenderReferenceQueueCapacity = 16U;
 
 using TtsIngressQueue =
     SpscAudioFrameQueue<TtsPcmFrame24k, kTtsIngressQueueCapacity>;
+using AcceptedRenderQueue =
+    SpscAudioFrameQueue<AcceptedRenderChunk48k,
+                        kAcceptedRenderQueueCapacity>;
 using RenderReferenceQueue =
     SpscAudioFrameQueue<RenderReferenceFrame48k,
                         kRenderReferenceQueueCapacity>;

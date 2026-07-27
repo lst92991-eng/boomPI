@@ -38,12 +38,18 @@ slot 与极性仍由板端实测后通过 `ChannelMap` 配置。`Mono16kFrame` �
 `AudioDspEngineConfig` 必须显式选择一种 reference source 和一种 layout：
 
 - `kHardwareCapture`：reference 来自经 HIL 确认的 Codec/I2S/TDM 数字回采平面。
-- `kSoftwarePlayback`：reference 来自最终播放链路中已实际提交的数字 PCM。
+- `kSoftwarePlayback`：reference 来自最终播放链路中已被 playback sink 接受的数字 PCM。
 - layout 只能是 mono-left、mono-right 或 stereo，具体选择必须来自真实 API 和硬件证据。
 
 同一时刻只能启用一种 reference source。软件 reference 不能使用收到的原始 TTS 包，
-必须位于 jitter、重采样、音量、duck、混音和 limiter 之后；partial ALSA write 只能
-贡献已接受的 prefix，不能补零伪装成完整帧。
+必须位于 jitter、重采样、音量、duck、混音和 limiter 之后；partial device write 只能
+贡献已接受的 prefix，不能补零伪装成完整帧。P2f-b-a 的 `AcceptedRenderQueue` 只提供
+portable accepted ledger；它尚未接到真实 ALSA adapter 或 AEC consumer。accepted 也不
+等于 presented、played 或 audible，预计 presentation 时间不能冒充硬件完成证据。
+adapter 若返回 malformed positive count，committer 会把请求范围内可能已接受的样本
+保守推进且不重放，但禁止用不可信 timing 发布 reference，并要求取消。control result
+的零初始化值必须是 invalid/unset；accepted sequence 不得回绕，耗尽后即使完成
+`Drop`/`Prepare` 也只能请求 terminal runtime restart。
 
 v1 配置要求一次性启用完整的 AEC、NS、BF 和 AGC feature mask。这一约束只防止外层
 遗漏或重复叠加处理，不代表已经知道 Rockchip 库内部的算法顺序，也不证明四项能力

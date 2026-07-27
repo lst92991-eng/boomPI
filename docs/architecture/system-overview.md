@@ -55,14 +55,29 @@ Mode1 失败时只能进入有记录的软件参考方案评审，不能同时�
 P2 当前已实现 48 kHz capture/16 kHz mono 的固定帧契约、预分配 SPSC ownership、
 producer sequence、consumer continuity gate、可配置四通道解交织/极性、四路
 48→16 kHz FIR、generation-safe 采集前端，以及 24 kHz TTS/48 kHz reference 固定帧、
-actor 授权的 playback epoch fence/代际门禁和有界软件 drain。核心层还定义了
-`AudioDspEngine` 和 `WakeWordEngine`、unavailable fail-closed 实现、测试 target 专用
-fake，以及默认关闭并要求真实交叉 target、显式路径/固定 SHA-256 的 vendor 依赖
-闸门。当前 pins 只允许显式 opt-in 的 Debug feasibility probe，Release 配置拒绝。
-这些内容已进入 host 可构建边界，但尚未连接 ALSA、Rockchip 3A、Snowboy 或任何真实
-DSP/唤醒 backend；通过依赖 configure 也不代表 adapter 或模型运行成功。partial ALSA reference、
-wake/VAD worker、500 ms pre-roll、Arm/Cancel ACK、driver drop 和确认播放进度仍属于
-后续集成，Mode1 slot 顺序和实时率也仍需 HIL。
+actor 授权的 playback epoch fence/代际门禁和有界软件 drain。P2f-a 已实现 pre-ALSA
+24→48 kHz renderer；P2f-b-a 已实现 portable `PcmPlaybackSink` 契约、64 槽
+`AcceptedRenderQueue` ledger 和不拥有线程的非阻塞 `PlaybackCommitter`。committer 对
+partial write 精确记账，required-software-reference 模式先取得 ledger 容量再写 sink，
+并在 cancel/write 竞态中保留不可逆的 accepted prefix。本地 cancel 只有在 actor 已推进
+fence、generation 精确匹配且 `Drop`、PCM incarnation 换代和 `Prepare` 均成功后才 ACK；
+结果分别标识 retired 与 prepared PCM incarnation，prepared identity 在 `Prepare` 成功前
+保持 0。sink control 与 committer 公共结果的 aggregate `{}` 都是 invalid/unset，不会
+零初始化成成功。malformed positive
+write 仍按请求范围保守推进且绝不重放，但不发布不可信 timing reference，并强制取消。
+accepted sequence 耗尽后须先 `Drop`/`Prepare`，随后仍是 terminal restart-required，不能
+假恢复。该本地 ACK 不证明声学静音或 DSP/reference 已复位。核心层还定义了 `AudioDspEngine` 和
+`WakeWordEngine`、unavailable fail-closed 实现、测试 target 专用 fake，以及默认关闭并
+要求真实交叉 target、显式路径/固定 SHA-256 的 vendor 依赖闸门。当前 pins 只允许显式
+opt-in 的 Debug feasibility probe，Release 配置拒绝。
+
+这些内容已进入 host 可构建边界，但 playback sink/committer 目前只由 scripted sink
+验证。真实 ALSA adapter、renderer/committer worker、Arm/Cancel 控制 mailbox、DSP
+reference-reset producer 与 application actor ACK join、accepted ledger 到 AEC 的组装/
+消费、normal-EOS presentation completion、wake/VAD worker 和 500 ms pre-roll 均属于
+后续集成。accepted 只表示 sink 接受的数字 PCM 前缀，不等于 presented、played、audible
+或“播放完成”。Rockchip 3A、Snowboy、Mode1 slot 顺序、实时率和声学行为仍需板端 HIL；
+通过依赖 configure 或 host fake 不代表 adapter、模型或硬件运行成功。
 
 DSP 输入固定为 `MIC-L`、`MIC-R`、`REF-L`、`REF-R` 四个 16 kHz 平面，目标输出是
 16 kHz mono。reference 必须显式选择硬件回采或最终软件播放路径，不能混用。Rockchip

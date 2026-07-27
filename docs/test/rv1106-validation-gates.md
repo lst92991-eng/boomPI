@@ -15,8 +15,21 @@
 
 - [ ] 记录真实 ALSA card/device、支持格式、period/buffer 和 mixer 控件。
 - [ ] 验证 48 kHz capture/playback 全双工，不用串行播放与录音冒充。
+- [ ] 用真实 ALSA adapter 验证 partial write、would-block/interrupted、xrun/suspend、
+  device loss、`drop`/`prepare` 和重新建链；不得重复写出已经 accepted 的 prefix。
+- [ ] 对 adapter 故障注入验证 control aggregate `{}` 失败关闭；malformed positive count
+  只能保守推进请求范围、禁止重放和伪 timing reference，并立即进入取消路径。
+- [ ] 验证 accepted sequence 耗尽会在下一次 write 前拒绝；完成 `drop`/`prepare` 后仍
+  保持 terminal restart-required，不能通过换 generation 或重建 committer 假恢复。
+- [ ] 验证 cancel fence 到停止旧代际 write、本地 playback ACK、DSP/reference reset ACK
+  join 和最终扬声器静音的时序；结果必须区分 retired/prepared PCM incarnation，且本地
+  `drop`/`prepare` 返回不能单独充当声学静音证据。
+- [ ] 用 ALSA status/delay 与可观测硬件证据定义 normal-EOS presentation completion；
+  sink accepted 或预计 presentation timestamp 不能直接报告为 played/audible。
 - [ ] 用可辨识信号确认 Mode1 四通道顺序、双麦极性和数字参考采样位置。
 - [ ] Mode1 不成立时停止，不自动启用未经评审的软件 reference。
+- [ ] 若评审后启用软件 reference，验证 accepted-prefix ledger 到 AEC 输入的组装、换代、
+  partial/cancel 边界、延迟对齐和旧 reference 清除；不得用原始 TTS 或补零前缀代替。
 - [ ] 验证 Rockchip 3A 16 kHz 输入布局、错误码、单帧最坏耗时和持续实时率。
 - [ ] 最终壳体中记录距离、角度、音量、背景噪声、ERLE、残余回声和 double-talk 结果。
 

@@ -8,8 +8,11 @@
 epoch fence 和有界软件队列清理。本阶段还建立了 DSP/唤醒核心接口、失败关闭实现、
 测试专用 fake 和默认关闭的 vendor 依赖闸门。P2f-a 还完成了纯软件的 24→48 kHz
 播放渲染：wide-int32 FIR、音量/扬声器数字增益、duck、带 release 的块峰值 limiter
-和最终 S16 输出；ALSA、Rockchip 3A/Snowboy 真实 adapter、wake/VAD worker、
-实际播放、AEC reference 和打断闭环尚未接入。
+和最终 S16 输出；P2f-b-a 完成了 portable sink、64 槽 accepted-prefix ledger、
+partial exactly-once committer 和本地 `Drop -> Prepare` cancel ACK 状态机。真实 ALSA、
+renderer/committer worker、控制 mailbox、DSP reset producer/join、normal-EOS presentation
+completion、Rockchip 3A/Snowboy adapter、wake/VAD worker、AEC reference 消费和打断闭环
+尚未接入。accepted 不等于 presented、played 或 audible。
 Host 测试和交叉编译不能替代真机全双工、Mode1、AEC 或声学验收。
 
 ## 帧契约
@@ -153,21 +156,58 @@ imported targets，不等于 adapter 已实现或 HIL 通过。vendor 库、模�
   `TTS 24 kHz S16 -> 65-tap/Q31 2x FIR -> int32 wide -> volume/speaker gain ->`
   `duck -> block-peak limiter -> S16`，统一检查 generation/连续性、管理内部 scratch、
   EOS prefix/drain 和故障换代。它不观察 `PlaybackEpochFence`，也不是 cancel barrier
-  或 Arm ACK。P2f-b 的 worker 必须先观察 fence、执行失效处理并通过完整 generation
-  gate，才可调用 renderer；renderer 返回后，在每次 ALSA write/重试之前还必须重新
-  观察 fence、在 epoch 改变时先使 gate 失效，并再次核对完整 generation，随后才能
-  记录 accepted-prefix。不能只依赖 facade 阻止 render 与 write 之间竞态产生的旧 PCM。
+  或 Arm ACK。未来 renderer/committer worker 必须先观察 fence、执行失效处理并通过
+  完整 generation gate，才可调用 renderer；renderer 返回后仍须通过 committer 在
+  每次设备 write 前重新检查。当前两者尚未由 worker 串接。
 - `PlaybackPcmFrame48k` 只表示上述 facade 生成的有界 mono 软件 PCM chunk。它不携带
-  ALSA 时序，也不证明任何样本已被内核接受、到达 Codec/DAC、从扬声器可闻播放或已经
-  发布到软件 AEC reference；P2f-a 的 host 结果同样不是板端 HIL 结论。
+  设备 write 时序，也不证明任何样本已被 sink 接受、到达 Codec/DAC、从扬声器可闻
+  播放或已经发布到软件 AEC reference；P2f-a 的 host 结果同样不是板端 HIL 结论。
+- P2f-b-a 的 `PcmPlaybackSink` 是单一 playback worker 独占的 portable 边界，提供一次
+  非阻塞 interleaved-S16 write 以及 `Drop`/`Prepare` 控制。write 结果明确区分
+  accepted、would-block、interrupted、xrun、suspended、device-lost、zero-progress、
+  fatal 和 unavailable；只有正向 accepted 结果携带精确接受长度、write 完成时间、
+  首样本预计 presentation 时间、写前排队长度和 timing source。`UnavailablePcmPlaybackSink`
+  始终失败关闭。control code 的零值是 `kUnset`，因此 value-initialized
+  `PcmPlaybackControlResult{}` 必定 invalid 且不能被误判为成功；只有显式
+  `kSucceeded` 且 native error 为 0 才成功。这里还没有真实 ALSA adapter；host
+  scripted sink 的返回值不是 `snd_pcm_write*`、DMA、Codec 或扬声器证据。
+- `AcceptedRenderChunk48k` 表示一次正向 sink write 实际接受的 mono 连续前缀。它保留
+  source metadata，并额外携带非零 PCM incarnation、不可复用的 accepted sequence、
+  跨正常 prefix 和 EOS FIR drain 的绝对 source offset、接受长度、chunk/EOS 完成标志、
+  write 完成时间、预计 presentation 时间、写前排队长度和 timing source。每条记录
+  最多 960 samples，未使用尾部必须为零；预计 presentation 时间不是确认播放时间。
+  固定 64 槽 `AcceptedRenderQueue` 是 accepted ledger，不是完整
+  `RenderReferenceFrame48k`，也没有接到 AEC consumer。
+- `PlaybackCommitter` 是不拥有线程、无阻塞、热路径不分配内存的 portable commit core；
+  submit、commit、cancel 和 reference-reset 四类公共结果也都以 `kUnset` 为零值，空
+  aggregate 不会表示 accepted、acknowledged 或 confirmed。
+  `PumpOnce` 最多尝试一次 sink write。sink 报告的任何正 accepted count 都是不可逆
+  线性化点，即使 result code、timing 或附加字段自相矛盾，也不能把该范围重放。
+  required-software-reference 模式会在 write 前预留 accepted ledger lease，因此 ledger
+  backpressure 导致零 sink write。committer 在 write 前紧邻位置以及 write/publish 后
+  重新观察 fence/gate；若 cancel 与通过完整校验的 positive write 竞态，先精确推进
+  cursor 并发布事实性的 accepted prefix，再进入 cancellation-required，绝不重放或
+  隐去已接受样本。partial write 每次只推进一次，EOS prefix/drain 使用 metadata 加
+  source offset 判序。
+- malformed positive result 会把报告长度保守截到本次请求范围，推进 cursor、代际累计
+  数和 accepted sequence，然后返回 `kAcceptedThenSinkProtocolFault` 并要求取消；它不
+  发布 `AcceptedRenderChunk48k`，因为不可信 timing 不能伪造成 reference。这样可能
+  丢失软件 reference 覆盖，但不会重放设备可能已接受的 PCM；该代际必须由 cancel 隔离。
+- accepted sequence 非零且不得回绕或复用。分配 `UINT64_MAX` 后，后续 submit/write 在
+  设备调用前返回 restart-required；actor 仍须推进 fence 并执行 cancel，使旧 PCM 经
+  `Drop`/`Prepare` 退役。即使该本地 teardown 成功并 ACK，committer 也进入 terminal
+  fault，拒绝 reference-reset confirmation 和新 Arm；只能静止并重启整个运行时/进程，
+  不能靠新 generation 或新 committer 假恢复 sequence 空间。
 - `RenderReferenceFrame48k` 固定为 48 kHz、20 ms、每通道 960 samples，允许 mono
   或 stereo；内容定义为重采样、音量、duck、混音和 limiter 之后的最终数字 PCM，
   不能用收到的原始 TTS 包代替。metadata 时间戳表示首样本预计到达 DAC 的本地
-  单调时刻，必须不早于 render 完成时刻；排队延迟上限为 1.5 秒。
-- 完整 reference frame 只能在对应完整 20 ms PCM 已被未来 ALSA 层接受后发布。
-  当前固定帧类型不能表示 partial write 后紧接 cancel 的已接受前缀；P2f-b 必须增加
-  独立的有界 `AcceptedRenderChunk48k` 契约并只发布 accepted prefix。不得把 partial
-  prefix 填充或伪装成完整 reference，也不得声称本阶段已经接通软件 AEC reference。
+  单调时刻，必须不早于 render 完成时刻；排队延迟上限为 1.5 秒。当前 committer 不
+  生成该完整 reference frame；以后只能从 accepted ledger 组装，不得把 partial prefix
+  补零伪装成完整 reference，也不得声称软件 AEC reference 已接通。
+- `kEndOfStreamAccepted` 只证明最终 EOS chunk 已被 sink 接受。generation 在该状态仍可
+  取消；当前没有基于真实 ALSA status/delay、DMA 或硬件事件的正常 EOS presentation
+  completion，也没有安全退役 generation 并通知 actor 的完成事务。EOS accepted 不得
+  写成 presented、played、audible 或“播放完成”。
 - `PlaybackGenerationGate` 只由 playback worker 操作。激活必须同时携带 actor
   授权的非零 `(epoch, turn_id, stream_id)` 和从 `PlaybackEpochFence` 观察到的相同
   epoch；网络输入不能自行激活代际。活动代际必须先精确退役，迟到的旧 cancel 不能
@@ -179,15 +219,32 @@ imported targets，不等于 adapter 已实现或 HIL 通过。vendor 库、模�
 - gate 只保留当前和最近退役的 `(epoch, stream_id)`；actor 必须保证整个 session 内
   不复用历史身份，并在允许网络 producer 发布新代际前等待未来 playback Arm ACK。
   这是明确的控制面责任，不能依赖网络包到达顺序碰巧正确。
-- TTS ingress 固定 64 帧，即 1.28 秒；软件 reference 队列固定 16 帧，即 320 ms。
+- TTS ingress 固定 64 帧，即 1.28 秒；accepted ledger 固定 64 个 accepted chunk，
+  每个可以是完整 chunk 或 partial prefix；完整软件 reference 队列固定 16 帧，即 320 ms。
   `DrainPublishedTtsFrames` 只能由 consumer 调用，每次最多丢弃 64 个已发布帧，避免
   持续生产者饿死控制处理。触及上限不代表队列已空，producer 已持有但尚未发布的
-  lease 也不可见；它以后即使发布，仍须在 ALSA commit 前再次通过 generation gate。
-- 软件队列 drain 与 ALSA `snd_pcm_drain()` 完全不同。未来取消必须停止旧代际写入、
-  丢弃未提交 chunk、调用 `snd_pcm_drop()`/`prepare()`、使旧 reference 断代并等待
-  playback ACK。当前原语不执行这些动作，也不把 submitted samples 当成已经听到。
+  lease 也不可见；它以后即使发布，仍须在 sink commit 前再次通过 generation gate。
+- 软件队列 drain 与 ALSA `snd_pcm_drain()` 完全不同。本地 `PlaybackCommitter::Cancel`
+  要求 actor 先把 fence 推进到新 epoch，并携带精确 request ID 和旧 generation。它使
+  gate 失效、丢弃 committer 内尚未接受的 suffix、执行 sink `Drop`、递增 PCM
+  incarnation，再执行 `Prepare`；只有 `Drop` 和 `Prepare` 均成功才返回幂等的本地
+  playback cancel ACK。失败或 identity 耗尽进入 sink fault，不得 ACK。该事务本身不
+  清理尚未由 worker 接管的 TTS ingress，也不消费已发布或 consumer-held 的 accepted
+  ledger 项。
+- cancel result 分开携带 `retired_pcm_incarnation` 和 `prepared_pcm_incarnation`。
+  前者标识 `Drop` 针对的旧 timeline，并须结合 `drop_succeeded` 判断是否确已退役；
+  后者只有新 timeline 的 `Prepare` 成功后才非零。若 Drop 后 incarnation 已耗尽或
+  Prepare 失败，prepared 值保持 0，禁止把递增过但未准备好的 identity 写成可用。
+- 本地 playback cancel ACK 只证明 committer 已完成上述控制调用，不证明声学静音，
+  也不证明旧 reference 已从 DSP/AEC 队列和算法历史中清除。当前 committer 对 software
+  和 hardware reference policy 都保守地在每次成功 cancel 后进入
+  `kAwaitingReferenceReset`，并要求匹配 request/generation 的 `ConfirmReferenceReset`
+  后才允许 Arm 新代际；这个方法只是确认入口。控制 mailbox、
+  application actor 的 ACK join、DSP reset 执行端和 ACK producer 尚未实现，host 测试
+  只是直接调用该入口。
 - TTS 队列满时的集成策略是停止 credit 并取消 response，禁止丢一帧后继续播放；
-  `size_approx()` 只供诊断，不能计算 credit。该 actor/network/playback 握手留在 P2f。
+  `size_approx()` 只供诊断，不能计算 credit。该 actor/network/playback 握手和实际
+  renderer/committer worker 仍属于后续集成。
 
 ## SPSC ownership
 
@@ -242,9 +299,16 @@ Host CTest 覆盖固定格式、非法 metadata、FIFO、满队列、槽复用�
 DSP/唤醒契约的配置校验、POD 结果一致性、unavailable fail-closed 和测试 fake。
 播放侧还覆盖 65-tap Q31 表再生成、跨帧 bit-exact 插值、频响、wide-int32 overshoot、
 任意合法 EOS prefix+63 drain、音量/扬声器增益、80 ms duck/recovery、limiter
-即时 attack/跨 chunk release、统计量、facade 状态与故障换代。上述输出仍只属于
-pre-ALSA software PCM。
+即时 attack/跨 chunk release、统计量、facade 状态与故障换代。P2f-b-a 进一步覆盖
+accepted chunk 的字段/尾部约束和 64 槽 ledger，portable sink 结果与 fail-closed
+unavailable/zero-initialized control，实现 partial exactly-once、write 前 backpressure、
+fence/write 竞态、malformed positive 不重放/不发布伪 reference、typed fault、EOS
+prefix/drain ordering、terminal sequence exhaustion、retired/prepared PCM incarnation，
+以及精确 generation 的本地
+`Drop -> Prepare -> cancel ACK -> reference-reset confirmation` 状态机。
 ASan/UBSan 用于边界和生命周期检查，ThreadSanitizer
 用于 SPSC race 检查；RV1106 preset 只证明目标工具链可编译。
-真实 ALSA/DSP/Snowboy 行为仍按 [RV1106 验证闸门](../test/rv1106-validation-gates.md)
-执行。
+这些结果仍只证明 pre-platform software PCM、portable contract 和 scripted sink 行为；
+真实 ALSA、renderer/committer worker、控制 mailbox、DSP reset producer/join、AEC
+reference 消费、normal-EOS presentation completion、DSP/Snowboy 和声学行为仍按
+[RV1106 验证闸门](../test/rv1106-validation-gates.md)执行。

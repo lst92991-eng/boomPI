@@ -3,6 +3,15 @@
 #include <cstddef>
 
 namespace boompi::audio {
+namespace {
+
+bool IsValidPlaybackTimingSource(
+    const PlaybackTimingSource timing_source) noexcept {
+  return timing_source == PlaybackTimingSource::kSoftwareEstimate ||
+         timing_source == PlaybackTimingSource::kAlsaStatus;
+}
+
+}  // namespace
 
 bool TtsPcmFrame24k::HasValidLength() const noexcept {
   if (format.sample_rate_hz != kSampleRateHz ||
@@ -111,10 +120,52 @@ void PlaybackPcmFrame48k::ResetHeader() noexcept {
   end_of_stream = false;
 }
 
+bool AcceptedRenderChunk48k::HasValidLength() const noexcept {
+  const auto accepted_end =
+      static_cast<std::uint32_t>(absolute_source_offset_sample_frames) +
+      static_cast<std::uint32_t>(accepted_samples);
+  if (format.sample_rate_hz != kSampleRateHz ||
+      format.frame_duration_ms != kFrameDurationMs ||
+      format.channels != kChannelCount ||
+      format.sample_format != kSampleFormat || metadata.epoch == 0U ||
+      metadata.stream_id == 0U || metadata.turn_id == 0U ||
+      pcm_incarnation == 0U || accepted_chunk_sequence == 0U ||
+      accepted_samples == 0U || accepted_samples > kSampleCapacity ||
+      accepted_end > kMaximumSourceSpanSampleFrames ||
+      (source_end_of_stream && !completes_render_chunk) ||
+      write_completed_timestamp_us == 0U ||
+      estimated_presentation_timestamp_us == 0U ||
+      estimated_presentation_timestamp_us < write_completed_timestamp_us ||
+      queued_sample_frames_before_write > kMaximumQueuedSampleFrames ||
+      !IsValidPlaybackTimingSource(timing_source)) {
+    return false;
+  }
+
+  for (std::size_t sample_index = accepted_samples;
+       sample_index < samples.size(); ++sample_index) {
+    if (samples[sample_index] != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void AcceptedRenderChunk48k::ResetHeader() noexcept {
+  format = AudioFormat{};
+  metadata = AudioFrameMetadata{};
+  pcm_incarnation = 0U;
+  accepted_chunk_sequence = 0U;
+  absolute_source_offset_sample_frames = 0U;
+  accepted_samples = 0U;
+  completes_render_chunk = false;
+  source_end_of_stream = false;
+  write_completed_timestamp_us = 0U;
+  estimated_presentation_timestamp_us = 0U;
+  queued_sample_frames_before_write = 0U;
+  timing_source = PlaybackTimingSource::kUnset;
+}
+
 bool RenderReferenceFrame48k::HasValidLength() const noexcept {
-  const bool timing_source_valid =
-      timing_source == PlaybackTimingSource::kSoftwareEstimate ||
-      timing_source == PlaybackTimingSource::kAlsaStatus;
   if (format.sample_rate_hz != kSampleRateHz ||
       format.frame_duration_ms != kFrameDurationMs ||
       (format.channels != 1U && format.channels != kMaximumChannels) ||
@@ -125,7 +176,7 @@ bool RenderReferenceFrame48k::HasValidLength() const noexcept {
       render_completed_timestamp_us == 0U ||
       metadata.monotonic_timestamp_us < render_completed_timestamp_us ||
       queued_sample_frames_before_write > kMaximumQueuedSampleFrames ||
-      !timing_source_valid) {
+      !IsValidPlaybackTimingSource(timing_source)) {
     return false;
   }
 

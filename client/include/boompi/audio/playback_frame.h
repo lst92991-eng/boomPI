@@ -104,6 +104,65 @@ struct PlaybackPcmFrame48k final {
   void ResetHeader() noexcept;
 };
 
+// One exact mono prefix accepted by a positive playback-device write. The
+// source identity is the renderer metadata plus an absolute offset spanning
+// its normal prefix and optional FIR drain. This record proves only device
+// acceptance; its presentation timestamp remains an estimate and it never
+// proves Codec/DAC output or audible speaker playback.
+struct AcceptedRenderChunk48k final {
+  static constexpr std::uint32_t kSampleRateHz = 48000U;
+  static constexpr std::uint16_t kFrameDurationMs = 20U;
+  static constexpr std::uint8_t kChannelCount = 1U;
+  static constexpr std::uint16_t kSampleCapacity = 960U;
+  static constexpr std::uint16_t kMaximumSourceSpanSampleFrames = 1023U;
+  static constexpr std::uint32_t kMaximumQueuedDurationMs = 1500U;
+  static constexpr std::uint32_t kMaximumQueuedSampleFrames =
+      (kSampleRateHz * kMaximumQueuedDurationMs) / 1000U;
+  static constexpr SampleFormat kSampleFormat = SampleFormat::kPcmS16Le;
+
+  AudioFormat format{};
+  // This remains the source render metadata. In particular, its timestamp is
+  // not rewritten to mean write completion or estimated presentation.
+  AudioFrameMetadata metadata{};
+  // Non-zero identity for one prepared PCM timeline. The playback owner must
+  // allocate a new value after drop/prepare, reopen, or any equivalent
+  // timeline reset and must not reuse it during the process lifetime.
+  std::uint64_t pcm_incarnation{0U};
+  // Process-wide, non-zero sequence allocated only for positive accepted
+  // writes. It must increase without reuse; exhaustion requires a quiescent
+  // runtime restart rather than wraparound.
+  std::uint64_t accepted_chunk_sequence{0U};
+  // Absolute offset in the source render span identified by metadata. A
+  // normal 20 ms prefix occupies 0..959 and an EOS FIR drain can extend the
+  // same source span through offset 1022.
+  std::uint16_t absolute_source_offset_sample_frames{0U};
+  std::uint16_t accepted_samples{0U};
+  // True only when this accepted prefix reaches the end of the particular
+  // PlaybackPcmFrame48k passed to the device. A source EOS marker is legal
+  // only on such a completing accepted prefix.
+  bool completes_render_chunk{false};
+  bool source_end_of_stream{false};
+  // Local monotonic timestamp captured after the positive device write
+  // returned. The presentation estimate is for samples[0], must not precede
+  // write completion, and is qualified by timing_source.
+  std::uint64_t write_completed_timestamp_us{0U};
+  std::uint64_t estimated_presentation_timestamp_us{0U};
+  std::uint32_t queued_sample_frames_before_write{0U};
+  PlaybackTimingSource timing_source{PlaybackTimingSource::kUnset};
+  std::array<std::int16_t, kSampleCapacity> samples{};
+
+  static constexpr std::size_t sample_capacity() noexcept {
+    return kSampleCapacity;
+  }
+
+  bool HasValidLength() const noexcept;
+
+  // Header reset intentionally preserves PCM storage. A producer must copy
+  // exactly the accepted prefix and zero every unused tail sample before
+  // publishing a queue lease.
+  void ResetHeader() noexcept;
+};
+
 struct RenderReferenceFrame48k final {
   static constexpr std::uint32_t kSampleRateHz = 48000U;
   static constexpr std::uint16_t kFrameDurationMs = 20U;

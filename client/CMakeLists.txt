@@ -43,7 +43,9 @@ boompi_add_library(boompi_audio_core
   src/audio/capture_channel_mapper.cpp
   src/audio/fir_decimator_48_to_16.cpp
   src/audio/frame_continuity_gate.cpp
+  src/audio/pcm_playback_sink.cpp
   src/audio/playback_buffer.cpp
+  src/audio/playback_committer.cpp
   src/audio/playback_frame.cpp
   src/audio/playback_gain_limiter.cpp
   src/audio/playback_generation.cpp
@@ -110,6 +112,7 @@ install(TARGETS boompi_supervisor RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR})
 
 if(BOOMPI_BUILD_TESTS)
   add_library(boompi_test_support STATIC
+    tests/support/scripted_pcm_playback_sink.cpp
     tests/support/fake_audio_engines.cpp
     tests/support/test_context.cpp)
   target_include_directories(boompi_test_support
@@ -237,6 +240,28 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_audio_playback_renderer_tests
     COMMAND boompi_audio_playback_renderer_tests)
 
+  add_executable(boompi_audio_pcm_playback_sink_tests
+    tests/unit/audio_pcm_playback_sink_tests.cpp)
+  boompi_configure_target(boompi_audio_pcm_playback_sink_tests)
+  target_link_libraries(boompi_audio_pcm_playback_sink_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_pcm_playback_sink_tests
+    COMMAND boompi_audio_pcm_playback_sink_tests)
+
+  add_executable(boompi_audio_playback_committer_tests
+    tests/unit/audio_playback_committer_tests.cpp)
+  boompi_configure_target(boompi_audio_playback_committer_tests)
+  target_link_libraries(boompi_audio_playback_committer_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_playback_committer_tests
+    COMMAND boompi_audio_playback_committer_tests)
+
   add_executable(boompi_audio_backend_contract_tests
     tests/unit/audio_backend_contract_tests.cpp)
   boompi_configure_target(boompi_audio_backend_contract_tests)
@@ -259,6 +284,8 @@ if(BOOMPI_BUILD_TESTS)
     boompi_audio_playback_resampler_tests
     boompi_audio_playback_gain_limiter_tests
     boompi_audio_playback_renderer_tests
+    boompi_audio_pcm_playback_sink_tests
+    boompi_audio_playback_committer_tests
     boompi_audio_backend_contract_tests
     PROPERTIES TIMEOUT 20)
 endif()

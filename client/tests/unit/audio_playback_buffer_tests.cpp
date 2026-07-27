@@ -40,6 +40,14 @@ static_assert(
     "software playback frames must remain standard-layout");
 static_assert(
     std::is_trivially_copyable<
+        boompi::audio::AcceptedRenderChunk48k>::value,
+    "accepted render chunks must remain trivially copyable");
+static_assert(
+    std::is_standard_layout<
+        boompi::audio::AcceptedRenderChunk48k>::value,
+    "accepted render chunks must remain standard-layout");
+static_assert(
+    std::is_trivially_copyable<
         boompi::audio::RenderReferenceFrame48k>::value,
     "render reference frames must remain trivially copyable");
 static_assert(
@@ -58,8 +66,14 @@ static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
               "playback epoch fence requires lock-free 32-bit atomics");
 static_assert(boompi::audio::TtsIngressQueue::capacity() == 64U,
               "TTS ingress capacity changed");
+static_assert(boompi::audio::AcceptedRenderQueue::capacity() == 64U,
+              "accepted render capacity changed");
 static_assert(boompi::audio::RenderReferenceQueue::capacity() == 16U,
               "render reference capacity changed");
+static_assert(
+    boompi::audio::AcceptedRenderChunk48k::kMaximumQueuedSampleFrames ==
+        72000U,
+    "1.5 second accepted-render queue limit changed");
 static_assert(
     boompi::audio::RenderReferenceFrame48k::kMaximumQueuedSampleFrames ==
         72000U,
@@ -106,6 +120,48 @@ void FillPlaybackPcmFrame(
         index < valid_samples
             ? static_cast<std::int16_t>(
                   static_cast<std::int32_t>(index % 20001U) - 10000)
+            : 0;
+  }
+}
+
+void FillAcceptedRenderChunk(
+    boompi::audio::AcceptedRenderChunk48k* const chunk,
+    const std::uint64_t accepted_chunk_sequence = 1U,
+    const std::uint16_t absolute_source_offset_sample_frames = 0U,
+    const std::uint16_t accepted_samples = 960U,
+    const bool completes_render_chunk = true,
+    const bool source_end_of_stream = false) {
+  chunk->format = {48000U, 20U, 1U,
+                   boompi::audio::SampleFormat::kPcmS16Le};
+  chunk->metadata.monotonic_timestamp_us =
+      20000U + accepted_chunk_sequence * 20000U;
+  chunk->metadata.sequence = static_cast<std::uint32_t>(
+      (accepted_chunk_sequence - 1U) &
+      std::numeric_limits<std::uint32_t>::max());
+  chunk->metadata.stream_id = 3U;
+  chunk->metadata.turn_id = 2U;
+  chunk->metadata.epoch = 1U;
+  chunk->pcm_incarnation = 9U;
+  chunk->accepted_chunk_sequence = accepted_chunk_sequence;
+  chunk->absolute_source_offset_sample_frames =
+      absolute_source_offset_sample_frames;
+  chunk->accepted_samples = accepted_samples;
+  chunk->completes_render_chunk = completes_render_chunk;
+  chunk->source_end_of_stream = source_end_of_stream;
+  chunk->write_completed_timestamp_us =
+      chunk->metadata.monotonic_timestamp_us + 1000U;
+  chunk->estimated_presentation_timestamp_us =
+      chunk->write_completed_timestamp_us + 2000U;
+  chunk->queued_sample_frames_before_write = 96U;
+  chunk->timing_source =
+      boompi::audio::PlaybackTimingSource::kSoftwareEstimate;
+  for (std::size_t index = 0U; index < chunk->samples.size(); ++index) {
+    chunk->samples[index] =
+        index < accepted_samples
+            ? static_cast<std::int16_t>(
+                  static_cast<std::int32_t>(
+                      (accepted_chunk_sequence + index) % 20001U) -
+                  10000)
             : 0;
   }
 }
@@ -277,6 +333,148 @@ void TestPlaybackPcmFrameContract(boompi::test::TestContext& context) {
   BOOMPI_EXPECT(context, !frame.end_of_stream);
   BOOMPI_EXPECT(context, frame.samples.front() == -1234);
   BOOMPI_EXPECT(context, frame.samples.back() == 2345);
+}
+
+void TestAcceptedRenderChunkContract(
+    boompi::test::TestContext& context) {
+  boompi::audio::AcceptedRenderChunk48k chunk{};
+  FillAcceptedRenderChunk(&chunk);
+  BOOMPI_EXPECT(context, chunk.HasValidLength());
+  BOOMPI_EXPECT(context, chunk.sample_capacity() == 960U);
+  BOOMPI_EXPECT(context, chunk.accepted_samples == 960U);
+  BOOMPI_EXPECT(context, chunk.completes_render_chunk);
+  BOOMPI_EXPECT(context, !chunk.source_end_of_stream);
+
+  FillAcceptedRenderChunk(&chunk, 2U, 100U, 273U, false, false);
+  BOOMPI_EXPECT(context, chunk.HasValidLength());
+  BOOMPI_EXPECT(context,
+                chunk.absolute_source_offset_sample_frames == 100U);
+  BOOMPI_EXPECT(context, chunk.accepted_samples == 273U);
+  BOOMPI_EXPECT(context, chunk.samples[272U] != 0);
+  BOOMPI_EXPECT(context, chunk.samples[273U] == 0);
+
+  FillAcceptedRenderChunk(&chunk, 3U, 960U, 63U, true, true);
+  chunk.queued_sample_frames_before_write =
+      boompi::audio::AcceptedRenderChunk48k::
+          kMaximumQueuedSampleFrames;
+  chunk.timing_source = boompi::audio::PlaybackTimingSource::kAlsaStatus;
+  chunk.estimated_presentation_timestamp_us =
+      chunk.write_completed_timestamp_us;
+  BOOMPI_EXPECT(context, chunk.HasValidLength());
+  BOOMPI_EXPECT(context,
+                chunk.absolute_source_offset_sample_frames +
+                        chunk.accepted_samples ==
+                    boompi::audio::AcceptedRenderChunk48k::
+                        kMaximumSourceSpanSampleFrames);
+
+  FillAcceptedRenderChunk(&chunk, 4U, 1022U, 1U, true, true);
+  BOOMPI_EXPECT(context, chunk.HasValidLength());
+
+  auto invalid = chunk;
+  invalid.format.sample_rate_hz = 24000U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid = chunk;
+  invalid.format.frame_duration_ms = 10U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid = chunk;
+  invalid.format.channels = 2U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid = chunk;
+  invalid.format.sample_format =
+      static_cast<boompi::audio::SampleFormat>(0U);
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+
+  invalid = chunk;
+  invalid.metadata.epoch = 0U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid = chunk;
+  invalid.metadata.stream_id = 0U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid = chunk;
+  invalid.metadata.turn_id = 0U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid = chunk;
+  invalid.pcm_incarnation = 0U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid = chunk;
+  invalid.accepted_chunk_sequence = 0U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+
+  invalid = chunk;
+  invalid.accepted_samples = 0U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid = chunk;
+  invalid.accepted_samples = 961U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid = chunk;
+  invalid.absolute_source_offset_sample_frames = 1023U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  FillAcceptedRenderChunk(&invalid, 5U, 960U, 64U, true, true);
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+
+  FillAcceptedRenderChunk(&invalid, 5U, 50U, 20U, false, true);
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid.source_end_of_stream = false;
+  BOOMPI_EXPECT(context, invalid.HasValidLength());
+  invalid.completes_render_chunk = true;
+  BOOMPI_EXPECT(context, invalid.HasValidLength());
+
+  FillAcceptedRenderChunk(&invalid, 6U, 0U, 10U, true, false);
+  invalid.write_completed_timestamp_us = 0U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  FillAcceptedRenderChunk(&invalid, 6U, 0U, 10U, true, false);
+  invalid.estimated_presentation_timestamp_us = 0U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  FillAcceptedRenderChunk(&invalid, 6U, 0U, 10U, true, false);
+  invalid.estimated_presentation_timestamp_us =
+      invalid.write_completed_timestamp_us - 1U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  FillAcceptedRenderChunk(&invalid, 6U, 0U, 10U, true, false);
+  invalid.estimated_presentation_timestamp_us =
+      invalid.write_completed_timestamp_us;
+  BOOMPI_EXPECT(context, invalid.HasValidLength());
+
+  invalid.queued_sample_frames_before_write =
+      boompi::audio::AcceptedRenderChunk48k::
+          kMaximumQueuedSampleFrames +
+      1U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  FillAcceptedRenderChunk(&invalid, 6U, 0U, 10U, true, false);
+  invalid.timing_source = boompi::audio::PlaybackTimingSource::kUnset;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid.timing_source =
+      static_cast<boompi::audio::PlaybackTimingSource>(99U);
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+
+  FillAcceptedRenderChunk(&invalid, 7U, 0U, 10U, true, false);
+  invalid.samples[10U] = 1;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid.samples[10U] = 0;
+  BOOMPI_EXPECT(context, invalid.HasValidLength());
+
+  invalid.samples.front() = -1234;
+  invalid.samples.back() = 2345;
+  invalid.ResetHeader();
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  BOOMPI_EXPECT(context, invalid.format.sample_rate_hz == 0U);
+  BOOMPI_EXPECT(context, invalid.metadata.epoch == 0U);
+  BOOMPI_EXPECT(context, invalid.pcm_incarnation == 0U);
+  BOOMPI_EXPECT(context, invalid.accepted_chunk_sequence == 0U);
+  BOOMPI_EXPECT(
+      context, invalid.absolute_source_offset_sample_frames == 0U);
+  BOOMPI_EXPECT(context, invalid.accepted_samples == 0U);
+  BOOMPI_EXPECT(context, !invalid.completes_render_chunk);
+  BOOMPI_EXPECT(context, !invalid.source_end_of_stream);
+  BOOMPI_EXPECT(context, invalid.write_completed_timestamp_us == 0U);
+  BOOMPI_EXPECT(
+      context, invalid.estimated_presentation_timestamp_us == 0U);
+  BOOMPI_EXPECT(context,
+                invalid.queued_sample_frames_before_write == 0U);
+  BOOMPI_EXPECT(
+      context,
+      invalid.timing_source == boompi::audio::PlaybackTimingSource::kUnset);
+  BOOMPI_EXPECT(context, invalid.samples.front() == -1234);
+  BOOMPI_EXPECT(context, invalid.samples.back() == 2345);
 }
 
 void TestResampledPcmFrameContract(
@@ -659,6 +857,117 @@ void TestHeldProducerLeaseAndLatePublish(
   BOOMPI_EXPECT(context, queue.size_approx() == 0U);
 }
 
+void TestAcceptedRenderQueueBoundariesAndFifo(
+    boompi::test::TestContext& context) {
+  {
+    boompi::audio::AcceptedRenderQueue queue;
+    BOOMPI_EXPECT(context, !queue.TryAcquireRead());
+
+    auto write = queue.TryAcquireWrite();
+    BOOMPI_EXPECT(context, static_cast<bool>(write));
+    if (!write) {
+      return;
+    }
+    FillAcceptedRenderChunk(write.get(), 1U, 960U, 63U, true, true);
+    write->write_completed_timestamp_us = 0U;
+    BOOMPI_EXPECT(context, !write.Publish());
+    BOOMPI_EXPECT(context, queue.size_approx() == 0U);
+    write->write_completed_timestamp_us =
+        write->metadata.monotonic_timestamp_us + 1000U;
+    BOOMPI_EXPECT(context, write.Publish());
+    BOOMPI_EXPECT(context, queue.size_approx() == 1U);
+
+    auto read = queue.TryAcquireRead();
+    BOOMPI_EXPECT(context, static_cast<bool>(read));
+    if (!read) {
+      return;
+    }
+    BOOMPI_EXPECT(context, read->HasValidLength());
+    BOOMPI_EXPECT(context, read->accepted_chunk_sequence == 1U);
+    BOOMPI_EXPECT(context, read->source_end_of_stream);
+    BOOMPI_EXPECT(context, read.Release());
+
+    write = queue.TryAcquireWrite();
+    BOOMPI_EXPECT(context, static_cast<bool>(write));
+    if (!write) {
+      return;
+    }
+    FillAcceptedRenderChunk(write.get(), 2U, 0U, 1U, true, false);
+    BOOMPI_EXPECT(context, write.Cancel());
+    BOOMPI_EXPECT(context, queue.size_approx() == 0U);
+    BOOMPI_EXPECT(context, !queue.TryAcquireRead());
+  }
+
+  {
+    boompi::audio::AcceptedRenderQueue queue;
+    for (std::uint64_t sequence = 1U;
+         sequence <= boompi::audio::kAcceptedRenderQueueCapacity;
+         ++sequence) {
+      auto write = queue.TryAcquireWrite();
+      BOOMPI_EXPECT(context, static_cast<bool>(write));
+      if (!write) {
+        return;
+      }
+      FillAcceptedRenderChunk(write.get(), sequence, 0U, 1U, true, false);
+      BOOMPI_EXPECT(context, write.Publish());
+    }
+    BOOMPI_EXPECT(
+        context,
+        queue.size_approx() ==
+            boompi::audio::kAcceptedRenderQueueCapacity);
+    BOOMPI_EXPECT(context, !queue.TryAcquireWrite());
+
+    constexpr std::uint64_t kFirstReadCount = 32U;
+    for (std::uint64_t sequence = 1U; sequence <= kFirstReadCount;
+         ++sequence) {
+      auto read = queue.TryAcquireRead();
+      BOOMPI_EXPECT(context, static_cast<bool>(read));
+      if (!read) {
+        return;
+      }
+      BOOMPI_EXPECT(context, read->accepted_chunk_sequence == sequence);
+      BOOMPI_EXPECT(context, read->HasValidLength());
+      BOOMPI_EXPECT(context, read.Release());
+    }
+    BOOMPI_EXPECT(context, queue.size_approx() == 32U);
+
+    const std::uint64_t first_wrapped_sequence =
+        boompi::audio::kAcceptedRenderQueueCapacity + 1U;
+    const std::uint64_t last_wrapped_sequence =
+        boompi::audio::kAcceptedRenderQueueCapacity + kFirstReadCount;
+    for (std::uint64_t sequence = first_wrapped_sequence;
+         sequence <= last_wrapped_sequence; ++sequence) {
+      auto write = queue.TryAcquireWrite();
+      BOOMPI_EXPECT(context, static_cast<bool>(write));
+      if (!write) {
+        return;
+      }
+      FillAcceptedRenderChunk(write.get(), sequence, 0U, 1U, true, false);
+      BOOMPI_EXPECT(context, write.Publish());
+    }
+    BOOMPI_EXPECT(
+        context,
+        queue.size_approx() ==
+            boompi::audio::kAcceptedRenderQueueCapacity);
+    BOOMPI_EXPECT(context, !queue.TryAcquireWrite());
+
+    for (std::uint64_t sequence = kFirstReadCount + 1U;
+         sequence <= last_wrapped_sequence; ++sequence) {
+      auto read = queue.TryAcquireRead();
+      BOOMPI_EXPECT(context, static_cast<bool>(read));
+      if (!read) {
+        return;
+      }
+      BOOMPI_EXPECT(context, read->accepted_chunk_sequence == sequence);
+      BOOMPI_EXPECT(context, read->accepted_samples == 1U);
+      BOOMPI_EXPECT(context, read->HasValidLength());
+      BOOMPI_EXPECT(context, read.Release());
+    }
+    BOOMPI_EXPECT(context, queue.size_approx() == 0U);
+    BOOMPI_EXPECT(context, !queue.TryAcquireRead());
+  }
+}
+
 void TestRenderReferenceQueueCapacity(
     boompi::test::TestContext& context) {
   boompi::audio::RenderReferenceQueue queue;
@@ -694,12 +1003,14 @@ int main() {
   TestTtsFrameContract(context);
   TestResampledPcmFrameContract(context);
   TestPlaybackPcmFrameContract(context);
+  TestAcceptedRenderChunkContract(context);
   TestRenderReferenceFrameContract(context);
   TestGenerationValidityAndGate(context);
   TestPlaybackEpochFenceValidation(context);
   TestPlaybackEpochFenceReleaseAcquire(context);
   TestDrainEmptyPartialAndFull(context);
   TestHeldProducerLeaseAndLatePublish(context);
+  TestAcceptedRenderQueueBoundariesAndFifo(context);
   TestRenderReferenceQueueCapacity(context);
 
   if (context.failures() != 0U) {
