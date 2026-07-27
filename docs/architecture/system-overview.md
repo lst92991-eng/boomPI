@@ -75,8 +75,10 @@ P2f-b-b1 已把 playback 控制面收敛为 host 可验证的固定容量值拷�
 lifecycle 与 urgent cancel 分槽，local cancel completion 不受普通结果背压影响；producer
 start/stop、DSP/reference reset、EOS accepted 与 critical stream event 也各有明确契约。
 network producer 的执行规则是 Stop 优先，并在启用 Start、获取 write lease 及每次 publish
-前重验 fence/授权。critical 槽满时，未来 playback worker 必须保留精确事件、停止
-ingress/render/commit 并优先重试，不能覆盖或静默丢弃。
+前重验 fence/授权。P2f-b-b2 的 deterministic host worker core 已接通 renderer、committer
+和 playback mailbox，并以有界单步推进；critical 槽满时保留精确事件、停止普通
+ingress/render/commit 并优先重试，不能覆盖或静默丢弃，同时 urgent cancel 始终可执行
+teardown。该 core 不创建实际线程。
 
 application actor 独占精确 cancellation join。active cancel 只有汇合 producer stop、
 本地 `Drop -> Prepare`、producer 已停后的稳定 ingress 空观察、按 retired PCM incarnation
@@ -84,8 +86,8 @@ application actor 独占精确 cancellation join。active cancel 只有汇合 pr
 never-armed 与 renderer-only/no-sink 路径只有在严格证明未进入 sink、没有 accepted PCM
 的情况下才可跳过 DSP reset，且仍需 producer stop 和稳定 ingress 空。
 
-这些内容已进入 host 可构建边界，但 playback sink/committer 目前只由 scripted sink
-验证，mailbox 与 join 也还没有实际执行端。真实 ALSA adapter、单播放 worker、network
+这些内容已进入 host 可构建边界，但 playback sink/committer 和 worker core 目前只由
+deterministic host 调用及 scripted sink 验证。真实 ALSA adapter、实际播放线程/调度、network
 producer endpoint、DSP endpoint、accepted ledger 到 AEC 的组装/消费、normal-EOS
 presentation completion、wake/VAD worker 和 500 ms pre-roll 均属于后续集成。accepted
 （包括 EOS accepted）只表示 sink 接受的数字 PCM 前缀，不等于 presented、played、

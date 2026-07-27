@@ -49,11 +49,18 @@ struct PlaybackCancelCommand final {
 enum class PlaybackArmResultCode : std::uint8_t {
   kUnset = 0,
   kAcknowledged,
+  // A result can still be structurally valid at the cold fence value zero
+  // when the echoed request/generation identity itself is complete.
   kInvalidCommand,
+  // An observed value of zero is valid here: it can mean that no usable fence
+  // epoch was available, and therefore still cannot authorize this generation.
   kFenceMismatch,
   kRendererRejected,
   kCommitterRejected,
+  // Unlike a generic mismatch, this proves cancellation observed a concrete,
+  // nonzero epoch different from the generation before Arm was acknowledged.
   kCancelledBeforeAcknowledgement,
+  // A terminal initialization/core fault can precede the first nonzero fence.
   kFaulted,
 };
 
@@ -170,6 +177,10 @@ enum class PlaybackLocalCancelCode : std::uint8_t {
   kGenerationMismatch,
   kFenceNotAdvanced,
   kRejected,
+  // Terminal typed completion. This can mean either that Drop/Prepare
+  // completed but another identity space was exhausted, or that Drop retired
+  // the old PCM timeline but the PCM incarnation itself could not advance.
+  // It is never an ordinary cancellation-barrier ACK.
   kRestartRequired,
   kFaulted,
 };
@@ -400,9 +411,14 @@ using PlaybackEndOfStreamEventMailbox =
 // so ordinary EOS backpressure cannot hide them. Once a valid critical event
 // exists, the sole worker producer must stop acquiring ingress, rendering, and
 // committing. If TryPush returns false, it must retain the exact event in local
-// pending state and retry it before all other work; it must never overwrite,
-// downgrade, or silently drop the event. The later worker-core phase is
-// responsible for enforcing this retry invariant.
+// pending state and retry it before all non-urgent work; it must never
+// overwrite, downgrade, or silently drop the event. Urgent cancel is the sole
+// exception: it must remain serviceable while a critical event is pending so
+// teardown can always make progress. The worker core enforces this retry and
+// urgent-cancel invariant.
+// PlaybackWorkerCore currently emits kCancellationRequired here. kFaulted is
+// reserved for a future runner/platform adapter that can attach a truthful
+// negative native error; pure core terminal faults use sticky Step/state.
 using PlaybackCriticalStreamEventMailbox =
     event::SpscPodQueue<PlaybackCriticalStreamEvent, 1U>;
 

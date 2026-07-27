@@ -12,7 +12,9 @@ epoch fence 和有界软件队列清理。本阶段还建立了 DSP/唤醒核心
 partial exactly-once committer 和本地 `Drop -> Prepare` cancel ACK 状态机。P2f-b-b1
 完成了 host 可验证的固定容量 SPSC 控制/结果通道、独立 urgent cancel、producer
 start/stop 与 DSP reset 契约、分槽 EOS/critical 事件，以及 actor-owned exact
-cancellation join。真实单播放 worker、network producer/DSP 执行端、ALSA adapter、
+cancellation join。P2f-b-b2 再以不创建线程的 deterministic host worker core 接通
+renderer、committer、mailbox 和有界单步状态推进。实际播放线程/调度、network
+producer/DSP 执行端、ALSA adapter、
 normal-EOS presentation completion、Rockchip 3A/Snowboy adapter、wake/VAD worker、
 AEC reference 消费和打断闭环尚未接入。accepted（包括 EOS accepted）不等于
 presented、played 或 audible。
@@ -159,9 +161,10 @@ imported targets，不等于 adapter 已实现或 HIL 通过。vendor 库、模�
   `TTS 24 kHz S16 -> 65-tap/Q31 2x FIR -> int32 wide -> volume/speaker gain ->`
   `duck -> block-peak limiter -> S16`，统一检查 generation/连续性、管理内部 scratch、
   EOS prefix/drain 和故障换代。它不观察 `PlaybackEpochFence`，也不是 cancel barrier
-  或 Arm ACK。未来 renderer/committer worker 必须先观察 fence、执行失效处理并通过
-  完整 generation gate，才可调用 renderer；renderer 返回后仍须通过 committer 在
-  每次设备 write 前重新检查。当前两者尚未由 worker 串接。
+  或 Arm ACK。P2f-b-b2 的 deterministic host worker core 已在调用 renderer 前观察
+  fence、执行失效处理并通过完整 generation gate；renderer 输出再交给 committer，后者
+  在每次设备 write 前重新检查。该 core 只提供同步、有界的 `Step`，尚未接入真实播放线程
+  与调度。
 - `PlaybackPcmFrame48k` 只表示上述 facade 生成的有界 mono 软件 PCM chunk。它不携带
   设备 write 时序，也不证明任何样本已被 sink 接受、到达 Codec/DAC、从扬声器可闻
   播放或已经发布到软件 AEC reference；P2f-a 的 host 结果同样不是板端 HIL 结论。
@@ -243,6 +246,10 @@ imported targets，不等于 adapter 已实现或 HIL 通过。vendor 库、模�
   和 hardware reference policy 都保守地在每次成功 cancel 后进入
   `kAwaitingReferenceReset`，并要求匹配 request/generation 的 `ConfirmReferenceReset`
   后才允许 Arm 新代际。
+- PCM incarnation 已为 `UINT64_MAX` 时，`Drop` 仍可事实性退役旧 timeline，但不能递增
+  incarnation 或执行 `Prepare`。worker 将该 Drop-only 事实包装为结构有效、非 ACK 的
+  terminal `kRestartRequired` completion；actor cancellation join 必须进入
+  `kTerminalRestartRequired`，禁止把它当作普通 barrier 完成或继续 Arm。
 - P2f-b-b1 的 `SpscPodQueue` 是单 producer/单 consumer、固定容量、值拷贝的 POD
   mailbox，不提供 lease、覆盖或动态分配。normal lifecycle command/result 分别固定为
   8/16 槽；urgent cancel 和 local cancel completion 各有独立 1 槽通道，因此普通控制或
@@ -264,13 +271,27 @@ imported targets，不等于 adapter 已实现或 HIL 通过。vendor 库、模�
   renderer-only 路径还必须证明 cancel fence 之后 renderer 已 disarm、committer 从未
   Arm 且无 accepted PCM。两条 no-sink 路径仍必须等待 producer stop 和稳定 ingress 空，
   不能从空结构体或“看起来空闲”推断完成。
-- EOS accepted 事件使用 16 槽普通事件通道，cancellation-required/fault 使用独立 1 槽
+- worker 只为可关联的控制身份发布 mailbox result：普通 lifecycle 除 shutdown 外需要
+  非零 request 与完整 generation，shutdown 至少需要非零 request，urgent cancel 需要
+  非零 request 与完整 generation。身份完整但 payload 组合非法时返回自身 `valid()==true`
+  的 typed error；无法关联的 envelope 不伪造无效 result，由 `Step()` 返回
+  `kInvalidControlInput` 交给 runner 诊断。成功 Arm 在 ACK 真正进入结果 mailbox 后才从
+  `kArming` 转为 `kActive`，因此 pending ACK 不能被 public state 冒充授权。
+- 最终 `QuiesceIngress` ACK 会按精确 request/generation/retired-incarnation 缓存；ACK
+  发布后的精确重试原样重放相同计数和 empty proof，不重新 drain、不清零统计，也不改变
+  当前或新 generation 的状态。达到 64 帧上限的 `kInProgress` 仍由原事务继续推进，不能
+  冒充最终 ACK。
+- EOS accepted 事件使用 16 槽普通事件通道，cancellation-required/fault 契约使用独立 1 槽
   critical 通道。EOS 槽满时 worker 必须保留并重试同一事件，且不能先接受新 generation；
-  critical 槽满时必须保留精确事件、停止 ingress/render/commit，并在其他工作之前重试，
-  禁止覆盖、降级或静默丢弃。实际执行这些规则的单播放 worker 尚未实现。
+  critical 槽满时必须保留精确事件、停止 ingress/render/commit，并在所有非 urgent 工作
+  之前重试，禁止覆盖、降级或静默丢弃。urgent cancel 是唯一例外，critical pending 时
+  仍必须能执行 teardown。deterministic host worker core 已执行该规则，但它不创建线程；
+  当前 core 只在 committer/renderer 要求 teardown 时发布 `kCancellationRequired`。带原生
+  errno 的异步 `kFaulted` 事件留给后续 runner/platform adapter；core 自身的纯内部 terminal
+  fault 通过 sticky `state()` 与 `Step()` 的 `kFaulted` 暴露，不能伪造 native error。
 - TTS 队列满时的集成策略是停止 credit 并取消 response，禁止丢一帧后继续播放；
   `size_approx()` 只供诊断，不能计算 credit。该 actor/network/playback 握手和实际
-  renderer/committer worker 仍属于后续集成。
+  network producer、真实线程调度与 credit 握手仍属于后续集成。
 
 ## SPSC ownership
 
@@ -335,10 +356,14 @@ prefix/drain ordering、terminal sequence exhaustion、retired/prepared PCM inca
 P2f-b-b1 还覆盖固定 POD mailbox 的失败关闭、满队列/FIFO/回绕和 100,000 条双线程
 传递，验证 ordinary backpressure 不阻塞 urgent cancel；并覆盖 producer start/stop、
 DSP reset、EOS/critical 分槽契约，以及 active/no-sink cancellation join 的顺序、重复、
-身份、epoch/incarnation 和失败路径。ASan/UBSan 用于边界和生命周期检查。当前 Linux
+身份、epoch/incarnation 和失败路径。P2f-b-b2 的独立 worker 测试覆盖 deterministic
+有界推进、分阶段 Arm、ingress→render→commit、EOS prefix/drain、事件保留重试、
+critical pending 下 urgent cancel teardown，以及 active/no-sink 取消路径。ASan/UBSan
+用于边界和生命周期检查。当前 Linux
 ThreadSanitizer 运行时因 `unexpected memory mapping` 未能启动测试，这不是 race 报告，
 也不能记作 TSan 通过；RV1106 preset 只证明目标工具链可编译。
-这些结果仍只证明 pre-platform software PCM、portable contract、mailbox/join 状态机和
-scripted sink 行为；真实 ALSA、单播放 worker、network producer/DSP endpoint、AEC
+这些结果仍只证明 pre-platform software PCM、portable contract、mailbox/join 状态机、
+deterministic host worker core 和 scripted sink 行为；真实线程/调度、ALSA、network
+producer/DSP endpoint、AEC
 reference 消费、normal-EOS presentation completion、DSP/Snowboy 和声学行为仍按
 [RV1106 验证闸门](../test/rv1106-validation-gates.md)执行。

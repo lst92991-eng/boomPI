@@ -158,9 +158,16 @@ go build -trimpath ./cmd/boompi-server
   路径还必须证明 cancel fence 后 renderer 已 disarm。乱序、身份/epoch/incarnation 不匹配、
   冲突重复和 barrier failure 均不得误完成。
 - mailbox 契约要求未来 network producer 先处理 Stop，并在 Start 生效、获取 write lease
-  和每次 publish 前重验 Stop/fence/授权。critical 事件槽满时，未来 playback worker 必须
-  retain/halt/retry 精确事件；这些 endpoint 与执行循环尚未实现，host 测试只验证契约和
-  join 状态机。
+  和每次 publish 前重验 Stop/fence/授权。`boompi_audio_playback_worker_tests` 验证
+  deterministic host worker core 的有界单步推进、分阶段 Arm、ingress→render→commit、
+  EOS prefix/drain，以及 EOS/critical 事件的精确保留重试；critical pending 会暂停普通
+  数据工作，但 urgent cancel 仍可执行 teardown。该 core 不创建线程，network producer
+  与 DSP endpoint 仍未实现。
+- worker 测试还覆盖：冷 fence=0 的结构有效 Arm error、不可关联 envelope 只通过
+  `kInvalidControlInput` 报告且不污染 result mailbox、可关联非法 payload 产生结构有效的
+  typed error、Arm ACK 发布前保持 `kArming`、精确 Quiesce ACK 原样重放，以及 PCM
+  incarnation 耗尽时 Drop-only completion 被 actor join 识别为 terminal restart，而不是
+  invalid input 或普通取消 ACK。
 - playback gate 覆盖 fence epoch 授权、epoch→stream→turn 的 stale 隔离、精确 retire、
   迟到 cancel 和最近身份防复用；fence 覆盖非零严格递增、耗尽及 release/acquire。
 - 软件 drain 覆盖空、部分、满 64 帧和 held producer lease 晚发布；触及迭代上限不被
@@ -189,9 +196,10 @@ go build -trimpath ./cmd/boompi-server
 P2e-a 的完成条件仅是核心接口、失败关闭、测试 fake 和依赖闸门可重复验证。P2f-a 的
 playback target 与 FIR 生成器只验证 pre-ALSA software PCM；P2f-b-a 又验证了 portable
 sink、accepted-prefix ledger、committer 状态机和本地取消事务；P2f-b-b1 验证了固定
-mailbox、producer/DSP 合约和 actor cancellation join。scripted sink 返回的
+mailbox、producer/DSP 合约和 actor cancellation join；P2f-b-b2 验证了 deterministic
+host worker core。scripted sink 返回的
 accepted/timing 仍是 host 测试数据；没有执行真实 `snd_pcm_write*`、`snd_pcm_drop`、
-`snd_pcm_prepare`、单播放 worker、network producer endpoint、DSP endpoint、AEC reference
+`snd_pcm_prepare`、实际播放线程/调度、network producer endpoint、DSP endpoint、AEC reference
 消费、normal-EOS presentation completion 或壳体声学 HIL。accepted（包括 EOS accepted）
 不等于 presented、played 或 audible，本地 playback cancel ACK 也不等于扬声器静音或
 DSP 历史已经复位。后续必须先从匹配 BSP 的真实头文件确认 Rockchip `input_size`、packing、

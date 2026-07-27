@@ -146,6 +146,16 @@ bool CommitterCancellationBarrierSucceeded(
          result.native_error == 0;
 }
 
+bool CommitterPcmIncarnationExhausted(
+    const PlaybackCancelResult& result) noexcept {
+  return result.code == PlaybackCancelCode::kIncarnationExhausted &&
+         !result.acknowledged && result.reference_reset_required &&
+         result.drop_succeeded && !result.prepare_succeeded &&
+         result.retired_pcm_incarnation ==
+             std::numeric_limits<std::uint64_t>::max() &&
+         result.prepared_pcm_incarnation == 0U && result.native_error == 0;
+}
+
 bool ProducerStopAcksEqual(const TtsProducerStopAck& lhs,
                            const TtsProducerStopAck& rhs) noexcept {
   return lhs.code == rhs.code && lhs.request_id == rhs.request_id &&
@@ -261,13 +271,15 @@ bool PlaybackArmResult::valid() const noexcept {
     case PlaybackArmResultCode::kAcknowledged:
       return observed_fence_epoch == generation.epoch;
     case PlaybackArmResultCode::kFenceMismatch:
+      return observed_fence_epoch != generation.epoch;
     case PlaybackArmResultCode::kCancelledBeforeAcknowledgement:
       return observed_fence_epoch != 0U &&
              observed_fence_epoch != generation.epoch;
     case PlaybackArmResultCode::kInvalidCommand:
+    case PlaybackArmResultCode::kFaulted:
+      return true;
     case PlaybackArmResultCode::kRendererRejected:
     case PlaybackArmResultCode::kCommitterRejected:
-    case PlaybackArmResultCode::kFaulted:
       return observed_fence_epoch != 0U;
     case PlaybackArmResultCode::kUnset:
       return false;
@@ -429,13 +441,16 @@ bool PlaybackLocalCancelCompletion::renderer_only_quiesced() const noexcept {
 }
 
 bool PlaybackLocalCancelCompletion::terminal_restart_required() const noexcept {
-  return code == PlaybackLocalCancelCode::kRestartRequired &&
-         committer_result.code == PlaybackCancelCode::kRestartRequired &&
-         reference_reset_required && producer_lease_may_publish_late &&
-         renderer_disarmed_after_cancel_fence && !committer_prepared_idle &&
-         !renderer_generation_never_armed &&
-         !committer_generation_never_armed && !no_accepted_pcm_for_generation &&
-         CommitterCancellationBarrierSucceeded(committer_result);
+  if (code != PlaybackLocalCancelCode::kRestartRequired ||
+      !reference_reset_required || !producer_lease_may_publish_late ||
+      !renderer_disarmed_after_cancel_fence || committer_prepared_idle ||
+      renderer_generation_never_armed || committer_generation_never_armed ||
+      no_accepted_pcm_for_generation) {
+    return false;
+  }
+  return (committer_result.code == PlaybackCancelCode::kRestartRequired &&
+          CommitterCancellationBarrierSucceeded(committer_result)) ||
+         CommitterPcmIncarnationExhausted(committer_result);
 }
 
 bool PlaybackLocalCancelCompletion::valid() const noexcept {

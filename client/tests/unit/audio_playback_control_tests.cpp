@@ -1,6 +1,7 @@
 #include <atomic>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <thread>
 #include <type_traits>
 
@@ -1045,6 +1046,30 @@ void TestBarrierFailuresStayClosed(boompi::test::TestContext& context) {
     const auto result = join.ObserveProducerStop(failed);
     BOOMPI_EXPECT(context,
                   result.code == PlaybackCancellationJoinCode::kBarrierFailed);
+    BOOMPI_EXPECT(context,
+                  result.state == PlaybackCancellationJoinState::kFaulted);
+    BOOMPI_EXPECT(context, !result.can_arm_next_generation);
+  }
+
+  {
+    PlaybackCancellationJoin join;
+    BOOMPI_EXPECT(context, join.Begin(MakeCancelCommand()).code ==
+                               PlaybackCancellationJoinCode::kStarted);
+    auto terminal = MakeLocalCancelCompletion();
+    terminal.code = PlaybackLocalCancelCode::kRestartRequired;
+    terminal.committer_result.code = PlaybackCancelCode::kIncarnationExhausted;
+    terminal.committer_result.retired_pcm_incarnation =
+        std::numeric_limits<std::uint64_t>::max();
+    terminal.committer_result.prepared_pcm_incarnation = 0U;
+    terminal.committer_result.prepare_succeeded = false;
+    terminal.committer_result.acknowledged = false;
+    BOOMPI_EXPECT(context, terminal.valid());
+    BOOMPI_EXPECT(context, terminal.terminal_restart_required());
+    BOOMPI_EXPECT(context, !terminal.acknowledged());
+    const auto result = join.ObserveLocalCancel(terminal);
+    BOOMPI_EXPECT(
+        context,
+        result.code == PlaybackCancellationJoinCode::kTerminalRestartRequired);
     BOOMPI_EXPECT(context,
                   result.state == PlaybackCancellationJoinState::kFaulted);
     BOOMPI_EXPECT(context, !result.can_arm_next_generation);

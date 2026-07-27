@@ -52,6 +52,7 @@ boompi_add_library(boompi_audio_core
   src/audio/playback_generation.cpp
   src/audio/playback_renderer_24_to_48.cpp
   src/audio/playback_resampler_24_to_48.cpp
+  src/audio/playback_worker.cpp
   src/audio/wake_word_engine.cpp)
 target_link_libraries(boompi_audio_core PUBLIC boompi_event)
 
@@ -275,6 +276,17 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_audio_playback_control_tests
     COMMAND boompi_audio_playback_control_tests)
 
+  add_executable(boompi_audio_playback_worker_tests
+    tests/unit/audio_playback_worker_tests.cpp)
+  boompi_configure_target(boompi_audio_playback_worker_tests)
+  target_link_libraries(boompi_audio_playback_worker_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_playback_worker_tests
+    COMMAND boompi_audio_playback_worker_tests)
+
   add_executable(boompi_audio_backend_contract_tests
     tests/unit/audio_backend_contract_tests.cpp)
   boompi_configure_target(boompi_audio_backend_contract_tests)
@@ -300,6 +312,7 @@ if(BOOMPI_BUILD_TESTS)
     boompi_audio_pcm_playback_sink_tests
     boompi_audio_playback_committer_tests
     boompi_audio_playback_control_tests
+    boompi_audio_playback_worker_tests
     boompi_audio_backend_contract_tests
     PROPERTIES TIMEOUT 20)
 endif()

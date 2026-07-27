@@ -22,7 +22,8 @@
 - [ ] 验证 accepted sequence 耗尽会在下一次 write 前拒绝；完成 `drop`/`prepare` 后仍
   保持 terminal restart-required，不能通过换 generation 或重建 committer 假恢复。
 - [ ] 接入并验证单播放 worker、network producer endpoint 和 DSP endpoint。host 已有
-  固定 SPSC mailbox 与 cancellation join 契约，不代表这些执行端已经运行。
+  固定 SPSC mailbox、cancellation join 和 deterministic 单步 worker core；该 core 不创建
+  实际线程，也不代表 ALSA、network 或 DSP 执行端已经运行。
 - [ ] 验证 network producer 每轮先处理 Stop，并在 Start 生效、获取 write lease 与每次
   publish 前重验 Stop/fence/actor 授权；producer-stop ACK 后还必须由 playback worker
   取得稳定 ingress 空观察。
@@ -36,7 +37,7 @@
   才跳过 DSP reset；两条路径仍须等待 producer stop 和稳定 ingress 空。
 - [ ] 注满普通 EOS 与 critical 事件通道，确认 EOS 事件被保留并在新 generation 前重试，
   critical 事件被精确保留且 worker 停止 ingress/render/commit、优先重试，不覆盖、不降级、
-  不静默丢弃。
+  不静默丢弃；critical pending 时 urgent cancel 仍必须能推进 teardown。
 - [ ] 用 ALSA status/delay 与可观测硬件证据定义 normal-EOS presentation completion；
   sink accepted 或预计 presentation timestamp 不能直接报告为 played/audible。
 - [ ] 用可辨识信号确认 Mode1 四通道顺序、双麦极性和数字参考采样位置。
