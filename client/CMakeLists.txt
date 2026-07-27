@@ -38,6 +38,7 @@ boompi_add_library(boompi_config
 target_link_libraries(boompi_config PUBLIC boompi_event)
 
 boompi_add_library(boompi_audio_core
+  src/audio/audio_dsp_frame_bridge.cpp
   src/audio/audio_dsp_engine.cpp
   src/audio/audio_format.cpp
   src/audio/audio_frame.cpp
@@ -296,6 +297,17 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_audio_backend_contract_tests
     COMMAND boompi_audio_backend_contract_tests)
 
+  add_executable(boompi_audio_dsp_frame_bridge_tests
+    tests/unit/audio_dsp_frame_bridge_tests.cpp)
+  boompi_configure_target(boompi_audio_dsp_frame_bridge_tests)
+  target_link_libraries(boompi_audio_dsp_frame_bridge_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_dsp_frame_bridge_tests
+    COMMAND boompi_audio_dsp_frame_bridge_tests)
+
   add_executable(boompi_audio_pcm_transfer_tests
     tests/unit/audio_pcm_transfer_tests.cpp)
   boompi_configure_target(boompi_audio_pcm_transfer_tests)
@@ -321,6 +333,7 @@ if(BOOMPI_BUILD_TESTS)
     boompi_audio_pcm_playback_sink_tests
     boompi_audio_playback_committer_tests
     boompi_audio_backend_contract_tests
+    boompi_audio_dsp_frame_bridge_tests
     boompi_audio_pcm_transfer_tests
     PROPERTIES TIMEOUT 20)
 endif()
