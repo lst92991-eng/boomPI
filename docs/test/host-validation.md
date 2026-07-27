@@ -29,12 +29,18 @@ Linux 安装 ALSA 开发头后（Debian/Ubuntu 为 `libasound2-dev`），CI 还�
 `alsa-null-accepted-only` label 的 smoke。启用 ALSA 时，默认 ALL 构建还会生成不执行的
 link-check executable；Windows/macOS 默认不编译 libasound target。
 
-Linux/macOS 还需校验只读 P0 探针：
+Linux/macOS 还需校验只读 P0 探针和显式 opt-in HIL 脚本：
 
 ```text
 sh -n scripts/probes/rv1106_p0_probe.sh
+sh -n scripts/hil/rv1106_alsa_full_duplex.sh
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 ```
+
+ALSA HIL 的自动测试只使用 fake commands 与临时目录，必须覆盖 dry-run 在所有命令访问和
+文件写入前返回、缺失 opt-in、PCM 占用、mixer 恢复、有限字节/重叠和 dmesg delta。它不
+连接 Codec 或板卡，不能算作全双工通过。操作边界见
+[直接 ALSA 全双工 HIL 指南](p0-alsa-full-duplex-hil-guide.md)。
 
 Linux 上修改实时队列或 PCM 边界后，还需运行 sanitizer 构建。以下目录都是忽略的
 本地构建产物：
@@ -86,7 +92,7 @@ go vet ./...
 go build -trimpath ./cmd/boompi-server
 ```
 
-2026-07-27 21:12:34 +08:00 的最终树已在 clean 临时目录通过 16 个 CTest、31 个
+2026-07-27 22:12:23 +08:00 的最终树已在 clean 临时目录通过 16 个 CTest、47 个
 Python/script 测试，以及 Go 1.26.5 的 `go test ./...` 和 `go vet ./...`。这些是离线
 host/构建回归，不包含付费 provider 请求，也不替代 RV1106 HIL。
 

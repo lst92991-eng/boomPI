@@ -39,6 +39,11 @@ ALSA 的真实全双工、capture layout 和 3A 契约关闭。
 - [ ] 用直接 ALSA 与 raw rk_mpi 分别验证 48 kHz S16_LE 2ch 真全双工、有限 timeout、
   明确重叠区间、全部 exit code/录音字节数、停止顺序和 dmesg xrun delta；串行运行不能
   冒充全双工。
+- [x] 已实现默认 dry-run、三重显式 opt-in 的 direct ALSA 有界 HIL 工具和离线 fake 回归；
+  它请求 480-frame period/4 periods，保存实际 ALSA verbose 输出，以单调时钟验证重叠，
+  并在可达退出路径尝试恢复、回读单个 DAC enum，恢复失败独立报错。当前链路断开，尚未在板端
+  执行，不能勾选上一项。
+  操作契约见 [直接 ALSA 全双工 HIL 指南](p0-alsa-full-duplex-hil-guide.md)。
 - [ ] 逐个 `amixer cget` 保存所有将改控件，设置后回读，并在正常/异常退出恢复原值。
   预构建 AI test 会无条件清除 loopback，不能假定原值为 `Disabled`。
 - [ ] 通过能力查询后才尝试 4ch；固定 `TRCM clk-trcm=1`，逐次验证 loopback

@@ -136,6 +136,13 @@ hard-float/uClibc，保留 Rockit/MPP/RGA `NEEDED` 与 21 个 `UND`，无 `RPATH
 test 和直接 3A 库存在，并看到 VQE JSON 缺失。探针未打开 PCM 或调用 vendor API；随后
 物理链路断开，因此 adapter 与 HIL 状态仍是“未完成”。
 
+下一步先运行独立的 direct ALSA 有界工具，不经过现有 production adapter：首轮请求
+48 kHz/S16_LE/2ch、480-frame period 和 4 periods，数字播放固定为全零，并把指定 DAC enum
+切到 Off 后回读。工具默认 dry-run，板端执行需要三重 opt-in、PCM 两次占用检查、单调时钟
+重叠、精确字节数、连续 dmesg delta 和 mixer 恢复。详细契约见
+[直接 ALSA 全双工 HIL 指南](../test/p0-alsa-full-duplex-hil-guide.md)。它尚未在板端运行，
+也不是新的 playback/control/worker 抽象。
+
 ## Rockchip 3A 候选与未决契约
 
 匹配 BSP 已确认 `rkaudio_preprocess_init`、`rkaudio_preprocess_short` 和拼写如此的

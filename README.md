@@ -119,6 +119,10 @@ sh -n scripts/probes/rv1106_p0_probe.sh
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 ```
 
+同一 Python 入口也使用全 fake ALSA/mixer 环境回归显式 opt-in 的
+[直接 ALSA 全双工 HIL 工具](docs/test/p0-alsa-full-duplex-hil-guide.md)。自动测试不会打开
+真实 PCM；板端物理链路恢复前，该工具只有 dry-run/离线证据，不能写成 48 kHz 已通过。
+
 Windows 使用支持所选编译器的 PowerShell/Developer PowerShell；Linux 和 macOS 使用系统 C++ 工具链。CI 会在 Windows、Linux 和 macOS 上执行同一组 host 检查。
 
 Windows 如果 CMake 自动选择 Visual Studio 这类多配置生成器，构建和测试时显式选择 Debug：
@@ -210,6 +214,10 @@ hard-float/uClibc 产物保留 Rockit/MPP/RGA `NEEDED`、21 个 raw 生命周期
 ```powershell
 Get-Content -Raw scripts/probes/rv1106_p0_probe.sh | ssh <board-host> "sh -s"
 ```
+
+只读盘点和运行库闭包通过后，再按
+[直接 ALSA 全双工 HIL 指南](docs/test/p0-alsa-full-duplex-hil-guide.md)先 dry-run；真正测试必须
+显式确认 PCM I/O、单个 DAC mixer 写入和短录音 artifact。脚本默认不会执行这些操作。
 
 发布前使用 `scripts/probes/verify_rv1106_elf.py` 检查 strip 后的目标 ELF，拒绝
 错误 ARM ABI、glibc、过高 GLIBCXX、RPATH/RUNPATH 和开发机绝对路径。
