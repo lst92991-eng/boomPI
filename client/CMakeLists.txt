@@ -107,6 +107,19 @@ boompi_configure_target(boompi_supervisor)
 target_link_libraries(boompi_supervisor PRIVATE boompi_update)
 set_target_properties(boompi_supervisor PROPERTIES OUTPUT_NAME "boompi-supervisor")
 
+if(BOOMPI_ENABLE_ROCKCHIP_3A)
+  add_executable(boompi_rockchip_3a_probe EXCLUDE_FROM_ALL
+    apps/rockchip_3a_probe/main.cpp)
+  boompi_configure_target(boompi_rockchip_3a_probe)
+  target_include_directories(boompi_rockchip_3a_probe
+    PRIVATE "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}")
+  target_link_libraries(boompi_rockchip_3a_probe
+    PRIVATE boompi_vendor::rockchip_3a_aec)
+  set_target_properties(boompi_rockchip_3a_probe PROPERTIES
+    OUTPUT_NAME "boompi-rockchip-3a-probe"
+    SKIP_BUILD_RPATH TRUE)
+endif()
+
 install(TARGETS boompi_client RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS boompi_supervisor RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR})
 
