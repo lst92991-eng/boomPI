@@ -9,11 +9,13 @@ epoch fence 和有界软件队列清理。本阶段还建立了 DSP/唤醒核心
 测试专用 fake 和默认关闭的 vendor 依赖闸门。P2f-a 还完成了纯软件的 24→48 kHz
 播放渲染：wide-int32 FIR、音量/扬声器数字增益、duck、带 release 的块峰值 limiter
 和最终 S16 输出；P2f-b-a 完成了 portable sink、64 槽 accepted-prefix ledger、
-partial exactly-once committer 和本地 `Drop -> Prepare` cancel ACK 状态机。真实 ALSA、
+partial exactly-once committer 和本地 `Drop -> Prepare` cancel ACK 状态机。P2f-b-b
+进一步实现了 RV1106 ALSA RAII backend、主线 `PcmPlaybackSink` 的 48 kHz mono→2ch
+设备适配器，以及 2/4ch capture reader；短时静音全双工 HIL 已通过。产品级
 renderer/committer worker、控制 mailbox、DSP reset producer/join、normal-EOS presentation
 completion、Rockchip 3A/Snowboy adapter、wake/VAD worker、AEC reference 消费和打断闭环
-尚未接入。accepted 不等于 presented、played 或 audible。
-Host 测试和交叉编译不能替代真机全双工、Mode1、AEC 或声学验收。
+尚未接入。accepted 不等于 presented、played 或 audible；短时静音 HIL 也不证明
+Mode1、通道内容、极性、DAC reference、AEC 或声学效果。
 
 ## 帧契约
 
@@ -171,8 +173,11 @@ imported targets，不等于 adapter 已实现或 HIL 通过。vendor 库、模�
   首样本预计 presentation 时间、写前排队长度和 timing source。`UnavailablePcmPlaybackSink`
   始终失败关闭。control code 的零值是 `kUnset`，因此 value-initialized
   `PcmPlaybackControlResult{}` 必定 invalid 且不能被误判为成功；只有显式
-  `kSucceeded` 且 native error 为 0 才成功。这里还没有真实 ALSA adapter；host
-  scripted sink 的返回值不是 `snd_pcm_write*`、DMA、Codec 或扬声器证据。
+  `kSucceeded` 且 native error 为 0 才成功。RV1106 的 `PcmPlaybackSink48k` 是该
+  portable 边界的设备适配器：它以固定 scratch 将 mono 复制为板端已确认的 2ch
+  interleaved S16，查询 `snd_pcm_delay` 后执行一次非阻塞 write，并把 positive count
+  和软件 presentation estimate 返回给 committer。delay 查询失败、超过 1.5 秒或
+  时间戳溢出均失败关闭；适配器本身不拥有 generation、accepted ledger 或取消状态。
 - `AcceptedRenderChunk48k` 表示一次正向 sink write 实际接受的 mono 连续前缀。它保留
   source metadata，并额外携带非零 PCM incarnation、不可复用的 accepted sequence、
   跨正常 prefix 和 EOS FIR drain 的绝对 source offset、接受长度、chunk/EOS 完成标志、
@@ -310,7 +315,10 @@ prefix/drain ordering、terminal sequence exhaustion、retired/prepared PCM inca
 `Drop -> Prepare -> cancel ACK -> reference-reset confirmation` 状态机。
 ASan/UBSan 用于边界和生命周期检查，ThreadSanitizer
 用于 SPSC race 检查；RV1106 preset 只证明目标工具链可编译。
-这些结果仍只证明 pre-platform software PCM、portable contract 和 scripted sink 行为；
-真实 ALSA、renderer/committer worker、控制 mailbox、DSP reset producer/join、AEC
-reference 消费、normal-EOS presentation completion、DSP/Snowboy 和声学行为仍按
-[RV1106 验证闸门](../test/rv1106-validation-gates.md)执行。
+平台测试还覆盖 mono→2ch 复制、ALSA result/control 映射、delay/队列/时间戳失败关闭、
+capture partial/xrun/timeout/discontinuity，以及主线 committer 经真实平台适配接口产生
+accepted ledger。当前镜像的短时静音 ALSA HIL 见
+[RV1106 ALSA 全双工 smoke 记录](../test/rv1106-alsa-smoke-20260727.md)；迁移后的
+committer 组合尚未重新执行板端 smoke。renderer/committer worker、控制 mailbox、DSP
+reset producer/join、AEC reference 消费、normal-EOS presentation completion、
+DSP/Snowboy 和声学行为仍按 [RV1106 验证闸门](../test/rv1106-validation-gates.md)执行。

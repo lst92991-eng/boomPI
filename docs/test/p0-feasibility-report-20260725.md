@@ -4,15 +4,19 @@
 
 P0 当前为“部分通过”，不能标记完成。匹配 BSP 的 C++ 交叉构建、Rockchip 3A
 二进制 ABI 与离线零输入板端调用、Snowboy 加 OpenBLAS 的干净链接和 TLS 链接已经
-验证；生产程序板端执行、48 kHz 全双工、Mode1 四通道、3A/Snowboy 实时处理、
-Wi-Fi AP/STA 能力和 UI 刷新路径仍需真机补证。
+验证；当前镜像的 48 kHz 短时静音全双工也已通过。生产客户端板端执行、可辨识
+播放/采集内容、Mode1 四通道、3A/Snowboy 实时处理、Wi-Fi AP/STA 能力和 UI
+刷新路径仍需真机补证。
 
-本轮只读取 SDK、sysroot、既有第三方依赖和主机网络状态。没有打开 PCM、录音、
-播放、扫描 Wi-Fi、修改 mixer、刷镜像、改设备树、重启或写入板卡。
+2026-07-25 的初始检查只读取 SDK、sysroot、既有第三方依赖和主机网络状态，没有
+打开 PCM。2026-07-27 的补充验证打开了 PCM，但只播放静音并丢弃采集样本；没有保存
+录音、播放可辨识信号、扫描 Wi-Fi、修改 mixer、刷镜像、改设备树、重启或持久写入板卡。
 
 2026-07-27 补充验证在同一 BSP 基线的 RV1106 板卡上执行了 Debug-only 离线 3A
 探针，只向 `/tmp` 复制程序并以全零内存缓冲区调用库，没有打开 PCM 或修改板卡配置。
 完整记录见 [Rockchip 3A 离线 ABI 探针报告](rockchip-3a-offline-probe-20260727.md)。
+同日的 ALSA 补充验证见
+[RV1106 ALSA 全双工 smoke 记录](rv1106-alsa-smoke-20260727.md)。
 
 ## 状态矩阵
 
@@ -20,12 +24,13 @@ Wi-Fi AP/STA 能力和 UI 刷新路径仍需真机补证。
 | --- | --- | --- |
 | C++ 工具链与 sysroot | 通过 | GCC 8.3.0 Buildroot wrapper 成功构建两个 RV1106 ELF |
 | 目标 ELF ABI | 通过 | ELF32 ARM EABI5、hard-float、uClibc loader、无 RPATH/RUNPATH |
-| 最小程序真机执行 | 部分通过 | 2026-07-27 离线 3A 探针执行成功；生产客户端 smoke 尚未执行 |
+| 最小程序真机执行 | 部分通过 | 2026-07-27 离线 3A 探针和 ALSA 平台 smoke 执行成功；生产客户端 smoke 尚未执行 |
 | Rockchip 3A ABI | 通过（离线） | 固定头文件/库哈希、符号、交叉链接、ELF 和板端零输入调用均通过 |
 | Rockchip 3A 功能/实时率 | 未验证 | 需要真实双麦、参考通道、通道顺序和 16 kHz 连续输入 |
 | Snowboy ABI/链接 | 候选通过 | 原始静态库加交叉编译 OpenBLAS 可生成干净 RV1106 ELF |
 | Snowboy 模型加载/实时率 | 未验证 | 需要板端模型加载、连续 16 kHz 和 CPU/RSS 数据 |
-| ALSA/Mode1 | 未验证 | 历史单项结果不能替代当前镜像的全双工四通道测试 |
+| ALSA 48 kHz 全双工 | 通过（短时静音） | 当前镜像上同时推进 4 通道 capture 与 2 通道 playback 50 个周期，失败 0；不证明可听播放或采集内容正确 |
+| Mode1/通道与参考 | 未验证 | Mode1 保持 Disabled；四通道顺序、双麦极性、DAC reference 采样位置和 AEC 均未验证 |
 | TLS ABI | 候选通过 | OpenSSL 3.5.7 LTS 已在目标工具链静态构建并链接干净 ELF |
 | WSS 握手/SPKI | 未验证 | 仍需板端证书校验、SPKI 固定、重连和 half-open 测试 |
 | Wi-Fi 配网 | 候选 | 镜像含 `hostapd`、`wpa_supplicant` 和 `iw`；驱动模式仍待 `iw list` |
@@ -179,7 +184,12 @@ P0 推荐以锁定的 3.5.x 外部构建作为 WSS 候选，不回退到 1.1.1v�
 
 2026-07-27 管理通道已恢复，离线 3A 探针在 Buildroot 2023.02.6、内核 5.10.160、
 ARMv7l 的目标板上退出 0。该结果只解除最小 3A ABI 调用的板端执行阻塞，不替代生产
-客户端、ALSA、实时率或声学验证。板卡时钟未同步，报告以主机时间为准。
+客户端、实时率或声学验证。板卡时钟未同步，报告以主机时间为准。
+
+同日的 ALSA 平台 smoke 在相同镜像上以显式 `hw:0,0` 参数同时推进 48 kHz、S16_LE、
+4 通道 capture 与 2 通道 playback 50 个周期，失败 0。测试全程使用静音且不保存 PCM；
+Mode1 保持 Disabled，因此该结果不能证明四通道内容、极性、DAC reference、可听播放
+或 AEC。该 HIL 对应报告中的固定 smoke 二进制；当前主线 committer 迁移后尚未板端重跑。
 
 为避免泄露环境标识，本报告不保存 IP、MAC、SSID、主机名、私钥路径或完整本地
 目录。历史板端输出仅作为定位线索，不用于勾选当前镜像的 P0 闸门。
@@ -215,9 +225,9 @@ boomPI 客户端、Snowboy 最小链接产物和 OpenSSL 3.5.7 TLS 最小产物�
 
 1. 评审并明确 16 ms 厂商块与 20 ms 公共音频帧之间的缓冲、输出状态和元数据契约；
    禁止用填充、丢弃或重复规避。
-2. 记录 ALSA 实际能力，再验证真正同时运行的 48 kHz capture/playback。
-3. 用可辨识信号确认四通道顺序、双麦极性和数字参考采样位置。
-4. 在契约获批后实现适配器，分别验证 Rockchip 3A 与 Snowboy 的初始化、错误路径和
+2. 在允许出声/采音并保存、恢复 mixer 原值的前提下，用可辨识信号确认 Mode1
+   四通道顺序、双麦极性和数字参考采样位置。
+3. 在契约获批后实现适配器，分别验证 Rockchip 3A 与 Snowboy 的初始化、错误路径和
    短时实时率；功能通过前不做长时间压力测试。
-5. 执行生产客户端板端 smoke，并核对 loader、依赖和故障关闭行为。
-6. 核对 Wi-Fi 驱动 AP/STA 模式、UI backend 和受支持 TLS 方案。
+4. 执行生产客户端板端 smoke，并核对 loader、依赖和故障关闭行为。
+5. 核对 Wi-Fi 驱动 AP/STA 模式、UI backend 和受支持 TLS 方案。
