@@ -27,6 +27,19 @@ static_assert(std::is_standard_layout<boompi::audio::TtsPcmFrame24k>::value,
               "TTS queue frames must remain standard-layout");
 static_assert(
     std::is_trivially_copyable<
+        boompi::audio::ResampledPcmFrame48k>::value,
+    "wide resampled frames must remain trivially copyable");
+static_assert(
+    std::is_standard_layout<boompi::audio::ResampledPcmFrame48k>::value,
+    "wide resampled frames must remain standard-layout");
+static_assert(
+    std::is_trivially_copyable<boompi::audio::PlaybackPcmFrame48k>::value,
+    "software playback frames must remain trivially copyable");
+static_assert(
+    std::is_standard_layout<boompi::audio::PlaybackPcmFrame48k>::value,
+    "software playback frames must remain standard-layout");
+static_assert(
+    std::is_trivially_copyable<
         boompi::audio::RenderReferenceFrame48k>::value,
     "render reference frames must remain trivially copyable");
 static_assert(
@@ -71,6 +84,47 @@ void FillTtsFrame(boompi::audio::TtsPcmFrame24k* const frame,
             ? static_cast<std::int16_t>(
                   static_cast<std::int32_t>((sequence + index) % 30001U) -
                   15000)
+            : 0;
+  }
+}
+
+void FillPlaybackPcmFrame(
+    boompi::audio::PlaybackPcmFrame48k* const frame,
+    const std::uint16_t valid_samples = 960U) {
+  frame->format = {48000U, 20U, 1U,
+                   boompi::audio::SampleFormat::kPcmS16Le};
+  frame->metadata.monotonic_timestamp_us = 20000U;
+  frame->metadata.sequence = 7U;
+  frame->metadata.stream_id = 3U;
+  frame->metadata.turn_id = 2U;
+  frame->metadata.epoch = 1U;
+  frame->source_offset_sample_frames = 0U;
+  frame->valid_samples = valid_samples;
+  frame->end_of_stream = valid_samples < frame->samples.size();
+  for (std::size_t index = 0U; index < frame->samples.size(); ++index) {
+    frame->samples[index] =
+        index < valid_samples
+            ? static_cast<std::int16_t>(
+                  static_cast<std::int32_t>(index % 20001U) - 10000)
+            : 0;
+  }
+}
+
+void FillResampledPcmFrame(
+    boompi::audio::ResampledPcmFrame48k* const frame,
+    const std::uint16_t valid_samples = 960U) {
+  frame->metadata.monotonic_timestamp_us = 20000U;
+  frame->metadata.sequence = 7U;
+  frame->metadata.stream_id = 3U;
+  frame->metadata.turn_id = 2U;
+  frame->metadata.epoch = 1U;
+  frame->source_offset_sample_frames = 0U;
+  frame->valid_samples = valid_samples;
+  frame->end_of_stream = false;
+  for (std::size_t index = 0U; index < frame->samples.size(); ++index) {
+    frame->samples[index] =
+        index < valid_samples
+            ? static_cast<std::int32_t>(index) * 257 - 70000
             : 0;
   }
 }
@@ -162,6 +216,93 @@ void TestTtsFrameContract(boompi::test::TestContext& context) {
   BOOMPI_EXPECT(context, !frame.end_of_stream);
   BOOMPI_EXPECT(context, frame.samples[0U] == -1234);
   BOOMPI_EXPECT(context, frame.samples[479U] == 2345);
+}
+
+void TestPlaybackPcmFrameContract(boompi::test::TestContext& context) {
+  boompi::audio::PlaybackPcmFrame48k frame{};
+  FillPlaybackPcmFrame(&frame);
+  BOOMPI_EXPECT(context, frame.HasValidLength());
+  BOOMPI_EXPECT(context, frame.sample_capacity() == 960U);
+  BOOMPI_EXPECT(context, frame.valid_samples == 960U);
+  BOOMPI_EXPECT(context, !frame.end_of_stream);
+
+  auto invalid = frame;
+  invalid.format.sample_rate_hz = 24000U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid = frame;
+  invalid.format.channels = 2U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid = frame;
+  invalid.metadata.epoch = 0U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid = frame;
+  invalid.metadata.stream_id = 0U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid = frame;
+  invalid.metadata.turn_id = 0U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+  invalid = frame;
+  invalid.valid_samples = 0U;
+  BOOMPI_EXPECT(context, !invalid.HasValidLength());
+
+  FillPlaybackPcmFrame(&frame, 273U);
+  BOOMPI_EXPECT(context, frame.HasValidLength());
+  frame.end_of_stream = false;
+  BOOMPI_EXPECT(context, frame.HasValidLength());
+  frame.samples.back() = 1;
+  BOOMPI_EXPECT(context, !frame.HasValidLength());
+  frame.samples.back() = 0;
+  BOOMPI_EXPECT(context, frame.HasValidLength());
+
+  FillPlaybackPcmFrame(&frame, 63U);
+  frame.source_offset_sample_frames = 960U;
+  frame.end_of_stream = true;
+  BOOMPI_EXPECT(context, frame.HasValidLength());
+  frame.valid_samples = 64U;
+  BOOMPI_EXPECT(context, !frame.HasValidLength());
+  frame.valid_samples = 63U;
+  frame.source_offset_sample_frames = 961U;
+  BOOMPI_EXPECT(context, !frame.HasValidLength());
+
+  FillPlaybackPcmFrame(&frame);
+  frame.source_offset_sample_frames = 1U;
+  BOOMPI_EXPECT(context, !frame.HasValidLength());
+
+  frame.samples.front() = -1234;
+  frame.samples.back() = 2345;
+  frame.ResetHeader();
+  BOOMPI_EXPECT(context, !frame.HasValidLength());
+  BOOMPI_EXPECT(context, frame.source_offset_sample_frames == 0U);
+  BOOMPI_EXPECT(context, frame.valid_samples == 0U);
+  BOOMPI_EXPECT(context, !frame.end_of_stream);
+  BOOMPI_EXPECT(context, frame.samples.front() == -1234);
+  BOOMPI_EXPECT(context, frame.samples.back() == 2345);
+}
+
+void TestResampledPcmFrameContract(
+    boompi::test::TestContext& context) {
+  boompi::audio::ResampledPcmFrame48k frame{};
+  FillResampledPcmFrame(&frame);
+  BOOMPI_EXPECT(context, frame.HasValidLength());
+  BOOMPI_EXPECT(context, frame.samples.front() == -70000);
+
+  FillResampledPcmFrame(&frame, 17U);
+  BOOMPI_EXPECT(context, frame.HasValidLength());
+  frame.samples.back() = 1;
+  BOOMPI_EXPECT(context, !frame.HasValidLength());
+  frame.samples.back() = 0;
+  frame.source_offset_sample_frames = 960U;
+  frame.valid_samples = 63U;
+  frame.end_of_stream = true;
+  BOOMPI_EXPECT(context, frame.HasValidLength());
+  frame.valid_samples = 64U;
+  BOOMPI_EXPECT(context, !frame.HasValidLength());
+
+  frame.samples.front() = -123456;
+  frame.ResetHeader();
+  BOOMPI_EXPECT(context, !frame.HasValidLength());
+  BOOMPI_EXPECT(context, frame.source_offset_sample_frames == 0U);
+  BOOMPI_EXPECT(context, frame.samples.front() == -123456);
 }
 
 void TestRenderReferenceFrameContract(
@@ -551,6 +692,8 @@ void TestRenderReferenceQueueCapacity(
 int main() {
   boompi::test::TestContext context;
   TestTtsFrameContract(context);
+  TestResampledPcmFrameContract(context);
+  TestPlaybackPcmFrameContract(context);
   TestRenderReferenceFrameContract(context);
   TestGenerationValidityAndGate(context);
   TestPlaybackEpochFenceValidation(context);

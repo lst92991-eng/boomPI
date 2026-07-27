@@ -21,6 +21,7 @@ cmake --build --preset host-debug --parallel
 ctest --preset host-debug --output-on-failure
 python scripts/verify_protocol_fixtures.py
 python scripts/dsp/generate_fir_decimator_48_to_16.py --check client/src/audio/fir_decimator_48_to_16.cpp --quiet
+python scripts/dsp/generate_playback_resampler_24_to_48.py --check client/src/audio/playback_resampler_24_to_48.cpp --quiet
 ```
 
 Linux/macOS 还需校验只读 P0 探针：
@@ -99,6 +100,23 @@ go build -trimpath ./cmd/boompi-server
   确定性测试。
 - TTS 短帧只有在 EOS 且未使用尾部全零时有效；完整 reference 的格式、时间戳来源、
   1.5 秒排队上限以及 `ResetHeader` 不清 PCM 均有边界测试。
+- `boompi_audio_playback_resampler_tests` 校验 65-tap Q31 half-band 表、int64 累加与
+  对称舍入、跨帧 bit-exact 结果、wide-int32 overshoot 和状态换代；生成器离线扫描
+  还必须保持 0–10 kHz 通带纹波不超过 0.005 dB、14–24 kHz 阻带衰减至少 76 dB。
+  当前提交表的证据为约 0.001664 dB 通带纹波和 -78.020480 dB 阻带峰值，host tone
+  测试另验证 1/6/10 kHz 增益误差不超过 0.01 dB，以及 10 kHz 输入的 14 kHz image
+  rejection 优于 70 dB。
+- EOS 测试必须覆盖最终 `Process` 的 exact-`2N` prefix（EOS false、要求 drain）和后续
+  63-sample drain（EOS true、末位显式为零），并验证 pending 状态、metadata 继承、
+  `source_offset_sample_frames`、未使用尾部清零和成功后自动退役。prefix/drain 使用相同
+  sequence/timestamp，后续 worker 不得用普通 `FrameContinuityGate` 直接判二者顺序。
+- `boompi_audio_playback_gain_limiter_tests` 校验 int32 wide 输入直到 final S16 才转换，
+  volume、speaker gain、duck/recovery Q16 ramp、块峰值 limiter 的即时 attack 与跨 chunk
+  release，以及过载/限幅/防御性 clamp 统计。默认 volume=60、speaker_gain=100；
+  volume=100 是合法配置，但最大音量和更高增益尚未完成最终壳体与板端 HIL 安全验收。
+- `boompi_audio_playback_renderer_tests` 校验 facade 的固定顺序、generation/连续性故障、
+  失败调用不推进状态、duck 跨帧变化和 EOS 两调用事务。facade 不观察 epoch fence，
+  不是 cancel/Arm ACK，也不证明 ALSA accepted-prefix、DAC/扬声器播放或 AEC reference。
 - playback gate 覆盖 fence epoch 授权、epoch→stream→turn 的 stale 隔离、精确 retire、
   迟到 cancel 和最近身份防复用；fence 覆盖非零严格递增、耗尽及 release/acquire。
 - 软件 drain 覆盖空、部分、满 64 帧和 held producer lease 晚发布；触及迭代上限不被
@@ -124,7 +142,9 @@ go build -trimpath ./cmd/boompi-server
 - Host DSP 测试只能证明算法和内存边界；实际通道顺序、CPU 实时率和声音质量仍按
   HIL 闸门验证。
 
-P2e-a 的完成条件仅是核心接口、失败关闭、测试 fake 和依赖闸门可重复验证。后续必须
+P2e-a 的完成条件仅是核心接口、失败关闭、测试 fake 和依赖闸门可重复验证。P2f-a
+新增的三个 playback CTest target 与 FIR 生成器只验证 pre-ALSA software PCM；没有
+执行 ALSA write、accepted-prefix/reference 发布、取消 ACK 或壳体声学 HIL。后续必须
 先从匹配 BSP 的真实头文件确认 Rockchip `input_size`、packing、返回码和 reset，再实现
 adapter；Snowboy 还需私有 legacy C ABI bridge、模型加载、单线程 wake worker、
 500 ms pre-roll/VAD 和板端准确率/实时率测试。上述工作完成前不得在 host 报告中写

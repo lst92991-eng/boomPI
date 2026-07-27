@@ -46,6 +46,64 @@ struct TtsPcmFrame24k final {
   void ResetHeader() noexcept;
 };
 
+// Wide signed PCM sample units produced by the FIR interpolator. Values may
+// exceed S16 during a valid band-limited overshoot, so this internal boundary
+// deliberately has no wire/ALSA AudioFormat and must never be cast directly
+// to S16. Gain, duck, and peak limiting consume it before the final S16 frame.
+struct ResampledPcmFrame48k final {
+  static constexpr std::uint32_t kSampleRateHz = 48000U;
+  static constexpr std::uint16_t kFrameDurationMs = 20U;
+  static constexpr std::uint8_t kChannelCount = 1U;
+  static constexpr std::uint16_t kFrameSamples = 960U;
+  static constexpr std::uint16_t kMaximumSourceOffsetSampleFrames = 960U;
+  static constexpr std::uint16_t kMaximumSourceSpanSampleFrames = 1023U;
+
+  AudioFrameMetadata metadata{};
+  std::uint16_t source_offset_sample_frames{0U};
+  std::uint16_t valid_samples{0U};
+  bool end_of_stream{false};
+  std::array<std::int32_t, kFrameSamples> samples{};
+
+  static constexpr std::size_t sample_capacity() noexcept {
+    return kFrameSamples;
+  }
+
+  bool HasValidLength() const noexcept;
+  void ResetHeader() noexcept;
+};
+
+// One bounded software-rendered mono PCM chunk after 24 -> 48 kHz conversion
+// and before any ALSA write. This type carries no claim that a sample reached
+// the kernel, Codec, speaker, or AEC reference path. A source frame can yield
+// a prefix and an FIR-drain chunk with the same metadata; source_offset lets
+// downstream code distinguish them. Every unused sample must be zero.
+struct PlaybackPcmFrame48k final {
+  static constexpr std::uint32_t kSampleRateHz = 48000U;
+  static constexpr std::uint16_t kFrameDurationMs = 20U;
+  static constexpr std::uint8_t kChannelCount = 1U;
+  static constexpr std::uint16_t kFrameSamples = 960U;
+  static constexpr std::uint16_t kMaximumSourceOffsetSampleFrames = 960U;
+  static constexpr std::uint16_t kMaximumSourceSpanSampleFrames = 1023U;
+  static constexpr SampleFormat kSampleFormat = SampleFormat::kPcmS16Le;
+
+  AudioFormat format{};
+  AudioFrameMetadata metadata{};
+  std::uint16_t source_offset_sample_frames{0U};
+  std::uint16_t valid_samples{0U};
+  bool end_of_stream{false};
+  std::array<std::int16_t, kFrameSamples> samples{};
+
+  static constexpr std::size_t sample_capacity() noexcept {
+    return kFrameSamples;
+  }
+
+  bool HasValidLength() const noexcept;
+
+  // Header reset intentionally preserves PCM storage. A producer overwrites
+  // the valid prefix and zeroes every unused tail sample before publication.
+  void ResetHeader() noexcept;
+};
+
 struct RenderReferenceFrame48k final {
   static constexpr std::uint32_t kSampleRateHz = 48000U;
   static constexpr std::uint16_t kFrameDurationMs = 20U;

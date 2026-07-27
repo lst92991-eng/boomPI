@@ -52,10 +52,9 @@ jobs:
         run: python scripts/verify_protocol_fixtures.py
 
       - name: Validate FIR coefficient design
-        run: >-
-          python scripts/dsp/generate_fir_decimator_48_to_16.py
-          --check client/src/audio/fir_decimator_48_to_16.cpp
-          --quiet
+        run: |
+          python scripts/dsp/generate_fir_decimator_48_to_16.py --check client/src/audio/fir_decimator_48_to_16.cpp --quiet
+          python scripts/dsp/generate_playback_resampler_24_to_48.py --check client/src/audio/playback_resampler_24_to_48.cpp --quiet
 
       - name: Validate audio vendor dependency gates
         run: python -m unittest scripts.tests.test_audio_vendor_cmake -v

@@ -2,7 +2,7 @@
 
 boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端负责连接 Qwen 新加坡区，板端不保存云端 API Key。
 
-> **P1 工程骨架已完成，P0 离线证据基线已建立，P2 本地音频正在实现。** Host 构建、测试、配置和协议边界已经建立；匹配 BSP 的 RV1106 交叉构建以及 Rockchip 3A、Snowboy/OpenBLAS 的 ABI/链接候选已经核对，但 P0 板端闸门仍是部分通过。当前只新增了音频后端核心契约、失败关闭实现、测试替身和默认关闭的依赖闸门，尚无真实 Rockchip/Snowboy adapter。真实板端执行、四通道 AEC、WSS 配对、Wi-Fi 二维码配网和 A/B 更新尚未完成。
+> **P1 工程骨架已完成，P0 离线证据基线已建立，P2 本地音频正在实现。** Host 构建、测试、配置和协议边界已经建立；匹配 BSP 的 RV1106 交叉构建以及 Rockchip 3A、Snowboy/OpenBLAS 的 ABI/链接候选已经核对，但 P0 板端闸门仍是部分通过。P2f-a 已增加 host 可验证的 24→48 kHz 软件播放渲染器，包括 wide-int32 FIR、音量/扬声器数字增益、duck 和带 release 的块峰值 limiter；它尚未接入 ALSA、DAC/扬声器或 AEC reference。真实 Rockchip/Snowboy adapter、四通道 AEC、WSS 配对、Wi-Fi 二维码配网和 A/B 更新尚未完成。
 
 ## 系统形态
 
@@ -40,7 +40,7 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 ### 软件阶段
 
-P1 已建立模块边界、构建入口、配置校验、测试支撑和协议 fixture，Windows/Linux/macOS CI 已通过。P0 的当前证据与板端待办见 [2026-07-25 可行性报告](docs/test/p0-feasibility-report-20260725.md)。P2 已实现固定音频帧、预分配 SPSC lease、sequence/discontinuity、连续性门禁、可配置四通道解交织/极性、四路 48→16 kHz FIR、generation-safe 采集前端，以及播放帧、actor 授权的 epoch fence/代际门禁和有界软件队列清理；具体边界见 [音频运行时文档](docs/architecture/audio-runtime.md)。本阶段还建立了 `AudioDspEngine`/`WakeWordEngine` 核心契约、明确失败的 unavailable 实现、仅测试 target 使用的 deterministic fake，以及显式路径和固定 SHA-256 的 vendor 依赖闸门。两个 vendor 开关默认关闭；当前固定输入只是 P0 可行性候选，只有显式 opt-in 的 Debug probe 才能创建 imported targets，Release 配置会拒绝它们。这些原语尚未连接 ALSA、3A、Snowboy 或真实打断闭环，固定 20 ms reference 也不能冒充 partial ALSA write 的 accepted prefix；真实 Mode1 通道顺序仍需板端确认。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
+P1 已建立模块边界、构建入口、配置校验、测试支撑和协议 fixture，Windows/Linux/macOS CI 已通过。P0 的当前证据与板端待办见 [2026-07-25 可行性报告](docs/test/p0-feasibility-report-20260725.md)。P2 已实现固定音频帧、预分配 SPSC lease、sequence/discontinuity、连续性门禁、可配置四通道解交织/极性、四路 48→16 kHz FIR、generation-safe 采集前端，以及播放帧、actor 授权的 epoch fence/代际门禁和有界软件队列清理；具体边界见 [音频运行时文档](docs/architecture/audio-runtime.md)。P2f-a 进一步实现 `PlaybackRenderer24To48`：65-tap Q31 FIR 先生成允许超过 S16 的 int32 中间 PCM，再依次应用音量、扬声器数字增益、约 80 ms duck 和带 release 的块峰值 limiter，最后只做一次 S16 转换；EOS 由 prefix 和 63-sample FIR drain 两个有界输出组成。软件默认 `volume=60`、`speaker_gain=100`；音量 100 可配置，但最大音量和更高扬声器增益尚未在最终壳体下做 HIL/声学安全验收。本阶段还建立了 `AudioDspEngine`/`WakeWordEngine` 核心契约、明确失败的 unavailable 实现、仅测试 target 使用的 deterministic fake，以及显式路径和固定 SHA-256 的 vendor 依赖闸门。两个 vendor 开关默认关闭；当前固定输入只是 P0 可行性候选，只有显式 opt-in 的 Debug probe 才能创建 imported targets，Release 配置会拒绝它们。这些原语尚未连接 ALSA、3A、Snowboy 或真实打断闭环，软件渲染 PCM 也不能冒充 ALSA accepted prefix、已播放音频或 AEC reference；真实 Mode1 通道顺序仍需板端确认。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
 
 ## 仓库结构
 
@@ -71,6 +71,8 @@ cmake --preset host-debug
 cmake --build --preset host-debug --parallel
 ctest --preset host-debug --output-on-failure
 python scripts/verify_protocol_fixtures.py
+python scripts/dsp/generate_fir_decimator_48_to_16.py --check client/src/audio/fir_decimator_48_to_16.cpp --quiet
+python scripts/dsp/generate_playback_resampler_24_to_48.py --check client/src/audio/playback_resampler_24_to_48.cpp --quiet
 ```
 
 Linux/macOS 还会运行 P0 探针的离线脱敏回归：
@@ -174,7 +176,7 @@ Get-Content -Raw scripts/probes/rv1106_p0_probe.sh | ssh <board-host> "sh -s"
 
 1. **P0 可行性闸门（进行中）**：工具链、Snowboy、Rockchip 3A、四通道参考、WSS、Wi-Fi AP 和 UI backend 探测。
 2. **P1 工程骨架（已完成）**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
-3. **P2 本地音频（进行中）**：48/16 kHz 与后端契约已建立；真实 AEC/BF/VAD、Snowboy adapter、播放和打断仍待集成与 HIL。
+3. **P2 本地音频（进行中）**：48/16 kHz、后端契约和 24→48 kHz 软件播放渲染器已建立；ALSA accepted-prefix/reference、真实 AEC/BF/VAD、Snowboy adapter、打断闭环和 HIL 仍待完成。
 4. **P3 服务端**：discovery、pairing、Qwen adapter、Session Actor 和 ToolRegistry。
 5. **P4 端到端对话**：流式文字/音频、取消、上下文、断网和延迟测量。
 6. **P5 UI 与配网**：表情、字幕、触摸、二维码和网络优先级。

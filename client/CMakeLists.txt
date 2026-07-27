@@ -45,7 +45,10 @@ boompi_add_library(boompi_audio_core
   src/audio/frame_continuity_gate.cpp
   src/audio/playback_buffer.cpp
   src/audio/playback_frame.cpp
+  src/audio/playback_gain_limiter.cpp
   src/audio/playback_generation.cpp
+  src/audio/playback_renderer_24_to_48.cpp
+  src/audio/playback_resampler_24_to_48.cpp
   src/audio/wake_word_engine.cpp)
 target_link_libraries(boompi_audio_core PUBLIC boompi_event)
 
@@ -201,6 +204,39 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_audio_playback_buffer_tests
     COMMAND boompi_audio_playback_buffer_tests)
 
+  add_executable(boompi_audio_playback_resampler_tests
+    tests/unit/audio_playback_resampler_tests.cpp)
+  boompi_configure_target(boompi_audio_playback_resampler_tests)
+  target_link_libraries(boompi_audio_playback_resampler_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_playback_resampler_tests
+    COMMAND boompi_audio_playback_resampler_tests)
+
+  add_executable(boompi_audio_playback_gain_limiter_tests
+    tests/unit/audio_playback_gain_limiter_tests.cpp)
+  boompi_configure_target(boompi_audio_playback_gain_limiter_tests)
+  target_link_libraries(boompi_audio_playback_gain_limiter_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_playback_gain_limiter_tests
+    COMMAND boompi_audio_playback_gain_limiter_tests)
+
+  add_executable(boompi_audio_playback_renderer_tests
+    tests/unit/audio_playback_renderer_tests.cpp)
+  boompi_configure_target(boompi_audio_playback_renderer_tests)
+  target_link_libraries(boompi_audio_playback_renderer_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_playback_renderer_tests
+    COMMAND boompi_audio_playback_renderer_tests)
+
   add_executable(boompi_audio_backend_contract_tests
     tests/unit/audio_backend_contract_tests.cpp)
   boompi_configure_target(boompi_audio_backend_contract_tests)
@@ -220,6 +256,9 @@ if(BOOMPI_BUILD_TESTS)
     boompi_audio_fir_decimator_tests
     boompi_audio_capture_dsp_frontend_tests
     boompi_audio_playback_buffer_tests
+    boompi_audio_playback_resampler_tests
+    boompi_audio_playback_gain_limiter_tests
+    boompi_audio_playback_renderer_tests
     boompi_audio_backend_contract_tests
     PROPERTIES TIMEOUT 20)
 endif()

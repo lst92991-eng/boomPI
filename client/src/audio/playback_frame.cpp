@@ -37,6 +37,80 @@ void TtsPcmFrame24k::ResetHeader() noexcept {
   end_of_stream = false;
 }
 
+bool ResampledPcmFrame48k::HasValidLength() const noexcept {
+  if (metadata.epoch == 0U || metadata.stream_id == 0U ||
+      metadata.turn_id == 0U || valid_samples == 0U ||
+      valid_samples > kFrameSamples) {
+    return false;
+  }
+
+  const auto source_end =
+      static_cast<std::uint32_t>(source_offset_sample_frames) +
+      static_cast<std::uint32_t>(valid_samples);
+  if (source_offset_sample_frames > kMaximumSourceOffsetSampleFrames ||
+      source_end > kMaximumSourceSpanSampleFrames ||
+      (valid_samples == kFrameSamples &&
+       source_offset_sample_frames != 0U)) {
+    return false;
+  }
+
+  if (valid_samples < kFrameSamples) {
+    for (std::size_t sample_index = valid_samples;
+         sample_index < samples.size(); ++sample_index) {
+      if (samples[sample_index] != 0) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void ResampledPcmFrame48k::ResetHeader() noexcept {
+  metadata = AudioFrameMetadata{};
+  source_offset_sample_frames = 0U;
+  valid_samples = 0U;
+  end_of_stream = false;
+}
+
+bool PlaybackPcmFrame48k::HasValidLength() const noexcept {
+  if (format.sample_rate_hz != kSampleRateHz ||
+      format.frame_duration_ms != kFrameDurationMs ||
+      format.channels != kChannelCount ||
+      format.sample_format != kSampleFormat || metadata.epoch == 0U ||
+      metadata.stream_id == 0U || metadata.turn_id == 0U ||
+      valid_samples == 0U || valid_samples > kFrameSamples) {
+    return false;
+  }
+
+  const auto source_end =
+      static_cast<std::uint32_t>(source_offset_sample_frames) +
+      static_cast<std::uint32_t>(valid_samples);
+  if (source_offset_sample_frames > kMaximumSourceOffsetSampleFrames ||
+      source_end > kMaximumSourceSpanSampleFrames ||
+      (valid_samples == kFrameSamples &&
+       source_offset_sample_frames != 0U)) {
+    return false;
+  }
+
+  if (valid_samples < kFrameSamples) {
+    for (std::size_t sample_index = valid_samples;
+         sample_index < samples.size(); ++sample_index) {
+      if (samples[sample_index] != 0) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void PlaybackPcmFrame48k::ResetHeader() noexcept {
+  format = AudioFormat{};
+  metadata = AudioFrameMetadata{};
+  source_offset_sample_frames = 0U;
+  valid_samples = 0U;
+  end_of_stream = false;
+}
+
 bool RenderReferenceFrame48k::HasValidLength() const noexcept {
   const bool timing_source_valid =
       timing_source == PlaybackTimingSource::kSoftwareEstimate ||

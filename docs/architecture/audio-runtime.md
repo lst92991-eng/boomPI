@@ -6,8 +6,10 @@
 预分配 SPSC 队列、生产 sequence、消费连续性门禁、四通道解交织/极性映射、
 四路 48→16 kHz FIR、generation-safe 采集前端编排，以及播放固定帧、代际门禁、
 epoch fence 和有界软件队列清理。本阶段还建立了 DSP/唤醒核心接口、失败关闭实现、
-测试专用 fake 和默认关闭的 vendor 依赖闸门；ALSA、Rockchip 3A/Snowboy 真实
-adapter、wake/VAD worker、实际播放和打断闭环尚未接入。
+测试专用 fake 和默认关闭的 vendor 依赖闸门。P2f-a 还完成了纯软件的 24→48 kHz
+播放渲染：wide-int32 FIR、音量/扬声器数字增益、duck、带 release 的块峰值 limiter
+和最终 S16 输出；ALSA、Rockchip 3A/Snowboy 真实 adapter、wake/VAD worker、
+实际播放、AEC reference 和打断闭环尚未接入。
 Host 测试和交叉编译不能替代真机全双工、Mode1、AEC 或声学验收。
 
 ## 帧契约
@@ -109,18 +111,61 @@ probe 校验绝对路径和 SHA-256；Release 配置拒绝这些候选。通过 
 imported targets，不等于 adapter 已实现或 HIL 通过。vendor 库、模型和资源继续保留
 在仓库外。
 
-## 播放帧、代际与软件缓冲
+## 播放软件渲染、代际与软件缓冲
 
 - `TtsPcmFrame24k` 固定为 24 kHz、20 ms、S16_LE、mono，正常帧携带 480 samples。
   provider 的最后一帧可以是 `1..479` samples，但必须同时标记 EOS，并把未使用尾部
   清零；这样复用的队列槽不会把旧 PCM 当成新回答播放。活跃 TTS 帧的 `epoch`、
   `turn_id` 和 `stream_id` 均非零。
+- `PlaybackResampler24To48` 是 playback worker 独占的固定 2 倍插值器。它使用
+  65-tap、Q31、线性相位 half-band Kaiser FIR，20 ms 完整输入从 480 个 24 kHz
+  samples 产生 960 个 48 kHz samples；跨帧保留 31 个源样本历史，群延迟为 32 个
+  48 kHz 输出样本（约 0.667 ms）。卷积使用 64-bit 累加和正负对称的
+  half-away-from-zero 舍入，热路径不分配、不加锁、不做 I/O 或浮点计算。
+- FIR 输出先保存在 `ResampledPcmFrame48k` 的 signed int32 wide 域。合法带限瞬态可以
+  超过 S16，因此重采样阶段不提前裁剪；`PlaybackGainLimiter` 处理完全部数字增益后才
+  执行整条渲染链唯一一次 S16 转换。可复现生成器约束 0–10 kHz 通带纹波不超过
+  0.005 dB、14–24 kHz 阻带衰减至少 76 dB；当前 Q31 表的离线扫描结果为约
+  0.001664 dB 通带纹波、-78.020480 dB 阻带峰值，10 kHz 增益约 +0.001068 dB，
+  14 kHz image edge 约 -78.206567 dB。
+- EOS 是严格的两调用事务。对含 `N` 个有效源样本的最终输入，`Process` 先输出
+  `2N` 个 prefix samples，强制 `end_of_stream=false` 并返回 `drain_required=true`；
+  随后的 `Drain` 再输出完整卷积后缀的 63 个 samples，设置
+  `end_of_stream=true` 并自动退役 generation。第 63 个 drain sample 是对应
+  `h[64]=0` 的显式终止零；最多前 62 个尾部位置非零。drain pending 期间拒绝新的
+  `Process`、`Arm` 和 `SetDucked`，显式 `Disarm` 可以取消未提交的尾部。
+- prefix 和 drain 继承同一份 metadata，包括相同的 sequence 与 timestamp，并用
+  `source_offset_sample_frames` 分别标记 0 和 `2N`。因此下游顺序键必须包含 offset；
+  不能把这两个 chunk 直接送入只按 metadata 连续性判断的普通 `FrameContinuityGate`。
+- `PlaybackGainLimiter` 的顺序固定为 `volume × speaker_gain`、逐样本 duck/recovery
+  envelope、块峰值 limiter、最终 S16。默认 volume 为 60%、speaker gain 为 100%、
+  duck target 为 25%、duck/recovery ramp 均为 80 ms、limiter ceiling 为 95%、
+  limiter release 为 80 ms。volume 可配置为 0–100%，speaker gain 可配置为
+  0–400%；100% 音量合法，但最大音量和高于 100% 的额外数字增益尚未经过最终壳体
+  与板端 HIL/声学安全验收，且更高增益可能因 limiter 动作而降低动态范围。
+- duck/recovery 以 48 kHz Q16 增益逐样本变化并跨 chunk 连续；重复设置相同 target
+  不重启 ramp。limiter 先查看当前 chunk 的 wide peak，不增加额外帧 lookahead；
+  若需要更强衰减，会在该 chunk 首样本前立即 attack。release 按样本跨 chunk
+  单调恢复，若当前 chunk 的峰值上限更低则暂停恢复而不暗中消耗 release 时间；新的
+  更高峰值会在 chunk 边界再次立即 attack。结果同时报告 limiter 前超过 S16 的样本数、
+  实际受 limiter 衰减的样本数和最终防御性 clamp 数；正常整数路径最后一项应为 0。
+- `PlaybackRenderer24To48` 是上述两级的 playback-worker facade，固定执行
+  `TTS 24 kHz S16 -> 65-tap/Q31 2x FIR -> int32 wide -> volume/speaker gain ->`
+  `duck -> block-peak limiter -> S16`，统一检查 generation/连续性、管理内部 scratch、
+  EOS prefix/drain 和故障换代。它不观察 `PlaybackEpochFence`，也不是 cancel barrier
+  或 Arm ACK。P2f-b 的 worker 必须先观察 fence、执行失效处理并通过完整 generation
+  gate，才可调用 renderer；renderer 返回后，在每次 ALSA write/重试之前还必须重新
+  观察 fence、在 epoch 改变时先使 gate 失效，并再次核对完整 generation，随后才能
+  记录 accepted-prefix。不能只依赖 facade 阻止 render 与 write 之间竞态产生的旧 PCM。
+- `PlaybackPcmFrame48k` 只表示上述 facade 生成的有界 mono 软件 PCM chunk。它不携带
+  ALSA 时序，也不证明任何样本已被内核接受、到达 Codec/DAC、从扬声器可闻播放或已经
+  发布到软件 AEC reference；P2f-a 的 host 结果同样不是板端 HIL 结论。
 - `RenderReferenceFrame48k` 固定为 48 kHz、20 ms、每通道 960 samples，允许 mono
   或 stereo；内容定义为重采样、音量、duck、混音和 limiter 之后的最终数字 PCM，
   不能用收到的原始 TTS 包代替。metadata 时间戳表示首样本预计到达 DAC 的本地
   单调时刻，必须不早于 render 完成时刻；排队延迟上限为 1.5 秒。
 - 完整 reference frame 只能在对应完整 20 ms PCM 已被未来 ALSA 层接受后发布。
-  当前固定帧类型不能表示 partial write 后紧接 cancel 的已接受前缀；P2f 必须增加
+  当前固定帧类型不能表示 partial write 后紧接 cancel 的已接受前缀；P2f-b 必须增加
   独立的有界 `AcceptedRenderChunk48k` 契约并只发布 accepted prefix。不得把 partial
   prefix 填充或伪装成完整 reference，也不得声称本阶段已经接通软件 AEC reference。
 - `PlaybackGenerationGate` 只由 playback worker 操作。激活必须同时携带 actor
@@ -195,6 +240,10 @@ Host CTest 覆盖固定格式、非法 metadata、FIFO、满队列、槽复用�
 饱和、跨帧 FIR、独立参考卷积、频响、舍入、重置、完整采集前端的 generation
 切换、旧帧隔离和错误恢复，播放帧、fence、gate、held lease 和有界 drain，以及
 DSP/唤醒契约的配置校验、POD 结果一致性、unavailable fail-closed 和测试 fake。
+播放侧还覆盖 65-tap Q31 表再生成、跨帧 bit-exact 插值、频响、wide-int32 overshoot、
+任意合法 EOS prefix+63 drain、音量/扬声器增益、80 ms duck/recovery、limiter
+即时 attack/跨 chunk release、统计量、facade 状态与故障换代。上述输出仍只属于
+pre-ALSA software PCM。
 ASan/UBSan 用于边界和生命周期检查，ThreadSanitizer
 用于 SPSC race 检查；RV1106 preset 只证明目标工具链可编译。
 真实 ALSA/DSP/Snowboy 行为仍按 [RV1106 验证闸门](../test/rv1106-validation-gates.md)
