@@ -24,6 +24,11 @@ python scripts/dsp/generate_fir_decimator_48_to_16.py --check client/src/audio/f
 python scripts/dsp/generate_playback_resampler_24_to_48.py --check client/src/audio/playback_resampler_24_to_48.cpp --quiet
 ```
 
+Linux 安装 ALSA 开发头后（Debian/Ubuntu 为 `libasound2-dev`），CI 还会把同一 preset 显式配置为
+`-DBOOMPI_ENABLE_ALSA_PLAYBACK=ON`，并运行带
+`alsa-null-accepted-only` label 的 smoke。启用 ALSA 时，默认 ALL 构建还会生成不执行的
+link-check executable；Windows/macOS 默认不编译 libasound target。
+
 Linux/macOS 还需校验只读 P0 探针：
 
 ```text
@@ -130,6 +135,14 @@ go build -trimpath ./cmd/boompi-server
   control aggregate `{}` 通过 `kUnset` 失败关闭、`UnavailablePcmPlaybackSink` 失败关闭，
   以及固定容量 scripted sink 的参数校验、unchecked malformed 注入、脚本消耗、hook 和
   调用顺序。scripted accepted/timing 是测试输入，不是真实 ALSA 证据。
+- `boompi_audio_pcm_playback_adapter_tests` 用 fake device 校验显式 48 kHz 设备配置、
+  mono/双声道固定映射、full/partial、全部 typed code 与 native errno、写前/写后 status、
+  positive 后仍为 PREPARED、时钟/timestamp/overflow 故障，以及 `Drop`/`Prepare` 的精确
+  调用次数。任何 positive 后故障必须保留 accepted count 且形成 malformed result，不能
+  重放或发布伪 timing。Linux 显式启用 ALSA 后，`alsa-null-accepted-only` 另验证真实
+  libasound named PCM API 边界的 exact configure/status/write/drop/prepare；显式 named
+  plugin 仍可能在内部转换，且 `null` 会丢弃 PCM，不能证明直接硬件路径 exact、hardware
+  presentation、played 或 audible。
 - `boompi_audio_playback_committer_tests` 校验配置/初始化、partial write exactly-once、
   四类 committer 公共结果的空 aggregate 也必须保持 `kUnset`，不得默认 accepted/ACK；
   accepted ledger backpressure 下零 sink write、write 前后 fence 竞态、would-block/
@@ -197,9 +210,10 @@ P2e-a 的完成条件仅是核心接口、失败关闭、测试 fake 和依赖�
 playback target 与 FIR 生成器只验证 pre-ALSA software PCM；P2f-b-a 又验证了 portable
 sink、accepted-prefix ledger、committer 状态机和本地取消事务；P2f-b-b1 验证了固定
 mailbox、producer/DSP 合约和 actor cancellation join；P2f-b-b2 验证了 deterministic
-host worker core。scripted sink 返回的
-accepted/timing 仍是 host 测试数据；没有执行真实 `snd_pcm_write*`、`snd_pcm_drop`、
-`snd_pcm_prepare`、实际播放线程/调度、network producer endpoint、DSP endpoint、AEC reference
+host worker core。P2f-c-a 又验证了 fake-device adapter；Linux opt-in 会对 ALSA `null`
+执行真实 `snd_pcm_writei`、`snd_pcm_drop` 和 `snd_pcm_prepare`，但该插件只丢弃数字 PCM，
+adapter 也尚未由 runtime 创建。当前没有实际播放线程/调度、物理 ALSA/Codec、network
+producer endpoint、DSP endpoint、AEC reference
 消费、normal-EOS presentation completion 或壳体声学 HIL。accepted（包括 EOS accepted）
 不等于 presented、played 或 audible，本地 playback cancel ACK 也不等于扬声器静音或
 DSP 历史已经复位。后续必须先从匹配 BSP 的真实头文件确认 Rockchip `input_size`、packing、

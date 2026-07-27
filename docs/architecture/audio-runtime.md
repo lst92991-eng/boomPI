@@ -175,8 +175,14 @@ imported targets，不等于 adapter 已实现或 HIL 通过。vendor 库、模�
   首样本预计 presentation 时间、写前排队长度和 timing source。`UnavailablePcmPlaybackSink`
   始终失败关闭。control code 的零值是 `kUnset`，因此 value-initialized
   `PcmPlaybackControlResult{}` 必定 invalid 且不能被误判为成功；只有显式
-  `kSucceeded` 且 native error 为 0 才成功。这里还没有真实 ALSA adapter；host
-  scripted sink 的返回值不是 `snd_pcm_write*`、DMA、Codec 或扬声器证据。
+  `kSucceeded` 且 native error 为 0 才成功。P2f-c-a 的 `PcmPlaybackSink48k` 把 mono
+  复制到显式一/二声道设备，Linux `AlsaPcmPlaybackDevice` 负责 nonblocking named-PCM
+  API 边界的 exact format/period/buffer 协商；ALSA 插件内部转换和直接硬件路径仍须 HIL
+  单独确认。每个正 write 后必须再次取得同一 device 的 status 与
+  `CLOCK_MONOTONIC` 时间；只有 RUNNING timeline 才能发布 `kAlsaStatus` timing，仍为
+  PREPARED、时钟不一致或 status 失败时保留正 accepted count 并返回 malformed-positive，
+  由 committer 推进后取消。该 adapter 不调用 `snd_pcm_recover`，xrun/suspend 仍统一走
+  `Drop -> Prepare` incarnation 事务。它尚未由 composition root 创建，也没有真实 runner。
 - `AcceptedRenderChunk48k` 表示一次正向 sink write 实际接受的 mono 连续前缀。它保留
   source metadata，并额外携带非零 PCM incarnation、不可复用的 accepted sequence、
   跨正常 prefix 和 EOS FIR drain 的绝对 source offset、接受长度、chunk/EOS 完成标志、
@@ -359,11 +365,13 @@ DSP reset、EOS/critical 分槽契约，以及 active/no-sink cancellation join 
 身份、epoch/incarnation 和失败路径。P2f-b-b2 的独立 worker 测试覆盖 deterministic
 有界推进、分阶段 Arm、ingress→render→commit、EOS prefix/drain、事件保留重试、
 critical pending 下 urgent cancel teardown，以及 active/no-sink 取消路径。ASan/UBSan
-用于边界和生命周期检查。当前 Linux
+用于边界和生命周期检查。P2f-c-a 的 fake-device 测试再覆盖 mono/stereo 映射、写前/
+写后 status、partial 与全部 typed error/native errno、positive 后 PREPARED/clock/status
+故障、malformed-positive 和 `Drop`/`Prepare`；Linux ALSA `null` smoke 只验证数字
+accepted，RV1106 sysroot 构建只验证目标 ABI/头库兼容。当前 Linux
 ThreadSanitizer 运行时因 `unexpected memory mapping` 未能启动测试，这不是 race 报告，
 也不能记作 TSan 通过；RV1106 preset 只证明目标工具链可编译。
-这些结果仍只证明 pre-platform software PCM、portable contract、mailbox/join 状态机、
-deterministic host worker core 和 scripted sink 行为；真实线程/调度、ALSA、network
-producer/DSP endpoint、AEC
+这些结果仍不证明实际产品播放线程、物理 ALSA/Codec/DAC 或扬声器行为；真实线程/调度、
+adapter runtime composition、network producer/DSP endpoint、AEC
 reference 消费、normal-EOS presentation completion、DSP/Snowboy 和声学行为仍按
 [RV1106 验证闸门](../test/rv1106-validation-gates.md)执行。

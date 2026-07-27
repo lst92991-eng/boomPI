@@ -1,8 +1,11 @@
 # RV1106 验证闸门
 
-本文列出进入真实功能开发前必须完成的板端检查。除非测试记录明确给出板卡、镜像、日期和命令输出，否则状态均为“未验证”。
+本文列出进入真实功能开发前必须完成的验证。Host/交叉构建项只有在记录环境或工具链、
+日期、命令和输出后才可标为通过；板端/HIL 项还必须明确板卡和镜像，否则均为“未验证”。
 
-当前分项证据和阻断见 [2026-07-25 P0 可行性报告](p0-feasibility-report-20260725.md)。
+当前分项证据和阻断见 [2026-07-25 P0 可行性报告](p0-feasibility-report-20260725.md)；
+P2f-c-a 的 host/null/交叉链接证据见
+[2026-07-27 ALSA playback adapter 验证记录](p2f-c-a-validation-20260727.md)。
 
 ## P0 环境与 ABI
 
@@ -13,10 +16,19 @@
 
 ## 音频
 
+- [x] Host fake 已覆盖 playback adapter 的 mono/stereo、partial、typed errno、写前/写后
+  status、PREPARED 后正写、malformed-positive 和 `Drop`/`Prepare`；Linux ALSA `null`
+  accepted-only smoke 已通过。两者都不是物理硬件或声学证据。
+- [x] 匹配 BSP 的 GCC 8.3/uClibc sysroot 已用 ALSA 1.2.8 头/库构建真实 playback
+  device adapter，并链接默认 ALL 的 adapter/ALSA/clock 符号检查 executable；该结果不代表
+  `boompi-client` composition root 已实例化它，也不代表 executable 已在板端运行。
 - [ ] 记录真实 ALSA card/device、支持格式、period/buffer 和 mixer 控件。
 - [ ] 验证 48 kHz capture/playback 全双工，不用串行播放与录音冒充。
 - [ ] 用真实 ALSA adapter 验证 partial write、would-block/interrupted、xrun/suspend、
   device loss、`drop`/`prepare` 和重新建链；不得重复写出已经 accepted 的 prefix。
+- [ ] 对真实设备和解析后的直接硬件路径回读 exact 48 kHz/S16_LE/RW_INTERLEAVED、playback channels、period、
+  buffer、start threshold、avail-min 和 MONOTONIC timestamp；写后仍为 PREPARED 时不得
+  生成 presentation timing。named PCM 插件边界的 exact 不得冒充底层硬件路径 exact。
 - [ ] 对 adapter 故障注入验证 control aggregate `{}` 失败关闭；malformed positive count
   只能保守推进请求范围、禁止重放和伪 timing reference，并立即进入取消路径。
 - [ ] 验证 accepted sequence 耗尽会在下一次 write 前拒绝；完成 `drop`/`prepare` 后仍

@@ -2,7 +2,7 @@
 
 boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端负责连接 Qwen 新加坡区，板端不保存云端 API Key。
 
-> **P1 工程骨架已完成，P0 离线证据基线已建立，P2 本地音频正在实现。** Host 构建、测试、配置和协议边界已经建立；匹配 BSP 的 RV1106 交叉构建以及 Rockchip 3A、Snowboy/OpenBLAS 的 ABI/链接候选已经核对，但 P0 板端闸门仍是部分通过。P2f-a 已增加 host 可验证的 24→48 kHz 软件播放渲染器；P2f-b-a 又增加可移植 PCM sink 契约、64 槽 accepted-prefix ledger 和单 worker 非阻塞 committer。P2f-b-b1 已增加固定容量 SPSC 控制/结果通道、独立 urgent cancel、producer start/stop 与 DSP reset 契约、分槽的 EOS/critical 事件，以及 actor 独占的精确取消 join。P2f-b-b2 再把 renderer、committer 和这些 mailbox 接成 deterministic host worker core：每次调用只推进有界工作，不创建真实线程。这里的 accepted（包括 EOS accepted）只表示 sink 接受的数字 PCM 前缀，不等于 presented、played 或 audible。实际播放线程/调度、network producer/DSP 执行端、ALSA adapter、AEC reference 消费和板端 HIL，以及 Rockchip/Snowboy adapter、四通道 AEC、WSS 配对、Wi-Fi 二维码配网和 A/B 更新尚未完成。
+> **P1 工程骨架已完成，P0 离线证据基线已建立，P2 本地音频正在实现。** Host 构建、测试、配置和协议边界已经建立；匹配 BSP 的 RV1106 交叉构建以及 Rockchip 3A、Snowboy/OpenBLAS 的 ABI/链接候选已经核对，但 P0 板端闸门仍是部分通过。P2f-a 已增加 host 可验证的 24→48 kHz 软件播放渲染器；P2f-b-a 又增加可移植 PCM sink 契约、64 槽 accepted-prefix ledger 和单 worker 非阻塞 committer。P2f-b-b1 已增加固定容量 SPSC 控制/结果通道、独立 urgent cancel、producer start/stop 与 DSP reset 契约、分槽的 EOS/critical 事件，以及 actor 独占的精确取消 join。P2f-b-b2 再把 renderer、committer 和这些 mailbox 接成 deterministic host worker core：每次调用只推进有界工作，不创建真实线程。P2f-c-a 已增加显式配置、非阻塞且不隐式 recover 的 ALSA playback device，以及 host 可故障注入的 mono→设备声道 sink adapter；Linux `null` 只验证 ALSA 数字 accepted，RV1106 sysroot 只验证交叉编译/链接。这里的 accepted（包括 EOS accepted）只表示设备接受的数字 PCM 前缀，不等于 presented、played 或 audible。实际播放线程/调度、adapter 与 runtime 的组成、network producer/DSP 执行端、AEC reference 消费和板端 HIL，以及 Rockchip/Snowboy adapter、四通道 AEC、WSS 配对、Wi-Fi 二维码配网和 A/B 更新尚未完成。
 
 ## 系统形态
 
@@ -40,7 +40,11 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 ### 软件阶段
 
-P1 已建立模块边界、构建入口、配置校验、测试支撑和协议 fixture，Windows/Linux/macOS CI 已通过。P0 的当前证据与板端待办见 [2026-07-25 可行性报告](docs/test/p0-feasibility-report-20260725.md)。P2 已实现固定音频帧、预分配 SPSC lease、sequence/discontinuity、连续性门禁、可配置四通道解交织/极性、四路 48→16 kHz FIR、generation-safe 采集前端，以及播放帧、actor 授权的 epoch fence/代际门禁和有界软件队列清理；具体边界见 [音频运行时文档](docs/architecture/audio-runtime.md)。P2f-a 进一步实现 `PlaybackRenderer24To48`：65-tap Q31 FIR 先生成允许超过 S16 的 int32 中间 PCM，再依次应用音量、扬声器数字增益、约 80 ms duck 和带 release 的块峰值 limiter，最后只做一次 S16 转换；EOS 由 prefix 和 63-sample FIR drain 两个有界输出组成。P2f-b-a 实现了 `PcmPlaybackSink`/`UnavailablePcmPlaybackSink`、`AcceptedRenderChunk48k`/64 槽 `AcceptedRenderQueue` 和 portable `PlaybackCommitter`。正向 sink write 是 accepted-prefix 的线性化点；required-software-reference 模式在 write 前预留 ledger 槽，因此 backpressure 不会先写出无法记账的 PCM。committer 对 partial write 精确推进一次，并在 fence 竞态下先记录不可逆 accepted prefix，再要求取消。本地 cancel 只有在 actor 已推进 fence、generation 精确匹配且 `Drop`、PCM incarnation 换代和 `Prepare` 均成功后才 ACK；该 ACK 不证明声学静音或 DSP/reference 已复位。P2f-b-b1 又建立了 host 可验证的值拷贝 SPSC mailbox 和 actor-owned cancellation join：normal lifecycle 与 urgent cancel 分槽，local cancel completion 不会被普通结果背压遮挡；producer start/stop、DSP/reference reset、EOS accepted 和 critical stream event 都有固定容量契约。active cancel 只有汇合 producer stop、本地 `Drop -> Prepare`、producer 已停后的稳定 ingress 空观察、按 retired PCM incarnation 完成的 DSP reset，以及 worker 的 reference-reset confirmation 后，才允许 Arm 下一代际。never-armed 与 renderer-only/no-sink 路径也必须提供严格的“从未进入 sink、无 accepted PCM”事实，并仍等待 producer stop 与稳定 ingress 空，才可跳过 DSP reset。P2f-b-b2 的 deterministic host worker core 以单次有界 `Step` 风格把 renderer、committer、urgent/lifecycle mailbox、事件保留重试和取消 teardown 接通；critical pending 会暂停普通 ingress/render/commit，但 urgent cancel 始终可推进 teardown。该 core 自身不创建线程，也没有连接真实 ALSA、network 或 DSP endpoint。软件默认 `volume=60`、`speaker_gain=100`；音量 100 可配置，但最大音量和更高扬声器增益尚未在最终壳体下做 HIL/声学安全验收。本阶段还建立了 `AudioDspEngine`/`WakeWordEngine` 核心契约、明确失败的 unavailable 实现、仅测试 target 使用的 deterministic fake，以及显式路径和固定 SHA-256 的 vendor 依赖闸门。两个 vendor 开关默认关闭；当前固定输入只是 P0 可行性候选，只有显式 opt-in 的 Debug probe 才能创建 imported targets，Release 配置会拒绝它们。实际播放线程/调度、network producer endpoint、DSP endpoint、ALSA adapter、AEC reference 消费和正常 EOS presentation completion 尚未连接。accepted 不能冒充 presented、played、audible 或板端 HIL 证据。真实 3A、Snowboy 和 Mode1 通道顺序也仍需板端确认。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
+P1 已建立模块边界、构建入口、配置校验、测试支撑和协议 fixture，Windows/Linux/macOS CI 已通过。P0 的当前证据与板端待办见 [2026-07-25 可行性报告](docs/test/p0-feasibility-report-20260725.md)。P2 已完成固定音频帧、无热路径分配的队列、四通道解交织/极性、48→16 kHz FIR、generation-safe 采集前端，以及 24→48 kHz 播放渲染、accepted-prefix 记账、epoch fence、取消汇合和 deterministic worker core；具体契约见 [音频运行时文档](docs/architecture/audio-runtime.md)。
+
+P2f-c-a 已增加 `PcmPlaybackSink48k` 和 `AlsaPcmPlaybackDevice`。adapter 使用固定 scratch 将 mono 复制到显式的一或二声道设备，在正写前后都读取同一设备、同一单调时钟域的状态；只有写后状态为 `RUNNING`，且 status timestamp 位于 write-complete 与 status-return 后观测时间之间，才用写后 delay 扣除本次 accepted 帧来估算其首帧 presentation 时间。ALSA 后端只做有界 `status`、`write`、`drop` 和 `prepare`，以 nonblocking 方式要求所打开 named PCM 的 API 边界精确为 48 kHz/S16_LE/RW_INTERLEAVED，不会在热路径隐式调用 `snd_pcm_recover`。显式选择的 ALSA 插件仍可能在内部转换，因此 named-PCM exact 不能冒充直接硬件路径 exact。partial、native errno 和 malformed-positive 事实都会保留，无法可信定时的正接受前缀只推进记账并触发取消，不发布伪 reference。
+
+Linux `null` smoke 只证明 libasound API 和数字 accepted；RV1106 GCC 8.3/uClibc 默认 ALL link-check 只证明 adapter、ALSA 和 clock 符号可在目标 sysroot 解析，二者都不是板端运行或出声证据。软件默认 `volume=60`、`speaker_gain=100`；音量 100 可配置，但最大音量和更高扬声器增益仍需在最终壳体下做 HIL/声学安全验收。实际播放线程/调度、adapter 与 runtime 的组成、network producer/DSP endpoint、AEC reference 消费和正常 EOS presentation completion 尚未连接。真实 3A、Snowboy 和 Mode1 通道顺序也仍需板端确认。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
 
 播放提交的审计加固同样失败关闭：value-initialized sink control 和 committer 公共结果
 都是无效的 unset 状态，不能被空 aggregate 误判为成功；
@@ -81,6 +85,17 @@ python scripts/verify_protocol_fixtures.py
 python scripts/dsp/generate_fir_decimator_48_to_16.py --check client/src/audio/fir_decimator_48_to_16.cpp --quiet
 python scripts/dsp/generate_playback_resampler_24_to_48.py --check client/src/audio/playback_resampler_24_to_48.cpp --quiet
 ```
+
+Linux 安装 ALSA 开发包（Debian/Ubuntu 为 `libasound2-dev`）后，可显式启用 ALSA，
+并用丢弃数字 PCM 的 `null` 插件验证 API/accepted 边界：
+
+```text
+cmake --preset host-debug -DBOOMPI_ENABLE_ALSA_PLAYBACK=ON
+cmake --build --preset host-debug --parallel
+ctest --preset host-debug --output-on-failure --no-tests=error -L alsa-null-accepted-only
+```
+
+该 smoke 不连接 Codec、DAC 或扬声器，不能写成 played/audible。
 
 Linux/macOS 还会运行 P0 探针的离线脱敏回归：
 
@@ -183,7 +198,7 @@ Get-Content -Raw scripts/probes/rv1106_p0_probe.sh | ssh <board-host> "sh -s"
 
 1. **P0 可行性闸门（进行中）**：工具链、Snowboy、Rockchip 3A、四通道参考、WSS、Wi-Fi AP 和 UI backend 探测。
 2. **P1 工程骨架（已完成）**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
-3. **P2 本地音频（进行中）**：48/16 kHz、后端契约、24→48 kHz 软件 renderer、portable sink/accepted ledger/committer、固定 playback mailbox、取消 ACK join 和 deterministic host worker core 已建立；实际播放线程/调度、network producer/DSP endpoint、ALSA adapter、AEC/BF/VAD、Snowboy adapter、正常 EOS 播放完成、打断闭环和 HIL 仍待完成。
+3. **P2 本地音频（进行中）**：48/16 kHz、后端契约、24→48 kHz 软件 renderer、portable sink/accepted ledger/committer、固定 playback mailbox、取消 ACK join、deterministic host worker core 和未组成的 ALSA adapter 已建立；实际播放线程/调度、runtime composition、network producer/DSP endpoint、AEC/BF/VAD、Snowboy adapter、正常 EOS 播放完成、打断闭环和 HIL 仍待完成。
 4. **P3 服务端**：discovery、pairing、Qwen adapter、Session Actor 和 ToolRegistry。
 5. **P4 端到端对话**：流式文字/音频、取消、上下文、断网和延迟测量。
 6. **P5 UI 与配网**：表情、字幕、触摸、二维码和网络优先级。

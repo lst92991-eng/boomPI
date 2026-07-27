@@ -33,6 +33,40 @@ CaptureFrame: 48 kHz / 20 ms / 4ch interleaved
 slot 与极性仍由板端实测后通过 `ChannelMap` 配置。`Mono16kFrame` 是未来真实 3A 的
 目标输出；当前 unavailable engine 不会把某一路麦克风直接伪装成 AEC 后 mono。
 
+## ALSA playback adapter
+
+P2f-c-a 增加了两层播放平台边界：跨平台 `PcmPlaybackSink48k` 只负责设备状态校验、
+mono 到显式一/二声道的固定 scratch 映射和 portable result；Linux
+`AlsaPcmPlaybackDevice` 独占一个以 `SND_PCM_NONBLOCK` 打开的 playback handle。
+设备名、声道、period、buffer、start threshold 和 avail-min 都由冷路径配置提供；
+adapter 不选择示例板号、不改 mixer，并关闭 libasound 的 automatic resample/channel/format
+转换。exact 回读只约束所打开 named PCM 的 API 边界；如果配置选择 `default`、`plug`、
+`plughw` 或其他插件，插件内部仍可能转换。产品 HIL 必须另行记录解析后的直接硬件路径，
+不能把 named-PCM exact 冒充 Codec/I2S 硬件路径 exact。
+
+每次写入固定按以下顺序推进：
+
+1. 写前 status 必须是 PREPARED 或 RUNNING，delay 在 0–1.5 秒边界内。
+2. 最多调用一次 `snd_pcm_writei`，正返回的 partial prefix 立即成为不可逆事实。
+3. 正返回后从同一 device 取得 `CLOCK_MONOTONIC` write-complete 时间，再取一次 status。
+4. 只有写后状态为 RUNNING、单调时钟域一致，且 status timestamp 位于 write-complete
+   与 status-return 后观测时间之间时，才把 timing 标为 `kAlsaStatus`；写后仍是 PREPARED
+   表示尚未跨过 start threshold，不能预言起播时间。
+5. 任一写后错误都保留正 accepted count，返回 intentionally malformed positive result，
+   由 committer 精确推进一次后取消；不发布伪 AEC reference，也绝不重放该 prefix。
+
+`EAGAIN/EINTR/EPIPE/ESTRPIPE/ENODEV|ENXIO|ENOTTY` 分别映射为 would-block、
+interrupted、xrun、suspended 和 device-lost，原负 errno 保留用于有界诊断。热路径禁止
+调用 `snd_pcm_recover`：恢复不能绕过 PCM incarnation；xrun/suspend 统一由 actor 推进
+fence 后执行现有 `Drop -> incarnation++ -> Prepare` 事务。
+
+`BOOMPI_ENABLE_ALSA_PLAYBACK` 在普通 host 默认关闭、RV1106 target 默认开启。启用后，
+默认 ALL 构建会链接一个不安装、不自动执行的 `boompi_alsa_playback_link_check`，以便在
+tests-off 的交叉构建中也解析 adapter、ALSA 和单调时钟符号；它只证明链接兼容。Linux
+还可显式运行 `alsa-null-accepted-only` smoke；`null` 会丢弃数字 PCM，只能证明
+libasound API 与 accepted 边界，不能证明 hardware presentation、played 或 audible。
+当前 composition root 还没有创建该 device/sink，也没有实际 playback runner。
+
 ## AudioDspEngine 契约
 
 `AudioDspEngineConfig` 必须显式选择一种 reference source 和一种 layout：
@@ -44,7 +78,8 @@ slot 与极性仍由板端实测后通过 `ChannelMap` 配置。`Mono16kFrame` �
 同一时刻只能启用一种 reference source。软件 reference 不能使用收到的原始 TTS 包，
 必须位于 jitter、重采样、音量、duck、混音和 limiter 之后；partial device write 只能
 贡献已接受的 prefix，不能补零伪装成完整帧。P2f-b-a 的 `AcceptedRenderQueue` 只提供
-portable accepted ledger；它尚未接到真实 ALSA adapter 或 AEC consumer。accepted 也不
+portable accepted ledger；P2f-c-a 的真实 ALSA adapter 尚未由 runtime 组成，也未接到
+AEC consumer。accepted 也不
 等于 presented、played 或 audible，预计 presentation 时间不能冒充硬件完成证据。
 adapter 若返回 malformed positive count，committer 会把请求范围内可能已接受的样本
 保守推进且不重放，但禁止用不可信 timing 发布 reference，并要求取消。control result

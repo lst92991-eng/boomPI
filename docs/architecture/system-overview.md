@@ -86,10 +86,12 @@ application actor 独占精确 cancellation join。active cancel 只有汇合 pr
 never-armed 与 renderer-only/no-sink 路径只有在严格证明未进入 sink、没有 accepted PCM
 的情况下才可跳过 DSP reset，且仍需 producer stop 和稳定 ingress 空。
 
-这些内容已进入 host 可构建边界，但 playback sink/committer 和 worker core 目前只由
-deterministic host 调用及 scripted sink 验证。真实 ALSA adapter、实际播放线程/调度、network
-producer endpoint、DSP endpoint、accepted ledger 到 AEC 的组装/消费、normal-EOS
-presentation completion、wake/VAD worker 和 500 ms pre-roll 均属于后续集成。accepted
+这些内容已进入 host 可构建边界。P2f-c-a 新增的 `PcmPlaybackSink48k` 与 Linux
+`AlsaPcmPlaybackDevice` 已分别通过 fake-device 故障注入、ALSA `null` accepted-only smoke
+和 RV1106 sysroot 交叉构建；设备名、声道、period、buffer、start threshold 与 avail-min
+都必须显式提供。它们尚未由 composition root 创建，也没有接入实际播放线程。实际线程/
+调度、network producer endpoint、DSP endpoint、accepted ledger 到 AEC 的组装/消费、
+normal-EOS presentation completion、wake/VAD worker 和 500 ms pre-roll 均属于后续集成。accepted
 （包括 EOS accepted）只表示 sink 接受的数字 PCM 前缀，不等于 presented、played、
 audible 或“播放完成”。Rockchip 3A、Snowboy、Mode1 slot 顺序、实时率和声学行为仍需
 板端 HIL；通过依赖 configure 或 host fake 不代表 adapter、模型或硬件运行成功。
