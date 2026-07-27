@@ -3,12 +3,16 @@
 ## 结论
 
 P0 当前为“部分通过”，不能标记完成。匹配 BSP 的 C++ 交叉构建、Rockchip 3A
-二进制 ABI、Snowboy 加 OpenBLAS 的干净链接和 TLS 链接已经验证；真实板端执行、
-48 kHz 全双工、Mode1 四通道、3A/Snowboy 实时处理、Wi-Fi AP/STA 能力和 UI
-刷新路径仍需真机补证。
+二进制 ABI 与离线零输入板端调用、Snowboy 加 OpenBLAS 的干净链接和 TLS 链接已经
+验证；生产程序板端执行、48 kHz 全双工、Mode1 四通道、3A/Snowboy 实时处理、
+Wi-Fi AP/STA 能力和 UI 刷新路径仍需真机补证。
 
 本轮只读取 SDK、sysroot、既有第三方依赖和主机网络状态。没有打开 PCM、录音、
 播放、扫描 Wi-Fi、修改 mixer、刷镜像、改设备树、重启或写入板卡。
+
+2026-07-27 补充验证在同一 BSP 基线的 RV1106 板卡上执行了 Debug-only 离线 3A
+探针，只向 `/tmp` 复制程序并以全零内存缓冲区调用库，没有打开 PCM 或修改板卡配置。
+完整记录见 [Rockchip 3A 离线 ABI 探针报告](rockchip-3a-offline-probe-20260727.md)。
 
 ## 状态矩阵
 
@@ -16,9 +20,9 @@ P0 当前为“部分通过”，不能标记完成。匹配 BSP 的 C++ 交叉�
 | --- | --- | --- |
 | C++ 工具链与 sysroot | 通过 | GCC 8.3.0 Buildroot wrapper 成功构建两个 RV1106 ELF |
 | 目标 ELF ABI | 通过 | ELF32 ARM EABI5、hard-float、uClibc loader、无 RPATH/RUNPATH |
-| 最小程序真机执行 | 阻塞 | 直连物理链路存在，但本轮 SSH 管理通道无响应 |
-| Rockchip 3A ABI | 候选通过 | 匹配 ARMv7/uClibc；API、资源和哈希已核对 |
-| Rockchip 3A 功能/实时率 | 未验证 | 需要真实双麦、参考通道和 16 kHz 连续输入 |
+| 最小程序真机执行 | 部分通过 | 2026-07-27 离线 3A 探针执行成功；生产客户端 smoke 尚未执行 |
+| Rockchip 3A ABI | 通过（离线） | 固定头文件/库哈希、符号、交叉链接、ELF 和板端零输入调用均通过 |
+| Rockchip 3A 功能/实时率 | 未验证 | 需要真实双麦、参考通道、通道顺序和 16 kHz 连续输入 |
 | Snowboy ABI/链接 | 候选通过 | 原始静态库加交叉编译 OpenBLAS 可生成干净 RV1106 ELF |
 | Snowboy 模型加载/实时率 | 未验证 | 需要板端模型加载、连续 16 kHz 和 CPU/RSS 数据 |
 | ALSA/Mode1 | 未验证 | 历史单项结果不能替代当前镜像的全双工四通道测试 |
@@ -73,10 +77,24 @@ int rkaudio_preprocess_short(
 void rkaudio_preprocess_destory(void *handle);
 ```
 
-已确认只按 16-bit PCM 接入；完整 3A 的文档范围为 8/16 kHz。头文件默认
-`NUM_REF_CHANNEL=1`，但这不能证明板上 Mode1 的四通道顺序。`libaec_bf_process.so`
-是 ARMv7 EABI5、NEON/VFPv4、hard-float、uClibc，动态依赖为
-`librkaudio_common.so`、`libgcc_s.so.1` 和 `libc.so.0`。
+头文件与反汇编共同确认只接受 16-bit PCM。官方资料列出多个采样率，但本项目只在
+16 kHz 验证：每通道固定 16 ms，即 256 个样本；`input_size` 是所有源通道与参考
+通道的 `int16_t` 样本总数，2 mic + 2 ref 时必须为 1024。处理成功返回单声道输出
+字节数，16 kHz 时为 512；长度不匹配返回 0。导出的 ABI 没有 reset，当前唯一有
+证据的复位方式是 destroy 后重新 init。头文件默认 `NUM_REF_CHANNEL=1`，官方资料的
+`REF_POSITION`/可选重排说明也不能证明板上 Mode1 的四通道顺序。
+
+`libaec_bf_process.so` 是 ARMv7 EABI5、NEON/VFPv4、hard-float、uClibc，动态依赖为
+`librkaudio_common.so`、`libgcc_s.so.1` 和 `libc.so.0`。离线探针的 NEEDED 不含
+`librkaudio_detect.so`。目标镜像缺少预期的 `config_aivqe.json`，但结构体参数路径
+仍能以零输入完成 init/process/destroy/reinit；这不证明文件配置模式、实际通道排列、
+AEC/BF 效果或实时性。
+
+Rockchip 库固定 16 ms，而当前 `AudioDspEngine` 公共契约固定 20 ms，并要求每次
+`Process` 同步产出携带当前元数据的一帧。80 ms 内是 5 个厂商块与 4 个公共帧，若不
+引入“需要更多输入/输出可用”状态、按最早缓冲输入保存元数据并在 Arm/Disarm/故障时
+清空缓冲，就只能填充、丢弃、重复或错配元数据。因此当前保持 fail-closed，没有实现
+生产适配器；必须先完成公共契约评审。
 
 固定 SHA-256：
 
@@ -88,8 +106,8 @@ void rkaudio_preprocess_destory(void *handle);
 | `librkaudio_detect.so` | `f84b66a2d1d561fbb3c36e288a57f1e9ef50990974d9be9accbb0aaebcbae396` |
 | `config_aivqe.json` | `1d160fde184935cf43a49feae7be0dfd24efdc82ff9de2ea8b35aba6318074f9` |
 
-当前 assembled OEM/rootfs 能看到 3A 库，但没有看到 `config_aivqe.json` 和相关
-模型资源。若后续选择文件配置模式，打包规则必须显式安装并校验这些资源。
+当前目标镜像能看到 3A 库，但没有看到 `config_aivqe.json` 和相关模型资源。若后续
+选择文件配置模式，打包规则必须显式安装并校验这些资源。
 
 ## Snowboy
 
@@ -155,9 +173,13 @@ P0 推荐以锁定的 3.5.x 外部构建作为 WSS 候选，不回退到 1.1.1v�
 
 ## 板卡连接状态
 
-本轮检查时，Windows 直连网口为 `Up/100 Mbps`，DHCP 日志在十余分钟前仍有板卡
+2026-07-25 检查时，Windows 直连网口为 `Up/100 Mbps`，DHCP 日志在十余分钟前仍有板卡
 租约活动，但 SSH 和调试端口均超时。结论只能是“物理链路及近期 DHCP 有证据，
 当前管理通道不可用”，不能据此断言板卡断电或当前镜像正常。
+
+2026-07-27 管理通道已恢复，离线 3A 探针在 Buildroot 2023.02.6、内核 5.10.160、
+ARMv7l 的目标板上退出 0。该结果只解除最小 3A ABI 调用的板端执行阻塞，不替代生产
+客户端、ALSA、实时率或声学验证。板卡时钟未同步，报告以主机时间为准。
 
 为避免泄露环境标识，本报告不保存 IP、MAC、SSID、主机名、私钥路径或完整本地
 目录。历史板端输出仅作为定位线索，不用于勾选当前镜像的 P0 闸门。
@@ -191,10 +213,11 @@ boomPI 客户端、Snowboy 最小链接产物和 OpenSSL 3.5.7 TLS 最小产物�
 
 ## 解除 P0 阻塞的顺序
 
-1. 恢复板端 SSH，运行只读探针并保存脱敏 JSON。
-2. 将当前交叉编译的 ABI smoke 只复制到板端 `/tmp`，核对 loader 后执行。
-3. 记录 ALSA 实际能力，再验证真正同时运行的 48 kHz capture/playback。
-4. 用可辨识信号确认四通道顺序、双麦极性和数字参考采样位置。
-5. 分别验证 Rockchip 3A 与 Snowboy 的初始化、错误路径和短时实时率；功能通过前
-   不做长时间压力测试。
+1. 评审并明确 16 ms 厂商块与 20 ms 公共音频帧之间的缓冲、输出状态和元数据契约；
+   禁止用填充、丢弃或重复规避。
+2. 记录 ALSA 实际能力，再验证真正同时运行的 48 kHz capture/playback。
+3. 用可辨识信号确认四通道顺序、双麦极性和数字参考采样位置。
+4. 在契约获批后实现适配器，分别验证 Rockchip 3A 与 Snowboy 的初始化、错误路径和
+   短时实时率；功能通过前不做长时间压力测试。
+5. 执行生产客户端板端 smoke，并核对 loader、依赖和故障关闭行为。
 6. 核对 Wi-Fi 驱动 AP/STA 模式、UI backend 和受支持 TLS 方案。

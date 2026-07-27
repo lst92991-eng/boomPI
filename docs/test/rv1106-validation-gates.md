@@ -2,12 +2,13 @@
 
 本文列出进入真实功能开发前必须完成的板端检查。除非测试记录明确给出板卡、镜像、日期和命令输出，否则状态均为“未验证”。
 
-当前分项证据和阻断见 [2026-07-25 P0 可行性报告](p0-feasibility-report-20260725.md)。
+当前分项证据和阻断见 [2026-07-25 P0 可行性报告](p0-feasibility-report-20260725.md)
+及 [2026-07-27 Rockchip 3A 离线 ABI 探针报告](rockchip-3a-offline-probe-20260727.md)。
 
 ## P0 环境与 ABI
 
 - [ ] 记录 CPU ISA、float ABI、动态加载器、libc、libstdc++ 和内核版本。
-- [ ] 确认交叉编译器与目标 sysroot 匹配，并运行最小 C++ smoke executable。交叉构建与 ELF 检查已通过，真机执行待补。
+- [x] 确认交叉编译器与目标 sysroot 匹配，并运行最小 C++ smoke executable。2026-07-27 的 Debug-only 3A 离线探针已在目标板退出 0；生产客户端 smoke 仍待补。
 - [ ] 确认 ALSA、TLS、pthread 和所需系统调用在目标镜像可用。sysroot 链接已通过，当前板端运行待补。
 - [x] 对 Rockchip/Snowboy 运行库执行 `file`、`readelf` 和依赖/符号检查。功能与性能仍分别保留在下方闸门。
 
@@ -30,7 +31,8 @@
 - [ ] Mode1 不成立时停止，不自动启用未经评审的软件 reference。
 - [ ] 若评审后启用软件 reference，验证 accepted-prefix ledger 到 AEC 输入的组装、换代、
   partial/cancel 边界、延迟对齐和旧 reference 清除；不得用原始 TTS 或补零前缀代替。
-- [ ] 验证 Rockchip 3A 16 kHz 输入布局、错误码、单帧最坏耗时和持续实时率。
+- [ ] 验证 Rockchip 3A 16 kHz 输入布局、错误码、单帧最坏耗时和持续实时率。离线 ABI 已确认固定 16 ms、2 mic + 2 ref 时 `input_size=1024` 个样本、成功返回 512 字节单声道输出、长度不匹配返回 0；实际通道排列、声学效果和实时率仍未验证。
+- [ ] 评审 16 ms 厂商块与 20 ms `AudioDspEngine` 帧之间的缓冲、输出可用状态和元数据归属；评审完成前保持 fail-closed，禁止填充、丢弃或重复。
 - [ ] 最终壳体中记录距离、角度、音量、背景噪声、ERLE、残余回声和 double-talk 结果。
 
 ## Snowboy

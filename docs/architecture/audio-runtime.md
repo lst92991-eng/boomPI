@@ -104,8 +104,10 @@ Snowboy 的 `-2` 只表示 detector 的 silence 分类，不是产品 VAD。
 
 generation/continuity gate、500 ms AEC 后 pre-roll 和产品 VAD 属于尚未实现的单线程
 wake/VAD worker。默认 `UnavailableWakeWordEngine` 永不报告 detection；测试 fake
-也不会进入发布 target。Rockchip 的 `input_size` 单位、packing、返回码、算法组合和
-reset，以及 Snowboy 模型加载与实时率仍未验证，不得从接口名称猜实现。详细边界见
+也不会进入发布 target。Rockchip 的软件 ABI 已确认固定 16 ms、interleaved S16、
+`input_size` 为跨通道 sample 总数且返回 mono bytes，但它无法按当前冻结的 20 ms 同步
+输出契约一对一接入；真实 packing、声学效果、实时率和完整错误域仍未验证。Snowboy
+模型加载与实时率也仍未验证。详细边界见
 [音频后端契约与依赖闸门](audio-backends.md)。
 
 两个 vendor 开关默认 `OFF`。当前 pins 只允许在核对 Linux/ARM cross target、固定

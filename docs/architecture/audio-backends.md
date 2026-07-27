@@ -72,21 +72,38 @@ engine 由一个 DSP worker 独占并串行执行：
 从不输出未经处理的麦克风 PCM。`FakeAudioDspEngine` 只编入测试 target；它用于验证
 编排、generation 和错误恢复，不实现 AEC/NS/BF/AGC，也不得进入发布产物。
 
-## Rockchip 3A 未决 API
+## Rockchip 3A 已核对边界与阻断
 
-P0 仅证明一组头文件/库是目标 ABI 候选。本阶段没有足够证据回答下列问题，因此实现
-不得根据库名、示例板或函数直觉猜测：
+2026-07-27 已用匹配 BSP commit `994243753789` 的固定头文件/共享库完成 Debug-only
+交叉链接，并在目标板 `/tmp` 运行两轮纯内存全零输入探针。板端三库 SHA-256 与 P0 pin
+一致；探针 ELF 为 ARM EABI5 hard-float/uClibc，无 `RPATH/RUNPATH`。详细条件、命令、
+脱敏结果和限制见 [Rockchip 3A 离线 ABI 探针记录](../test/rockchip-3a-offline-probe-20260727.md)。
 
-- `input_size` 的单位是 bytes、单通道 samples、总 samples 还是固定帧数。
-- 输入是 planar 还是 interleaved，麦克风/reference 的 packing 与顺序是什么。
-- mono/stereo reference 如何表达，左右 reference 是否都被真实算法消费。
-- 返回值是成功码、输出长度、检测状态还是负错误码；错误后是否必须重新初始化。
-- 初始化结构、配置文件、模型资源的 ownership、寿命、线程限制和释放顺序。
-- AEC、NS、BF、AGC 是否组合在一个入口、内部顺序、是否允许分别关闭。
-- 16 kHz 帧长、算法延迟、reset 语义、CPU/RSS 和单帧最坏耗时。
+匹配头文件、vendor 指南、导出符号、反汇编和板端返回值已经关闭以下软件 ABI：
 
-进入真实 adapter 前必须以匹配 BSP 的头文件、可链接 smoke、脱敏输入和板端返回值记录
-逐项关闭这些问题。没有证据时状态只能写“未验证”。
+- 一次调用固定处理 16 ms；16 kHz 时每通道 256 samples。
+- 输入为 interleaved S16。`input_size` 是所有 source/reference 通道合计的 `int16`
+  sample 数；`2 mic + 2 ref` 时必须为 1024，1023 返回 0。
+- 成功返回 mono 输出 byte 数；16 kHz/16 ms 返回 512。未来 bridge 必须要求精确返回值，
+  不能把所有非负值都解释为成功。
+- mic/reference 的逻辑前后位置由 `pos`/`ref_pos` 表达，`Array_list` 可重排；这不证明
+  ALSA Mode1 的物理 slot、极性或 reference 采样点。
+- 初始化成功返回非空 handle。头文件和导出符号没有独立 reset；当前只验证了
+  `destory`、参数释放和重新初始化。`rkaudio_param_set` 不能冒充历史状态 reset。
+- 当前 preprocess 入口使用 `RKAUDIOParam` 结构配置。板端没有找到 pinned JSON，但
+  struct-param probe 可初始化；不能外推其他 Rockchip 模式不需要 JSON。
+- 探针直接依赖 AEC/BF 与 common 库，不加载 detect。全零输入只证明 ABI、尺寸、调用和
+  guard，不证明 AEC、ANR、BF、AGC 的效果或实际内部顺序。
+
+vendor 16 ms 与核心 20 ms 无法按当前同步 `Process` 契约一对一映射：80 ms 内分别是
+5 个 vendor 块与 4 个核心帧。补零、丢样、重复样本或给缓存旧 PCM 复制当前 metadata
+都会破坏连续性。公共契约必须先经评审，至少能表达非错误的“需要更多输入”、最早缓存
+输入的 metadata 归属和 generation/fault 清理，再实现 adapter。此前 Release 保持
+fail-closed。
+
+仍未验证真实双麦/reference packing、声学参数、返回值的完整错误域、算法延迟、
+CPU/RSS、单帧最坏耗时、持续实时率、故障恢复和声学效果。vendor 指南虽列出多个
+采样率，本轮只执行 16 kHz，不能据此宣称 48 kHz 已通过。
 
 ## WakeWordEngine 契约
 
@@ -136,8 +153,9 @@ CMake 对每个输入执行存在性、文件类型和固定 SHA-256 检查，�
 停止 configure。固定值来自 [P0 可行性报告](../test/p0-feasibility-report-20260725.md)
 中的审计基线，但它们只是可行性候选，不是发布批准。必须显式设置
 `BOOMPI_ALLOW_FEASIBILITY_AUDIO_VENDOR_INPUTS=ON`，并把生成器限制为 Debug-only，
-才会创建供私有 link probe 使用的 imported targets；Release/RelWithDebInfo/MinSizeRel
-和包含其他 configuration 的多配置生成器都会被拒绝。通过该闸门不等于 adapter 已经
+才会创建 imported targets。启用 Rockchip 时还会定义显式构建、`EXCLUDE_FROM_ALL`
+且不安装的 `boompi_rockchip_3a_probe`；Release/RelWithDebInfo/MinSizeRel 和包含其他
+configuration 的多配置生成器都会被拒绝。通过该闸门或 probe 不等于 adapter 已经
 实现、模型可以加载或板端实时率已经通过。
 
 当前 OpenBLAS archive 含多线程实现，只完成了 ABI/link 候选验证。发布接入前必须按
@@ -156,9 +174,10 @@ Snowboy 候选静态库使用旧 libstdc++ 字符串 ABI。未来只能由一个
 
 ## 后续验证顺序
 
-1. 用匹配 BSP 的 Rockchip 头文件关闭 `input_size`、packing、return 和 reset 等 API
-   问题，再实现独立 adapter 与错误转换。
-2. 在板端验证 16 kHz 双麦/reference 输入、mono 输出、算法延迟、CPU/RSS 和实时率。
+1. 评审 16 ms vendor 块与 20 ms 核心帧的缓冲、输出可用性、metadata 和 generation
+   契约，再实现独立 adapter 与错误转换。
+2. 在板端验证真实 16 kHz 双麦/reference packing、mono 输出、算法延迟、CPU/RSS 和
+   实时率。
 3. 实现私有 Snowboy legacy bridge、启动期模型/格式校验和单线程 wake worker。
 4. 验证目标英文模型的加载、准确率、误唤醒、漏唤醒和最坏帧耗时，再进行至少
    30 分钟稳定性测试。
