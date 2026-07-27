@@ -2,17 +2,20 @@
 
 ## 本阶段状态
 
-P2e-a 只建立 host 可验证的 `AudioDspEngine`、`WakeWordEngine` 接口、失败关闭实现、
-测试 target 专用的确定性 fake，以及外部依赖的 CMake 配置闸门。仓库中还没有
-Rockchip 3A adapter、Snowboy adapter、wake/VAD worker 或真实模型加载代码，也没有
-调用板端 vendor API。接口、fake 和依赖文件已纳入 host 构建与验证范围，只能证明
-类型、状态和失败路径可测试，不能证明 AEC、波束形成、唤醒或实时率已经可用。
+P2e-a 建立了 host 可验证的 `AudioDspEngine`、`WakeWordEngine` 接口、失败关闭实现、
+测试 target 专用的确定性 fake，以及外部依赖的 CMake 配置闸门。后续已增加
+allocation-free 的 `AudioDspFrameBridge16k` 和 Debug-only Snowboy feasibility
+adapter/probe。仓库中仍没有 Rockchip 3A platform adapter、wake/VAD worker 或可用于
+发布的 Snowboy runtime；产品 runtime 也没有调用这些 vendor API。当前代码与证据只能
+证明帧整形、适配器结果映射和受控板端正向探针，不能证明 AEC、波束形成、产品唤醒
+或持续实时率已经可用。
 
 真实状态必须区分为三层：
 
 1. **核心契约已实现**：固定帧、generation、错误分类和 fail-closed 行为。
 2. **依赖候选可配置**：只有显式启用并通过路径与 SHA-256 检查时才创建 imported target。
-3. **真实 adapter 与 HIL 未完成**：尚未把任何 vendor 函数接入运行时，也未在板端处理音频。
+3. **feasibility adapter 已隔离**：Snowboy 正向离线探针已执行，但异常安全不满足产品
+   要求；Rockchip adapter、产品 worker 与完整 HIL 仍未完成。
 
 ## 数据流与帧布局
 
@@ -86,7 +89,8 @@ engine 由一个 DSP worker 独占并串行执行：
 - 一次调用固定处理 16 ms；16 kHz 时每通道 256 samples。
 - 输入为 interleaved S16。`input_size` 是所有 source/reference 通道合计的 `int16`
   sample 数；`2 mic + 2 ref` 时必须为 1024，1023 返回 0。
-- 成功返回 mono 输出 byte 数；16 kHz/16 ms 返回 512。未来 bridge 必须要求精确返回值，
+- 成功返回 mono 输出 byte 数；16 kHz/16 ms 返回 512。platform adapter 必须先把 byte
+  数转换为 sample 数，再让 bridge 要求精确返回值，
   不能把所有非负值都解释为成功。
 - mic/reference 的逻辑前后位置由 `pos`/`ref_pos` 表达，`Array_list` 可重排；这不证明
   ALSA Mode1 的物理 slot、极性或 reference 采样点。
@@ -97,11 +101,13 @@ engine 由一个 DSP worker 独占并串行执行：
 - 探针直接依赖 AEC/BF 与 common 库，不加载 detect。全零输入只证明 ABI、尺寸、调用和
   guard，不证明 AEC、ANR、BF、AGC 的效果或实际内部顺序。
 
-vendor 16 ms 与核心 20 ms 无法按当前同步 `Process` 契约一对一映射：80 ms 内分别是
-5 个 vendor 块与 4 个核心帧。补零、丢样、重复样本或给缓存旧 PCM 复制当前 metadata
-都会破坏连续性。公共契约必须先经评审，至少能表达非错误的“需要更多输入”、最早缓存
-输入的 metadata 归属和 generation/fault 清理，再实现 adapter。此前 Release 保持
-fail-closed。
+vendor 16 ms 与核心 20 ms 不能一对一映射：80 ms 内分别是 5 个 vendor 块与 4 个
+核心帧。`AudioDspFrameBridge16k` 已把该比率作为独立、有界状态机实现，明确表达
+`kNeedMoreInput`/`kOutputAvailable`、最早缓存输入的 metadata 归属以及
+generation/fault 清理；Host 测试覆盖 1/1/1/2 backend block 调用节奏、0/1/1/2 输出
+节奏、1,000 帧逐样本守恒和错误清空。它不改变 `AudioDspEngine`，也不声明 Rockchip
+packing、reset 或错误码已经适配；platform adapter 与板端连续输入 HIL 完成前 Release
+仍保持 fail-closed。
 
 仍未验证真实双麦/reference packing、声学参数、返回值的完整错误域、算法延迟、
 CPU/RSS、单帧最坏耗时、持续实时率、故障恢复和声学效果。vendor 指南虽列出多个
@@ -114,7 +120,7 @@ CPU/RSS、单帧最坏耗时、持续实时率、故障恢复和声学效果。v
 一基 keyword index，以及可选的 `score_milli`。
 
 - `score_milli` 只有在 `score_available=true` 时有效，范围为 0–1000。
-- Snowboy API 不提供置信度，因此未来 Snowboy adapter 必须返回
+- Snowboy API 不提供置信度，因此当前 feasibility adapter 返回
   `score_available=false`、`score_milli=0`；sensitivity 不是检测分数。
 - Snowboy `RunDetection()` 的 `-2` 只映射为 diagnostic `kSilence`，不能作为产品 VAD。
 - `-1`、异常、未知负值或越界 keyword index 都必须转换为 backend error 并失败关闭。
@@ -156,9 +162,11 @@ CMake 对每个输入执行存在性、文件类型和固定 SHA-256 检查，�
 中的审计基线，但它们只是可行性候选，不是发布批准。必须显式设置
 `BOOMPI_ALLOW_FEASIBILITY_AUDIO_VENDOR_INPUTS=ON`，并把生成器限制为 Debug-only，
 才会创建 imported targets。启用 Rockchip 时还会定义显式构建、`EXCLUDE_FROM_ALL`
-且不安装的 `boompi_rockchip_3a_probe`；Release/RelWithDebInfo/MinSizeRel 和包含其他
-configuration 的多配置生成器都会被拒绝。通过该闸门或 probe 不等于 adapter 已经
-实现、模型可以加载或板端实时率已经通过。
+且不安装的 `boompi_rockchip_3a_probe`；启用 Snowboy 时只在相同 Debug feasibility
+闸门内创建私有 legacy bridge、platform adapter 和显式构建、`EXCLUDE_FROM_ALL`、
+不安装的 `boompi_snowboy_offline_probe`。Release/RelWithDebInfo/MinSizeRel 和包含其他
+configuration 的多配置生成器都会被拒绝。通过该闸门或 probe 不等于产品 adapter
+获批、模型错误路径安全或持续板端实时率已经通过。
 
 当前 OpenBLAS archive 含多线程实现，只完成了 ABI/link 候选验证。发布接入前必须按
 单线程配置重建、记录来源与许可、生成新的 SHA-256，并替换本模块 pin；不得用
@@ -168,20 +176,23 @@ Snowboy、OpenBLAS、Rockchip 库、资源和模型继续保留在仓库外；�
 SHA-256 和再分发范围全部确认前禁止提交二进制。显式路径不得写入 preset、安装包日志
 或 target 的 PUBLIC 接口。
 
-Snowboy 候选静态库使用旧 libstdc++ 字符串 ABI。未来只能由一个私有 C bridge TU
+Snowboy 候选静态库使用旧 libstdc++ 字符串 ABI。当前只有一个私有 C bridge TU
 包含 `snowboy-detect.h` 并私有设置 `_GLIBCXX_USE_CXX11_ABI=0`；bridge 外只传固定宽度
 整数、PCM 指针、长度和不透明 handle，不传 `std::string`、异常、RTTI 或 Snowboy
-对象。所有异常必须在 bridge 内转换为错误码，旧 ABI 定义不得扩散到 `boompi_audio_core`
-或应用。v1 不使用动态插件，也不因兼容失败擅自改成多进程或替换唤醒引擎。
+对象。普通 backend 返回与可传播异常会被转换为错误码，旧 ABI 定义不扩散到
+`boompi_audio_core` 或应用；但缺失模型的实测结果是库内直接 `terminate`，证明当前
+archive 不能作为安全的同进程边界。v1 不使用动态插件，也不因兼容失败擅自改成多进程
+或替换唤醒引擎。
 
 ## 后续验证顺序
 
-1. 评审 16 ms vendor 块与 20 ms 核心帧的缓冲、输出可用性、metadata 和 generation
-   契约，再实现独立 adapter 与错误转换。
+1. 在已实现的 16↔20 ms bridge 之外补齐 Rockchip platform adapter 与精确错误转换。
 2. 在板端验证真实 16 kHz 双麦/reference packing、mono 输出、算法延迟、CPU/RSS 和
    实时率。
-3. 实现私有 Snowboy legacy bridge、启动期模型/格式校验和单线程 wake worker。
-4. 验证目标英文模型的加载、准确率、误唤醒、漏唤醒和最坏帧耗时，再进行至少
+3. 获取或重建错误可返回且使用单线程 OpenBLAS 的 Snowboy runtime，再把已实现的
+   feasibility adapter 接入单线程 wake worker。
+4. 在已完成默认模型正向离线检测的基础上，验证真实麦克风准确率、误唤醒、漏唤醒
+   和最坏帧耗时，再进行至少
    30 分钟稳定性测试。
 5. 最后接入 500 ms pre-roll、独立 VAD 和播放打断闭环；功能通过前不进行压力测试。
 

@@ -5,8 +5,8 @@
 P0 当前为“部分通过”，不能标记完成。匹配 BSP 的 C++ 交叉构建、Rockchip 3A
 二进制 ABI 与离线零输入板端调用、Snowboy 加 OpenBLAS 的干净链接和 TLS 链接已经
 验证；当前镜像的 48 kHz 短时静音全双工也已通过。生产客户端板端执行、可辨识
-播放/采集内容、Mode1 四通道、3A/Snowboy 实时处理、Wi-Fi AP/STA 能力和 UI
-刷新路径仍需真机补证。
+播放/采集内容、Mode1 四通道、3A 实时处理、可安全失败的 Snowboy 产品 runtime、
+Wi-Fi AP/STA 能力和 UI 刷新路径仍需真机补证。
 
 2026-07-25 的初始检查只读取 SDK、sysroot、既有第三方依赖和主机网络状态，没有
 打开 PCM。2026-07-27 的补充验证打开了 PCM，但只播放静音并丢弃采集样本；没有保存
@@ -17,6 +17,8 @@ P0 当前为“部分通过”，不能标记完成。匹配 BSP 的 C++ 交叉�
 完整记录见 [Rockchip 3A 离线 ABI 探针报告](rockchip-3a-offline-probe-20260727.md)。
 同日的 ALSA 补充验证见
 [RV1106 ALSA 全双工 smoke 记录](rv1106-alsa-smoke-20260727.md)。
+Snowboy 默认模型的正向离线检测与致命错误路径见
+[Snowboy P0 板端探针记录](snowboy-p0-probe-20260727.md)。
 
 ## 状态矩阵
 
@@ -27,8 +29,8 @@ P0 当前为“部分通过”，不能标记完成。匹配 BSP 的 C++ 交叉�
 | 最小程序真机执行 | 部分通过 | 2026-07-27 离线 3A 探针和 ALSA 平台 smoke 执行成功；生产客户端 smoke 尚未执行 |
 | Rockchip 3A ABI | 通过（离线） | 固定头文件/库哈希、符号、交叉链接、ELF 和板端零输入调用均通过 |
 | Rockchip 3A 功能/实时率 | 未验证 | 需要真实双麦、参考通道、通道顺序和 16 kHz 连续输入 |
-| Snowboy ABI/链接 | 候选通过 | 原始静态库加交叉编译 OpenBLAS 可生成干净 RV1106 ELF |
-| Snowboy 模型加载/实时率 | 未验证 | 需要板端模型加载、连续 16 kHz 和 CPU/RSS 数据 |
+| Snowboy ABI/链接 | 候选通过 | 私有旧 ABI bridge、固定静态库与 OpenBLAS 可生成干净 RV1106 ELF，旧 ABI 未扩散 |
+| Snowboy 模型/产品安全 | 阻塞 | 默认模型板端加载成功，47 帧 fixture 检测 1 次、最大 7.197 ms；缺失模型会直接 `terminate`/`Aborted`，不能接产品 runtime |
 | ALSA 48 kHz 全双工 | 通过（短时静音） | 当前镜像上同时推进 4 通道 capture 与 2 通道 playback 50 个周期，失败 0；不证明可听播放或采集内容正确 |
 | Mode1/通道与参考 | 未验证 | Mode1 保持 Disabled；四通道顺序、双麦极性、DAC reference 采样位置和 AEC 均未验证 |
 | TLS ABI | 候选通过 | OpenSSL 3.5.7 LTS 已在目标工具链静态构建并链接干净 ELF |
@@ -140,8 +142,15 @@ libstdc++ 字符串 ABI，接入 target 必须隔离
 使用 OpenBLAS commit `1bd74ad3d1e8d21f86d1a6be35abfcdf27c0208a` 的 ARMv7
 静态库完成了最小链接。strip 后产物为 uClibc hard-float PIE，没有
 RPATH/RUNPATH 或开发机绝对路径，最高需要 `GLIBCXX_3.4.20`，低于目标 rootfs
-的 `GLIBCXX_3.4.25`。这只证明链接可行，不证明 `common.res`/模型能在板端加载，
-也不证明唤醒准确率或实时率。上述 OpenBLAS archive 哈希只固定本次链接候选；
+的 `GLIBCXX_3.4.25`。后续 Debug-only probe 已在板端加载固定 `common.res` 与默认模型：
+50 个全零 20 ms 帧均映射为 diagnostic silence；47 个上游 `snowboy.wav` fixture 帧中
+产生一次 keyword 1，最大单帧处理耗时 7.197 ms，最大 RSS 3,180 KiB，reset 成功。
+这只证明短时正向离线路径，不证明真实麦克风准确率、误唤醒率或持续实时率。
+
+缺失模型的受控错误路径会在旧静态库内部直接 `terminate`/`Aborted`，私有 C bridge
+外层的 `catch (...)` 无法获得控制权。因此当前 feasibility adapter/probe 不接
+`boompi-client`，Release capability 保持 unavailable。上述 OpenBLAS archive 哈希只
+固定本次链接候选；
 它仍需按单线程配置重建、重新固定哈希并做板端最坏耗时验证后才能成为发布输入。
 当前 CMake 闸门因此只允许显式 opt-in 的 Debug feasibility probe，并拒绝 Release 配置。
 
@@ -223,11 +232,11 @@ boomPI 客户端、Snowboy 最小链接产物和 OpenSSL 3.5.7 TLS 最小产物�
 
 ## 解除 P0 阻塞的顺序
 
-1. 评审并明确 16 ms 厂商块与 20 ms 公共音频帧之间的缓冲、输出状态和元数据契约；
+1. 在已通过 Host 守恒测试的 16↔20 ms bridge 上补齐 Rockchip platform adapter；继续
    禁止用填充、丢弃或重复规避。
 2. 在允许出声/采音并保存、恢复 mixer 原值的前提下，用可辨识信号确认 Mode1
    四通道顺序、双麦极性和数字参考采样位置。
-3. 在契约获批后实现适配器，分别验证 Rockchip 3A 与 Snowboy 的初始化、错误路径和
-   短时实时率；功能通过前不做长时间压力测试。
+3. 获取或重建错误可返回、单线程 OpenBLAS 的 Snowboy runtime；当前 archive 的缺失
+   模型路径会终止进程，不能接入产品或进入长时间压力测试。
 4. 执行生产客户端板端 smoke，并核对 loader、依赖和故障关闭行为。
 5. 核对 Wi-Fi 驱动 AP/STA 模式、UI backend 和受支持 TLS 方案。

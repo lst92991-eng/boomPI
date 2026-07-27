@@ -11,11 +11,13 @@ epoch fence 和有界软件队列清理。本阶段还建立了 DSP/唤醒核心
 和最终 S16 输出；P2f-b-a 完成了 portable sink、64 槽 accepted-prefix ledger、
 partial exactly-once committer 和本地 `Drop -> Prepare` cancel ACK 状态机。P2f-b-b
 进一步实现了 RV1106 ALSA RAII backend、主线 `PcmPlaybackSink` 的 48 kHz mono→2ch
-设备适配器，以及 2/4ch capture reader；短时静音全双工 HIL 已通过。产品级
-renderer/committer worker、控制 mailbox、DSP reset producer/join、normal-EOS presentation
-completion、Rockchip 3A/Snowboy adapter、wake/VAD worker、AEC reference 消费和打断闭环
-尚未接入。accepted 不等于 presented、played 或 audible；短时静音 HIL 也不证明
-Mode1、通道内容、极性、DAC reference、AEC 或声学效果。
+设备适配器，以及 2/4ch capture reader；短时静音全双工 HIL 已通过。当前还实现了
+allocation-free 的 20↔16 ms DSP 帧桥，以及默认关闭、Debug-only 的 Snowboy
+feasibility adapter/probe。产品级 renderer/committer worker、控制 mailbox、DSP reset
+producer/join、normal-EOS presentation completion、Rockchip 3A platform adapter、可安全
+失败的 Snowboy runtime、wake/VAD worker、AEC reference 消费和打断闭环尚未接入。
+accepted 不等于 presented、played 或 audible；短时静音 HIL 也不证明 Mode1、通道
+内容、极性、DAC reference、AEC 或声学效果。
 
 ## 帧契约
 
@@ -100,23 +102,33 @@ engine 由 DSP worker 独占；Configure/Arm/Disarm/Process 与销毁均在该 w
 不实现任何音频算法。
 
 `WakeWordEngine` 固定消费完整的 16 kHz/20 ms mono frame，并返回无字符串 POD
-decision/error。可用 score 的规范范围是 0–1000；Snowboy 没有置信度输出，因此未来
-adapter 必须返回 `score_available=false`、`score_milli=0`，不能用 sensitivity 代替。
+decision/error。可用 score 的规范范围是 0–1000；Snowboy 没有置信度输出，因此当前
+feasibility adapter 返回 `score_available=false`、`score_milli=0`，不使用 sensitivity
+冒充检测分数。
 Snowboy 的 `-2` 只表示 detector 的 silence 分类，不是产品 VAD。
 
 generation/continuity gate、500 ms AEC 后 pre-roll 和产品 VAD 属于尚未实现的单线程
 wake/VAD worker。默认 `UnavailableWakeWordEngine` 永不报告 detection；测试 fake
 也不会进入发布 target。Rockchip 的软件 ABI 已确认固定 16 ms、interleaved S16、
-`input_size` 为跨通道 sample 总数且返回 mono bytes，但它无法按当前冻结的 20 ms 同步
-输出契约一对一接入；真实 packing、声学效果、实时率和完整错误域仍未验证。Snowboy
-模型加载与实时率也仍未验证。详细边界见
+`input_size` 为跨通道 sample 总数且返回 mono bytes。`AudioDspFrameBridge16k` 在不修改
+冻结的 `AudioDspEngine` 契约下完成 20 ms 核心帧与 16 ms backend 块的有界整形：每次
+核心输入同步调用一到两个精确 backend block，完整 20 ms 输出按流序排队，80 ms 周期内
+样本严格守恒；输出 metadata 归属最早尚未消费的输入。bridge 的 `kUnset` 零值失败关闭，
+backend fault/discontinuity 会清空所有缓存并要求新 generation。它尚未绑定 Rockchip
+packing 或接入产品 DSP worker，真实声学、实时率和完整错误域仍未验证。
+
+Snowboy feasibility adapter 已通过 fake bridge 的 Host 错误映射测试，并在板端加载
+固定默认模型：47 个 20 ms 上游 fixture 帧产生一次 keyword 1，观测最大处理耗时
+7.197 ms，reset 成功。缺失模型却会使旧静态库直接 `terminate`/`Aborted`，私有 bridge
+的 `catch (...)` 无法获得控制权；因此该 target 保持 Debug-only、`EXCLUDE_FROM_ALL`
+且不接产品 runtime，Release capability 仍为 unavailable。详细边界见
 [音频后端契约与依赖闸门](audio-backends.md)。
 
 两个 vendor 开关默认 `OFF`。当前 pins 只允许在核对 Linux/ARM cross target、固定
 RV1106 GNU compiler 与 uClibc sysroot 后，用显式 feasibility opt-in 的 Debug-only
 probe 校验绝对路径和 SHA-256；Release 配置拒绝这些候选。通过 configure 只创建
-imported targets，不等于 adapter 已实现或 HIL 通过。vendor 库、模型和资源继续保留
-在仓库外。
+imported targets，不等于 adapter 获得发布批准或产品链路已接通。vendor 库、模型和
+资源继续保留在仓库外。
 
 ## 播放软件渲染、代际与软件缓冲
 

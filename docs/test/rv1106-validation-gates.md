@@ -4,7 +4,8 @@
 
 当前分项证据和阻断见 [2026-07-25 P0 可行性报告](p0-feasibility-report-20260725.md)
 、[2026-07-27 Rockchip 3A 离线 ABI 探针报告](rockchip-3a-offline-probe-20260727.md)
-及 [2026-07-27 RV1106 ALSA 全双工 smoke 记录](rv1106-alsa-smoke-20260727.md)。
+、[2026-07-27 RV1106 ALSA 全双工 smoke 记录](rv1106-alsa-smoke-20260727.md)
+及 [2026-07-27 Snowboy P0 板端探针记录](snowboy-p0-probe-20260727.md)。
 
 ## P0 环境与 ABI
 
@@ -33,15 +34,15 @@
 - [ ] 若评审后启用软件 reference，验证 accepted-prefix ledger 到 AEC 输入的组装、换代、
   partial/cancel 边界、延迟对齐和旧 reference 清除；不得用原始 TTS 或补零前缀代替。
 - [ ] 验证 Rockchip 3A 16 kHz 输入布局、错误码、单帧最坏耗时和持续实时率。离线 ABI 已确认固定 16 ms、2 mic + 2 ref 时 `input_size=1024` 个样本、成功返回 512 字节单声道输出、长度不匹配返回 0；实际通道排列、声学效果和实时率仍未验证。
-- [ ] 评审 16 ms 厂商块与 20 ms `AudioDspEngine` 帧之间的缓冲、输出可用状态和元数据归属；评审完成前保持 fail-closed，禁止填充、丢弃或重复。
+- [x] 评审 16 ms 厂商块与 20 ms 核心帧之间的缓冲、输出可用状态和元数据归属。独立 `AudioDspFrameBridge16k` 已实现 `kNeedMoreInput`/`kOutputAvailable`、最早输入 metadata 归属、换代清空和逐样本守恒；它不修改冻结的 `AudioDspEngine`，Rockchip platform adapter 与板端连续输入仍待补。
 - [ ] 最终壳体中记录距离、角度、音量、背景噪声、ERLE、残余回声和 double-talk 结果。
 
 ## Snowboy
 
-- [ ] 确认 runtime/model 来源、SHA-256 和再分发许可。
-- [ ] 验证模型初始化、16 kHz mono 连续输入、目标英文唤醒和错误路径。
-- [ ] 记录 CPU、RSS、最坏帧耗时、漏唤醒和误唤醒；功能跑通后再进行至少 30 分钟稳定性测试。
-- [ ] 不兼容时保存证据并请求架构决策，禁止静默换引擎或自行改为多进程。
+- [x] 确认当前 feasibility runtime/default model 的来源、SHA-256 和许可；其他模型与未来发布 runtime 必须重新核对，不能外推。
+- [ ] 验证模型初始化、16 kHz mono 连续输入、目标英文唤醒和安全错误路径。默认模型正向离线探针已检测 keyword 1，但缺失模型会直接 `terminate`/`Aborted`，因此该闸门保持失败。
+- [ ] 记录 CPU、RSS、最坏帧耗时、漏唤醒和误唤醒；当前短测已记录最大 7.197 ms 与 3,180 KiB，真实麦克风统计及至少 30 分钟稳定性仍未执行。
+- [ ] 不兼容时保存证据并请求架构决策，禁止静默换引擎或自行改为多进程。致命错误证据已保存，当前代码保持 Debug-only feasibility 且未接产品 runtime。
 
 ## 网络、UI 与系统
 
