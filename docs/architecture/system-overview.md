@@ -71,13 +71,26 @@ accepted sequence 耗尽后须先 `Drop`/`Prepare`，随后仍是 terminal resta
 要求真实交叉 target、显式路径/固定 SHA-256 的 vendor 依赖闸门。当前 pins 只允许显式
 opt-in 的 Debug feasibility probe，Release 配置拒绝。
 
+P2f-b-b1 已把 playback 控制面收敛为 host 可验证的固定容量值拷贝 SPSC 通道：normal
+lifecycle 与 urgent cancel 分槽，local cancel completion 不受普通结果背压影响；producer
+start/stop、DSP/reference reset、EOS accepted 与 critical stream event 也各有明确契约。
+network producer 的执行规则是 Stop 优先，并在启用 Start、获取 write lease 及每次 publish
+前重验 fence/授权。critical 槽满时，未来 playback worker 必须保留精确事件、停止
+ingress/render/commit 并优先重试，不能覆盖或静默丢弃。
+
+application actor 独占精确 cancellation join。active cancel 只有汇合 producer stop、
+本地 `Drop -> Prepare`、producer 已停后的稳定 ingress 空观察、按 retired PCM incarnation
+完成的 DSP reset，以及 worker `ConfirmReferenceReset` 后，才允许 Arm 下一代际。
+never-armed 与 renderer-only/no-sink 路径只有在严格证明未进入 sink、没有 accepted PCM
+的情况下才可跳过 DSP reset，且仍需 producer stop 和稳定 ingress 空。
+
 这些内容已进入 host 可构建边界，但 playback sink/committer 目前只由 scripted sink
-验证。真实 ALSA adapter、renderer/committer worker、Arm/Cancel 控制 mailbox、DSP
-reference-reset producer 与 application actor ACK join、accepted ledger 到 AEC 的组装/
-消费、normal-EOS presentation completion、wake/VAD worker 和 500 ms pre-roll 均属于
-后续集成。accepted 只表示 sink 接受的数字 PCM 前缀，不等于 presented、played、audible
-或“播放完成”。Rockchip 3A、Snowboy、Mode1 slot 顺序、实时率和声学行为仍需板端 HIL；
-通过依赖 configure 或 host fake 不代表 adapter、模型或硬件运行成功。
+验证，mailbox 与 join 也还没有实际执行端。真实 ALSA adapter、单播放 worker、network
+producer endpoint、DSP endpoint、accepted ledger 到 AEC 的组装/消费、normal-EOS
+presentation completion、wake/VAD worker 和 500 ms pre-roll 均属于后续集成。accepted
+（包括 EOS accepted）只表示 sink 接受的数字 PCM 前缀，不等于 presented、played、
+audible 或“播放完成”。Rockchip 3A、Snowboy、Mode1 slot 顺序、实时率和声学行为仍需
+板端 HIL；通过依赖 configure 或 host fake 不代表 adapter、模型或硬件运行成功。
 
 DSP 输入固定为 `MIC-L`、`MIC-R`、`REF-L`、`REF-R` 四个 16 kHz 平面，目标输出是
 16 kHz mono。reference 必须显式选择硬件回采或最终软件播放路径，不能混用。Rockchip

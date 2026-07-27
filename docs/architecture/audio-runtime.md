@@ -9,10 +9,13 @@ epoch fence 和有界软件队列清理。本阶段还建立了 DSP/唤醒核心
 测试专用 fake 和默认关闭的 vendor 依赖闸门。P2f-a 还完成了纯软件的 24→48 kHz
 播放渲染：wide-int32 FIR、音量/扬声器数字增益、duck、带 release 的块峰值 limiter
 和最终 S16 输出；P2f-b-a 完成了 portable sink、64 槽 accepted-prefix ledger、
-partial exactly-once committer 和本地 `Drop -> Prepare` cancel ACK 状态机。真实 ALSA、
-renderer/committer worker、控制 mailbox、DSP reset producer/join、normal-EOS presentation
-completion、Rockchip 3A/Snowboy adapter、wake/VAD worker、AEC reference 消费和打断闭环
-尚未接入。accepted 不等于 presented、played 或 audible。
+partial exactly-once committer 和本地 `Drop -> Prepare` cancel ACK 状态机。P2f-b-b1
+完成了 host 可验证的固定容量 SPSC 控制/结果通道、独立 urgent cancel、producer
+start/stop 与 DSP reset 契约、分槽 EOS/critical 事件，以及 actor-owned exact
+cancellation join。真实单播放 worker、network producer/DSP 执行端、ALSA adapter、
+normal-EOS presentation completion、Rockchip 3A/Snowboy adapter、wake/VAD worker、
+AEC reference 消费和打断闭环尚未接入。accepted（包括 EOS accepted）不等于
+presented、played 或 audible。
 Host 测试和交叉编译不能替代真机全双工、Mode1、AEC 或声学验收。
 
 ## 帧契约
@@ -239,9 +242,32 @@ imported targets，不等于 adapter 已实现或 HIL 通过。vendor 库、模�
   也不证明旧 reference 已从 DSP/AEC 队列和算法历史中清除。当前 committer 对 software
   和 hardware reference policy 都保守地在每次成功 cancel 后进入
   `kAwaitingReferenceReset`，并要求匹配 request/generation 的 `ConfirmReferenceReset`
-  后才允许 Arm 新代际；这个方法只是确认入口。控制 mailbox、
-  application actor 的 ACK join、DSP reset 执行端和 ACK producer 尚未实现，host 测试
-  只是直接调用该入口。
+  后才允许 Arm 新代际。
+- P2f-b-b1 的 `SpscPodQueue` 是单 producer/单 consumer、固定容量、值拷贝的 POD
+  mailbox，不提供 lease、覆盖或动态分配。normal lifecycle command/result 分别固定为
+  8/16 槽；urgent cancel 和 local cancel completion 各有独立 1 槽通道，因此普通控制或
+  结果背压不能延迟、覆盖或隐藏取消。空 aggregate 仍以 `kUnset` 失败关闭。
+- actor 到 network producer 的 start permit 与 stop request 分槽。未来 producer endpoint
+  每轮必须先处理 Stop，再核对 fence/actor 授权，随后才处理 Start；弹出 Start 不能形成
+  持久授权，在启用发布、获取写 lease 以及每次发布数据前，都必须重新确认没有 Stop
+  待处理且 generation 仍获授权。producer-stop ACK 只证明旧代际不会再获取或发布数据，
+  且没有持有写 lease；它本身不证明 ingress 已空。该 endpoint 尚未实现。
+- `PlaybackCancellationJoin` 由 application actor 独占，并按精确 request、generation、
+  cancel epoch 和 retired PCM incarnation 汇合 ACK。active cancel 必须依次取得：producer
+  stop；本地 `Drop -> Prepare`；producer 已停后、低于有界 drain 上限的稳定 ingress 空
+  观察；DSP/reference consumer 释放 lease、丢弃 retired incarnation、确认 local cancel
+  后 accepted queue 已空并重置算法历史；最后再由 playback worker 完成
+  `ConfirmReferenceReset`。只有全部成立才允许 Arm 下一代际，任一中间 ACK 都不证明
+  DAC/扬声器静音。
+- never-armed 路径只有在精确证明 renderer 与 committer 均从未 Arm、committer 仍为
+  prepared-idle 且该 generation 没有 accepted PCM 时，才可跳过 DSP reset；
+  renderer-only 路径还必须证明 cancel fence 之后 renderer 已 disarm、committer 从未
+  Arm 且无 accepted PCM。两条 no-sink 路径仍必须等待 producer stop 和稳定 ingress 空，
+  不能从空结构体或“看起来空闲”推断完成。
+- EOS accepted 事件使用 16 槽普通事件通道，cancellation-required/fault 使用独立 1 槽
+  critical 通道。EOS 槽满时 worker 必须保留并重试同一事件，且不能先接受新 generation；
+  critical 槽满时必须保留精确事件、停止 ingress/render/commit，并在其他工作之前重试，
+  禁止覆盖、降级或静默丢弃。实际执行这些规则的单播放 worker 尚未实现。
 - TTS 队列满时的集成策略是停止 credit 并取消 response，禁止丢一帧后继续播放；
   `size_approx()` 只供诊断，不能计算 credit。该 actor/network/playback 握手和实际
   renderer/committer worker 仍属于后续集成。
@@ -306,9 +332,13 @@ fence/write 竞态、malformed positive 不重放/不发布伪 reference、typed
 prefix/drain ordering、terminal sequence exhaustion、retired/prepared PCM incarnation，
 以及精确 generation 的本地
 `Drop -> Prepare -> cancel ACK -> reference-reset confirmation` 状态机。
-ASan/UBSan 用于边界和生命周期检查，ThreadSanitizer
-用于 SPSC race 检查；RV1106 preset 只证明目标工具链可编译。
-这些结果仍只证明 pre-platform software PCM、portable contract 和 scripted sink 行为；
-真实 ALSA、renderer/committer worker、控制 mailbox、DSP reset producer/join、AEC
+P2f-b-b1 还覆盖固定 POD mailbox 的失败关闭、满队列/FIFO/回绕和 100,000 条双线程
+传递，验证 ordinary backpressure 不阻塞 urgent cancel；并覆盖 producer start/stop、
+DSP reset、EOS/critical 分槽契约，以及 active/no-sink cancellation join 的顺序、重复、
+身份、epoch/incarnation 和失败路径。ASan/UBSan 用于边界和生命周期检查。当前 Linux
+ThreadSanitizer 运行时因 `unexpected memory mapping` 未能启动测试，这不是 race 报告，
+也不能记作 TSan 通过；RV1106 preset 只证明目标工具链可编译。
+这些结果仍只证明 pre-platform software PCM、portable contract、mailbox/join 状态机和
+scripted sink 行为；真实 ALSA、单播放 worker、network producer/DSP endpoint、AEC
 reference 消费、normal-EOS presentation completion、DSP/Snowboy 和声学行为仍按
 [RV1106 验证闸门](../test/rv1106-validation-gates.md)执行。

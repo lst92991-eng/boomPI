@@ -61,6 +61,11 @@ TSAN_OPTIONS=halt_on_error=1 build/host-tsan/client/boompi_audio_queue_tests
 `setarch "$(uname -m)" -R` 后重试。不得据此忽略真实 race 报告，也不得把关闭
 ASLR 的设置带入产品运行环境。
 
+本阶段的 Linux TSan 二进制已成功构建，但运行时在测试逻辑启动前即以
+`FATAL: ThreadSanitizer: unexpected memory mapping` 退出。因此该项当前状态是
+“运行时环境不可用”，不是代码 race 报告，也不能记作 TSan 通过；GCC Debug/Release
+以及 ASan/UBSan 是分开执行的验证结果。
+
 Windows 如果使用 Visual Studio 多配置生成器，将 build/test 两条命令改为：
 
 ```text
@@ -141,6 +146,21 @@ go build -trimpath ./cmd/boompi-server
 - cancel 结果测试分别核对 `retired_pcm_incarnation` 与 `prepared_pcm_incarnation`：只有
   `drop_succeeded` 证明旧 timeline 已退役，只有 `prepare_succeeded` 才允许 prepared 值
   非零；incarnation 耗尽或 prepare 失败时 prepared 值必须为 0 且不得 ACK。
+- `boompi_audio_playback_control_tests` 校验固定容量值拷贝 SPSC mailbox 的空 aggregate
+  失败关闭、满队列/FIFO/回绕和 100,000 条双线程传递，并证明 normal lifecycle 满槽时
+  独立 urgent cancel 仍可发布。它还覆盖 producer start/stop、DSP reset、EOS/critical
+  分槽契约，以及 actor-owned exact cancellation join 的 active、never-armed 和
+  renderer-only 路径。
+- active cancel 测试只有在 producer stop、本地 `Drop -> Prepare`、producer 已停后的稳定
+  ingress 空观察、按 retired PCM incarnation 完成的 DSP reset 和 worker
+  `ConfirmReferenceReset` 全部到齐后才允许 Arm。no-sink 快捷路径仍要求 producer stop 与
+  稳定 ingress 空，并必须严格证明 committer 从未 Arm、无 accepted PCM；renderer-only
+  路径还必须证明 cancel fence 后 renderer 已 disarm。乱序、身份/epoch/incarnation 不匹配、
+  冲突重复和 barrier failure 均不得误完成。
+- mailbox 契约要求未来 network producer 先处理 Stop，并在 Start 生效、获取 write lease
+  和每次 publish 前重验 Stop/fence/授权。critical 事件槽满时，未来 playback worker 必须
+  retain/halt/retry 精确事件；这些 endpoint 与执行循环尚未实现，host 测试只验证契约和
+  join 状态机。
 - playback gate 覆盖 fence epoch 授权、epoch→stream→turn 的 stale 隔离、精确 retire、
   迟到 cancel 和最近身份防复用；fence 覆盖非零严格递增、耗尽及 release/acquire。
 - 软件 drain 覆盖空、部分、满 64 帧和 held producer lease 晚发布；触及迭代上限不被
@@ -168,12 +188,13 @@ go build -trimpath ./cmd/boompi-server
 
 P2e-a 的完成条件仅是核心接口、失败关闭、测试 fake 和依赖闸门可重复验证。P2f-a 的
 playback target 与 FIR 生成器只验证 pre-ALSA software PCM；P2f-b-a 又验证了 portable
-sink、accepted-prefix ledger、committer 状态机和本地取消事务。scripted sink 返回的
+sink、accepted-prefix ledger、committer 状态机和本地取消事务；P2f-b-b1 验证了固定
+mailbox、producer/DSP 合约和 actor cancellation join。scripted sink 返回的
 accepted/timing 仍是 host 测试数据；没有执行真实 `snd_pcm_write*`、`snd_pcm_drop`、
-`snd_pcm_prepare`、renderer/committer worker、控制 mailbox、DSP reset producer/join、
-AEC reference 消费、normal-EOS presentation completion 或壳体声学 HIL。accepted 不等于
-presented、played 或 audible，本地 playback cancel ACK 也不等于扬声器静音或 DSP 历史
-已经复位。后续必须先从匹配 BSP 的真实头文件确认 Rockchip `input_size`、packing、
+`snd_pcm_prepare`、单播放 worker、network producer endpoint、DSP endpoint、AEC reference
+消费、normal-EOS presentation completion 或壳体声学 HIL。accepted（包括 EOS accepted）
+不等于 presented、played 或 audible，本地 playback cancel ACK 也不等于扬声器静音或
+DSP 历史已经复位。后续必须先从匹配 BSP 的真实头文件确认 Rockchip `input_size`、packing、
 返回码和 reset，再实现 adapter；Snowboy 还需私有 legacy C ABI bridge、模型加载、
 单线程 wake worker、500 ms pre-roll/VAD 和板端准确率/实时率测试。上述工作完成前不得
 在 host 报告中写“ALSA 播放已接通”“AEC 已接通”“EOS 已播放完成”或“唤醒已通过”。

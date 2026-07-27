@@ -46,6 +46,7 @@ boompi_add_library(boompi_audio_core
   src/audio/pcm_playback_sink.cpp
   src/audio/playback_buffer.cpp
   src/audio/playback_committer.cpp
+  src/audio/playback_control.cpp
   src/audio/playback_frame.cpp
   src/audio/playback_gain_limiter.cpp
   src/audio/playback_generation.cpp
@@ -262,6 +263,18 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_audio_playback_committer_tests
     COMMAND boompi_audio_playback_committer_tests)
 
+  add_executable(boompi_audio_playback_control_tests
+    tests/unit/audio_playback_control_tests.cpp)
+  boompi_configure_target(boompi_audio_playback_control_tests)
+  target_link_libraries(boompi_audio_playback_control_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support
+      Threads::Threads)
+  add_test(
+    NAME boompi_audio_playback_control_tests
+    COMMAND boompi_audio_playback_control_tests)
+
   add_executable(boompi_audio_backend_contract_tests
     tests/unit/audio_backend_contract_tests.cpp)
   boompi_configure_target(boompi_audio_backend_contract_tests)
@@ -286,6 +299,7 @@ if(BOOMPI_BUILD_TESTS)
     boompi_audio_playback_renderer_tests
     boompi_audio_pcm_playback_sink_tests
     boompi_audio_playback_committer_tests
+    boompi_audio_playback_control_tests
     boompi_audio_backend_contract_tests
     PROPERTIES TIMEOUT 20)
 endif()
