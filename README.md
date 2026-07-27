@@ -38,7 +38,8 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 - 48 kHz 真全双工、实际 capture 通道数和数字播放 reference slot。当前 DTB 的
   `TRCM clk-trcm=1` 只说明 TX/RX 共享 TX 时钟，不证明四通道；vendor VQE 样例选择的 loopback
   Mode2 也是另一项尚未在本板验证的 mixer 设置。
-- Rockchip 3A 的板端加载、实际通道契约和 16 kHz 实时率；SDK ABI 候选已核对。
+- Rockchip 3A 的板端加载、实际通道契约和 16 kHz 实时率；匹配 SDK 的交叉链接与三个
+  入口符号解析已通过，但对应 ELF 尚未在板端执行。
 - Snowboy 的板端模型加载、准确率和实时率；旧 ARM 库的交叉链接候选已核对。
 - 最终壳体下的 AEC、波束形成、双讲、远场和最大音量表现。
 - WSS 配对、断网恢复、端到端 Qwen 会话、长期稳定性和 A/B 回滚。
@@ -46,12 +47,15 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 ### 软件阶段
 
 P1 已建立 CMake/Go 构建、配置校验、协议 fixture 和跨平台 CI。P0 已确认匹配 BSP 的
-GCC 8.3/uClibc 工具链，以及 Rockchip 3A 和 Snowboy/OpenBLAS 的 ABI/链接候选；板端
+GCC 8.3/uClibc 工具链；Rockchip 3A 的 tests-off 默认 ALL 交叉链接和三个入口符号解析
+已通过，Snowboy/OpenBLAS 仍是 ABI/链接候选；板端
 能力仍是部分通过。当前 SDK 已找到 `librockit.so`、AI/AO 头文件与样例、预构建
 `rk_mpi_ai_test`/`rk_mpi_ao_test`，但 raw PCM 的实际参数、AI+AO 同时运行、VQE 资源
 安装和 3A 实时率尚未在当前镜像闭环验证。
 具体路径、哈希、两个 Mode 的区别和 HIL 顺序见
 [2026-07-27 vendor 音频证据基线](docs/test/p0-vendor-audio-inventory-20260727.md)。
+3A 交叉链接的命令、ELF 结果和严格边界另见
+[2026-07-27 Rockchip 3A 交叉链接验证记录](docs/test/p0-rockchip-3a-link-validation-20260727.md)。
 
 已有 playback renderer/committer/worker/ALSA adapter 及其 host、Linux `null`、RV1106
 交叉链接结果不会删除，详细证据保留在
@@ -171,8 +175,9 @@ Qwen 凭据只能通过当前进程环境提供：
 `BOOMPI_ENABLE_ROCKCHIP_3A` 和 `BOOMPI_ENABLE_SNOWBOY` 默认均为 `OFF`。当前 pins
 只用于可行性探针：必须同时核对 Linux/ARM 交叉编译、固定 RV1106 GNU compiler 和
 uClibc sysroot，并显式设置 `BOOMPI_ALLOW_FEASIBILITY_AUDIO_VENDOR_INPUTS=ON`；仅
-Debug-only 配置可继续逐项校验绝对路径和 SHA-256，Release 配置一律拒绝。它不会自动
-搜索相邻 SDK、下载依赖或生成尚不存在的 adapter。详细 cache 输入及安全边界见
+Debug-only 配置可继续逐项校验绝对路径和 SHA-256，Release 配置一律拒绝。启用 Rockchip
+3A 后，tests-off 默认 ALL 会链接一个不安装、不自动执行的符号检查 target；它不会自动
+搜索相邻 SDK、下载依赖或生成生产 adapter。详细 cache 输入及安全边界见
 [音频后端契约与依赖闸门](docs/architecture/audio-backends.md)。
 
 准备完成后使用：
@@ -183,6 +188,11 @@ cmake --build --preset rv1106-release --parallel
 ```
 
 2026-07-25 已使用与 BSP 匹配的 GCC 8.3.0 Buildroot wrapper 和 uClibc sysroot 成功构建 RV1106 Release 产物，并验证 ELF32 ARM EABI5 hard-float 与 loader；因当时板端管理通道不可用，产物尚未在板端执行。具体证据见 [P0 可行性报告](docs/test/p0-feasibility-report-20260725.md)，完整闸门见 [docs/test/rv1106-validation-gates.md](docs/test/rv1106-validation-gates.md)。刷镜像、改分区、设备树或启动项前必须单独取得用户授权。
+
+2026-07-27 又在匹配 GCC 8.3/uClibc 环境完成 Rockchip 3A Debug/tests-off 默认 ALL
+交叉链接：最终 ELF 保留 AEC/common `NEEDED` 与三个入口 `UND`。该目标没有运行或安装，
+不代表板端 PCM、通道布局或 3A 效果通过；详见
+[3A 交叉链接验证记录](docs/test/p0-rockchip-3a-link-validation-20260727.md)。
 
 恢复板端 SSH 后，可运行不会打开 PCM 或修改系统的脱敏探针：
 

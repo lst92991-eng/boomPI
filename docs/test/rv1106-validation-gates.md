@@ -6,6 +6,8 @@
 当前分项证据和阻断见 [2026-07-25 P0 可行性报告](p0-feasibility-report-20260725.md)；
 2026-07-27 的 Rockit/ALSA/3A/DTB 只读盘点见
 [vendor 音频证据基线](p0-vendor-audio-inventory-20260727.md)；
+Rockchip 3A 的 tests-off 交叉链接与符号证据见
+[3A 交叉链接验证记录](p0-rockchip-3a-link-validation-20260727.md)；
 P2f-c-a 的 host/null/交叉链接证据见
 [2026-07-27 ALSA playback adapter 验证记录](p2f-c-a-validation-20260727.md)。
 
@@ -34,8 +36,9 @@ ALSA 的真实全双工、capture layout 和 3A 契约关闭。
 - [ ] 通过能力查询后才尝试 4ch；固定 `TRCM clk-trcm=1`，逐次验证 loopback
   `Disabled/Mode1/Mode2/Mode2 Swap`，用正交低幅 L/R 序列确认双麦/reference slot、
   极性、延迟和漂移，再通过幅度/volume/mixer/mute 变化定位 reference tap。
-- [ ] 为直接 Rockchip 3A 增加 tests-off 默认 ALL link-check，实际引用
-  `rkaudio_preprocess_init/short/destory`，防止 `--as-needed` 形成空链接。
+- [x] 直接 Rockchip 3A 的 tests-off 默认 ALL link-check 已用匹配 GCC 8.3/uClibc 工具链
+  完成真实交叉链接；最终 ELF 保留 AEC/common `NEEDED` 与 init/short/destory 三个 `UND`。
+  该 target 不安装、不自动执行，不能作为板端加载或 3A 功能证据。
 - [ ] 在板端验证 16 kHz/S16、2 mic + 1 ref、256-sample 的物理 slot 到交织逻辑输入映射；核对
   `input_size=768 shorts`、成功 512 bytes、非法尺寸 0、init null，并记录错误恢复、
   CPU/RSS、单帧最坏耗时和持续实时率。

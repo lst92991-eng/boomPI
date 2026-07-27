@@ -225,7 +225,8 @@ function(_boompi_configure_rockchip_3a_dependency)
       boompi_vendor_rockchip_3a_detect
       boompi_vendor::rockchip_3a_common
       boompi_vendor::rockchip_3a_aec
-      boompi_vendor::rockchip_3a_detect)
+      boompi_vendor::rockchip_3a_detect
+      boompi_rockchip_3a_link_check)
     if(TARGET ${_target})
       message(FATAL_ERROR "Rockchip 3A imported target name collision")
     endif()
@@ -253,6 +254,21 @@ function(_boompi_configure_rockchip_3a_dependency)
     INTERFACE_LINK_LIBRARIES "boompi_vendor::rockchip_3a_common")
   add_library(boompi_vendor::rockchip_3a_detect ALIAS
     boompi_vendor_rockchip_3a_detect)
+
+  # This executable is part of ALL whenever the feasibility-only Rockchip 3A
+  # dependency is enabled. It is never installed or run automatically; its
+  # only purpose is to force the target linker to resolve the three direct 3A
+  # entry points instead of accepting unused imported targets under
+  # --as-needed.
+  add_executable(boompi_rockchip_3a_link_check
+    "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../tests/link/rockchip_3a_link_check.cpp")
+  target_compile_features(boompi_rockchip_3a_link_check PRIVATE cxx_std_17)
+  target_include_directories(boompi_rockchip_3a_link_check PRIVATE
+    "${_include_dir}")
+  target_link_libraries(boompi_rockchip_3a_link_check PRIVATE
+    boompi_vendor::rockchip_3a_aec)
+  set_target_properties(boompi_rockchip_3a_link_check PROPERTIES
+    SKIP_BUILD_RPATH TRUE)
 
   # Keep the validated non-library inputs part of configure dependency
   # tracking without adding host paths to target interfaces.

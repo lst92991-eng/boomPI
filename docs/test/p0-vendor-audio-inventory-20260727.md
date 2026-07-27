@@ -2,6 +2,11 @@
 
 采集时间：2026-07-27 20:27:14 +08:00。
 
+> 后续更新：同日已完成匹配 GCC 8.3/uClibc 的 Rockchip 3A tests-off 默认 ALL
+> [交叉链接与符号检查](p0-rockchip-3a-link-validation-20260727.md)。该结果只证明
+> `libaec_bf_process.so`/common 与三个公开入口可由目标 linker 解析；没有运行板端 ELF，
+> 不改变本文对 PCM、物理 slot、3A 效果和实时率“未验证”的结论。
+
 ## 结论
 
 匹配 BSP 已提供完成最小音频闭环所需的三类候选入口：Rockit

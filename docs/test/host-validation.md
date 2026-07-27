@@ -203,6 +203,15 @@ go build -trimpath ./cmd/boompi-server
   feasibility opt-in 和 Debug-only 配置；Release 被拒绝。绝对路径、文件类型、缺失和
   SHA-256 不符均在 configure 阶段失败。该夹具在 Windows/Linux/macOS CI 运行，默认
   测试不加载 Rockchip 库、Snowboy 模型或 OpenBLAS。
+- Linux 专用的合成 shared-object 夹具会在 `BOOMPI_BUILD_TESTS=OFF` 下执行默认 ALL，
+  确认 link-check target 确实生成且动态段无 `RPATH`/`RUNPATH`；分别删除 init、process、
+  destroy 任一入口时，链接必须失败。合成库只验证 CMake 回归，不能替代下一条真实 RV1106
+  交叉链接证据；Windows/macOS 明确跳过这两个 `.so` 链接用例。
+- 独立的 RV1106 Debug/tests-off feasibility 构建已真实链接
+  `boompi_rockchip_3a_link_check`。最终 ELF 保留 `libaec_bf_process.so`、
+  `librkaudio_common.so` 的 `NEEDED` 和三个 `rkaudio_preprocess_*` `UND`；这只证明匹配
+  header、库和目标 linker 的符号兼容，不是 host 测试，也没有运行或安装该 ELF。详见
+  [2026-07-27 Rockchip 3A 交叉链接验证记录](p0-rockchip-3a-link-validation-20260727.md)。
 - Host DSP 测试只能证明算法和内存边界；实际通道顺序、CPU 实时率和声音质量仍按
   HIL 闸门验证。
 
@@ -217,7 +226,8 @@ producer endpoint、DSP endpoint、AEC reference
 消费、normal-EOS presentation completion 或壳体声学 HIL。accepted（包括 EOS accepted）
 不等于 presented、played 或 audible，本地 playback cancel ACK 也不等于扬声器静音或
 DSP 历史已经复位。匹配 BSP 已关闭直接 Rockchip 3A 的固定 frame、`input_size` 和成功
-输出长度；后续必须先验证真实 packing/slot、错误恢复与板端实时率，再实现生产 adapter。
+输出长度，目标交叉链接与三个入口的符号解析也已通过；后续仍必须验证真实 packing/slot、
+板端加载、错误恢复与实时率，再实现生产 adapter。
 Snowboy 还需私有 legacy C ABI bridge、模型加载、
 单线程 wake worker、500 ms pre-roll/VAD 和板端准确率/实时率测试。上述工作完成前不得
 在 host 报告中写“ALSA 播放已接通”“AEC 已接通”“EOS 已播放完成”或“唤醒已通过”。

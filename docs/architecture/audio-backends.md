@@ -127,8 +127,10 @@ AGC 等模块可能组合启用，因此外层不得叠加同类处理；`wakeup
 - `RKAUDIOParam` ownership、线程限制和释放顺序，以及 file mode 资源的目标安装路径。
 - 算法延迟、CPU/RSS、单帧最坏耗时和持续实时率。
 
-必须先做真实符号 link-check，再用脱敏固定输入和板端返回记录逐项关闭。没有证据时状态
-只能写“未验证”。
+匹配工具链的真实符号 link-check 已通过；它只关闭编译、链接和三个动态入口的解析，详见
+[2026-07-27 Rockchip 3A 交叉链接验证记录](../test/p0-rockchip-3a-link-validation-20260727.md)。
+下一步仍须用脱敏固定输入和板端返回记录逐项关闭上述运行问题。没有证据时状态只能写
+“未验证”。
 
 ## WakeWordEngine 契约
 
@@ -182,9 +184,12 @@ CMake 对每个输入执行存在性、文件类型和固定 SHA-256 检查，�
 和包含其他 configuration 的多配置生成器都会被拒绝。通过该闸门不等于 adapter 已经
 实现、模型可以加载或板端实时率已经通过。
 
-当前 tests-off 默认 ALL 尚无 executable 引用这些 3A 符号，因此 imported target 的存在
-还不是实际链接证据。下一步必须增加显式引用 init/process/destroy 的私有 link-check，
-避免 `--as-needed` 形成空链接。
+显式启用 Rockchip feasibility 输入时，tests-off 默认 ALL 会构建不安装、不自动执行的
+`boompi_rockchip_3a_link_check`。它以匹配 header 的函数类型引用 init/process/destroy，
+交叉链接产物已保留 AEC/common `NEEDED` 和三个 `UND`，不会被 `--as-needed` 变成空链接；
+target 关闭 build RPATH，私有 BSP 路径不进入公共接口。该结果仍不证明板端 loader、初始化、
+音频处理或实时率，证据见
+[3A 交叉链接验证记录](../test/p0-rockchip-3a-link-validation-20260727.md)。
 
 当前 OpenBLAS archive 含多线程实现，只完成了 ABI/link 候选验证。发布接入前必须按
 单线程配置重建、记录来源与许可、生成新的 SHA-256，并替换本模块 pin；不得用
@@ -203,7 +208,7 @@ Snowboy 候选静态库使用旧 libstdc++ 字符串 ABI。未来只能由一个
 ## 后续验证顺序
 
 1. 先完成 rk_mpi/ALSA 48 kHz 全双工和通道相关性 HIL，确定真实麦克风/reference 输入。
-2. 增加直接 3A 符号 link-check，再在板端关闭物理 slot 映射、错误恢复、
+2. 直接 3A 符号 link-check 已通过；下一步在板端关闭物理 slot 映射、错误恢复、
    mono 输出、算法延迟、CPU/RSS 和实时率。
 3. 实现私有 Snowboy legacy bridge、启动期模型/格式校验和单线程 wake worker。
 4. 验证目标英文模型的加载、准确率、误唤醒、漏唤醒和最坏帧耗时，再进行至少
