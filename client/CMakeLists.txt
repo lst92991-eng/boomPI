@@ -1,5 +1,7 @@
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)
+option(BOOMPI_BUILD_RV1106_AUDIO_SMOKE
+  "Build the explicit RV1106 ALSA full-duplex smoke executable" OFF)
 
 function(boompi_configure_target target_name)
   target_compile_features(${target_name} PUBLIC cxx_std_17)
@@ -74,9 +76,17 @@ boompi_add_library(boompi_platform_posix
   src/platform/posix/monotonic_clock.cpp)
 
 boompi_add_library(boompi_platform_rv1106
+  src/platform/rv1106/audio_pcm_transfer.cpp
   src/platform/rv1106/build_environment.cpp)
-target_link_libraries(boompi_platform_rv1106 PUBLIC boompi_event)
+target_link_libraries(boompi_platform_rv1106
+  PUBLIC
+    boompi_audio_core
+    boompi_event)
 if(BOOMPI_TARGET_RV1106)
+  find_package(ALSA REQUIRED)
+  target_sources(boompi_platform_rv1106 PRIVATE
+    src/platform/rv1106/alsa_pcm_stream.cpp)
+  target_link_libraries(boompi_platform_rv1106 PRIVATE ALSA::ALSA)
   target_compile_definitions(boompi_platform_rv1106 PRIVATE BOOMPI_TARGET_RV1106=1)
 endif()
 
@@ -286,6 +296,17 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_audio_backend_contract_tests
     COMMAND boompi_audio_backend_contract_tests)
 
+  add_executable(boompi_audio_pcm_transfer_tests
+    tests/unit/audio_pcm_transfer_tests.cpp)
+  boompi_configure_target(boompi_audio_pcm_transfer_tests)
+  target_link_libraries(boompi_audio_pcm_transfer_tests
+    PRIVATE
+      boompi_platform_rv1106
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_pcm_transfer_tests
+    COMMAND boompi_audio_pcm_transfer_tests)
+
   set_tests_properties(
     boompi_host_tests
     boompi_audio_queue_tests
@@ -300,5 +321,19 @@ if(BOOMPI_BUILD_TESTS)
     boompi_audio_pcm_playback_sink_tests
     boompi_audio_playback_committer_tests
     boompi_audio_backend_contract_tests
+    boompi_audio_pcm_transfer_tests
     PROPERTIES TIMEOUT 20)
+endif()
+
+if(BOOMPI_TARGET_RV1106 AND BOOMPI_BUILD_RV1106_AUDIO_SMOKE)
+  add_executable(boompi_alsa_smoke
+    tests/smoke/rv1106_alsa_smoke.cpp)
+  boompi_configure_target(boompi_alsa_smoke)
+  target_link_libraries(boompi_alsa_smoke
+    PRIVATE
+      boompi_audio_core
+      boompi_platform_rv1106
+      Threads::Threads)
+  set_target_properties(boompi_alsa_smoke PROPERTIES
+    OUTPUT_NAME "boompi-alsa-smoke")
 endif()
