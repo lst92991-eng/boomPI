@@ -90,6 +90,39 @@ if(BOOMPI_TARGET_RV1106)
   target_link_libraries(boompi_platform_rv1106 PRIVATE ALSA::ALSA)
   target_compile_definitions(boompi_platform_rv1106 PRIVATE BOOMPI_TARGET_RV1106=1)
 endif()
+if(BOOMPI_ENABLE_SNOWBOY)
+  add_library(boompi_snowboy_legacy_bridge STATIC
+    src/platform/rv1106/snowboy_legacy_bridge.cpp)
+  boompi_configure_target(boompi_snowboy_legacy_bridge)
+  target_compile_definitions(boompi_snowboy_legacy_bridge
+    PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
+  target_include_directories(boompi_snowboy_legacy_bridge
+    PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/rv1106"
+      "${BOOMPI_SNOWBOY_INCLUDE_DIR}")
+  target_link_libraries(boompi_snowboy_legacy_bridge
+    PRIVATE boompi_vendor::snowboy)
+
+  target_sources(boompi_platform_rv1106 PRIVATE
+    src/platform/rv1106/snowboy_wake_word_engine.cpp)
+  target_include_directories(boompi_platform_rv1106
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/rv1106")
+  target_link_libraries(boompi_platform_rv1106
+    PRIVATE
+      boompi_audio_core
+      boompi_snowboy_legacy_bridge)
+
+  add_executable(boompi_snowboy_offline_probe EXCLUDE_FROM_ALL
+    apps/snowboy_offline_probe/main.cpp)
+  boompi_configure_target(boompi_snowboy_offline_probe)
+  target_link_libraries(boompi_snowboy_offline_probe
+    PRIVATE
+      boompi_audio_core
+      boompi_platform_rv1106)
+  set_target_properties(boompi_snowboy_offline_probe PROPERTIES
+    OUTPUT_NAME "boompi-snowboy-offline-probe"
+    SKIP_BUILD_RPATH TRUE)
+endif()
 
 boompi_add_library(boompi_application
   src/application/runtime.cpp)
@@ -308,6 +341,23 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_audio_dsp_frame_bridge_tests
     COMMAND boompi_audio_dsp_frame_bridge_tests)
 
+  add_executable(boompi_snowboy_wake_word_engine_tests
+    src/platform/rv1106/snowboy_wake_word_engine.cpp
+    tests/fixtures/snowboy_legacy_bridge_fake.cpp
+    tests/unit/snowboy_wake_word_engine_tests.cpp)
+  boompi_configure_target(boompi_snowboy_wake_word_engine_tests)
+  target_include_directories(boompi_snowboy_wake_word_engine_tests
+    PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/rv1106"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+  target_link_libraries(boompi_snowboy_wake_word_engine_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_snowboy_wake_word_engine_tests
+    COMMAND boompi_snowboy_wake_word_engine_tests)
+
   add_executable(boompi_audio_pcm_transfer_tests
     tests/unit/audio_pcm_transfer_tests.cpp)
   boompi_configure_target(boompi_audio_pcm_transfer_tests)
@@ -335,6 +385,7 @@ if(BOOMPI_BUILD_TESTS)
     boompi_audio_backend_contract_tests
     boompi_audio_dsp_frame_bridge_tests
     boompi_audio_pcm_transfer_tests
+    boompi_snowboy_wake_word_engine_tests
     PROPERTIES TIMEOUT 20)
 endif()
 
