@@ -11,6 +11,9 @@ option(BOOMPI_BUILD_TESTS "Build deterministic host tests" ON)
 option(BOOMPI_STRICT_WARNINGS "Treat warnings in boomPI sources as errors" ON)
 option(BOOMPI_TARGET_RV1106 "Build for the RV1106 target environment" OFF)
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/client/cmake/BoompiAudioVendorDependencies.cmake")
+boompi_configure_audio_vendor_dependencies()
+
 if(BOOMPI_BUILD_TESTS)
   include(CTest)
   enable_testing()

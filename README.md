@@ -2,7 +2,7 @@
 
 boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端负责连接 Qwen 新加坡区，板端不保存云端 API Key。
 
-> **P1 工程骨架与 P0 离线闸门已完成，P2 本地音频正在实现。** Host 构建、测试、配置和协议边界已经建立；匹配 BSP 的 RV1106 交叉构建、Rockchip 3A ABI 和 Snowboy 加 OpenBLAS 的链接候选已验证。真实板端执行、四通道 AEC、WSS 配对、Wi-Fi 二维码配网和 A/B 更新尚未完成。本文不会把硬件单项测试或接口骨架描述成完整产品能力。
+> **P1 工程骨架已完成，P0 离线证据基线已建立，P2 本地音频正在实现。** Host 构建、测试、配置和协议边界已经建立；匹配 BSP 的 RV1106 交叉构建以及 Rockchip 3A、Snowboy/OpenBLAS 的 ABI/链接候选已经核对，但 P0 板端闸门仍是部分通过。当前只新增了音频后端核心契约、失败关闭实现、测试替身和默认关闭的依赖闸门，尚无真实 Rockchip/Snowboy adapter。真实板端执行、四通道 AEC、WSS 配对、Wi-Fi 二维码配网和 A/B 更新尚未完成。
 
 ## 系统形态
 
@@ -20,7 +20,7 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 第一版目标包括双麦 AEC、Snowboy 英文唤醒、可打断流式 TTS、三秒连续对话、横屏表情与字幕、以太网/Wi-Fi、首次配网与本地服务端配对。SC3336 多模态、在线音乐和长期记忆不属于第一版运行链路。
 
-详细约束以 [AGENTS.md](AGENTS.md) 为准；架构摘要见 [docs/architecture/system-overview.md](docs/architecture/system-overview.md)，协议设计基线见 [protocol/protocol-v1.md](protocol/protocol-v1.md)。
+详细约束以 [AGENTS.md](AGENTS.md) 为准；架构摘要见 [docs/architecture/system-overview.md](docs/architecture/system-overview.md)，音频 vendor 边界见 [音频后端契约与依赖闸门](docs/architecture/audio-backends.md)，协议设计基线见 [protocol/protocol-v1.md](protocol/protocol-v1.md)。
 
 ## 当前真实状态
 
@@ -40,7 +40,7 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 ### 软件阶段
 
-P1 已建立模块边界、构建入口、配置校验、测试支撑和协议 fixture，Windows/Linux/macOS CI 已通过。P0 的当前证据与板端待办见 [2026-07-25 可行性报告](docs/test/p0-feasibility-report-20260725.md)。P2 已实现固定音频帧、预分配 SPSC lease、sequence/discontinuity、连续性门禁、可配置四通道解交织/极性、四路 48→16 kHz FIR、generation-safe 采集前端，以及播放帧、actor 授权的 epoch fence/代际门禁和有界软件队列清理；具体边界见 [音频运行时文档](docs/architecture/audio-runtime.md)。这些原语尚未连接 ALSA、3A、Snowboy 或真实打断闭环，固定 20 ms reference 也不能冒充 partial ALSA write 的 accepted prefix；真实 Mode1 通道顺序仍需板端确认。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
+P1 已建立模块边界、构建入口、配置校验、测试支撑和协议 fixture，Windows/Linux/macOS CI 已通过。P0 的当前证据与板端待办见 [2026-07-25 可行性报告](docs/test/p0-feasibility-report-20260725.md)。P2 已实现固定音频帧、预分配 SPSC lease、sequence/discontinuity、连续性门禁、可配置四通道解交织/极性、四路 48→16 kHz FIR、generation-safe 采集前端，以及播放帧、actor 授权的 epoch fence/代际门禁和有界软件队列清理；具体边界见 [音频运行时文档](docs/architecture/audio-runtime.md)。本阶段还建立了 `AudioDspEngine`/`WakeWordEngine` 核心契约、明确失败的 unavailable 实现、仅测试 target 使用的 deterministic fake，以及显式路径和固定 SHA-256 的 vendor 依赖闸门。两个 vendor 开关默认关闭；当前固定输入只是 P0 可行性候选，只有显式 opt-in 的 Debug probe 才能创建 imported targets，Release 配置会拒绝它们。这些原语尚未连接 ALSA、3A、Snowboy 或真实打断闭环，固定 20 ms reference 也不能冒充 partial ALSA write 的 accepted prefix；真实 Mode1 通道顺序仍需板端确认。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
 
 ## 仓库结构
 
@@ -137,6 +137,13 @@ Qwen 凭据只能通过当前进程环境提供：
 - `BOOMPI_RV1106_TOOLCHAIN_PREFIX`：可选；当前默认值为 `arm-rockchip830-linux-uclibcgnueabihf`，必须与实际 SDK 一致。
 - `BOOMPI_RV1106_SYSROOT`：接入目标系统库时必须指向与镜像匹配的 sysroot。
 
+`BOOMPI_ENABLE_ROCKCHIP_3A` 和 `BOOMPI_ENABLE_SNOWBOY` 默认均为 `OFF`。当前 pins
+只用于可行性探针：必须同时核对 Linux/ARM 交叉编译、固定 RV1106 GNU compiler 和
+uClibc sysroot，并显式设置 `BOOMPI_ALLOW_FEASIBILITY_AUDIO_VENDOR_INPUTS=ON`；仅
+Debug-only 配置可继续逐项校验绝对路径和 SHA-256，Release 配置一律拒绝。它不会自动
+搜索相邻 SDK、下载依赖或生成尚不存在的 adapter。详细 cache 输入及安全边界见
+[音频后端契约与依赖闸门](docs/architecture/audio-backends.md)。
+
 准备完成后使用：
 
 ```text
@@ -167,7 +174,7 @@ Get-Content -Raw scripts/probes/rv1106_p0_probe.sh | ssh <board-host> "sh -s"
 
 1. **P0 可行性闸门（进行中）**：工具链、Snowboy、Rockchip 3A、四通道参考、WSS、Wi-Fi AP 和 UI backend 探测。
 2. **P1 工程骨架（已完成）**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
-3. **P2 本地音频（进行中）**：48/16 kHz 链路、AEC/BF/VAD、Snowboy、播放和打断。
+3. **P2 本地音频（进行中）**：48/16 kHz 与后端契约已建立；真实 AEC/BF/VAD、Snowboy adapter、播放和打断仍待集成与 HIL。
 4. **P3 服务端**：discovery、pairing、Qwen adapter、Session Actor 和 ToolRegistry。
 5. **P4 端到端对话**：流式文字/音频、取消、上下文、断网和延迟测量。
 6. **P5 UI 与配网**：表情、字幕、触摸、二维码和网络优先级。

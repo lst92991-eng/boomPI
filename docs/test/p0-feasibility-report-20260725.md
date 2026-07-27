@@ -102,9 +102,11 @@ void rkaudio_preprocess_destory(void *handle);
 
 | 文件 | SHA-256 |
 | --- | --- |
+| `snowboy-detect.h` | `f203e88bccd3782b9fdfaa5f02ea2fab402671f415c9eae3609b67c1e622a363` |
 | `libsnowboy-detect.a` | `346db1193490a9cc404d49fcfb22ca612cd3a0e649c4863f411553eb1c4f9f1f` |
 | `common.res` | `5dd5258678182f2e055fa7a6167eba50ded3bf8b41f70faab11fd9b221de488b` |
 | `snowboy.umdl` | `7ccc61effbe05c27d8fd3428bf27e71578d2eddcc97ac9c1437fa0f9cacc64f1` |
+| OpenBLAS `libopenblas.a` | `fabfc588e0e0d94f3655d4ad5515e0c90fd161f016be5261e2f11d3df77a3e9d` |
 
 RPi 静态库为 ARMv6/VFPv2 hard-float，可在 Cortex-A7 上作为 ABI 候选。它使用旧
 libstdc++ 字符串 ABI，接入 target 必须隔离
@@ -116,7 +118,9 @@ libstdc++ 字符串 ABI，接入 target 必须隔离
 静态库完成了最小链接。strip 后产物为 uClibc hard-float PIE，没有
 RPATH/RUNPATH 或开发机绝对路径，最高需要 `GLIBCXX_3.4.20`，低于目标 rootfs
 的 `GLIBCXX_3.4.25`。这只证明链接可行，不证明 `common.res`/模型能在板端加载，
-也不证明唤醒准确率或实时率。
+也不证明唤醒准确率或实时率。上述 OpenBLAS archive 哈希只固定本次链接候选；
+它仍需按单线程配置重建、重新固定哈希并做板端最坏耗时验证后才能成为发布输入。
+当前 CMake 闸门因此只允许显式 opt-in 的 Debug feasibility probe，并拒绝 Release 配置。
 
 Snowboy、OpenBLAS 和模型二进制仍放在仓库外，通过显式 CMake cache 路径接入；
 在依赖来源、哈希和许可检查完成前不提交二进制。

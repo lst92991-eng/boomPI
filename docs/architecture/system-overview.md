@@ -36,7 +36,8 @@ UI/touch <- UI model                              Qwen Singapore
 跨线程 PCM 使用预分配有界队列；控制消息使用有界 EventBus。业务状态只能由 application actor 修改。实时音频路径不做文件或网络 I/O，不允许每帧动态分配或无界等待。
 
 帧槽、SPSC lease、sequence/discontinuity 和 consumer gate 的具体 ownership 见
-[音频运行时边界](audio-runtime.md)。
+[音频运行时边界](audio-runtime.md)；DSP/Snowboy 接口、失败关闭和 vendor 依赖闸门见
+[音频后端契约与依赖闸门](audio-backends.md)。
 
 ## 音频边界
 
@@ -54,10 +55,19 @@ Mode1 失败时只能进入有记录的软件参考方案评审，不能同时�
 P2 当前已实现 48 kHz capture/16 kHz mono 的固定帧契约、预分配 SPSC ownership、
 producer sequence、consumer continuity gate、可配置四通道解交织/极性、四路
 48→16 kHz FIR、generation-safe 采集前端，以及 24 kHz TTS/48 kHz reference 固定帧、
-actor 授权的 playback epoch fence/代际门禁和有界软件 drain。它们已通过 host 测试与
-RV1106 交叉编译，但尚未连接 ALSA、Rockchip 3A、Snowboy 或任何真实 DSP backend；
-partial ALSA reference、Arm/Cancel ACK、driver drop 和确认播放进度仍属于后续集成，
-Mode1 slot 顺序和实时率也仍需 HIL。
+actor 授权的 playback epoch fence/代际门禁和有界软件 drain。核心层还定义了
+`AudioDspEngine` 和 `WakeWordEngine`、unavailable fail-closed 实现、测试 target 专用
+fake，以及默认关闭并要求真实交叉 target、显式路径/固定 SHA-256 的 vendor 依赖
+闸门。当前 pins 只允许显式 opt-in 的 Debug feasibility probe，Release 配置拒绝。
+这些内容已进入 host 可构建边界，但尚未连接 ALSA、Rockchip 3A、Snowboy 或任何真实
+DSP/唤醒 backend；通过依赖 configure 也不代表 adapter 或模型运行成功。partial ALSA reference、
+wake/VAD worker、500 ms pre-roll、Arm/Cancel ACK、driver drop 和确认播放进度仍属于
+后续集成，Mode1 slot 顺序和实时率也仍需 HIL。
+
+DSP 输入固定为 `MIC-L`、`MIC-R`、`REF-L`、`REF-R` 四个 16 kHz 平面，目标输出是
+16 kHz mono。reference 必须显式选择硬件回采或最终软件播放路径，不能混用。Rockchip
+API 的 `input_size`、packing、返回值和内部算法组合，以及 Snowboy 模型加载、准确率和
+实时率目前都没有板端证据；实现不得通过硬编码或 fake 把这些未决项伪装成已完成。
 
 ## 状态与取消
 

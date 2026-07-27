@@ -57,6 +57,9 @@ jobs:
           --check client/src/audio/fir_decimator_48_to_16.cpp
           --quiet
 
+      - name: Validate audio vendor dependency gates
+        run: python -m unittest scripts.tests.test_audio_vendor_cmake -v
+
       - name: Validate POSIX P0 probes
         if: runner.os != 'Windows'
         run: |

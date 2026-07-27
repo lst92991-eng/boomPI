@@ -36,6 +36,7 @@ boompi_add_library(boompi_config
 target_link_libraries(boompi_config PUBLIC boompi_event)
 
 boompi_add_library(boompi_audio_core
+  src/audio/audio_dsp_engine.cpp
   src/audio/audio_format.cpp
   src/audio/audio_frame.cpp
   src/audio/capture_dsp_frontend.cpp
@@ -44,7 +45,8 @@ boompi_add_library(boompi_audio_core
   src/audio/frame_continuity_gate.cpp
   src/audio/playback_buffer.cpp
   src/audio/playback_frame.cpp
-  src/audio/playback_generation.cpp)
+  src/audio/playback_generation.cpp
+  src/audio/wake_word_engine.cpp)
 target_link_libraries(boompi_audio_core PUBLIC boompi_event)
 
 boompi_add_library(boompi_protocol
@@ -105,6 +107,7 @@ install(TARGETS boompi_supervisor RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR})
 
 if(BOOMPI_BUILD_TESTS)
   add_library(boompi_test_support STATIC
+    tests/support/fake_audio_engines.cpp
     tests/support/test_context.cpp)
   target_include_directories(boompi_test_support
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/include)
@@ -198,6 +201,17 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_audio_playback_buffer_tests
     COMMAND boompi_audio_playback_buffer_tests)
 
+  add_executable(boompi_audio_backend_contract_tests
+    tests/unit/audio_backend_contract_tests.cpp)
+  boompi_configure_target(boompi_audio_backend_contract_tests)
+  target_link_libraries(boompi_audio_backend_contract_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_backend_contract_tests
+    COMMAND boompi_audio_backend_contract_tests)
+
   set_tests_properties(
     boompi_host_tests
     boompi_audio_queue_tests
@@ -206,5 +220,6 @@ if(BOOMPI_BUILD_TESTS)
     boompi_audio_fir_decimator_tests
     boompi_audio_capture_dsp_frontend_tests
     boompi_audio_playback_buffer_tests
+    boompi_audio_backend_contract_tests
     PROPERTIES TIMEOUT 20)
 endif()

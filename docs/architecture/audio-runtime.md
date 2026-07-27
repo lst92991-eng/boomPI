@@ -5,8 +5,9 @@
 本文记录 P2 音频运行时的已实现基础契约。当前完成了 host 可验证的固定帧、
 预分配 SPSC 队列、生产 sequence、消费连续性门禁、四通道解交织/极性映射、
 四路 48→16 kHz FIR、generation-safe 采集前端编排，以及播放固定帧、代际门禁、
-epoch fence 和有界软件队列清理；ALSA、Rockchip 3A、Snowboy、实际播放和打断
-闭环尚未接入。
+epoch fence 和有界软件队列清理。本阶段还建立了 DSP/唤醒核心接口、失败关闭实现、
+测试专用 fake 和默认关闭的 vendor 依赖闸门；ALSA、Rockchip 3A/Snowboy 真实
+adapter、wake/VAD worker、实际播放和打断闭环尚未接入。
 Host 测试和交叉编译不能替代真机全双工、Mode1、AEC 或声学验收。
 
 ## 帧契约
@@ -76,6 +77,37 @@ CaptureFrame
   热路径只使用对象内预分配 scratch 和调用方输出，不分配、不加锁、不保存指针。
 - worker 只把首次锁存 fault 通过有界控制通道报告给 application actor；本对象不
   直接调用 mutex/deque `EventBus`。真实实时率和 Mode1 行为仍必须 HIL。
+
+## DSP 与唤醒后端契约
+
+`AudioDspEngine` 固定消费 `DspCaptureFrame16k` 的 `MIC-L`、`MIC-R`、`REF-L`、
+`REF-R` 四平面，成功时输出一个 16 kHz/20 ms mono `Mono16kFrame`。配置必须显式
+选择 hardware capture 或 software playback reference、mono-left/mono-right/stereo
+layout，并请求完整的 v1 AEC/NS/BF/AGC feature mask。这个 feature mask 是外层契约，
+不代表 Rockchip 内部算法顺序或组合能力已经验证。
+
+engine 由 DSP worker 独占；Configure/Arm/Disarm/Process 与销毁均在该 worker 串行
+执行。非成功结果使输出 header 无效；错误 generation、discontinuity 和 backend fault
+都不能继续产生伪连续 mono。默认 `UnavailableAudioDspEngine` 明确返回不支持，绝不
+把某一路原始麦克风复制成“处理后”输出。`FakeAudioDspEngine` 只用于 host 测试编排，
+不实现任何音频算法。
+
+`WakeWordEngine` 固定消费完整的 16 kHz/20 ms mono frame，并返回无字符串 POD
+decision/error。可用 score 的规范范围是 0–1000；Snowboy 没有置信度输出，因此未来
+adapter 必须返回 `score_available=false`、`score_milli=0`，不能用 sensitivity 代替。
+Snowboy 的 `-2` 只表示 detector 的 silence 分类，不是产品 VAD。
+
+generation/continuity gate、500 ms AEC 后 pre-roll 和产品 VAD 属于尚未实现的单线程
+wake/VAD worker。默认 `UnavailableWakeWordEngine` 永不报告 detection；测试 fake
+也不会进入发布 target。Rockchip 的 `input_size` 单位、packing、返回码、算法组合和
+reset，以及 Snowboy 模型加载与实时率仍未验证，不得从接口名称猜实现。详细边界见
+[音频后端契约与依赖闸门](audio-backends.md)。
+
+两个 vendor 开关默认 `OFF`。当前 pins 只允许在核对 Linux/ARM cross target、固定
+RV1106 GNU compiler 与 uClibc sysroot 后，用显式 feasibility opt-in 的 Debug-only
+probe 校验绝对路径和 SHA-256；Release 配置拒绝这些候选。通过 configure 只创建
+imported targets，不等于 adapter 已实现或 HIL 通过。vendor 库、模型和资源继续保留
+在仓库外。
 
 ## 播放帧、代际与软件缓冲
 
@@ -161,7 +193,9 @@ single producer
 Host CTest 覆盖固定格式、非法 metadata、FIFO、满队列、槽复用、lease move/RAII、
 丢帧传播、sequence 回绕、fault 锁存、100,000 帧双线程 FIFO、声道置换/极性/
 饱和、跨帧 FIR、独立参考卷积、频响、舍入、重置、完整采集前端的 generation
-切换、旧帧隔离和错误恢复，以及播放帧、fence、gate、held lease 和有界 drain。
+切换、旧帧隔离和错误恢复，播放帧、fence、gate、held lease 和有界 drain，以及
+DSP/唤醒契约的配置校验、POD 结果一致性、unavailable fail-closed 和测试 fake。
 ASan/UBSan 用于边界和生命周期检查，ThreadSanitizer
 用于 SPSC race 检查；RV1106 preset 只证明目标工具链可编译。
-真实 ALSA/DSP 行为仍按 [RV1106 验证闸门](../test/rv1106-validation-gates.md)执行。
+真实 ALSA/DSP/Snowboy 行为仍按 [RV1106 验证闸门](../test/rv1106-validation-gates.md)
+执行。

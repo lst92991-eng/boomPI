@@ -103,8 +103,32 @@ go build -trimpath ./cmd/boompi-server
   迟到 cancel 和最近身份防复用；fence 覆盖非零严格递增、耗尽及 release/acquire。
 - 软件 drain 覆盖空、部分、满 64 帧和 held producer lease 晚发布；触及迭代上限不被
   当作“已清空”，也不把软件队列结果描述为 ALSA 已 drop 或扬声器已经静音。
+- `AudioDspEngineConfig` 拒绝未指定/未知 reference source、未知 layout、未知 feature
+  bit 和不完整的 v1 AEC/NS/BF/AGC mask；hardware/software reference 不能同时隐含启用。
+- unavailable DSP 明确返回 backend unavailable，并使非成功输出 header 无效；测试
+  fake 只验证 Configure/Arm/Disarm、generation、stale、discontinuity 和 backend fault，
+  不得把复制测试波形描述成 AEC 后音频。
+- WakeWord POD 结果覆盖 no-event、silence、detected、invalid、unavailable、backend
+  error 和 fault 的字段一致性。score 只有在 available 时允许 0–1000；Snowboy 风格的
+  detection 必须允许 `score_available=false` 且 score 为 0；reset 的 bool/error 组合
+  也必须一致。
+- unavailable wake engine 对合法 16 kHz mono frame 返回 backend unavailable，对非法
+  格式返回 invalid frame，永不报告 detection。确定性 wake fake 只进入测试 target，
+  不能成为生产 fallback；Snowboy `-2` 不作为 VAD 测试结论。
+- vendor CMake 夹具验证两个 enable 选项确实默认关闭，并用全部十个不存在路径确认
+  OFF 时零访问、零路径泄漏；host 即使伪造 `BOOMPI_TARGET_RV1106=ON` 也不能越过
+  cross Linux/ARM、固定 compiler 和 uClibc sysroot 检查。当前 pins 还要求显式
+  feasibility opt-in 和 Debug-only 配置；Release 被拒绝。绝对路径、文件类型、缺失和
+  SHA-256 不符均在 configure 阶段失败。该夹具在 Windows/Linux/macOS CI 运行，默认
+  测试不加载 Rockchip 库、Snowboy 模型或 OpenBLAS。
 - Host DSP 测试只能证明算法和内存边界；实际通道顺序、CPU 实时率和声音质量仍按
   HIL 闸门验证。
+
+P2e-a 的完成条件仅是核心接口、失败关闭、测试 fake 和依赖闸门可重复验证。后续必须
+先从匹配 BSP 的真实头文件确认 Rockchip `input_size`、packing、返回码和 reset，再实现
+adapter；Snowboy 还需私有 legacy C ABI bridge、模型加载、单线程 wake worker、
+500 ms pre-roll/VAD 和板端准确率/实时率测试。上述工作完成前不得在 host 报告中写
+“AEC 已接通”或“唤醒已通过”。
 
 ## 报告要求
 
