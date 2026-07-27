@@ -2,10 +2,10 @@
 
 ## 当前状态
 
-本文记录 P2 音频运行时的已实现基础契约。当前只完成 host 可验证的固定帧、
-预分配 SPSC 队列、生产 sequence 和消费连续性门禁；ALSA、声道映射、重采样、
-Rockchip 3A、Snowboy、播放和打断尚未接入。Host 测试和交叉编译不能替代真机
-全双工、Mode1、AEC 或声学验收。
+本文记录 P2 音频运行时的已实现基础契约。当前完成了 host 可验证的固定帧、
+预分配 SPSC 队列、生产 sequence、消费连续性门禁、四通道解交织/极性映射和
+四路 48→16 kHz FIR；ALSA、Rockchip 3A、Snowboy、播放和打断尚未接入。
+Host 测试和交叉编译不能替代真机全双工、Mode1、AEC 或声学验收。
 
 ## 帧契约
 
@@ -18,6 +18,30 @@ Rockchip 3A、Snowboy、播放和打断尚未接入。Host 测试和交叉编译
 - 帧槽不会在复用时清零整块 PCM。生产者必须完整覆盖声明的样本范围后才设置
   长度并发布；ALSA partial period、xrun 或短读必须取消 lease、计入丢帧并走
   预分配 discard buffer，不能发布上一帧残留样本。
+
+## 声道映射与 48→16 kHz FIR
+
+- `ChannelMap` 按 `mic_left`、`mic_right`、`reference_left`、
+  `reference_right` 的逻辑顺序配置物理 slot 和 `+1/-1` 极性。创建时拒绝越界、
+  重复 slot 和非法极性；失败不会覆盖已经生效的 mapper。
+- mapper 只接受完整的 48 kHz、20 ms、四通道 `CaptureFrame`，输出四个独立平面。
+  对 `-32768` 反相时饱和为 `32767` 并计数。实际 Mode1 slot 和麦克风极性仍由
+  板端 HIL 决定，代码不把任何尚未实测的声道顺序写死。
+- `FirDecimator48To16` 对四个平面使用相同的 211-tap、Q15、线性相位 Kaiser FIR，
+  固定 phase 0 抽取，单帧从 `4 × 960` 产生 `4 × 320` samples，并为每路保存
+  210 个跨帧历史样本。群延迟为 105 个 48 kHz 输入样本，即 35 个 16 kHz 输出
+  样本（2.1875 ms）。
+- 设计截止频率为 7.5 kHz；生成器约束 0–7 kHz 通带纹波不超过 0.01 dB、8–24 kHz
+  阻带衰减至少 60 dB。当前量化表经离线频响扫描得到纹波约 0.006774 dB、阻带
+  峰值约 -64.160 dB，系数和严格为 32768。
+- 热路径不分配内存；卷积使用 64-bit 累加、正负对称的 half-away-from-zero 舍入
+  和 S16 饱和计数。同一 discontinuity 或新 generation 后，调用方必须先
+  `Reset()`，再处理新流，避免把上一代历史带入下一代。
+- mapper 和 decimator 实例都由一个 DSP worker 独占。映射只在 worker 启动前或
+  停止后创建；actor 发出的 reset/换代请求必须通过有界控制队列交给 DSP worker
+  串行执行，不能跨线程直接调用 `Create`、`Reset` 或 `Process`，也不在热路径加锁。
+- 这两个原语只提供确定性的输入整形，不等同于 AEC、波束形成、VAD 或已接通的
+  实时音频链路。
 
 ## SPSC ownership
 
@@ -66,6 +90,7 @@ single producer
 ## 验证
 
 Host CTest 覆盖固定格式、非法 metadata、FIFO、满队列、槽复用、lease move/RAII、
-丢帧传播、sequence 回绕、fault 锁存和 100,000 帧双线程 FIFO。ASan/UBSan 用于
-边界和生命周期检查，ThreadSanitizer 用于 SPSC race 检查；RV1106 preset 只证明目标工具链可编译。真实 ALSA/DSP 行为仍按
-[RV1106 验证闸门](../test/rv1106-validation-gates.md)执行。
+丢帧传播、sequence 回绕、fault 锁存、100,000 帧双线程 FIFO、声道置换/极性/
+饱和、跨帧 FIR、独立参考卷积、频响、舍入和重置。ASan/UBSan 用于边界和生命周期
+检查，ThreadSanitizer 用于 SPSC race 检查；RV1106 preset 只证明目标工具链可编译。
+真实 ALSA/DSP 行为仍按 [RV1106 验证闸门](../test/rv1106-validation-gates.md)执行。

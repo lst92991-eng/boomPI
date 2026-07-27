@@ -38,6 +38,8 @@ target_link_libraries(boompi_config PUBLIC boompi_event)
 boompi_add_library(boompi_audio_core
   src/audio/audio_format.cpp
   src/audio/audio_frame.cpp
+  src/audio/capture_channel_mapper.cpp
+  src/audio/fir_decimator_48_to_16.cpp
   src/audio/frame_continuity_gate.cpp)
 target_link_libraries(boompi_audio_core PUBLIC boompi_event)
 
@@ -147,9 +149,33 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_audio_continuity_tests
     COMMAND boompi_audio_continuity_tests)
 
+  add_executable(boompi_audio_channel_mapper_tests
+    tests/unit/audio_channel_mapper_tests.cpp)
+  boompi_configure_target(boompi_audio_channel_mapper_tests)
+  target_link_libraries(boompi_audio_channel_mapper_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_channel_mapper_tests
+    COMMAND boompi_audio_channel_mapper_tests)
+
+  add_executable(boompi_audio_fir_decimator_tests
+    tests/unit/audio_fir_decimator_tests.cpp)
+  boompi_configure_target(boompi_audio_fir_decimator_tests)
+  target_link_libraries(boompi_audio_fir_decimator_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_fir_decimator_tests
+    COMMAND boompi_audio_fir_decimator_tests)
+
   set_tests_properties(
     boompi_host_tests
     boompi_audio_queue_tests
     boompi_audio_continuity_tests
+    boompi_audio_channel_mapper_tests
+    boompi_audio_fir_decimator_tests
     PROPERTIES TIMEOUT 20)
 endif()

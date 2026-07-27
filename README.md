@@ -2,7 +2,7 @@
 
 boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端负责连接 Qwen 新加坡区，板端不保存云端 API Key。
 
-> **P1 工程骨架已完成，P0 可行性闸门正在补证。** Host 构建、测试、配置和协议边界已经建立；匹配 BSP 的 RV1106 交叉构建、Rockchip 3A ABI 和 Snowboy 加 OpenBLAS 的链接候选已验证。真实板端执行、四通道 AEC、WSS 配对、Wi-Fi 二维码配网和 A/B 更新尚未完成。本文不会把硬件单项测试或接口骨架描述成完整产品能力。
+> **P1 工程骨架与 P0 离线闸门已完成，P2 本地音频正在实现。** Host 构建、测试、配置和协议边界已经建立；匹配 BSP 的 RV1106 交叉构建、Rockchip 3A ABI 和 Snowboy 加 OpenBLAS 的链接候选已验证。真实板端执行、四通道 AEC、WSS 配对、Wi-Fi 二维码配网和 A/B 更新尚未完成。本文不会把硬件单项测试或接口骨架描述成完整产品能力。
 
 ## 系统形态
 
@@ -40,7 +40,7 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 ### 软件阶段
 
-P1 已建立模块边界、构建入口、配置校验、测试支撑和协议 fixture，Windows/Linux/macOS CI 已通过。P0 的当前证据与阻断见 [2026-07-25 可行性报告](docs/test/p0-feasibility-report-20260725.md)。P2 已开始实现固定音频帧、预分配 SPSC lease、sequence/discontinuity 和连续性门禁；具体边界见 [音频运行时文档](docs/architecture/audio-runtime.md)，尚未连接 ALSA、3A 或 Snowboy。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
+P1 已建立模块边界、构建入口、配置校验、测试支撑和协议 fixture，Windows/Linux/macOS CI 已通过。P0 的当前证据与板端待办见 [2026-07-25 可行性报告](docs/test/p0-feasibility-report-20260725.md)。P2 已实现固定音频帧、预分配 SPSC lease、sequence/discontinuity、连续性门禁、可配置四通道解交织/极性和四路 48→16 kHz FIR；具体边界见 [音频运行时文档](docs/architecture/audio-runtime.md)。这些 DSP 原语尚未连接 ALSA、3A 或 Snowboy，真实 Mode1 通道顺序也仍需板端确认。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
 
 ## 仓库结构
 

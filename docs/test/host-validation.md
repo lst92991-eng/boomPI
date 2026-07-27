@@ -20,6 +20,7 @@ cmake --preset host-debug
 cmake --build --preset host-debug --parallel
 ctest --preset host-debug --output-on-failure
 python scripts/verify_protocol_fixtures.py
+python scripts/dsp/generate_fir_decimator_48_to_16.py --check client/src/audio/fir_decimator_48_to_16.cpp --quiet
 ```
 
 Linux/macOS 还需校验只读 P0 探针：
@@ -84,6 +85,17 @@ go build -trimpath ./cmd/boompi-server
 - `protocol/fixtures/protocol-v1-golden.json` 能由标准库脚本解析，64-byte PCM header 的每个 offset 和 wire hex 一致。
 - malformed length、未知版本、超大 payload 和无效 ID 的测试不会越界或隐式改变状态。
 - 运行产物、配置秘密、证书私钥和本机绝对路径不进入 Git diff。
+
+## P2 DSP 检查项
+
+- mapper 对四个物理 slot 做一一置换，极性只能为 `+1/-1`；非法配置和非法帧不
+  修改调用方输出。
+- FIR 生成器与提交的 211 个 Q15 系数逐项一致，系数对称且总和为 32768。
+- 四路流式 48→16 kHz 结果与独立参考卷积一致；跨 20 ms 帧的历史、Reset、
+  正负 half-LSB 舍入和 S16 饱和均有确定性测试。
+- 频响测试输入使用固定非零相位，避免抽取后的正弦恰好落在零点而造成阻带假阳性。
+- Host DSP 测试只能证明算法和内存边界；实际通道顺序、CPU 实时率和声音质量仍按
+  HIL 闸门验证。
 
 ## 报告要求
 
