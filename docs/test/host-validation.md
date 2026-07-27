@@ -157,6 +157,10 @@ go build -trimpath ./cmd/boompi-server
 - unavailable wake engine 对合法 16 kHz mono frame 返回 backend unavailable，对非法
   格式返回 invalid frame，永不报告 detection。确定性 wake fake 只进入测试 target，
   不能成为生产 fallback；Snowboy `-2` 不作为 VAD 测试结论。
+- VAD 编排测试使用注入的 speech/silence 结果，不包含假算法；覆盖 25 帧 pre-roll 的句首
+  保留与 ring wrap、旧 epoch 隔离、6 秒/700 ms/60 秒精确边界、80 ms duck/160 ms
+  确认、确认时 cancel response 与 clear playback 同时出现、取消/断帧/非法输入/40 帧
+  输出溢出的全清理，以及跟踪 `operator new` 证明逐帧路径无动态分配。
 - vendor CMake 夹具验证两个 enable 选项确实默认关闭，并用全部十个不存在路径确认
   OFF 时零访问、零路径泄漏；host 即使伪造 `BOOMPI_TARGET_RV1106=ON` 也不能越过
   cross Linux/ARM、固定 compiler 和 uClibc sysroot 检查。当前 pins 还要求显式
@@ -175,7 +179,8 @@ AEC reference 消费、normal-EOS presentation completion 或壳体声学 HIL。
 presented、played 或 audible，本地 playback cancel ACK 也不等于扬声器静音或 DSP 历史
 已经复位。后续必须先从匹配 BSP 的真实头文件确认 Rockchip `input_size`、packing、
 返回码和 reset，再实现 adapter；Snowboy 还需私有 legacy C ABI bridge、模型加载、
-单线程 wake worker、500 ms pre-roll/VAD 和板端准确率/实时率测试。上述工作完成前不得
+单线程 wake worker、真实 VAD detector 和板端准确率/实时率测试。portable pre-roll/
+分段控制核心不能冒充真实 VAD 或已经接入的产品线程。上述工作完成前不得
 在 host 报告中写“ALSA 播放已接通”“AEC 已接通”“EOS 已播放完成”或“唤醒已通过”。
 
 ## 报告要求

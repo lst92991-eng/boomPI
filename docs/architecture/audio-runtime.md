@@ -15,7 +15,9 @@ partial exactly-once committer 和本地 `Drop -> Prepare` cancel ACK 状态机�
 allocation-free 的 20↔16 ms DSP 帧桥，以及默认关闭、Debug-only 的 Snowboy
 feasibility adapter/probe。产品级 renderer/committer worker、控制 mailbox、DSP reset
 producer/join、normal-EOS presentation completion、Rockchip 3A platform adapter、可安全
-失败的 Snowboy runtime、wake/VAD worker、AEC reference 消费和打断闭环尚未接入。
+失败的 Snowboy runtime、真实 VAD detector、wake/VAD worker、AEC reference 消费和打断
+闭环尚未接入。portable `VadUtteranceController` 已实现可注入检测结果的 pre-roll、语句
+分段和打断控制核心，但它不冒充 VAD 算法或已经运行的 worker。
 accepted 不等于 presented、played 或 audible；短时静音 HIL 也不证明 Mode1、通道
 内容、极性、DAC reference、AEC 或声学效果。
 
@@ -107,9 +109,21 @@ feasibility adapter 返回 `score_available=false`、`score_milli=0`，不使用
 冒充检测分数。
 Snowboy 的 `-2` 只表示 detector 的 silence 分类，不是产品 VAD。
 
-generation/continuity gate、500 ms AEC 后 pre-roll 和产品 VAD 属于尚未实现的单线程
-wake/VAD worker。默认 `UnavailableWakeWordEngine` 永不报告 detection；测试 fake
-也不会进入发布 target。Rockchip 的软件 ABI 已确认固定 16 ms、interleaved S16、
+`VadUtteranceController` 是由未来单线程 wake/VAD worker 独占的同步控制核心。它消费
+AEC 后 16 kHz/20 ms mono frame 和外部产品 VAD 注入的 speech/silence 结果；Snowboy 的
+silence 分类不能作为该结果。对象内部固定保存 25 帧（500 ms）常开 pre-roll 和 40 帧
+（800 ms）上行队列，不分配、不阻塞，也不执行日志、设备或网络 I/O。唤醒/连续对话后
+等待首语音 6 秒，连续 35 帧（700 ms）静音结束 utterance，单次最多 3000 帧（60 秒）。
+播放期间连续 4 帧（80 ms）speech 产生 duck intent，连续 8 帧（160 ms）确认时在同一
+结果中产生 interrupt、cancel response 和 clear playback intents，并把此前 25 帧作为
+新用户 utterance 的开头。旧 epoch/stream 帧在进入 VAD 和 pre-roll 前丢弃；当前代的
+discontinuity、非法观察值、pre-roll 不足或 40 帧输出溢出会清空全部 PCM 状态、取消当前
+turn、退役 generation，并要求新的 `Arm`。显式 cancel 同样清空 pre-roll/上行并原子给出
+对应的播放清理意图。正常分段结束不会丢弃已经排队的尾帧；owner 必须先按 FIFO 排出这些
+帧，再开始下一 user turn。
+
+默认 `UnavailableWakeWordEngine` 永不报告 detection；测试 fake 也不会进入发布 target。
+Rockchip 的软件 ABI 已确认固定 16 ms、interleaved S16、
 `input_size` 为跨通道 sample 总数且返回 mono bytes。`AudioDspFrameBridge16k` 在不修改
 冻结的 `AudioDspEngine` 契约下完成 20 ms 核心帧与 16 ms backend 块的有界整形：每次
 核心输入同步调用一到两个精确 backend block，完整 20 ms 输出按流序排队，80 ms 周期内

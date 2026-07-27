@@ -74,8 +74,9 @@ opt-in 的 Debug feasibility probe，Release 配置拒绝。
 这些内容已进入 host 可构建边界，但 playback sink/committer 目前只由 scripted sink
 验证。真实 ALSA adapter、renderer/committer worker、Arm/Cancel 控制 mailbox、DSP
 reference-reset producer 与 application actor ACK join、accepted ledger 到 AEC 的组装/
-消费、normal-EOS presentation completion、wake/VAD worker 和 500 ms pre-roll 均属于
-后续集成。accepted 只表示 sink 接受的数字 PCM 前缀，不等于 presented、played、audible
+消费、normal-EOS presentation completion、真实 VAD detector 和 wake/VAD worker 均属于
+后续集成。500 ms pre-roll、分段和打断意图的 portable 控制核心已经实现，但尚未接入
+产品线程。accepted 只表示 sink 接受的数字 PCM 前缀，不等于 presented、played、audible
 或“播放完成”。Rockchip 3A、Snowboy、Mode1 slot 顺序、实时率和声学行为仍需板端 HIL；
 通过依赖 configure 或 host fake 不代表 adapter、模型或硬件运行成功。
 

@@ -4,9 +4,10 @@
 
 P2e-a 建立了 host 可验证的 `AudioDspEngine`、`WakeWordEngine` 接口、失败关闭实现、
 测试 target 专用的确定性 fake，以及外部依赖的 CMake 配置闸门。后续已增加
-allocation-free 的 `AudioDspFrameBridge16k` 和 Debug-only Snowboy feasibility
-adapter/probe。仓库中仍没有 Rockchip 3A platform adapter、wake/VAD worker 或可用于
-发布的 Snowboy runtime；产品 runtime 也没有调用这些 vendor API。当前代码与证据只能
+allocation-free 的 `AudioDspFrameBridge16k`、portable `VadUtteranceController` 和
+Debug-only Snowboy feasibility adapter/probe。仓库中仍没有 Rockchip 3A platform
+adapter、真实 VAD detector、wake/VAD worker 或可用于发布的 Snowboy runtime；产品
+runtime 也没有调用这些 vendor API。当前代码与证据只能
 证明帧整形、适配器结果映射和受控板端正向探针，不能证明 AEC、波束形成、产品唤醒
 或持续实时率已经可用。
 
@@ -128,14 +129,19 @@ CPU/RSS、单帧最坏耗时、持续实时率、故障恢复和声学效果。v
 - reset 结果只有 `reset=true/error=None` 或 `reset=false/error!=None` 两种一致状态。
 
 generation、sequence/timestamp 连续性、500 ms pre-roll 和产品 VAD 都属于单独的
-wake/VAD worker，而不是 engine：
+wake/VAD worker，而不是 engine。当前 portable 控制核心已经固定以下边界：
 
-- worker 独占 engine、自己的 `FrameContinuityGate` 和输入 SPSC consumer。
+- worker 独占 engine、`VadUtteranceController` 和输入 SPSC consumer；所有方法都由该
+  owner 串行调用。
 - 旧 epoch/stream 帧不进入 detector、VAD 或 pre-roll。
 - discontinuity、丢帧或 backend error 清除 pre-roll、锁存 fault，并要求新 generation。
 - 500 ms pre-roll 是 AEC 后 mono 的 25 个 20 ms 固定帧；不能持久化原始录音。
 - 播放期间 80 ms duck、160 ms 打断确认和 700 ms 尾静音由独立产品 VAD 实现，
   不能使用 Snowboy silence 或 wake detection 代替。
+- 控制核心只接受注入的 speech/silence，不包含或虚构能量阈值算法；其上行输出固定为
+  40 帧（800 ms），消费者跟不上时清空并取消 turn，不补发陈旧 PCM。
+- 首语音等待上限为 6 秒，utterance 上限为 60 秒。打断确认结果同时携带 cancel response
+  和 clear playback queue，且排队的 utterance 开头始终包含完整 25 帧 pre-roll。
 
 `UnavailableWakeWordEngine` 对合法输入明确返回 backend unavailable，对非法格式返回
 invalid frame，永远不报告 silence、activity 或 detection。`FakeWakeWordEngine` 只在
@@ -194,7 +200,8 @@ archive 不能作为安全的同进程边界。v1 不使用动态插件，也不
 4. 在已完成默认模型正向离线检测的基础上，验证真实麦克风准确率、误唤醒、漏唤醒
    和最坏帧耗时，再进行至少
    30 分钟稳定性测试。
-5. 最后接入 500 ms pre-roll、独立 VAD 和播放打断闭环；功能通过前不进行压力测试。
+5. 把已实现的 500 ms pre-roll/分段/打断控制核心接入单线程 worker 和真实独立 VAD，
+   再验证播放清理 ACK 与上行顺序；功能通过前不进行压力测试。
 
 真实 adapter 或 HIL 记录完成前，README、UI capability 和测试报告都不得写“DSP 已接通”
 “Snowboy 可用”或“AEC/唤醒已通过”。

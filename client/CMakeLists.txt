@@ -54,6 +54,7 @@ boompi_add_library(boompi_audio_core
   src/audio/playback_generation.cpp
   src/audio/playback_renderer_24_to_48.cpp
   src/audio/playback_resampler_24_to_48.cpp
+  src/audio/vad_utterance_controller.cpp
   src/audio/wake_word_engine.cpp)
 target_link_libraries(boompi_audio_core PUBLIC boompi_event)
 
@@ -341,6 +342,17 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_audio_dsp_frame_bridge_tests
     COMMAND boompi_audio_dsp_frame_bridge_tests)
 
+  add_executable(boompi_audio_vad_utterance_controller_tests
+    tests/unit/audio_vad_utterance_controller_tests.cpp)
+  boompi_configure_target(boompi_audio_vad_utterance_controller_tests)
+  target_link_libraries(boompi_audio_vad_utterance_controller_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_vad_utterance_controller_tests
+    COMMAND boompi_audio_vad_utterance_controller_tests)
+
   add_executable(boompi_snowboy_wake_word_engine_tests
     src/platform/rv1106/snowboy_wake_word_engine.cpp
     tests/fixtures/snowboy_legacy_bridge_fake.cpp
@@ -384,6 +396,7 @@ if(BOOMPI_BUILD_TESTS)
     boompi_audio_playback_committer_tests
     boompi_audio_backend_contract_tests
     boompi_audio_dsp_frame_bridge_tests
+    boompi_audio_vad_utterance_controller_tests
     boompi_audio_pcm_transfer_tests
     boompi_snowboy_wake_word_engine_tests
     PROPERTIES TIMEOUT 20)
