@@ -1,5 +1,10 @@
 # P0 可行性报告（2026-07-25）
 
+> 后续更新：2026-07-27 已完成更精确的
+> [vendor 音频只读盘点](p0-vendor-audio-inventory-20260727.md)。本文中的“Mode1 四通道”
+> 是当时的组合假设；当前 DTB 的 TRCM Mode1 只表示 TX/RX 共享 TX 时钟，不能证明
+> capture 四槽或数字 reference。本文保留为历史证据，不据此宣称板端能力。
+
 ## 结论
 
 P0 当前为“部分通过”，不能标记完成。匹配 BSP 的 C++ 交叉构建、Rockchip 3A

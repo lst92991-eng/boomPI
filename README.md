@@ -2,7 +2,10 @@
 
 boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端负责连接 Qwen 新加坡区，板端不保存云端 API Key。
 
-> **P1 工程骨架已完成，P0 离线证据基线已建立，P2 本地音频正在实现。** Host 构建、测试、配置和协议边界已经建立；匹配 BSP 的 RV1106 交叉构建以及 Rockchip 3A、Snowboy/OpenBLAS 的 ABI/链接候选已经核对，但 P0 板端闸门仍是部分通过。P2f-a 已增加 host 可验证的 24→48 kHz 软件播放渲染器；P2f-b-a 又增加可移植 PCM sink 契约、64 槽 accepted-prefix ledger 和单 worker 非阻塞 committer。P2f-b-b1 已增加固定容量 SPSC 控制/结果通道、独立 urgent cancel、producer start/stop 与 DSP reset 契约、分槽的 EOS/critical 事件，以及 actor 独占的精确取消 join。P2f-b-b2 再把 renderer、committer 和这些 mailbox 接成 deterministic host worker core：每次调用只推进有界工作，不创建真实线程。P2f-c-a 已增加显式配置、非阻塞且不隐式 recover 的 ALSA playback device，以及 host 可故障注入的 mono→设备声道 sink adapter；Linux `null` 只验证 ALSA 数字 accepted，RV1106 sysroot 只验证交叉编译/链接。这里的 accepted（包括 EOS accepted）只表示设备接受的数字 PCM 前缀，不等于 presented、played 或 audible。实际播放线程/调度、adapter 与 runtime 的组成、network producer/DSP 执行端、AEC reference 消费和板端 HIL，以及 Rockchip/Snowboy adapter、四通道 AEC、WSS 配对、Wi-Fi 二维码配网和 A/B 更新尚未完成。
+> **P1 工程骨架已完成；当前第一闸门是 vendor 音频最小闭环。** 下一步先用匹配 BSP 的
+> `rk_mpi_ai`/`rk_mpi_ao` 与直接 ALSA 实测 48 kHz 全双工、真实通道布局和 Rockchip
+> VQE/3A，再决定生产模块如何拆分。此前的 renderer、queue、playback control、committer
+> 和 ALSA adapter 代码及测试保留为 host/交叉链接证据，但暂停扩展，不能冒充板端能力。
 
 ## 系统形态
 
@@ -32,7 +35,9 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 以上结果不代表以下事项已经通过：
 
-- 48 kHz 全双工与 Codec Mode1 四通道回采。
+- 48 kHz 真全双工、实际 capture 通道数和数字播放 reference slot。当前 DTB 的
+  `TRCM clk-trcm=1` 只说明 TX/RX 共享 TX 时钟，不证明四通道；vendor VQE 样例选择的 loopback
+  Mode2 也是另一项尚未在本板验证的 mixer 设置。
 - Rockchip 3A 的板端加载、实际通道契约和 16 kHz 实时率；SDK ABI 候选已核对。
 - Snowboy 的板端模型加载、准确率和实时率；旧 ARM 库的交叉链接候选已核对。
 - 最终壳体下的 AEC、波束形成、双讲、远场和最大音量表现。
@@ -40,18 +45,20 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 ### 软件阶段
 
-P1 已建立模块边界、构建入口、配置校验、测试支撑和协议 fixture，Windows/Linux/macOS CI 已通过。P0 的当前证据与板端待办见 [2026-07-25 可行性报告](docs/test/p0-feasibility-report-20260725.md)。P2 已完成固定音频帧、无热路径分配的队列、四通道解交织/极性、48→16 kHz FIR、generation-safe 采集前端，以及 24→48 kHz 播放渲染、accepted-prefix 记账、epoch fence、取消汇合和 deterministic worker core；具体契约见 [音频运行时文档](docs/architecture/audio-runtime.md)。
+P1 已建立 CMake/Go 构建、配置校验、协议 fixture 和跨平台 CI。P0 已确认匹配 BSP 的
+GCC 8.3/uClibc 工具链，以及 Rockchip 3A 和 Snowboy/OpenBLAS 的 ABI/链接候选；板端
+能力仍是部分通过。当前 SDK 已找到 `librockit.so`、AI/AO 头文件与样例、预构建
+`rk_mpi_ai_test`/`rk_mpi_ao_test`，但 raw PCM 的实际参数、AI+AO 同时运行、VQE 资源
+安装和 3A 实时率尚未在当前镜像闭环验证。
+具体路径、哈希、两个 Mode 的区别和 HIL 顺序见
+[2026-07-27 vendor 音频证据基线](docs/test/p0-vendor-audio-inventory-20260727.md)。
 
-P2f-c-a 已增加 `PcmPlaybackSink48k` 和 `AlsaPcmPlaybackDevice`。adapter 使用固定 scratch 将 mono 复制到显式的一或二声道设备，在正写前后都读取同一设备、同一单调时钟域的状态；只有写后状态为 `RUNNING`，且 status timestamp 位于 write-complete 与 status-return 后观测时间之间，才用写后 delay 扣除本次 accepted 帧来估算其首帧 presentation 时间。ALSA 后端只做有界 `status`、`write`、`drop` 和 `prepare`，以 nonblocking 方式要求所打开 named PCM 的 API 边界精确为 48 kHz/S16_LE/RW_INTERLEAVED，不会在热路径隐式调用 `snd_pcm_recover`。显式选择的 ALSA 插件仍可能在内部转换，因此 named-PCM exact 不能冒充直接硬件路径 exact。partial、native errno 和 malformed-positive 事实都会保留，无法可信定时的正接受前缀只推进记账并触发取消，不发布伪 reference。
-
-Linux `null` smoke 只证明 libasound API 和数字 accepted；RV1106 GCC 8.3/uClibc 默认 ALL link-check 只证明 adapter、ALSA 和 clock 符号可在目标 sysroot 解析，二者都不是板端运行或出声证据。软件默认 `volume=60`、`speaker_gain=100`；音量 100 可配置，但最大音量和更高扬声器增益仍需在最终壳体下做 HIL/声学安全验收。实际播放线程/调度、adapter 与 runtime 的组成、network producer/DSP endpoint、AEC reference 消费和正常 EOS presentation completion 尚未连接。真实 3A、Snowboy 和 Mode1 通道顺序也仍需板端确认。默认自动测试不得访问真实 Qwen，也不会消耗付费额度。功能完成情况必须以测试和板端记录为准，不能根据目录或接口名称推断。
-
-播放提交的审计加固同样失败关闭：value-initialized sink control 和 committer 公共结果
-都是无效的 unset 状态，不能被空 aggregate 误判为成功；
-malformed sink result 只要报告正接受长度，就按请求范围内可能已经接受的前缀保守推进并
-要求取消，绝不重放，但不会用不可信 timing 发布伪 reference。accepted sequence 耗尽后
-即使本地 `Drop`/`Prepare` 成功也进入 terminal restart-required，不能假恢复；cancel 结果
-分别报告被退役和已成功 prepare 的 PCM incarnation，后者在 prepare 成功前保持 0。
+已有 playback renderer/committer/worker/ALSA adapter 及其 host、Linux `null`、RV1106
+交叉链接结果不会删除，详细证据保留在
+[2026-07-27 ALSA playback adapter 验证记录](docs/test/p2f-c-a-validation-20260727.md)。
+这些模块现在冻结，不继续增加 runner、mailbox 或控制层；后续首先完成 vendor raw PCM
+最小闭环，再按真实阻塞、通道和时序需求复用或简化现有代码。默认自动测试不会访问真实
+Qwen，也不会消耗付费额度。
 
 ## 仓库结构
 
@@ -196,9 +203,11 @@ Get-Content -Raw scripts/probes/rv1106_p0_probe.sh | ssh <board-host> "sh -s"
 
 ## 路线图
 
-1. **P0 可行性闸门（进行中）**：工具链、Snowboy、Rockchip 3A、四通道参考、WSS、Wi-Fi AP 和 UI backend 探测。
+1. **P0 可行性闸门（进行中）**：先完成 rk_mpi/ALSA 48 kHz 全双工、真实 capture
+   layout、Rockchip VQE/3A，再继续 Snowboy、WSS、Wi-Fi AP 和 UI backend 探测。
 2. **P1 工程骨架（已完成）**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
-3. **P2 本地音频（进行中）**：48/16 kHz、后端契约、24→48 kHz 软件 renderer、portable sink/accepted ledger/committer、固定 playback mailbox、取消 ACK join、deterministic host worker core 和未组成的 ALSA adapter 已建立；实际播放线程/调度、runtime composition、network producer/DSP endpoint、AEC/BF/VAD、Snowboy adapter、正常 EOS 播放完成、打断闭环和 HIL 仍待完成。
+3. **P2 本地音频（进行中）**：现有 host 音频核心保留但冻结扩展；以 vendor raw PCM 最小
+   闭环和板端 HIL 为当前入口，实测后再决定哪些已有模块进入 runtime。
 4. **P3 服务端**：discovery、pairing、Qwen adapter、Session Actor 和 ToolRegistry。
 5. **P4 端到端对话**：流式文字/音频、取消、上下文、断网和延迟测量。
 6. **P5 UI 与配网**：表情、字幕、触摸、二维码和网络优先级。

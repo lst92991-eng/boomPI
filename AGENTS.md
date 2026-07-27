@@ -57,6 +57,27 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
 - 涉及刷镜像、改分区、改设备树、持久修改启动项或擦除板端数据时，必须取得用户对该次操作的明确授权。先做只读探测，不因“可能需要”就直接烧录。
 - 板端行为以真实 SSH 探测和实测为准；不得根据另一个 RV1106 示例板猜测设备节点、声卡编号或 GPIO。
 
+当前音频开发方向（2026-07-27）：
+
+- 先接通并测量幸狐/Rockchip BSP 已提供的 `rk_mpi_ai`/`rk_mpi_ao`、ALSA PCM、
+  Rockchip VQE 和 `libaec_bf_process.so` 的 `rkaudio_preprocess_*`，再决定生产模块边界。不得继续为尚未验证的行为增加
+  playback/control/committer/worker 等通用层。
+- 已提交的 renderer、queue、playback control、committer 和 ALSA adapter 代码及测试
+  作为历史实现和 host 证据保留，但在 vendor 最小闭环完成前冻结扩展；不得把 host fake、
+  ALSA `null` 或交叉链接写成板端能力。
+- 第一项板端闭环是同一时刻运行的 48 kHz capture/playback，其后用可辨识信号确认实际
+  通道数、双麦 slot、数字 reference slot、极性、延迟和时钟关系，最后才接 16 kHz 3A。
+- 过去文档把“Mode1 四通道”写成一个假设，现已拆开：当前 DTB 的
+  `rockchip,clk-trcm=<1>` 只表示 TX/RX 共享 TX LRCK/BCLK 的 TRCM 时钟模式，不证明
+  四通道或数字 reference；`rk_mpi_ai_test` 启用 AI VQE 时请求的
+  `I2STDM Digital Loopback Mode=Mode2` 又是独立的 mixer loopback 选择。两者都不能替代
+  当前镜像的通道相关性 HIL。
+- Rockit AI VQE 和直接调用 `libaec_bf_process.so` 是两条候选 vendor 路径。直接 3A 的
+  固定帧与 input/output 长度已由匹配 SDK 关闭；物理 packing/slot、错误恢复、依赖和实时率
+  仍须实测。两条路径禁止同时叠加，也不得根据库名推断内部算法。
+- 允许独立的、显式 opt-in 的板端探针 target 直接调用 vendor API。探针只用于关闭事实
+  问题，不需要先经过产品通用接口；测试产物和用户录音不提交仓库。
+
 机械声学基线：
 
 - 两只麦克风在正面横向排列，声学孔中心距 `35 mm ± 0.5 mm`。
@@ -179,7 +200,9 @@ NetworkState:
 
 启动顺序必须让显示、音频、Snowboy 和本地状态机先进入可用状态，再由网络 worker 在后台发现/连接服务端。服务端离线或 DNS/路由异常不得阻塞本地启动。
 
-客户端采用一个进程、七类主要执行上下文：
+下面七类是产品完整链路的职责清单，不是要求预先实现七个线程或七层框架。vendor 最小
+闭环阶段只使用验证所需的最少执行上下文；全双工、阻塞行为和耗时实测后，再按单一所有权
+拆分生产线程：
 
 1. 录音线程：只负责 ALSA 采集、时间戳和写入预分配队列。
 2. DSP 线程：解交织、重采样、AEC/NS/BF/AGC 和帧连续性检查。
@@ -189,7 +212,8 @@ NetworkState:
 6. application actor：唯一可以转换会话状态、创建/取消 turn 和编排工具调用的线程。
 7. UI 线程：唯一拥有 LVGL/显示对象，只消费 UI model 和上报触摸事件。
 
-可以在实测后合并非实时 worker，但必须保留清晰的单一所有权。任何跨线程共享对象都要在类型或模块文档中说明拥有者、生命周期和停止顺序。
+不得为了匹配这份清单继续增加空壳 worker。任何实际增加的线程和跨线程共享对象都要由
+测得的阻塞/实时需求支持，并在类型或模块文档中说明拥有者、生命周期和停止顺序。
 
 并发规则：
 
@@ -208,8 +232,11 @@ NetworkState:
 目标链路：
 
 ```text
-Codec/ALSA 48 kHz full duplex
-  -> 4ch capture candidate: MIC-L, MIC-R, DAC-REF-L, DAC-REF-R
+rk_mpi_ai/rk_mpi_ao or direct ALSA 48 kHz full duplex
+  -> measured capture layout
+       candidate A: dual microphone only
+       candidate B: microphone + digital playback reference (vendor Mode2 sample)
+       candidate C: MIC-L, MIC-R, REF-L, REF-R
   -> deinterleave + anti-alias resample 48 kHz -> 16 kHz
   -> Rockchip AudioDspEngine once: configured AEC/NS/BF/AGC processing
   -> VAD + Snowboy + 16 kHz S16_LE mono uplink
@@ -223,11 +250,16 @@ Qwen 24 kHz S16_LE mono downlink
 
 强约束：
 
-- Codec 48 kHz 全双工和 I2S/TDM Mode1 四通道回采是目标方案，不是已验证事实。P0 必须验证 ALSA 参数、通道顺序、左右极性、数字参考采样点相对 mixer/volume/DAC 输入的实际位置和延迟，以及 capture/playback 时钟关系；不得把数字 loopback 描述成功放或扬声器后的模拟参考。
+- Codec 48 kHz 全双工、可用 capture 通道数和 I2S/TDM loopback mode 均未验证。P0 必须
+  分别测试 rk_mpi 与直接 ALSA 的实际参数，并确认通道顺序、左右极性、数字参考采样点相对
+  mixer/volume/DAC 输入的位置和延迟，以及 capture/playback 时钟关系；不得把某个 vendor
+  样例、BCD channel mask 或数字 loopback 描述成功放/扬声器后的模拟参考。
 - Rockchip 3A 当前按仅支持 8/16 kHz 处理。未经头文件、ABI 和板端测试证明，不得让 vendor AEC 直接吃 48 kHz，也不得在文档中宣称支持。
-- 若 Mode1 失败，后备方案是从最终数字播放链路取软件参考，重采样到 16 kHz，并通过延迟估计对齐。不得直接用收到的原始 TTS 包作为 AEC 参考，因为它尚未经过 jitter、重采样、音量和混音。
+- 只有硬件回采经实测不可用并完成方案评审后，才能从最终数字播放链路取软件参考、重采样
+  到 16 kHz 并通过延迟估计对齐。不得直接用收到的原始 TTS 包作为 AEC 参考，因为它尚未
+  经过 jitter、重采样、音量和混音。
 - 硬件 Codec 回采和软件播放参考同一时刻只能启用一种，禁止把两种 reference 叠加后交给 AEC。
-- AEC、NS、BF、AGC 每一级只运行一次。若 `librkaudio` 内部已经组合实现，外层不得再叠加同类处理。
+- AEC、NS、BF、AGC 每一级只运行一次。若 Rockchip 3A 内部已经组合实现，外层不得再叠加同类处理。
 - 核心层只定义 `AudioDspEngine` 的输入、输出、帧连续性和延迟契约；Rockchip adapter 负责 vendor 实际算法顺序，不得把推测的内部顺序写成事实。
 - 第一版板端到服务端使用 16 kHz、16-bit、mono 原始 PCM，不使用 Opus。播放下行按 provider 实际格式标记，默认 Qwen 24 kHz PCM，板端统一转 48 kHz。
 - Snowboy 和上行网络消费同一份 AEC 后 16 kHz 音频，但必须各自使用独立有界队列，网络阻塞不得影响唤醒。
@@ -468,7 +500,8 @@ Host 自动测试至少覆盖：
 
 1. 确认 CPU ABI、libc、sysroot、ALSA、TLS 和运行库版本。
 2. 验证 48 kHz 全双工及所有实际声卡/mixer 参数。
-3. 验证 Mode1 四通道顺序、DAC reference 和双麦极性；失败则记录并进入软件参考方案评审。
+3. 验证 TRCM 时钟下的真实 capture 通道数、loopback mixer mode、DAC reference slot 和
+   双麦极性；没有四通道或硬件 reference 时记录证据并进入软件参考方案评审。
 4. 验证 Rockchip 3A 头文件/ABI、双麦输入、16 kHz 实时率和错误路径。
 5. 独立验证 Snowboy 动态库、模型加载、唤醒率和 CPU 占用。
 6. 验证播放、录音、AEC 后录音，再验证说话打断；功能通过前不进行长时间压力测试。
@@ -484,7 +517,8 @@ AEC/BF 验收必须在最终壳体、双麦 35 mm 和扬声器安装完成后进
 
 第一优先级始终是双麦输入、扬声器输出和可打断的 AEC 闭环。按以下里程碑推进：
 
-1. **P0 可行性闸门**：工具链、ABI、Snowboy、Rockchip 3A、四通道参考、WSS、Wi-Fi AP 和 UI backend 探测。
+1. **P0 可行性闸门**：工具链、ABI、真实 capture/reference 布局、Rockchip 3A、Snowboy、
+   WSS、Wi-Fi AP 和 UI backend 探测。
 2. **P1 工程骨架**：目录、CMake targets、Go module、配置、日志、事件和基础 CI。
 3. **P2 本地音频**：48/16 kHz 链路、AEC/BF/VAD、Snowboy、播放、打断和音频 smoke tools。
 4. **P3 服务端**：协议、discovery/pairing、Qwen adapter、Session Actor 和 ToolRegistry。

@@ -216,8 +216,9 @@ adapter 也尚未由 runtime 创建。当前没有实际播放线程/调度、�
 producer endpoint、DSP endpoint、AEC reference
 消费、normal-EOS presentation completion 或壳体声学 HIL。accepted（包括 EOS accepted）
 不等于 presented、played 或 audible，本地 playback cancel ACK 也不等于扬声器静音或
-DSP 历史已经复位。后续必须先从匹配 BSP 的真实头文件确认 Rockchip `input_size`、packing、
-返回码和 reset，再实现 adapter；Snowboy 还需私有 legacy C ABI bridge、模型加载、
+DSP 历史已经复位。匹配 BSP 已关闭直接 Rockchip 3A 的固定 frame、`input_size` 和成功
+输出长度；后续必须先验证真实 packing/slot、错误恢复与板端实时率，再实现生产 adapter。
+Snowboy 还需私有 legacy C ABI bridge、模型加载、
 单线程 wake worker、500 ms pre-roll/VAD 和板端准确率/实时率测试。上述工作完成前不得
 在 host 报告中写“ALSA 播放已接通”“AEC 已接通”“EOS 已播放完成”或“唤醒已通过”。
 

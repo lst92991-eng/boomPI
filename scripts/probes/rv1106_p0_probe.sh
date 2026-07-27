@@ -19,7 +19,7 @@ Usage: rv1106_p0_probe.sh [OPTIONS]
 Emit a read-only RV1106 P0 capability inventory as JSON on stdout.
 
 Options:
-  --rockchip-3a-lib PATH  Inspect this Rockchip 3A shared library.
+  --rockchip-3a-lib PATH  Inspect this libaec_bf_process.so candidate.
   --snowboy-lib PATH      Inspect this Snowboy shared library.
   --snowboy-model PATH    Report whether this Snowboy model is readable.
   -h, --help              Show this help text.
@@ -73,6 +73,13 @@ if [ -n "$PROBE_ROOT" ] && [ ! -d "$PROBE_ROOT" ]; then
     exit 2
 fi
 
+if [ -n "$ROCKCHIP_3A_LIB" ]; then
+    case "${ROCKCHIP_3A_LIB##*/}" in
+        libaec_bf_process.so*) ;;
+        *) argument_error ;;
+    esac
+fi
+
 root_path() {
     printf '%s%s' "$PROBE_ROOT" "$1"
 }
@@ -99,20 +106,31 @@ count_entries() (
     printf '%s' "$probe_count"
 )
 
-first_rockchip_3a_library() {
+first_rockchip_3a_aec_library() {
     for probe_entry in \
-        "$PROBE_ROOT"/oem/usr/lib/librkaudio*.so* \
         "$PROBE_ROOT"/oem/usr/lib/libaec_bf_process.so* \
-        "$PROBE_ROOT"/usr/lib/librkaudio*.so* \
-        "$PROBE_ROOT"/lib/librkaudio*.so* \
-        "$PROBE_ROOT"/usr/lib/libRKAudio*.so* \
-        "$PROBE_ROOT"/usr/lib/librockchip*audio*.so*; do
+        "$PROBE_ROOT"/usr/lib/libaec_bf_process.so* \
+        "$PROBE_ROOT"/lib/libaec_bf_process.so*; do
         if is_readable_entry "$probe_entry"; then
             printf '%s' "$probe_entry"
             return 0
         fi
     done
     return 1
+}
+
+first_rockchip_3a_common_library() {
+    first_readable_candidate \
+        "$PROBE_ROOT"/oem/usr/lib/librkaudio_common.so* \
+        "$PROBE_ROOT"/usr/lib/librkaudio_common.so* \
+        "$PROBE_ROOT"/lib/librkaudio_common.so*
+}
+
+first_rockchip_3a_detect_library() {
+    first_readable_candidate \
+        "$PROBE_ROOT"/oem/usr/lib/librkaudio_detect.so* \
+        "$PROBE_ROOT"/usr/lib/librkaudio_detect.so* \
+        "$PROBE_ROOT"/lib/librkaudio_detect.so*
 }
 
 first_snowboy_library() {
@@ -171,6 +189,32 @@ first_rockchip_header_present() {
         fi
     done
     printf '%s' false
+}
+
+first_readable_candidate() {
+    for probe_entry in "$@"; do
+        if is_readable_entry "$probe_entry"; then
+            printf '%s' "$probe_entry"
+            return 0
+        fi
+    done
+    return 1
+}
+
+candidate_present() {
+    if [ -n "$1" ] && is_readable_entry "$1"; then
+        printf '%s' true
+    else
+        printf '%s' false
+    fi
+}
+
+candidate_executable() {
+    if [ -n "$1" ] && [ -f "$1" ] && [ -x "$1" ]; then
+        printf '%s' true
+    else
+        printf '%s' false
+    fi
 }
 
 map_machine() {
@@ -383,6 +427,54 @@ if { [ "$ALSA_CAPTURE_ENDPOINT_COUNT" -gt 0 ] || [ "$ALSA_CAPTURE_NODE_COUNT" -g
     ALSA_FULL_DUPLEX_CANDIDATE=true
 fi
 
+RK_MPI_AI_TEST=$(first_readable_candidate \
+    "$PROBE_ROOT"/oem/usr/bin/rk_mpi_ai_test \
+    "$PROBE_ROOT"/usr/bin/rk_mpi_ai_test \
+    "$PROBE_ROOT"/bin/rk_mpi_ai_test || :)
+RK_MPI_AO_TEST=$(first_readable_candidate \
+    "$PROBE_ROOT"/oem/usr/bin/rk_mpi_ao_test \
+    "$PROBE_ROOT"/usr/bin/rk_mpi_ao_test \
+    "$PROBE_ROOT"/bin/rk_mpi_ao_test || :)
+RK_MPI_PIPELINE_STRESS_TEST=$(first_readable_candidate \
+    "$PROBE_ROOT"/oem/usr/bin/sample_ai_aenc_adec_ao_stresstest \
+    "$PROBE_ROOT"/usr/bin/sample_ai_aenc_adec_ao_stresstest \
+    "$PROBE_ROOT"/bin/sample_ai_aenc_adec_ao_stresstest || :)
+ROCKIT_LIBRARY=$(first_readable_candidate \
+    "$PROBE_ROOT"/oem/usr/lib/librockit.so \
+    "$PROBE_ROOT"/usr/lib/librockit.so \
+    "$PROBE_ROOT"/lib/librockit.so || :)
+AI_VQE_CONFIG=$(first_readable_candidate \
+    "$PROBE_ROOT"/oem/usr/share/vqefiles/config_aivqe.json \
+    "$PROBE_ROOT"/usr/share/vqefiles/config_aivqe.json \
+    "$PROBE_ROOT"/etc/vqefiles/config_aivqe.json || :)
+AO_VQE_CONFIG=$(first_readable_candidate \
+    "$PROBE_ROOT"/oem/usr/share/vqefiles/config_aovqe.json \
+    "$PROBE_ROOT"/usr/share/vqefiles/config_aovqe.json \
+    "$PROBE_ROOT"/etc/vqefiles/config_aovqe.json || :)
+
+RK_MPI_AI_TEST_PRESENT=$(candidate_present "$RK_MPI_AI_TEST")
+RK_MPI_AI_TEST_EXECUTABLE=$(candidate_executable "$RK_MPI_AI_TEST")
+RK_MPI_AO_TEST_PRESENT=$(candidate_present "$RK_MPI_AO_TEST")
+RK_MPI_AO_TEST_EXECUTABLE=$(candidate_executable "$RK_MPI_AO_TEST")
+RK_MPI_PIPELINE_STRESS_TEST_PRESENT=$(candidate_present "$RK_MPI_PIPELINE_STRESS_TEST")
+RK_MPI_PIPELINE_STRESS_TEST_EXECUTABLE=$(candidate_executable "$RK_MPI_PIPELINE_STRESS_TEST")
+ROCKIT_LIBRARY_PRESENT=$(candidate_present "$ROCKIT_LIBRARY")
+AI_VQE_CONFIG_PRESENT=$(candidate_present "$AI_VQE_CONFIG")
+AO_VQE_CONFIG_PRESENT=$(candidate_present "$AO_VQE_CONFIG")
+
+RK_MPI_STATUS=missing
+if [ "$RK_MPI_AI_TEST_PRESENT" = true ] || [ "$RK_MPI_AO_TEST_PRESENT" = true ] ||
+   [ "$ROCKIT_LIBRARY_PRESENT" = true ]; then
+    RK_MPI_STATUS=candidate
+fi
+probe_elf "$ROCKIT_LIBRARY"
+ROCKIT_ELF_INSPECTION=$ELF_INSPECTION
+ROCKIT_ELF_CLASS_BITS=$ELF_CLASS_BITS
+ROCKIT_ELF_MACHINE=$ELF_MACHINE
+ROCKIT_ELF_FLOAT_ABI=$ELF_FLOAT_ABI
+ROCKIT_ELF_NEEDED_COUNT=$ELF_NEEDED_COUNT
+ROCKIT_ABI_COMPATIBILITY=$(elf_compatibility "$ROCKIT_ELF_INSPECTION" "$ROCKIT_ELF_MACHINE" "$ROCKIT_ELF_CLASS_BITS" "$ROCKIT_ELF_FLOAT_ABI")
+
 FRAMEBUFFER_NODE_COUNT=$(count_entries "$PROBE_ROOT"/dev/fb*)
 DRM_CARD_NODE_COUNT=$(count_entries "$PROBE_ROOT"/dev/dri/card*)
 INPUT_EVENT_NODE_COUNT=$(count_entries "$PROBE_ROOT"/dev/input/event*)
@@ -408,10 +500,13 @@ for probe_entry in "$PROBE_ROOT"/sys/bus/spi/devices/*/modalias; do
 done
 
 if [ -z "$ROCKCHIP_3A_LIB" ]; then
-    ROCKCHIP_3A_LIB=$(first_rockchip_3a_library || :)
+    ROCKCHIP_3A_LIB=$(first_rockchip_3a_aec_library || :)
 fi
-ROCKCHIP_3A_LIBRARY_PRESENT=false
-[ -n "$ROCKCHIP_3A_LIB" ] && is_readable_entry "$ROCKCHIP_3A_LIB" && ROCKCHIP_3A_LIBRARY_PRESENT=true
+ROCKCHIP_3A_COMMON_LIB=$(first_rockchip_3a_common_library || :)
+ROCKCHIP_3A_DETECT_LIB=$(first_rockchip_3a_detect_library || :)
+ROCKCHIP_3A_AEC_LIBRARY_PRESENT=$(candidate_present "$ROCKCHIP_3A_LIB")
+ROCKCHIP_3A_COMMON_LIBRARY_PRESENT=$(candidate_present "$ROCKCHIP_3A_COMMON_LIB")
+ROCKCHIP_3A_DETECT_LIBRARY_PRESENT=$(candidate_present "$ROCKCHIP_3A_DETECT_LIB")
 ROCKCHIP_3A_HEADER_PRESENT=$(first_rockchip_header_present)
 probe_elf "$ROCKCHIP_3A_LIB"
 ROCKCHIP_ELF_INSPECTION=$ELF_INSPECTION
@@ -420,8 +515,21 @@ ROCKCHIP_ELF_MACHINE=$ELF_MACHINE
 ROCKCHIP_ELF_FLOAT_ABI=$ELF_FLOAT_ABI
 ROCKCHIP_ELF_NEEDED_COUNT=$ELF_NEEDED_COUNT
 ROCKCHIP_ABI_COMPATIBILITY=$(elf_compatibility "$ROCKCHIP_ELF_INSPECTION" "$ROCKCHIP_ELF_MACHINE" "$ROCKCHIP_ELF_CLASS_BITS" "$ROCKCHIP_ELF_FLOAT_ABI")
+probe_elf "$ROCKCHIP_3A_COMMON_LIB"
+ROCKCHIP_COMMON_ELF_INSPECTION=$ELF_INSPECTION
+ROCKCHIP_COMMON_ELF_CLASS_BITS=$ELF_CLASS_BITS
+ROCKCHIP_COMMON_ELF_MACHINE=$ELF_MACHINE
+ROCKCHIP_COMMON_ELF_FLOAT_ABI=$ELF_FLOAT_ABI
+ROCKCHIP_COMMON_ELF_NEEDED_COUNT=$ELF_NEEDED_COUNT
+ROCKCHIP_COMMON_ABI_COMPATIBILITY=$(elf_compatibility "$ROCKCHIP_COMMON_ELF_INSPECTION" "$ROCKCHIP_COMMON_ELF_MACHINE" "$ROCKCHIP_COMMON_ELF_CLASS_BITS" "$ROCKCHIP_COMMON_ELF_FLOAT_ABI")
 ROCKCHIP_STATUS=missing
-[ "$ROCKCHIP_3A_LIBRARY_PRESENT" = true ] && ROCKCHIP_STATUS=candidate
+if [ "$ROCKCHIP_3A_AEC_LIBRARY_PRESENT" = true ] &&
+   [ "$ROCKCHIP_3A_COMMON_LIBRARY_PRESENT" = true ]; then
+    ROCKCHIP_STATUS=candidate
+elif [ "$ROCKCHIP_3A_AEC_LIBRARY_PRESENT" = true ] ||
+     [ "$ROCKCHIP_3A_COMMON_LIBRARY_PRESENT" = true ]; then
+    ROCKCHIP_STATUS=incomplete
+fi
 
 if [ -z "$SNOWBOY_LIB" ]; then
     SNOWBOY_LIB=$(first_snowboy_library || :)
@@ -505,7 +613,7 @@ esac
 
 cat <<EOF
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "probe": "boompi-rv1106-p0",
   "mode": "read_only",
   "collected_at_utc": "$COLLECTED_AT_UTC",
@@ -550,9 +658,10 @@ cat <<EOF
     "playback_node_count": $ALSA_PLAYBACK_NODE_COUNT,
     "control_node_count": $ALSA_CONTROL_NODE_COUNT,
     "full_duplex_candidate": $ALSA_FULL_DUPLEX_CANDIDATE,
-    "rate_48000_verified": "unknown",
-    "mode1_four_channel_verified": "unknown",
-    "channel_order_verified": "unknown",
+    "rate_48000_full_duplex_verified": "unknown",
+    "capture_channel_count_verified": "unknown",
+    "capture_channel_layout_verified": "unknown",
+    "digital_reference_position_verified": "unknown",
     "microphone_polarity_verified": "unknown"
   },
   "devices": {
@@ -567,16 +676,45 @@ cat <<EOF
     "st7789_detected": $ST7789_DETECTED
   },
   "vendor": {
+    "rockchip_mpi_audio": {
+      "status": "$RK_MPI_STATUS",
+      "rockit_library_present": $ROCKIT_LIBRARY_PRESENT,
+      "ai_test_present": $RK_MPI_AI_TEST_PRESENT,
+      "ai_test_executable": $RK_MPI_AI_TEST_EXECUTABLE,
+      "ao_test_present": $RK_MPI_AO_TEST_PRESENT,
+      "ao_test_executable": $RK_MPI_AO_TEST_EXECUTABLE,
+      "encoded_pipeline_stress_sample_present": $RK_MPI_PIPELINE_STRESS_TEST_PRESENT,
+      "encoded_pipeline_stress_sample_executable": $RK_MPI_PIPELINE_STRESS_TEST_EXECUTABLE,
+      "ai_vqe_config_present": $AI_VQE_CONFIG_PRESENT,
+      "ao_vqe_config_present": $AO_VQE_CONFIG_PRESENT,
+      "rockit_elf_inspection": "$ROCKIT_ELF_INSPECTION",
+      "rockit_elf_class_bits": $ROCKIT_ELF_CLASS_BITS,
+      "rockit_elf_machine": "$ROCKIT_ELF_MACHINE",
+      "rockit_elf_float_abi": "$ROCKIT_ELF_FLOAT_ABI",
+      "rockit_needed_count": $ROCKIT_ELF_NEEDED_COUNT,
+      "rockit_target_abi_compatibility": "$ROCKIT_ABI_COMPATIBILITY",
+      "rate_48000_full_duplex_verified": "unknown",
+      "capture_layout_verified": "unknown",
+      "vqe_initialized": "unknown"
+    },
     "rockchip_3a": {
       "status": "$ROCKCHIP_STATUS",
-      "library_present": $ROCKCHIP_3A_LIBRARY_PRESENT,
+      "aec_library_present": $ROCKCHIP_3A_AEC_LIBRARY_PRESENT,
+      "common_library_present": $ROCKCHIP_3A_COMMON_LIBRARY_PRESENT,
+      "detect_library_present": $ROCKCHIP_3A_DETECT_LIBRARY_PRESENT,
       "header_present": $ROCKCHIP_3A_HEADER_PRESENT,
       "elf_inspection": "$ROCKCHIP_ELF_INSPECTION",
       "elf_class_bits": $ROCKCHIP_ELF_CLASS_BITS,
       "elf_machine": "$ROCKCHIP_ELF_MACHINE",
       "elf_float_abi": "$ROCKCHIP_ELF_FLOAT_ABI",
       "needed_count": $ROCKCHIP_ELF_NEEDED_COUNT,
-      "target_abi_compatibility": "$ROCKCHIP_ABI_COMPATIBILITY",
+      "aec_target_abi_compatibility": "$ROCKCHIP_ABI_COMPATIBILITY",
+      "common_elf_inspection": "$ROCKCHIP_COMMON_ELF_INSPECTION",
+      "common_elf_class_bits": $ROCKCHIP_COMMON_ELF_CLASS_BITS,
+      "common_elf_machine": "$ROCKCHIP_COMMON_ELF_MACHINE",
+      "common_elf_float_abi": "$ROCKCHIP_COMMON_ELF_FLOAT_ABI",
+      "common_needed_count": $ROCKCHIP_COMMON_ELF_NEEDED_COUNT,
+      "common_target_abi_compatibility": "$ROCKCHIP_COMMON_ABI_COMPATIBILITY",
       "api_abi_verified": "unknown",
       "realtime_16khz_verified": "unknown"
     },
@@ -623,6 +761,8 @@ cat <<EOF
   },
   "validation": {
     "alsa_devices_opened": false,
+    "vendor_audio_binaries_executed": false,
+    "vqe_initialized": false,
     "wifi_scan_performed": false,
     "functional_hardware_validation_performed": false
   }

@@ -18,7 +18,7 @@ producer/DSP 执行端、ALSA adapter、
 normal-EOS presentation completion、Rockchip 3A/Snowboy adapter、wake/VAD worker、
 AEC reference 消费和打断闭环尚未接入。accepted（包括 EOS accepted）不等于
 presented、played 或 audible。
-Host 测试和交叉编译不能替代真机全双工、Mode1、AEC 或声学验收。
+Host 测试和交叉编译不能替代真机全双工、capture/reference layout、AEC 或声学验收。
 
 ## 帧契约
 
@@ -38,8 +38,8 @@ Host 测试和交叉编译不能替代真机全双工、Mode1、AEC 或声学验
   `reference_right` 的逻辑顺序配置物理 slot 和 `+1/-1` 极性。创建时拒绝越界、
   重复 slot 和非法极性；失败不会覆盖已经生效的 mapper。
 - mapper 只接受完整的 48 kHz、20 ms、四通道 `CaptureFrame`，输出四个独立平面。
-  对 `-32768` 反相时饱和为 `32767` 并计数。实际 Mode1 slot 和麦克风极性仍由
-  板端 HIL 决定，代码不把任何尚未实测的声道顺序写死。
+  对 `-32768` 反相时饱和为 `32767` 并计数。这是已有 host 候选，不证明板端提供四槽；
+  实际 capture slot 和麦克风极性仍由板端 HIL 决定。
 - `FirDecimator48To16` 对四个平面使用相同的 211-tap、Q15、线性相位 Kaiser FIR，
   固定 phase 0 抽取，单帧从 `4 × 960` 产生 `4 × 320` samples，并为每路保存
   210 个跨帧历史样本。群延迟为 105 个 48 kHz 输入样本，即 35 个 16 kHz 输出
@@ -86,7 +86,7 @@ CaptureFrame
 - mapper/FIR 饱和属于可诊断的幅度事件，不中断合法帧；POD 结果分别返回两类计数。
   热路径只使用对象内预分配 scratch 和调用方输出，不分配、不加锁、不保存指针。
 - worker 只把首次锁存 fault 通过有界控制通道报告给 application actor；本对象不
-  直接调用 mutex/deque `EventBus`。真实实时率和 Mode1 行为仍必须 HIL。
+  直接调用 mutex/deque `EventBus`。真实实时率、TRCM 时钟和 loopback mixer 行为仍必须 HIL。
 
 ## DSP 与唤醒后端契约
 
@@ -109,8 +109,9 @@ Snowboy 的 `-2` 只表示 detector 的 silence 分类，不是产品 VAD。
 
 generation/continuity gate、500 ms AEC 后 pre-roll 和产品 VAD 属于尚未实现的单线程
 wake/VAD worker。默认 `UnavailableWakeWordEngine` 永不报告 detection；测试 fake
-也不会进入发布 target。Rockchip 的 `input_size` 单位、packing、返回码、算法组合和
-reset，以及 Snowboy 模型加载与实时率仍未验证，不得从接口名称猜实现。详细边界见
+也不会进入发布 target。直接 3A 的固定 frame/input/output 长度已由匹配 SDK 关闭；
+物理 packing/slot、错误恢复、算法实时率，以及 Snowboy 模型加载与实时率仍未验证，
+不得从接口名称猜实现。详细边界见
 [音频后端契约与依赖闸门](audio-backends.md)。
 
 两个 vendor 开关默认 `OFF`。当前 pins 只允许在核对 Linux/ARM cross target、固定

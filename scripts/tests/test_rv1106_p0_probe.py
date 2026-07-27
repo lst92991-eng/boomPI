@@ -79,12 +79,25 @@ class P0ProbeTest(unittest.TestCase):
             "dev/spidev0.0",
             "dev/watchdog",
             "oem/usr/lib/libaec_bf_process.so",
+            "oem/usr/lib/librockit.so",
+            "oem/usr/lib/librkaudio.so",
+            "oem/usr/lib/librkaudio_common.so",
+            "oem/usr/lib/librkaudio_detect.so",
             "oem/usr/lib/libstdc++.so.6",
             "oem/usr/include/rkaudio_preprocess.h",
+            "oem/usr/share/vqefiles/config_aivqe.json",
+            "oem/usr/share/vqefiles/config_aovqe.json",
             "userdata/boompi/models/snowboy/libsnowboy-detect.a",
             "userdata/boompi/models/snowboy/SECRET_NETWORK.pmdl",
         ):
             write_text(root, relative, "fixture")
+
+        for command in (
+            "rk_mpi_ai_test",
+            "rk_mpi_ao_test",
+            "sample_ai_aenc_adec_ao_stresstest",
+        ):
+            write_command(root / "oem/usr/bin", command, "exit 0\n")
 
         write_command(
             bin_dir,
@@ -144,7 +157,7 @@ class P0ProbeTest(unittest.TestCase):
             root, bin_dir = self.make_rich_fixture(base)
             output, document = self.run_probe(root, bin_dir)
 
-            self.assertEqual(document["schema_version"], 1)
+            self.assertEqual(document["schema_version"], 2)
             self.assertEqual(document["mode"], "read_only")
             self.assertEqual(document["target"]["machine"], "arm32")
             self.assertEqual(document["target"]["word_bits"], 32)
@@ -155,9 +168,36 @@ class P0ProbeTest(unittest.TestCase):
 
             self.assertEqual(document["alsa"]["card_count"], 1)
             self.assertTrue(document["alsa"]["full_duplex_candidate"])
-            self.assertEqual(document["alsa"]["rate_48000_verified"], "unknown")
+            self.assertEqual(
+                document["alsa"]["rate_48000_full_duplex_verified"], "unknown"
+            )
+            mpi_audio = document["vendor"]["rockchip_mpi_audio"]
+            self.assertEqual(mpi_audio["status"], "candidate")
+            self.assertTrue(mpi_audio["rockit_library_present"])
+            self.assertTrue(mpi_audio["ai_test_executable"])
+            self.assertTrue(mpi_audio["ao_test_executable"])
+            self.assertTrue(mpi_audio["encoded_pipeline_stress_sample_executable"])
+            self.assertTrue(mpi_audio["ai_vqe_config_present"])
+            self.assertTrue(mpi_audio["ao_vqe_config_present"])
+            self.assertEqual(
+                mpi_audio["rockit_target_abi_compatibility"], "candidate"
+            )
+            self.assertEqual(mpi_audio["capture_layout_verified"], "unknown")
             self.assertEqual(document["vendor"]["rockchip_3a"]["status"], "candidate")
-            self.assertEqual(document["vendor"]["rockchip_3a"]["target_abi_compatibility"], "candidate")
+            self.assertTrue(
+                document["vendor"]["rockchip_3a"]["aec_library_present"]
+            )
+            self.assertTrue(
+                document["vendor"]["rockchip_3a"]["common_library_present"]
+            )
+            self.assertEqual(
+                document["vendor"]["rockchip_3a"]["aec_target_abi_compatibility"],
+                "candidate",
+            )
+            self.assertEqual(
+                document["vendor"]["rockchip_3a"]["common_target_abi_compatibility"],
+                "candidate",
+            )
             self.assertEqual(document["vendor"]["snowboy"]["status"], "candidate")
             self.assertTrue(document["vendor"]["snowboy"]["model_present"])
             self.assertTrue(document["devices"]["gt911_detected"])
@@ -180,6 +220,61 @@ class P0ProbeTest(unittest.TestCase):
             for secret in forbidden:
                 self.assertNotIn(secret, output)
 
+    def test_rockit_library_abi_is_checked_without_ai_test(self):
+        with tempfile.TemporaryDirectory(prefix="boompi-probe-rockit-only-") as temporary:
+            base = Path(temporary)
+            root, bin_dir = self.make_rich_fixture(base)
+            (root / "oem/usr/bin/rk_mpi_ai_test").unlink()
+
+            _, document = self.run_probe(root, bin_dir)
+            mpi_audio = document["vendor"]["rockchip_mpi_audio"]
+            self.assertFalse(mpi_audio["ai_test_present"])
+            self.assertTrue(mpi_audio["rockit_library_present"])
+            self.assertEqual(
+                mpi_audio["rockit_target_abi_compatibility"], "candidate"
+            )
+
+    def test_ai_test_does_not_mask_rockit_library_abi_mismatch(self):
+        with tempfile.TemporaryDirectory(prefix="boompi-probe-rockit-mismatch-") as temporary:
+            base = Path(temporary)
+            root, bin_dir = self.make_rich_fixture(base)
+            write_command(
+                bin_dir,
+                "readelf",
+                'case "$1" in\n'
+                '  -h) echo "Class: ELF32"; echo "Data: little endian"; '
+                'case "$2" in *librockit.so) echo "Machine: X86-64";; '
+                '*) echo "Machine: ARM";; esac; echo "Flags: hard-float ABI";;\n'
+                '  -A) echo "Tag_ABI_VFP_args: VFP registers";;\n'
+                '  -l) echo "[Requesting program interpreter: /lib/ld-uClibc.so.0]";;\n'
+                '  -d) echo "(NEEDED) Shared library: [libc.so.0]";;\n'
+                '  *) exit 1;;\n'
+                'esac\n',
+            )
+
+            _, document = self.run_probe(root, bin_dir)
+            mpi_audio = document["vendor"]["rockchip_mpi_audio"]
+            self.assertTrue(mpi_audio["ai_test_present"])
+            self.assertEqual(mpi_audio["rockit_elf_machine"], "x86_64")
+            self.assertEqual(
+                mpi_audio["rockit_target_abi_compatibility"], "mismatch"
+            )
+
+    def test_unrelated_rkaudio_player_library_is_not_a_3a_candidate(self):
+        with tempfile.TemporaryDirectory(prefix="boompi-probe-rkaudio-player-") as temporary:
+            base = Path(temporary)
+            root = base / "root"
+            bin_dir = base / "bin"
+            root.mkdir()
+            bin_dir.mkdir()
+            write_text(root, "oem/usr/lib/librkaudio.so", "not the microphone 3A library")
+
+            _, document = self.run_probe(root, bin_dir)
+            rockchip_3a = document["vendor"]["rockchip_3a"]
+            self.assertEqual(rockchip_3a["status"], "missing")
+            self.assertFalse(rockchip_3a["aec_library_present"])
+            self.assertFalse(rockchip_3a["common_library_present"])
+
     def test_empty_root_returns_valid_unknowns(self):
         with tempfile.TemporaryDirectory(prefix="boompi-probe-empty-") as temporary:
             base = Path(temporary)
@@ -191,9 +286,14 @@ class P0ProbeTest(unittest.TestCase):
 
             self.assertTrue(output.startswith("{\n"))
             self.assertEqual(document["alsa"]["status"], "missing")
+            self.assertEqual(
+                document["vendor"]["rockchip_mpi_audio"]["status"], "missing"
+            )
             self.assertEqual(document["vendor"]["rockchip_3a"]["status"], "missing")
             self.assertEqual(document["vendor"]["snowboy"]["status"], "missing")
             self.assertFalse(document["validation"]["alsa_devices_opened"])
+            self.assertFalse(document["validation"]["vendor_audio_binaries_executed"])
+            self.assertFalse(document["validation"]["vqe_initialized"])
             self.assertFalse(document["validation"]["wifi_scan_performed"])
 
     def test_optional_dependencies_can_be_missing(self):
@@ -233,6 +333,18 @@ class P0ProbeTest(unittest.TestCase):
         )
         self.assertIn("read-only", completed.stdout)
         self.assertIn("nor emitted", completed.stdout)
+
+    def test_unrelated_explicit_3a_library_is_rejected_without_path_leak(self):
+        secret_path = "/private/SECRET/librkaudio.so"
+        completed = subprocess.run(
+            ["/bin/sh", str(PROBE), "--rockchip-3a-lib", secret_path],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn(secret_path, completed.stderr)
+        self.assertNotIn("SECRET", completed.stderr)
 
 
 if __name__ == "__main__":

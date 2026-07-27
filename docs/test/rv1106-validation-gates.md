@@ -4,6 +4,8 @@
 日期、命令和输出后才可标为通过；板端/HIL 项还必须明确板卡和镜像，否则均为“未验证”。
 
 当前分项证据和阻断见 [2026-07-25 P0 可行性报告](p0-feasibility-report-20260725.md)；
+2026-07-27 的 Rockit/ALSA/3A/DTB 只读盘点见
+[vendor 音频证据基线](p0-vendor-audio-inventory-20260727.md)；
 P2f-c-a 的 host/null/交叉链接证据见
 [2026-07-27 ALSA playback adapter 验证记录](p2f-c-a-validation-20260727.md)。
 
@@ -15,6 +17,28 @@ P2f-c-a 的 host/null/交叉链接证据见
 - [x] 对 Rockchip/Snowboy 运行库执行 `file`、`readelf` 和依赖/符号检查。功能与性能仍分别保留在下方闸门。
 
 ## 音频
+
+当前执行顺序是 vendor backend 最小闭环优先。以下已完成的 playback host/交叉测试继续
+作为证据保留，但其余 playback worker、control 和 runtime 组合项暂停扩展，直到 rk_mpi/
+ALSA 的真实全双工、capture layout 和 3A 契约关闭。
+
+- [x] 只读核对 rk_mpi AI/AO 头文件、raw frame 生命周期、`librockit.so` 依赖、预构建
+  test、当前 DTB/codec/ALSA 声明和 3A 候选；这些仍不是板端功能验证。
+- [ ] 在当前板/镜像运行 schema v2 只读探针，记录 Rockit/MPI/3A/VQE 资源存在性；不得
+  根据 SDK output 代替目标 rootfs。
+- [ ] 用直接 ALSA 与 raw rk_mpi 分别验证 48 kHz S16_LE 2ch 真全双工、有限 timeout、
+  明确重叠区间、全部 exit code/录音字节数、停止顺序和 dmesg xrun delta；串行运行不能
+  冒充全双工。
+- [ ] 逐个 `amixer cget` 保存所有将改控件，设置后回读，并在正常/异常退出恢复原值。
+  预构建 AI test 会无条件清除 loopback，不能假定原值为 `Disabled`。
+- [ ] 通过能力查询后才尝试 4ch；固定 `TRCM clk-trcm=1`，逐次验证 loopback
+  `Disabled/Mode1/Mode2/Mode2 Swap`，用正交低幅 L/R 序列确认双麦/reference slot、
+  极性、延迟和漂移，再通过幅度/volume/mixer/mute 变化定位 reference tap。
+- [ ] 为直接 Rockchip 3A 增加 tests-off 默认 ALL link-check，实际引用
+  `rkaudio_preprocess_init/short/destory`，防止 `--as-needed` 形成空链接。
+- [ ] 在板端验证 16 kHz/S16、2 mic + 1 ref、256-sample 的物理 slot 到交织逻辑输入映射；核对
+  `input_size=768 shorts`、成功 512 bytes、非法尺寸 0、init null，并记录错误恢复、
+  CPU/RSS、单帧最坏耗时和持续实时率。
 
 - [x] Host fake 已覆盖 playback adapter 的 mono/stereo、partial、typed errno、写前/写后
   status、PREPARED 后正写、malformed-positive 和 `Drop`/`Prepare`；Linux ALSA `null`
@@ -52,8 +76,9 @@ P2f-c-a 的 host/null/交叉链接证据见
   不静默丢弃；critical pending 时 urgent cancel 仍必须能推进 teardown。
 - [ ] 用 ALSA status/delay 与可观测硬件证据定义 normal-EOS presentation completion；
   sink accepted 或预计 presentation timestamp 不能直接报告为 played/audible。
-- [ ] 用可辨识信号确认 Mode1 四通道顺序、双麦极性和数字参考采样位置。
-- [ ] Mode1 不成立时停止，不自动启用未经评审的软件 reference。
+- [ ] 区分并记录 DTB TRCM 时钟模式与 `I2STDM Digital Loopback Mode` mixer 设置；二者
+  都不得当作 capture slot 证据。
+- [ ] 没有可靠硬件 reference 时停止，不自动启用未经评审的软件 reference。
 - [ ] 若评审后启用软件 reference，验证 accepted-prefix ledger 到 AEC 输入的组装、换代、
   partial/cancel 边界、延迟对齐和旧 reference 清除；不得用原始 TTS 或补零前缀代替。
 - [ ] 验证 Rockchip 3A 16 kHz 输入布局、错误码、单帧最坏耗时和持续实时率。

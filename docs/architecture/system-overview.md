@@ -23,6 +23,9 @@ UI/touch <- UI model                              Qwen Singapore
 
 ## 客户端所有权
 
+下表是完整产品的职责/所有权地图，不要求在 vendor 最小闭环前创建七个线程或对应的
+通用层。实际阻塞与实时率测出后，再用最少执行上下文承载这些职责。
+
 | 执行上下文 | 独占资源与职责 |
 | --- | --- |
 | Capture | ALSA capture handle、采集 sequence 和源时间戳 |
@@ -41,16 +44,22 @@ UI/touch <- UI model                              Qwen Singapore
 
 ## 音频边界
 
-目标硬件链路是 Codec/ALSA 48 kHz 全双工，候选四通道采集为双麦加双路数字播放参考。Rockchip 3A 按 16 kHz adapter 接入，处理后的 16 kHz mono 同时供 Snowboy、VAD 和服务端上行使用。Qwen 下行默认按 24 kHz mono 标记，板端转为 48 kHz 后再执行音量、提示音混合和限幅。
+目标硬件链路是 48 kHz 全双工。实际 capture layout 可能是双麦、麦克风加数字播放
+reference，或双麦加一个/多个 reference；必须先由 rk_mpi/ALSA HIL 测得，不能预设四通道。
+Rockchip 3A 按已核对的 16 kHz/16 ms 候选接入，处理后的 16 kHz mono 同时供
+Snowboy、VAD 和服务端上行使用。Qwen 下行默认按 24 kHz mono 标记，板端转为 48 kHz
+后再执行音量、提示音混合和限幅。
 
 下列事项仍是 P0 验证闸门：
 
-- Mode1 四通道是否在当前 DTS、驱动和 ALSA 配置下成立。
-- 实际通道顺序、极性、数字参考采样位置与时钟关系。
+- 48 kHz AI/AO 真全双工、实际通道数、顺序、极性、数字 reference 位置与时钟关系。
+- 固定 `TRCM clk-trcm=1`（TX 时钟源）时，各个 `I2STDM Digital Loopback Mode` mixer
+  枚举的真实 frame 布局；二者是不同控制面。
 - Rockchip 3A ABI、帧布局和算法能力。
 - Snowboy 与目标 libc/libstdc++/ARM ABI 的兼容性。
 
-Mode1 失败时只能进入有记录的软件参考方案评审，不能同时混用硬件和软件 reference。
+没有可靠硬件 reference 时只能进入有记录的软件参考方案评审，不能同时混用硬件和软件
+reference。
 
 P2 当前已实现 48 kHz capture/16 kHz mono 的固定帧契约、预分配 SPSC ownership、
 producer sequence、consumer continuity gate、可配置四通道解交织/极性、四路
@@ -93,13 +102,15 @@ never-armed 与 renderer-only/no-sink 路径只有在严格证明未进入 sink�
 调度、network producer endpoint、DSP endpoint、accepted ledger 到 AEC 的组装/消费、
 normal-EOS presentation completion、wake/VAD worker 和 500 ms pre-roll 均属于后续集成。accepted
 （包括 EOS accepted）只表示 sink 接受的数字 PCM 前缀，不等于 presented、played、
-audible 或“播放完成”。Rockchip 3A、Snowboy、Mode1 slot 顺序、实时率和声学行为仍需
+audible 或“播放完成”。Rockchip 3A、Snowboy、真实 capture/reference slot、实时率和声学行为仍需
 板端 HIL；通过依赖 configure 或 host fake 不代表 adapter、模型或硬件运行成功。
 
-DSP 输入固定为 `MIC-L`、`MIC-R`、`REF-L`、`REF-R` 四个 16 kHz 平面，目标输出是
-16 kHz mono。reference 必须显式选择硬件回采或最终软件播放路径，不能混用。Rockchip
-API 的 `input_size`、packing、返回值和内部算法组合，以及 Snowboy 模型加载、准确率和
-实时率目前都没有板端证据；实现不得通过硬编码或 fake 把这些未决项伪装成已完成。
+现有 host DSP 候选输入固定为 `MIC-L`、`MIC-R`、`REF-L`、`REF-R` 四个 16 kHz 平面，
+但生产链路不再预设板端一定提供四槽。reference 必须显式选择硬件回采或最终软件播放
+路径，不能混用。直接 3A 的固定 16 ms frame、2 mic + 1 ref 时
+`input_size=768` shorts、BF mono 成功返回 512 bytes 已由匹配 SDK 契约关闭；物理
+packing/slot、错误恢复、算法实时率和 Snowboy 板端行为仍未验证，不能通过硬编码或 fake
+伪装成已完成。
 
 ## 状态与取消
 

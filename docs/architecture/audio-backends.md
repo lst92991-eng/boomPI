@@ -2,11 +2,14 @@
 
 ## 本阶段状态
 
-P2e-a 只建立 host 可验证的 `AudioDspEngine`、`WakeWordEngine` 接口、失败关闭实现、
-测试 target 专用的确定性 fake，以及外部依赖的 CMake 配置闸门。仓库中还没有
-Rockchip 3A adapter、Snowboy adapter、wake/VAD worker 或真实模型加载代码，也没有
-调用板端 vendor API。接口、fake 和依赖文件已纳入 host 构建与验证范围，只能证明
-类型、状态和失败路径可测试，不能证明 AEC、波束形成、唤醒或实时率已经可用。
+当前方向是 vendor backend 先接通、最小闭环、再按实测拆分。此前建立的
+`AudioDspEngine`/`WakeWordEngine`、renderer、playback control/committer/worker 和 ALSA
+playback adapter 继续保留，但暂停增加新抽象或 runtime 组成。它们的 host fake、ALSA
+`null` 和交叉链接结果只证明相应软件边界，不能证明板端 AEC、全双工或实时率。
+
+下一项实现直接面向匹配 BSP 的 `rk_mpi_ai`/`rk_mpi_ao`、ALSA PCM、Rockchip
+VQE 和 `libaec_bf_process.so` 探针。详细只读证据见
+[P0 vendor 音频证据基线](../test/p0-vendor-audio-inventory-20260727.md)。
 
 真实状态必须区分为三层：
 
@@ -17,23 +20,22 @@ Rockchip 3A adapter、Snowboy adapter、wake/VAD worker 或真实模型加载代
 ## 数据流与帧布局
 
 ```text
-CaptureFrame: 48 kHz / 20 ms / 4ch interleaved
-  -> CaptureDspFrontend
-  -> DspCaptureFrame16k: 4 x 320 planar
-       [MIC-L, MIC-R, REF-L, REF-R]
-  -> AudioDspEngine
-  -> Mono16kFrame: 16 kHz / 20 ms / mono / 320 samples
-       +-> wake/VAD 专用有界队列
-       `-> uplink 专用有界队列
+rk_mpi or ALSA: 48 kHz / S16_LE / measured channel count
+  -> measured layout: dual-mic | mic+reference | 2mic+reference(s)
+  -> explicit map and 48 -> 16 kHz conversion
+  -> one verified Rockchip 3A path
+  -> 16 kHz mono for VAD / wake / uplink
 ```
 
-该目标数据路径要求输入为四通道；通用 `CaptureFrame` 类型仍允许承载两通道帧。
-
-`DspCaptureFrame16k` 的四个平面只定义逻辑角色，不声明真实 Mode1 slot 顺序。物理
-slot 与极性仍由板端实测后通过 `ChannelMap` 配置。`Mono16kFrame` 是未来真实 3A 的
-目标输出；当前 unavailable engine 不会把某一路麦克风直接伪装成 AEC 后 mono。
+现有 `CaptureDspFrontend`/`DspCaptureFrame16k` 实现了四逻辑平面候选，但不再将其视为
+生产输入前提。当前 DTB 的 `TRCM clk-trcm=1` 只是共享 TX 时钟；vendor AI VQE 样例请求的
+loopback Mode2 是独立 mixer 选择。物理 slot、极性、reference 数量和 packing 必须由
+板端相关性测试确定后再适配，不能把某一路麦克风伪装成 AEC 后 mono。
 
 ## ALSA playback adapter
+
+本节记录已经完成的历史实现和审计边界；vendor 最小闭环完成前不继续为它增加 runner、
+mailbox、control 或 worker 层。
 
 P2f-c-a 增加了两层播放平台边界：跨平台 `PcmPlaybackSink48k` 只负责设备状态校验、
 mono 到显式一/二声道的固定 scratch 映射和 portable result；Linux
@@ -107,21 +109,26 @@ engine 由一个 DSP worker 独占并串行执行：
 从不输出未经处理的麦克风 PCM。`FakeAudioDspEngine` 只编入测试 target；它用于验证
 编排、generation 和错误恢复，不实现 AEC/NS/BF/AGC，也不得进入发布产物。
 
-## Rockchip 3A 未决 API
+## Rockchip 3A 候选与未决契约
 
-P0 仅证明一组头文件/库是目标 ABI 候选。本阶段没有足够证据回答下列问题，因此实现
-不得根据库名、示例板或函数直觉猜测：
+匹配 BSP 已确认 `rkaudio_preprocess_init`、`rkaudio_preprocess_short` 和拼写如此的
+`rkaudio_preprocess_destory` 三个入口，精确实现库为 `libaec_bf_process.so`，目标 ABI 是
+ARMv7 hard-float/uClibc。匹配 header/PDF/wrapper 和 binary 已确定 16 kHz、16-bit、
+256 samples（16 ms）；`src_chan=2, ref_chan=1` 时输入为 768 shorts，默认 ref-last，BF
+mono 成功返回 512 bytes，非法尺寸返回 0，init 失败返回 null。直接 API 由调用方构造
+`RKAUDIOParam`，不读取 VQE JSON；Rockit/RockAA file mode 才解析 JSON。AEC、BF、ANR、
+AGC 等模块可能组合启用，因此外层不得叠加同类处理；`wakeup_status` 也不是产品 VAD。
 
-- `input_size` 的单位是 bytes、单通道 samples、总 samples 还是固定帧数。
-- 输入是 planar 还是 interleaved，麦克风/reference 的 packing 与顺序是什么。
-- mono/stereo reference 如何表达，左右 reference 是否都被真实算法消费。
-- 返回值是成功码、输出长度、检测状态还是负错误码；错误后是否必须重新初始化。
-- 初始化结构、配置文件、模型资源的 ownership、寿命、线程限制和释放顺序。
-- AEC、NS、BF、AGC 是否组合在一个入口、内部顺序、是否允许分别关闭。
-- 16 kHz 帧长、算法延迟、reset 语义、CPU/RSS 和单帧最坏耗时。
+这些仍是 SDK 契约候选而不是板端事实。进入生产 adapter 前必须关闭：
 
-进入真实 adapter 前必须以匹配 BSP 的头文件、可链接 smoke、脱敏输入和板端返回值记录
-逐项关闭这些问题。没有证据时状态只能写“未验证”。
+- direct API 的逻辑输入是 interleaved；板端物理 capture slot 如何映射到
+  `[mic0,mic1,ref]`，以及 reference tap、极性和延迟仍需 HIL。
+- 处理失败和设备 discontinuity 后是否必须 destroy/re-init。
+- `RKAUDIOParam` ownership、线程限制和释放顺序，以及 file mode 资源的目标安装路径。
+- 算法延迟、CPU/RSS、单帧最坏耗时和持续实时率。
+
+必须先做真实符号 link-check，再用脱敏固定输入和板端返回记录逐项关闭。没有证据时状态
+只能写“未验证”。
 
 ## WakeWordEngine 契约
 
@@ -171,9 +178,13 @@ CMake 对每个输入执行存在性、文件类型和固定 SHA-256 检查，�
 停止 configure。固定值来自 [P0 可行性报告](../test/p0-feasibility-report-20260725.md)
 中的审计基线，但它们只是可行性候选，不是发布批准。必须显式设置
 `BOOMPI_ALLOW_FEASIBILITY_AUDIO_VENDOR_INPUTS=ON`，并把生成器限制为 Debug-only，
-才会创建供私有 link probe 使用的 imported targets；Release/RelWithDebInfo/MinSizeRel
+才会创建 imported targets；Release/RelWithDebInfo/MinSizeRel
 和包含其他 configuration 的多配置生成器都会被拒绝。通过该闸门不等于 adapter 已经
 实现、模型可以加载或板端实时率已经通过。
+
+当前 tests-off 默认 ALL 尚无 executable 引用这些 3A 符号，因此 imported target 的存在
+还不是实际链接证据。下一步必须增加显式引用 init/process/destroy 的私有 link-check，
+避免 `--as-needed` 形成空链接。
 
 当前 OpenBLAS archive 含多线程实现，只完成了 ABI/link 候选验证。发布接入前必须按
 单线程配置重建、记录来源与许可、生成新的 SHA-256，并替换本模块 pin；不得用
@@ -191,9 +202,9 @@ Snowboy 候选静态库使用旧 libstdc++ 字符串 ABI。未来只能由一个
 
 ## 后续验证顺序
 
-1. 用匹配 BSP 的 Rockchip 头文件关闭 `input_size`、packing、return 和 reset 等 API
-   问题，再实现独立 adapter 与错误转换。
-2. 在板端验证 16 kHz 双麦/reference 输入、mono 输出、算法延迟、CPU/RSS 和实时率。
+1. 先完成 rk_mpi/ALSA 48 kHz 全双工和通道相关性 HIL，确定真实麦克风/reference 输入。
+2. 增加直接 3A 符号 link-check，再在板端关闭物理 slot 映射、错误恢复、
+   mono 输出、算法延迟、CPU/RSS 和实时率。
 3. 实现私有 Snowboy legacy bridge、启动期模型/格式校验和单线程 wake worker。
 4. 验证目标英文模型的加载、准确率、误唤醒、漏唤醒和最坏帧耗时，再进行至少
    30 分钟稳定性测试。
