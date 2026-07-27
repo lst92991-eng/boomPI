@@ -12,12 +12,12 @@ epoch fence 和有界软件队列清理。本阶段还建立了 DSP/唤醒核心
 partial exactly-once committer 和本地 `Drop -> Prepare` cancel ACK 状态机。P2f-b-b
 进一步实现了 RV1106 ALSA RAII backend、主线 `PcmPlaybackSink` 的 48 kHz mono→2ch
 设备适配器，以及 2/4ch capture reader；短时静音全双工 HIL 已通过。当前还实现了
-allocation-free 的 20↔16 ms DSP 帧桥，以及默认关闭、Debug-only 的 Snowboy
-feasibility adapter/probe。产品级 renderer/committer worker、控制 mailbox、DSP reset
-producer/join、normal-EOS presentation completion、Rockchip 3A platform adapter、可安全
-失败的 Snowboy runtime、真实 VAD detector、wake/VAD worker、AEC reference 消费和打断
-闭环尚未接入。portable `VadUtteranceController` 已实现可注入检测结果的 pre-roll、语句
-分段和打断控制核心，但它不冒充 VAD 算法或已经运行的 worker。
+allocation-free 的 20↔16 ms DSP 帧桥，以及默认关闭、Debug-only 的 Rockchip 3A 与
+Snowboy feasibility adapter/probe。产品级 renderer/committer worker、控制 mailbox、
+DSP reset producer/join、normal-EOS presentation completion、可安全失败的 Snowboy
+runtime、真实 VAD detector、wake/VAD worker、AEC reference 消费和打断闭环尚未接入。
+portable `VadUtteranceController` 已实现可注入检测结果的 pre-roll、语句分段和打断控制
+核心，但它不冒充 VAD 算法或已经运行的 worker。
 accepted 不等于 presented、played 或 audible；短时静音 HIL 也不证明 Mode1、通道
 内容、极性、DAC reference、AEC 或声学效果。
 
@@ -128,8 +128,10 @@ Rockchip 的软件 ABI 已确认固定 16 ms、interleaved S16、
 冻结的 `AudioDspEngine` 契约下完成 20 ms 核心帧与 16 ms backend 块的有界整形：每次
 核心输入同步调用一到两个精确 backend block，完整 20 ms 输出按流序排队，80 ms 周期内
 样本严格守恒；输出 metadata 归属最早尚未消费的输入。bridge 的 `kUnset` 零值失败关闭，
-backend fault/discontinuity 会清空所有缓存并要求新 generation。它尚未绑定 Rockchip
-packing 或接入产品 DSP worker，真实声学、实时率和完整错误域仍未验证。
+backend fault/discontinuity 会清空所有缓存并要求新 generation。
+`Rockchip3aAudioDspAdapter` 已绑定固定逻辑 packing、精确 byte-count 错误映射和
+destroy/init reset；Host 长序列和板端两代零输入探针通过。它尚未接入产品 DSP worker，
+真实物理 packing、声学、实时率和完整错误域仍未验证。
 
 Snowboy feasibility adapter 已通过 fake bridge 的 Host 错误映射测试，并在板端加载
 固定默认模型：47 个 20 ms 上游 fixture 帧产生一次 keyword 1，观测最大处理耗时

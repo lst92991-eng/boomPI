@@ -4,10 +4,10 @@
 
 P2e-a 建立了 host 可验证的 `AudioDspEngine`、`WakeWordEngine` 接口、失败关闭实现、
 测试 target 专用的确定性 fake，以及外部依赖的 CMake 配置闸门。后续已增加
-allocation-free 的 `AudioDspFrameBridge16k`、portable `VadUtteranceController` 和
-Debug-only Snowboy feasibility adapter/probe。仓库中仍没有 Rockchip 3A platform
-adapter、真实 VAD detector、wake/VAD worker 或可用于发布的 Snowboy runtime；产品
-runtime 也没有调用这些 vendor API。当前代码与证据只能
+allocation-free 的 `AudioDspFrameBridge16k`、portable `VadUtteranceController`，以及
+Debug-only Rockchip 3A 和 Snowboy feasibility adapter/probe。仓库中仍没有真实 VAD
+detector、wake/VAD worker 或可用于发布的 Snowboy runtime；产品 runtime 也没有调用
+这些 vendor API。当前代码与证据只能
 证明帧整形、适配器结果映射和受控板端正向探针，不能证明 AEC、波束形成、产品唤醒
 或持续实时率已经可用。
 
@@ -15,8 +15,9 @@ runtime 也没有调用这些 vendor API。当前代码与证据只能
 
 1. **核心契约已实现**：固定帧、generation、错误分类和 fail-closed 行为。
 2. **依赖候选可配置**：只有显式启用并通过路径与 SHA-256 检查时才创建 imported target。
-3. **feasibility adapter 已隔离**：Snowboy 正向离线探针已执行，但异常安全不满足产品
-   要求；Rockchip adapter、产品 worker 与完整 HIL 仍未完成。
+3. **feasibility adapter 已隔离**：Rockchip adapter 的零输入 ABI/换代探针已执行；
+   Snowboy 正向离线探针已执行，但异常安全不满足产品要求。两者均未接产品 worker，
+   完整 HIL 尚未完成。
 
 ## 数据流与帧布局
 
@@ -105,10 +106,13 @@ engine 由一个 DSP worker 独占并串行执行：
 vendor 16 ms 与核心 20 ms 不能一对一映射：80 ms 内分别是 5 个 vendor 块与 4 个
 核心帧。`AudioDspFrameBridge16k` 已把该比率作为独立、有界状态机实现，明确表达
 `kNeedMoreInput`/`kOutputAvailable`、最早缓存输入的 metadata 归属以及
-generation/fault 清理；Host 测试覆盖 1/1/1/2 backend block 调用节奏、0/1/1/2 输出
-节奏、1,000 帧逐样本守恒和错误清空。它不改变 `AudioDspEngine`，也不声明 Rockchip
-packing、reset 或错误码已经适配；platform adapter 与板端连续输入 HIL 完成前 Release
-仍保持 fail-closed。
+generation/fault 清理。`Rockchip3aAudioDspAdapter` 在其上实现固定
+`MIC-L/MIC-R/REF-L/REF-R` 交织、精确 1024-sample 输入、512-byte 输出检查和
+destroy/init reset；Host fake 覆盖 1/1/1/2 backend block 调用节奏、0/1/1/2 输出节奏、
+1,000 帧逐样本守恒、错误清空和换代。板端全零输入也完成两代各 4 输入/5 vendor 调用/
+4 输出。它不改变 `AudioDspEngine`，也不声明物理 packing、完整错误域或声学效果已验证；
+连续非零输入 HIL 完成前 Release 仍保持 fail-closed。详细证据见
+[Rockchip 3A 可行性平台适配器离线探针记录](../test/rockchip-3a-adapter-probe-20260727.md)。
 
 仍未验证真实双麦/reference packing、声学参数、返回值的完整错误域、算法延迟、
 CPU/RSS、单帧最坏耗时、持续实时率、故障恢复和声学效果。vendor 指南虽列出多个
@@ -168,7 +172,8 @@ CMake 对每个输入执行存在性、文件类型和固定 SHA-256 检查，�
 中的审计基线，但它们只是可行性候选，不是发布批准。必须显式设置
 `BOOMPI_ALLOW_FEASIBILITY_AUDIO_VENDOR_INPUTS=ON`，并把生成器限制为 Debug-only，
 才会创建 imported targets。启用 Rockchip 时还会定义显式构建、`EXCLUDE_FROM_ALL`
-且不安装的 `boompi_rockchip_3a_probe`；启用 Snowboy 时只在相同 Debug feasibility
+且不安装的 `boompi_rockchip_3a_probe` 和 `boompi_rockchip_3a_adapter_probe`；启用
+Snowboy 时只在相同 Debug feasibility
 闸门内创建私有 legacy bridge、platform adapter 和显式构建、`EXCLUDE_FROM_ALL`、
 不安装的 `boompi_snowboy_offline_probe`。Release/RelWithDebInfo/MinSizeRel 和包含其他
 configuration 的多配置生成器都会被拒绝。通过该闸门或 probe 不等于产品 adapter
@@ -192,7 +197,7 @@ archive 不能作为安全的同进程边界。v1 不使用动态插件，也不
 
 ## 后续验证顺序
 
-1. 在已实现的 16↔20 ms bridge 之外补齐 Rockchip platform adapter 与精确错误转换。
+1. 把已通过零输入探针的 Rockchip platform adapter 接入单线程 DSP worker 与 reset ACK。
 2. 在板端验证真实 16 kHz 双麦/reference packing、mono 输出、算法延迟、CPU/RSS 和
    实时率。
 3. 获取或重建错误可返回且使用单线程 OpenBLAS 的 Snowboy runtime，再把已实现的

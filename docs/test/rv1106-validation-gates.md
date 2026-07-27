@@ -4,6 +4,7 @@
 
 当前分项证据和阻断见 [2026-07-25 P0 可行性报告](p0-feasibility-report-20260725.md)
 、[2026-07-27 Rockchip 3A 离线 ABI 探针报告](rockchip-3a-offline-probe-20260727.md)
+、[2026-07-27 Rockchip 3A 可行性平台适配器离线探针报告](rockchip-3a-adapter-probe-20260727.md)
 、[2026-07-27 RV1106 ALSA 全双工 smoke 记录](rv1106-alsa-smoke-20260727.md)
 及 [2026-07-27 Snowboy P0 板端探针记录](snowboy-p0-probe-20260727.md)。
 
@@ -34,7 +35,7 @@
 - [ ] 若评审后启用软件 reference，验证 accepted-prefix ledger 到 AEC 输入的组装、换代、
   partial/cancel 边界、延迟对齐和旧 reference 清除；不得用原始 TTS 或补零前缀代替。
 - [ ] 验证 Rockchip 3A 16 kHz 输入布局、错误码、单帧最坏耗时和持续实时率。离线 ABI 已确认固定 16 ms、2 mic + 2 ref 时 `input_size=1024` 个样本、成功返回 512 字节单声道输出、长度不匹配返回 0；实际通道排列、声学效果和实时率仍未验证。
-- [x] 评审 16 ms 厂商块与 20 ms 核心帧之间的缓冲、输出可用状态和元数据归属。独立 `AudioDspFrameBridge16k` 已实现 `kNeedMoreInput`/`kOutputAvailable`、最早输入 metadata 归属、换代清空和逐样本守恒；它不修改冻结的 `AudioDspEngine`，Rockchip platform adapter 与板端连续输入仍待补。
+- [x] 评审并实现 16 ms 厂商块与 20 ms 核心帧之间的缓冲、输出可用状态和元数据归属。`AudioDspFrameBridge16k` 与 `Rockchip3aAudioDspAdapter` 已实现 `kNeedMoreInput`/`kOutputAvailable`、最早输入 metadata 归属、固定逻辑 packing、精确返回长度检查、换代清空和逐样本守恒；不修改冻结的 `AudioDspEngine`。板端两代全零输入通过，真实连续双麦/reference 输入仍待补。
 - [ ] 最终壳体中记录距离、角度、音量、背景噪声、ERLE、残余回声和 double-talk 结果。
 
 ## Snowboy

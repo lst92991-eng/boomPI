@@ -79,7 +79,8 @@ boompi_add_library(boompi_platform_posix
 
 boompi_add_library(boompi_platform_rv1106
   src/platform/rv1106/audio_pcm_transfer.cpp
-  src/platform/rv1106/build_environment.cpp)
+  src/platform/rv1106/build_environment.cpp
+  src/platform/rv1106/rockchip_3a_audio_dsp_adapter.cpp)
 target_link_libraries(boompi_platform_rv1106
   PUBLIC
     boompi_audio_core
@@ -153,6 +154,13 @@ target_link_libraries(boompi_supervisor PRIVATE boompi_update)
 set_target_properties(boompi_supervisor PROPERTIES OUTPUT_NAME "boompi-supervisor")
 
 if(BOOMPI_ENABLE_ROCKCHIP_3A)
+  target_sources(boompi_platform_rv1106 PRIVATE
+    src/platform/rv1106/rockchip_3a_preprocess_session.cpp)
+  target_include_directories(boompi_platform_rv1106
+    PRIVATE "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}")
+  target_link_libraries(boompi_platform_rv1106
+    PRIVATE boompi_vendor::rockchip_3a_aec)
+
   add_executable(boompi_rockchip_3a_probe EXCLUDE_FROM_ALL
     apps/rockchip_3a_probe/main.cpp)
   boompi_configure_target(boompi_rockchip_3a_probe)
@@ -162,6 +170,17 @@ if(BOOMPI_ENABLE_ROCKCHIP_3A)
     PRIVATE boompi_vendor::rockchip_3a_aec)
   set_target_properties(boompi_rockchip_3a_probe PROPERTIES
     OUTPUT_NAME "boompi-rockchip-3a-probe"
+    SKIP_BUILD_RPATH TRUE)
+
+  add_executable(boompi_rockchip_3a_adapter_probe EXCLUDE_FROM_ALL
+    apps/rockchip_3a_adapter_probe/main.cpp)
+  boompi_configure_target(boompi_rockchip_3a_adapter_probe)
+  target_link_libraries(boompi_rockchip_3a_adapter_probe
+    PRIVATE
+      boompi_audio_core
+      boompi_platform_rv1106)
+  set_target_properties(boompi_rockchip_3a_adapter_probe PROPERTIES
+    OUTPUT_NAME "boompi-rockchip-3a-adapter-probe"
     SKIP_BUILD_RPATH TRUE)
 endif()
 
@@ -353,6 +372,17 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_audio_vad_utterance_controller_tests
     COMMAND boompi_audio_vad_utterance_controller_tests)
 
+  add_executable(boompi_rockchip_3a_audio_dsp_adapter_tests
+    tests/unit/rockchip_3a_audio_dsp_adapter_tests.cpp)
+  boompi_configure_target(boompi_rockchip_3a_audio_dsp_adapter_tests)
+  target_link_libraries(boompi_rockchip_3a_audio_dsp_adapter_tests
+    PRIVATE
+      boompi_platform_rv1106
+      boompi_test_support)
+  add_test(
+    NAME boompi_rockchip_3a_audio_dsp_adapter_tests
+    COMMAND boompi_rockchip_3a_audio_dsp_adapter_tests)
+
   add_executable(boompi_snowboy_wake_word_engine_tests
     src/platform/rv1106/snowboy_wake_word_engine.cpp
     tests/fixtures/snowboy_legacy_bridge_fake.cpp
@@ -397,6 +427,7 @@ if(BOOMPI_BUILD_TESTS)
     boompi_audio_backend_contract_tests
     boompi_audio_dsp_frame_bridge_tests
     boompi_audio_vad_utterance_controller_tests
+    boompi_rockchip_3a_audio_dsp_adapter_tests
     boompi_audio_pcm_transfer_tests
     boompi_snowboy_wake_word_engine_tests
     PROPERTIES TIMEOUT 20)

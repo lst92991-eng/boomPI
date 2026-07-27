@@ -4,9 +4,10 @@
 
 P0 当前为“部分通过”，不能标记完成。匹配 BSP 的 C++ 交叉构建、Rockchip 3A
 二进制 ABI 与离线零输入板端调用、Snowboy 加 OpenBLAS 的干净链接和 TLS 链接已经
-验证；当前镜像的 48 kHz 短时静音全双工也已通过。生产客户端板端执行、可辨识
-播放/采集内容、Mode1 四通道、3A 实时处理、可安全失败的 Snowboy 产品 runtime、
-Wi-Fi AP/STA 能力和 UI 刷新路径仍需真机补证。
+验证；当前镜像的 48 kHz 短时静音全双工也已通过，Rockchip 3A 平台适配器的
+跨帧节拍、故障清空、重新初始化和板端零输入路径也已通过。生产客户端 DSP worker
+接线、可辨识播放/采集内容、Mode1 四通道、3A 声学效果与实时处理、可安全失败的
+Snowboy 产品 runtime、Wi-Fi AP/STA 能力和 UI 刷新路径仍需真机补证。
 
 2026-07-25 的初始检查只读取 SDK、sysroot、既有第三方依赖和主机网络状态，没有
 打开 PCM。2026-07-27 的补充验证打开了 PCM，但只播放静音并丢弃采集样本；没有保存
@@ -14,7 +15,9 @@ Wi-Fi AP/STA 能力和 UI 刷新路径仍需真机补证。
 
 2026-07-27 补充验证在同一 BSP 基线的 RV1106 板卡上执行了 Debug-only 离线 3A
 探针，只向 `/tmp` 复制程序并以全零内存缓冲区调用库，没有打开 PCM 或修改板卡配置。
-完整记录见 [Rockchip 3A 离线 ABI 探针报告](rockchip-3a-offline-probe-20260727.md)。
+ABI 可行性记录见
+[Rockchip 3A 离线 ABI 探针报告](rockchip-3a-offline-probe-20260727.md)，平台适配器
+记录见 [Rockchip 3A 平台适配器板端探针报告](rockchip-3a-adapter-probe-20260727.md)。
 同日的 ALSA 补充验证见
 [RV1106 ALSA 全双工 smoke 记录](rv1106-alsa-smoke-20260727.md)。
 Snowboy 默认模型的正向离线检测与致命错误路径见
@@ -27,7 +30,7 @@ Snowboy 默认模型的正向离线检测与致命错误路径见
 | C++ 工具链与 sysroot | 通过 | GCC 8.3.0 Buildroot wrapper 成功构建两个 RV1106 ELF |
 | 目标 ELF ABI | 通过 | ELF32 ARM EABI5、hard-float、uClibc loader、无 RPATH/RUNPATH |
 | 最小程序真机执行 | 部分通过 | 2026-07-27 离线 3A 探针和 ALSA 平台 smoke 执行成功；生产客户端 smoke 尚未执行 |
-| Rockchip 3A ABI | 通过（离线） | 固定头文件/库哈希、符号、交叉链接、ELF 和板端零输入调用均通过 |
+| Rockchip 3A ABI/平台适配器 | 通过（离线） | 固定头文件/库哈希、跨帧节拍单测、严格错误映射、交叉链接、ELF 和板端两代零输入调用均通过；尚未接入 DSP worker |
 | Rockchip 3A 功能/实时率 | 未验证 | 需要真实双麦、参考通道、通道顺序和 16 kHz 连续输入 |
 | Snowboy ABI/链接 | 候选通过 | 私有旧 ABI bridge、固定静态库与 OpenBLAS 可生成干净 RV1106 ELF，旧 ABI 未扩散 |
 | Snowboy 模型/产品安全 | 阻塞 | 默认模型板端加载成功，47 帧 fixture 检测 1 次、最大 7.197 ms；缺失模型会直接 `terminate`/`Aborted`，不能接产品 runtime |
@@ -97,11 +100,13 @@ void rkaudio_preprocess_destory(void *handle);
 仍能以零输入完成 init/process/destroy/reinit；这不证明文件配置模式、实际通道排列、
 AEC/BF 效果或实时性。
 
-Rockchip 库固定 16 ms，而当前 `AudioDspEngine` 公共契约固定 20 ms，并要求每次
-`Process` 同步产出携带当前元数据的一帧。80 ms 内是 5 个厂商块与 4 个公共帧，若不
-引入“需要更多输入/输出可用”状态、按最早缓冲输入保存元数据并在 Arm/Disarm/故障时
-清空缓冲，就只能填充、丢弃、重复或错配元数据。因此当前保持 fail-closed，没有实现
-生产适配器；必须先完成公共契约评审。
+Rockchip 库固定 16 ms，而 `AudioDspEngine` 公共契约固定 20 ms。平台适配器通过
+既有 `AudioDspFrameBridge16k` 将 80 ms 内的 4 个公共输入帧转换为 5 个厂商块，再还原
+为 4 个公共输出帧；元数据绑定到最早缓冲输入，并在 Arm/Disarm/不连续/后端故障时
+清空。适配器不修改冻结的 `AudioDspEngine`，厂商库只在显式 opt-in 的构建闸门内接入，
+默认 Host/Release 构建不会加载它。主机单测与板端两代零输入探针已经验证节拍、样本守恒、
+错误映射和重新初始化；生产 DSP worker 接线、物理通道顺序、AEC/BF 声学效果与实时率
+仍未验证。
 
 固定 SHA-256：
 
