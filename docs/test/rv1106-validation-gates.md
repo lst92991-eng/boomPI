@@ -39,10 +39,17 @@
 
 ## Snowboy
 
-- [x] 确认当前 feasibility runtime/default model 的来源、SHA-256 和许可；其他模型与未来发布 runtime 必须重新核对，不能外推。
-- [ ] 验证模型初始化、16 kHz mono 连续输入、目标英文唤醒和安全错误路径。默认模型正向离线探针已检测 keyword 1，但缺失模型会直接 `terminate`/`Aborted`，因此该闸门保持失败。
-- [ ] 记录 CPU、RSS、最坏帧耗时、漏唤醒和误唤醒；当前短测已记录最大 7.197 ms 与 3,180 KiB，真实麦克风统计及至少 30 分钟稳定性仍未执行。
-- [ ] 不兼容时保存证据并请求架构决策，禁止静默换引擎或自行改为多进程。致命错误证据已保存，当前代码保持 Debug-only feasibility 且未接产品 runtime。
+- [x] 确认锁定 feasibility runtime、资源和默认 `snowboy.umdl` 的来源、SHA-256 与
+  Apache-2.0 范围；其他模型与未来发布 runtime 仍需逐个核对并完成 packaging review，
+  不能从当前候选外推。
+- [ ] 验证模型初始化、16 kHz mono 连续输入、目标英文唤醒和安全错误路径。默认模型
+  正向离线探针已检测 keyword 1，但缺失模型会直接 `terminate`/`Aborted`，因此该闸门
+  保持失败。
+- [ ] 记录 CPU、RSS、最坏帧耗时、漏唤醒和误唤醒；当前短测已记录最大 7.197 ms 与
+  3,180 KiB，真实麦克风统计及至少 30 分钟稳定性仍未执行。
+- [ ] fatal destructor/缺模型 `terminate` 证据已保存，架构选择和独立 helper 候选仍
+  待用户批准；尚未静默换引擎或自行改为多进程，当前代码保持 Debug-only feasibility
+  且未接产品 runtime。
 
 ## 网络、UI 与系统
 
