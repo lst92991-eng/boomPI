@@ -15,13 +15,18 @@ Rockchip MPI raw AI/AO 的 2026-07-27 tests-off 交叉链接、当时 21 个符�
 当前镜像的 MPI owner、init/stop 风险与只读执行阻断见
 [2026-07-28 MPI HIL 只读前置验证记录](p0-rockchip-mpi-audio-preflight-20260728.md)；
 P2f-c-a 的 host/null/交叉链接证据见
-[2026-07-27 ALSA playback adapter 验证记录](p2f-c-a-validation-20260727.md)。
+[2026-07-27 ALSA playback adapter 验证记录](p2f-c-a-validation-20260727.md)；
+三秒单麦手动单轮的真实 ALSA/TLS/WSS 闭环见
+[2026-07-28 RV1106 手动单轮 HIL 记录](p1-rv1106-manual-single-turn-hil-validation-20260728.md)。
 
 ## P0 环境与 ABI
 
-- [ ] 记录 CPU ISA、float ABI、动态加载器、libc、libstdc++ 和内核版本。
-- [ ] 确认交叉编译器与目标 sysroot 匹配，并运行最小 C++ smoke executable。交叉构建与 ELF 检查已通过，真机执行待补。
-- [ ] 确认 ALSA、TLS、pthread 和所需系统调用在目标镜像可用。sysroot 链接已通过，当前板端运行待补。
+- [x] 已记录 ARMv7-A/NEON/VFPv4、hard-float、`/lib/ld-uClibc.so.0`、uClibc、
+  libstdc++/GLIBCXX 边界和 Linux 5.10.160；见上述手动单轮 HIL 记录及 P0 可行性报告。
+- [x] 匹配 GCC 8.3/uClibc sysroot 的交叉构建、ELF 检查和真板最小 C++ client 均已通过；
+  2026-07-28 手动单轮产物按 SHA-256 部署到 `/tmp` 并返回 0，未覆盖持久程序。
+- [x] 当前手动单轮实际使用 ALSA、TLS、pthread、poll/clock/socket 等路径并在目标镜像返回
+  成功；该项只关闭当前最小 client 的运行时闭包，不代表 rk_mpi/3A/Snowboy 运行库已验证。
 - [x] 对 Rockchip/Snowboy 运行库执行 `file`、`readelf` 和依赖/符号检查。功能与性能仍分别保留在下方闸门。
 
 ## 音频
@@ -58,8 +63,8 @@ ALSA 的真实全双工、capture layout 和 3A 契约关闭。
   冒充全双工。
 - [x] 已实现默认 dry-run、三重显式 opt-in 的 direct ALSA 有界 HIL 工具和离线 fake 回归；
   它请求 480-frame period/4 periods，保存实际 ALSA verbose 输出，以单调时钟验证重叠，
-  并在可达退出路径尝试恢复、回读单个 DAC enum，恢复失败独立报错。当前链路断开，尚未在板端
-  执行，不能勾选上一项。
+  并在可达退出路径尝试恢复、回读单个 DAC enum，恢复失败独立报错。该全双工工具尚未在板端
+  执行，不能勾选上一项；手动串行单轮的成功不能替代它。
   操作契约见 [直接 ALSA 全双工 HIL 指南](p0-alsa-full-duplex-hil-guide.md)。
 - [ ] 逐个 `amixer cget` 保存所有将改控件，设置后回读，并在正常/异常退出恢复原值。
   预构建 AI test 会无条件清除 loopback，不能假定原值为 `Disabled`。
@@ -79,8 +84,16 @@ ALSA 的真实全双工、capture layout 和 3A 契约关闭。
 - [x] 匹配 BSP 的 GCC 8.3/uClibc sysroot 已用 ALSA 1.2.8 头/库构建真实 playback
   device adapter，并链接默认 ALL 的 adapter/ALSA/clock 符号检查 executable；该结果不代表
   `boompi-client` composition root 已实例化它，也不代表 executable 已在板端运行。
-- [ ] 记录真实 ALSA card/device、支持格式、period/buffer 和 mixer 控件。
+- [x] 已记录实际使用的 `hw:0,0` capture/playback，以及程序精确设置并显式回读的
+  48 kHz、2ch、960-frame period、3840-frame buffer；S16_LE/RW_INTERLEAVED 已精确设置。
+- [ ] 枚举硬件支持格式全集、解析后的底层硬件路径和全部相关 mixer 控件。
 - [ ] 验证 48 kHz capture/playback 全双工，不用串行播放与录音冒充。
+- [x] 2026-07-28 已在 `hw:0,0` 以精确 48 kHz/S16_LE/2ch、960-frame period、
+  3840-frame buffer 完成三秒单麦手动单轮：150 个 16 kHz 上行帧、96,000 字节、一次
+  commit，随后接收 25 个 24 kHz 下行帧并完成 26 个 renderer chunk 的 ALSA playback
+  写入与 drain；最后一帧后先用 `snd_pcm_drop()` 停止 capture，再 commit 和 playback。
+  客户端和 fake 服务端均通过，测试后 PCM closed。该串行单轮不勾选上一项全双工，也不证明
+  slot 0 非静音/信号质量、双麦或 AEC。
 - [ ] 用真实 ALSA adapter 验证 partial write、would-block/interrupted、xrun/suspend、
   device loss、`drop`/`prepare` 和重新建链；不得重复写出已经 accepted 的 prefix。
 - [ ] 对真实设备和解析后的直接硬件路径回读 exact 48 kHz/S16_LE/RW_INTERLEAVED、playback channels、period、

@@ -14,7 +14,7 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
               |
       RV1106 boompi-client
               |
-      局域网 WSS（板端离线单轮已通，产品状态机待接入）
+      目标：局域网 WSS（当前 reverse-tunnel 离线单轮已通）
               |
        boompi-server（Go）
               |
@@ -69,10 +69,13 @@ MPI 音频的八个头文件 pin、当时 21 个 `UND`、MPP/RGA SONAME 与未�
 最小闭环，再按真实阻塞、通道和时序需求复用或简化现有代码。默认自动测试不会访问真实
 Qwen，也不会消耗付费额度。
 
-2026-07-28 已完成固定 OpenSSL 3.5.7 的 C++ WSS 单轮闭环：Ubuntu 跨语言离线测试和
-RV1106 真机 smoke 都通过，错误 pin 会在 provider 打开前失败。该结果仍是独立测试入口，
-尚未接入产品状态机或真实音频；证据与边界见
-[P1 C++ WSS 单轮闭环验证记录](docs/test/p1-cpp-wss-client-validation-20260728.md)。
+2026-07-28 已完成固定 OpenSSL 3.5.7 的 C++ WSS 单轮闭环和真实板端手动单轮：RV1106
+从 `hw:0,0` 以 48 kHz/2ch 采集 slot 0，流式降采样到 16 kHz 后发送给离线 Go fake，
+再将 24 kHz 提示音转换为 48 kHz 并完成 ALSA playback 写入与 drain。客户端和服务端
+计数均通过，错误 pin 会在 provider 打开前失败；测试没有访问 Qwen。该入口尚未接入产品
+状态机，也不证明 slot 0 信号质量、声学可听、真全双工、双麦或 AEC。证据与边界见
+[P1 C++ WSS 单轮闭环验证记录](docs/test/p1-cpp-wss-client-validation-20260728.md)和
+[RV1106 手动单轮 HIL 验证记录](docs/test/p1-rv1106-manual-single-turn-hil-validation-20260728.md)。
 
 ## 仓库结构
 
@@ -174,7 +177,7 @@ Linux/macOS：
 ./boompi-server --config configs/config.yaml
 ```
 
-当前实现提供单设备 `wss://<host>:17806/ws`、稳定本地 TLS 身份、16 kHz PCM 上行、Qwen Realtime 流式转发、24 kHz PCM/文本下行与响应取消。开发阶段要求客户端在 `hello.payload.device_token` 中提交一个环境变量注入的共享令牌；服务端会在打开付费 provider 会话之前验证它。UDP 发现、六位码配对、每设备独立 Token、自动重连以及产品状态机和真实音频联调仍是后续工作，因此当前 WSS 仅用于受控局域网开发，不是完整的生产信任链。
+当前实现提供单设备 `wss://<host>:17806/ws`、稳定本地 TLS 身份、16 kHz PCM 上行、Qwen Realtime 流式转发、24 kHz PCM/文本下行与响应取消。开发阶段要求客户端在 `hello.payload.device_token` 中提交一个环境变量注入的共享令牌；服务端会在打开付费 provider 会话之前验证它。受控 reverse-tunnel 下的手动串行真实 ALSA 单轮已通过；UDP 发现、六位码配对、每设备独立 Token、自动重连、产品状态机、真全双工和双麦/AEC 联调仍是后续工作，因此当前 WSS 不是完整的生产信任链。
 
 Qwen 凭据只能通过当前进程环境提供：
 

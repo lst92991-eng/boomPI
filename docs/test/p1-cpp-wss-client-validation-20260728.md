@@ -1,9 +1,13 @@
 # P1 C++ WSS 单轮闭环验证记录（2026-07-28）
 
+> 后续更新：真实 `boompi-client` 已在 RV1106 上完成三秒单麦手动单轮采集、流式上行、
+> fake 24 kHz 下行和 48 kHz ALSA playback 写入与 drain。见
+> [RV1106 手动单轮音频闭环 HIL 验证记录](p1-rv1106-manual-single-turn-hil-validation-20260728.md)。
+
 - 时间：2026-07-28（Asia/Shanghai，UTC+08:00）
 - 范围：最小 C++ WSS 传输、单麦单轮协议闭环、固定 OpenSSL 3.5.7、
   RV1106 交叉链接与真机离线 fake HIL。
-- 证据边界：真机仅执行独立 WSS smoke，并通过临时 SSH reverse tunnel 连接 VM 内的
+- 初次验证的证据边界：真机仅执行独立 WSS smoke，并通过临时 SSH reverse tunnel 连接 VM 内的
   deterministic fake；没有访问 Qwen，也没有接入产品状态机、真实音频、正常局域网
   路由、发现/配对、重连或长期稳定性测试。
 
@@ -82,7 +86,8 @@ RV1106 OpenSSL 3.5.7 静态 package。Release/tests-off 全量默认构建在严
 通过，其中 `boompi-wss-client-smoke` 进入默认 `ALL`，因此真正解析了完整 TLS/WSS
 静态链接闭包。
 
-对 `--strip-unneeded` 部署副本运行 `verify_rv1106_elf.py` 与额外动态段检查：
+对初次独立 WSS smoke 的 `--strip-unneeded` 部署副本运行 `verify_rv1106_elf.py` 与额外
+动态段检查；这是历史 smoke 产物，不是后续手动音频 client：
 
 ```text
 ELF:             ELF32 little-endian ARM EABI5 hard-float
@@ -103,10 +108,11 @@ ABI 校验，但当前 WSS 单轮入口仍由独立 smoke 组成；把它接入�
 
 ## RV1106 真机离线 HIL
 
-板卡通过 `rv1106-board` SSH 恢复连接，环境为 Linux 5.10.160、ARMv7。板端时间为
-`2026-07-28T10:20:48+00:00`，已不再停在历史的 2021 年。剥离后的目标以 SHA-256
-`b8e5d9b52af7826e8c5c16c60c9f055cdb471fc71c089b2580893b69f92277db`
-复制到 `/tmp`，主机与板端哈希一致。
+板卡通过 `rv1106-board` SSH 恢复连接，环境为 Linux 5.10.160、ARMv7。当次短 smoke
+读到板端时间 `2026-07-28T10:20:48+00:00`；后续掉电后的手动音频 HIL 又观察到墙钟
+回到 2021 年，因此时间同步仍未关闭。该历史 smoke 的剥离目标以 SHA-256
+`b8e5d9b52af7826e8c5c16c60c9f055cdb471fc71c089b2580893b69f92277db` 复制到 `/tmp`，
+主机与板端哈希一致；它不是后续手动音频 client 产物。
 
 板卡只有 link-local Ethernet，VM 位于 NAT 网段，因此本次用一次性 SSH reverse
 tunnel 把板端 loopback 动态端口转到 VM 的动态测试端口。VM 运行同一个 Go app、
@@ -136,5 +142,6 @@ identity 时因 pin 不匹配在握手阶段失败；改用动态端口后才成
    reverse tunnel 不能替代这些网络证据。
 3. WSS 接入产品 runtime 后重新记录 connect 前、握手后、单轮结束后的
    `VmRSS`/`VmHWM`，再形成整机内存基线。
-4. 在已验证的 vendor/ALSA 48 kHz 链路上接入单麦采集与扬声器输出，先完成手动
-   单轮闭环，再进入 VAD、打断、Snowboy 和双麦/AEC。
+4. 手动单麦单轮已关闭，证据见
+   [RV1106 手动单轮音频闭环 HIL 验证记录](p1-rv1106-manual-single-turn-hil-validation-20260728.md)；
+   后续仍需关闭真全双工、VAD、打断、Snowboy 和双麦/AEC。
