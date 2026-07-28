@@ -106,6 +106,9 @@ BOOMPI_LIVE_QWEN=1 BOOMPI_LIVE_PCM=/absolute/path/to/16k-mono-s16le.pcm \
   go test -count=1 -run '^TestLiveRealtime$' -v ./internal/backend/qwen
 ```
 
+如需人工回放验证，可额外设置 `BOOMPI_LIVE_OUTPUT_PCM=/absolute/path/to/output.pcm`
+保存 24 kHz、单声道、S16_LE 返回音频；写入只在显式配置时启用，并限制在 60 秒以内。
+
 ## P1 最低检查项
 
 - CMake configure/build/CTest 在 Windows、Linux 和 macOS 上通过。

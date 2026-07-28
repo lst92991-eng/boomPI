@@ -185,6 +185,8 @@ BOOMPI_LIVE_QWEN=1 BOOMPI_LIVE_PCM=/absolute/path/to/16k-mono-s16le.pcm \
 ```
 
 该测试会上传音频并请求生成回答，可能产生费用；默认 `go test ./...` 仍保持离线。
+如需保存返回的 24 kHz、单声道、S16_LE PCM，可额外设置
+`BOOMPI_LIVE_OUTPUT_PCM=/absolute/path/to/output.pcm`；测试将输出限制在 60 秒以内。
 
 ## RV1106 交叉编译
 

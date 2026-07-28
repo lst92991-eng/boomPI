@@ -16,6 +16,7 @@ func TestLiveRealtime(t *testing.T) {
 		t.Skip("set BOOMPI_LIVE_QWEN=1 to run the paid provider test")
 	}
 	pcmPath := os.Getenv("BOOMPI_LIVE_PCM")
+	outputPath := os.Getenv("BOOMPI_LIVE_OUTPUT_PCM")
 	if pcmPath == "" {
 		t.Fatal("BOOMPI_LIVE_PCM is required")
 	}
@@ -61,7 +62,9 @@ func TestLiveRealtime(t *testing.T) {
 		t.Fatalf("commit live PCM: %v", err)
 	}
 
+	const maxLiveOutputBytes = 24_000 * 2 * 60
 	var textBytes, audioBytes int
+	var outputPCM []byte
 	for {
 		select {
 		case <-ctx.Done():
@@ -78,11 +81,25 @@ func TestLiveRealtime(t *testing.T) {
 					t.Fatalf("live audio sample rate=%d", event.SampleRateHz)
 				}
 				audioBytes += len(event.PCM)
+				if outputPath != "" {
+					if len(event.PCM) > maxLiveOutputBytes-len(outputPCM) {
+						t.Fatalf("live audio exceeds the 60-second capture limit: bytes=%d", audioBytes)
+					}
+					outputPCM = append(outputPCM, event.PCM...)
+				}
 			case backend.EventError:
 				t.Fatalf("live provider error: %v", event.Err)
 			case backend.EventDone:
 				if textBytes == 0 && audioBytes == 0 {
 					t.Fatal("live response completed without text or audio")
+				}
+				if outputPath != "" {
+					if len(outputPCM) == 0 {
+						t.Fatal("live response did not contain audio to save")
+					}
+					if err := os.WriteFile(outputPath, outputPCM, 0o600); err != nil {
+						t.Fatalf("write live output PCM: %v", err)
+					}
 				}
 				t.Logf("live Qwen response received: text_bytes=%d audio_bytes=%d", textBytes, audioBytes)
 				return
