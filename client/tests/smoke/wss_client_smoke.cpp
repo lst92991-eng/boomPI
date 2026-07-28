@@ -409,12 +409,19 @@ int main(const int argc, char* argv[]) {
     if (!status.ok()) return Fail("receive response", status);
     if (inbound.type == boompi::network::WssInboundMessageType::kPcm24k) {
       const auto& current = inbound.pcm_header;
+      const std::uint16_t expected_flags =
+          output_sequence == 0U ? 0x0001U : 0x0002U;
       if (!got_audio_start || current.device_uuid != header.device_uuid ||
           current.session_id != session_id || current.turn_id != kTurnId ||
           current.stream_id != downlink_stream_id || current.epoch != epoch ||
-          current.sequence != output_sequence ||
+          current.sequence != output_sequence || output_sequence > 1U ||
+          current.flags != expected_flags ||
           current.payload_length_bytes != inbound.pcm_payload.size()) {
         return FailMessage("downlink PCM identifiers are invalid");
+      }
+      if ((output_sequence == 0U && inbound.pcm_payload.size() != 960U) ||
+          (output_sequence == 1U && inbound.pcm_payload.size() != 482U)) {
+        return FailMessage("downlink PCM rechunking is invalid");
       }
       if (inbound.pcm_payload.size() >
           kMaximumDownlinkBytes - output_pcm.size()) {
@@ -450,7 +457,10 @@ int main(const int argc, char* argv[]) {
       return FailMessage("unexpected response control sequence");
     }
   }
-  const std::vector<std::uint8_t> expected_pcm{1U, 2U, 3U, 4U};
+  std::vector<std::uint8_t> expected_pcm(1442U);
+  for (std::size_t index = 0U; index < expected_pcm.size(); ++index) {
+    expected_pcm[index] = static_cast<std::uint8_t>(index % 251U);
+  }
   if (!got_start || !got_text || !got_audio_start || !got_done ||
       output_pcm != expected_pcm) {
     return FailMessage("deterministic response path is incomplete");

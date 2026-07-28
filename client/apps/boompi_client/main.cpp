@@ -3,6 +3,9 @@
 #include <string_view>
 
 #include "boompi/application/runtime.h"
+#if defined(BOOMPI_ENABLE_MANUAL_SINGLE_TURN)
+#include "boompi/application/manual_single_turn.h"
+#endif
 #include "boompi/config/client_config.h"
 #include "boompi/platform/monotonic_clock.h"
 #include "boompi/platform/rv1106_build_environment.h"
@@ -19,13 +22,16 @@ int ReportFailure(const char* const operation, const boompi::Status& status) {
 
 int main(const int argc, char* argv[]) {
   if (argc > 2) {
-    std::cerr << "usage: boompi-client [--check-config|--run-once]\n";
+    std::cerr << "usage: boompi-client "
+                 "[--check-config|--run-once|--manual-single-turn]\n";
     return EXIT_FAILURE;
   }
 
   const std::string_view argument = argc == 2 ? argv[1] : "--run-once";
-  if (argument != "--check-config" && argument != "--run-once") {
-    std::cerr << "usage: boompi-client [--check-config|--run-once]\n";
+  if (argument != "--check-config" && argument != "--run-once" &&
+      argument != "--manual-single-turn") {
+    std::cerr << "usage: boompi-client "
+                 "[--check-config|--run-once|--manual-single-turn]\n";
     return EXIT_FAILURE;
   }
 
@@ -53,8 +59,23 @@ int main(const int argc, char* argv[]) {
     return ReportFailure("runtime start", start_status);
   }
 
-  std::cout << "boompi-client: P1 runtime initialized\n";
+  boompi::Status run_status = boompi::Status::Ok();
+  if (argument == "--manual-single-turn") {
+#if defined(BOOMPI_ENABLE_MANUAL_SINGLE_TURN)
+    run_status = boompi::application::RunManualSingleTurnFromEnvironment();
+#else
+    std::cerr << "boompi-client: manual single turn is unavailable in this "
+                 "build\n";
+    run_status = boompi::Status::Error(boompi::StatusCode::kNotSupported,
+                                       "manual single turn is unavailable");
+#endif
+  } else {
+    std::cout << "boompi-client: P1 runtime initialized\n";
+  }
   const auto stop_status = runtime.Stop();
+  if (!run_status.ok()) {
+    return ReportFailure("manual single turn", run_status);
+  }
   if (!stop_status.ok()) {
     return ReportFailure("runtime stop", stop_status);
   }

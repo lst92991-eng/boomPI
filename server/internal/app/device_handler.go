@@ -25,6 +25,7 @@ import (
 
 const (
 	inputFrameBytes            = 640
+	outputFrameBytes           = 480 * 2
 	helloAuthenticationTimeout = 5 * time.Second
 )
 
@@ -45,8 +46,13 @@ type activeTurn struct {
 	downlinkStream uint32
 	epoch          uint32
 	expectedInput  uint32
+	inputStarted   bool
+	inputEnded     bool
+	inputCommitted bool
 	outputSequence uint32
 	pendingPCM     []byte
+	pendingOutput  []byte
+	outputStarted  bool
 	active         bool
 }
 
@@ -213,8 +219,13 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 		turn.downlinkStream = downlinkStream
 		turn.epoch = envelope.Epoch
 		turn.expectedInput = 0
+		turn.inputStarted = false
+		turn.inputEnded = false
+		turn.inputCommitted = false
 		turn.outputSequence = 0
 		turn.pendingPCM = nil
+		turn.pendingOutput = nil
+		turn.outputStarted = false
 		turn.active = true
 		state.mu.Lock()
 		state.turn = turn
@@ -225,9 +236,13 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 		if err := validateActiveEnvelope(turn, envelope); err != nil {
 			return err
 		}
+		if err := validateUplinkCommit(turn); err != nil {
+			return err
+		}
 		if err := flushFinalInput(ctx, actor, &turn); err != nil {
 			return err
 		}
+		turn.inputCommitted = true
 		state.mu.Lock()
 		state.turn = turn
 		state.mu.Unlock()
@@ -246,6 +261,7 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 		if sameTurn(state.turn, turn) {
 			state.turn.active = false
 			state.turn.pendingPCM = nil
+			state.turn.pendingOutput = nil
 		}
 		state.mu.Unlock()
 		if err := actor.Cancel(ctx, uint64(turn.epoch)); err != nil {
@@ -253,6 +269,7 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 		}
 		turn.active = false
 		turn.pendingPCM = nil
+		turn.pendingOutput = nil
 		return sendControl(ctx, connection, state, "response.cancelled", turn, map[string]any{"reason": "client_request"})
 	default:
 		return fmt.Errorf("unsupported control type %q", envelope.Type)
@@ -275,6 +292,10 @@ func (h *deviceHandler) handlePCM(ctx context.Context, actor *session.Actor, sta
 		state.mu.Unlock()
 		return err
 	}
+	if err := validateAndAdvanceUplinkFraming(turn, header.Flags); err != nil {
+		state.mu.Unlock()
+		return err
+	}
 	turn.expectedInput++
 	turn.pendingPCM = append(turn.pendingPCM, pcm...)
 	completeBytes := len(turn.pendingPCM) / inputFrameBytes * inputFrameBytes
@@ -289,6 +310,44 @@ func (h *deviceHandler) handlePCM(ctx context.Context, actor *session.Actor, sta
 		if err := actor.AppendPCM(ctx, uint64(epoch), completePCM[offset:offset+inputFrameBytes]); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateAndAdvanceUplinkFraming(turn *activeTurn, flags uint16) error {
+	if turn.inputCommitted {
+		return errors.New("PCM arrived after turn.commit")
+	}
+	if turn.inputEnded {
+		return errors.New("PCM arrived after the uplink END marker")
+	}
+	if flags&protocol.PCMFlagDiscontinuity != 0 {
+		return errors.New("uplink PCM discontinuity cancels the active turn")
+	}
+	start := flags&protocol.PCMFlagStart != 0
+	if !turn.inputStarted {
+		if !start {
+			return errors.New("first uplink PCM frame must carry START")
+		}
+		turn.inputStarted = true
+	} else if start {
+		return errors.New("uplink PCM START marker may only appear on the first frame")
+	}
+	if flags&protocol.PCMFlagEnd != 0 {
+		turn.inputEnded = true
+	}
+	return nil
+}
+
+func validateUplinkCommit(turn activeTurn) error {
+	if turn.inputCommitted {
+		return errors.New("turn.commit was received more than once")
+	}
+	if !turn.inputStarted {
+		return errors.New("turn.commit requires at least one uplink PCM frame")
+	}
+	if !turn.inputEnded {
+		return errors.New("turn.commit requires the uplink END marker")
 	}
 	return nil
 }
@@ -328,29 +387,35 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 					return err
 				}
 			case backend.EventAudio:
+				if event.SampleRateHz != 24_000 || len(event.PCM) == 0 ||
+					len(event.PCM)%2 != 0 || len(event.PCM) > protocol.MaxPCMPayloadBytes {
+					return errors.New("provider returned invalid 24 kHz mono S16_LE audio")
+				}
 				state.mu.Lock()
 				if !sameActiveTurn(state.turn, turn) {
 					state.mu.Unlock()
 					continue
 				}
 				turn = state.turn
-				if turn.outputSequence == 0 {
+				if !turn.outputStarted {
 					if err := sendControl(ctx, connection, state, "response.audio_start", turn, map[string]any{"response_id": event.ResponseID, "sample_rate_hz": event.SampleRateHz}); err != nil {
 						state.mu.Unlock()
 						return err
 					}
+					turn.outputStarted = true
 				}
-				header := protocol.PCMHeader{
-					Version: protocol.Version, Kind: protocol.AudioKindDownlink, AudioFormat: protocol.AudioFormatPCM16LE,
-					Channels: 1, SampleRateHz: uint32(event.SampleRateHz), PayloadLen: uint32(len(event.PCM)),
-					Sequence: turn.outputSequence, TimestampUS: state.timestampUS(), Epoch: turn.epoch,
-					DeviceUUID: turn.deviceUUID, SessionID: turn.sessionID, TurnID: turn.turnID, StreamID: turn.downlinkStream,
+				turn.pendingOutput = append(turn.pendingOutput, event.PCM...)
+				for len(turn.pendingOutput) > outputFrameBytes {
+					payload := append([]byte(nil), turn.pendingOutput[:outputFrameBytes]...)
+					copy(turn.pendingOutput, turn.pendingOutput[outputFrameBytes:])
+					turn.pendingOutput = turn.pendingOutput[:len(turn.pendingOutput)-outputFrameBytes]
+					if err := sendDownlinkPCM(ctx, connection, state, turn, payload, false); err != nil {
+						state.mu.Unlock()
+						return err
+					}
+					turn.outputSequence++
 				}
-				if err := connection.SendPCM(ctx, header, event.PCM); err != nil {
-					state.mu.Unlock()
-					return err
-				}
-				state.turn.outputSequence++
+				state.turn = turn
 				state.mu.Unlock()
 			case backend.EventDone:
 				state.mu.Lock()
@@ -358,11 +423,22 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 					state.mu.Unlock()
 					continue
 				}
+				turn = state.turn
+				if len(turn.pendingOutput) != 0 {
+					payload := append([]byte(nil), turn.pendingOutput...)
+					if err := sendDownlinkPCM(ctx, connection, state, turn, payload, true); err != nil {
+						state.mu.Unlock()
+						return err
+					}
+					turn.outputSequence++
+					turn.pendingOutput = nil
+				}
 				if err := sendControl(ctx, connection, state, "response.done", turn, map[string]any{"response_id": event.ResponseID}); err != nil {
 					state.mu.Unlock()
 					return err
 				}
-				state.turn.active = false
+				turn.active = false
+				state.turn = turn
 				state.mu.Unlock()
 			case backend.EventError:
 				state.mu.Lock()
@@ -377,10 +453,29 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 					return err
 				}
 				state.turn.active = false
+				state.turn.pendingOutput = nil
 				state.mu.Unlock()
 			}
 		}
 	}
+}
+
+func sendDownlinkPCM(ctx context.Context, connection *transport.Connection, state *connectionState, turn activeTurn, payload []byte, final bool) error {
+	flags := uint16(0)
+	if turn.outputSequence == 0 {
+		flags |= protocol.PCMFlagStart
+	}
+	if final {
+		flags |= protocol.PCMFlagEnd
+	}
+	header := protocol.PCMHeader{
+		Version: protocol.Version, Kind: protocol.AudioKindDownlink, Flags: flags,
+		AudioFormat: protocol.AudioFormatPCM16LE, Channels: 1, SampleRateHz: 24_000,
+		PayloadLen: uint32(len(payload)), Sequence: turn.outputSequence,
+		TimestampUS: state.timestampUS(), Epoch: turn.epoch, DeviceUUID: turn.deviceUUID,
+		SessionID: turn.sessionID, TurnID: turn.turnID, StreamID: turn.downlinkStream,
+	}
+	return connection.SendPCM(ctx, header, payload)
 }
 
 func (state *connectionState) timestampUS() uint64 {

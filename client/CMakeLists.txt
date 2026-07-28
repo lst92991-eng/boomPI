@@ -73,7 +73,8 @@ target_link_libraries(boompi_audio_core PUBLIC boompi_event)
 
 boompi_add_library(boompi_protocol
   src/protocol/audio_packet.cpp
-  src/protocol/envelope.cpp)
+  src/protocol/envelope.cpp
+  src/protocol/server_control.cpp)
 target_link_libraries(boompi_protocol PUBLIC boompi_event)
 
 boompi_add_library(boompi_network
@@ -247,10 +248,15 @@ if(BOOMPI_ENABLE_ALSA_PLAYBACK)
   endif()
   find_package(ALSA REQUIRED)
   boompi_add_library(boompi_platform_alsa
-    src/platform/rv1106/alsa_pcm_playback.cpp)
+    src/platform/rv1106/alsa_pcm_playback.cpp
+    src/platform/rv1106/alsa_single_turn_io.cpp)
   target_link_libraries(boompi_platform_alsa
     PUBLIC boompi_platform_audio
     PRIVATE ALSA::ALSA)
+  if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
+    target_compile_definitions(boompi_platform_alsa PRIVATE
+      BOOMPI_ALLOW_ALSA_NULL_TEST_PCM=1)
+  endif()
 
   # This target is intentionally part of ALL even when tests are disabled. It
   # makes the target linker resolve the adapter's ALSA and clock symbols before
@@ -281,6 +287,17 @@ boompi_configure_target(boompi_client)
 target_link_libraries(boompi_client PRIVATE boompi_application boompi_platform_rv1106)
 if(BOOMPI_ENABLE_ALSA_PLAYBACK)
   target_link_libraries(boompi_client PRIVATE boompi_platform_alsa)
+endif()
+if(BOOMPI_ENABLE_WSS_CLIENT AND BOOMPI_ENABLE_ALSA_PLAYBACK)
+  target_sources(boompi_client PRIVATE
+    src/application/manual_single_turn.cpp)
+  target_compile_definitions(boompi_client PRIVATE
+    BOOMPI_ENABLE_MANUAL_SINGLE_TURN=1)
+  target_link_libraries(boompi_client PRIVATE
+    boompi_audio_core
+    boompi_network
+    boompi_protocol
+    Threads::Threads)
 endif()
 if(BOOMPI_TARGET_RV1106)
   target_compile_definitions(boompi_client PRIVATE BOOMPI_TARGET_RV1106=1)
@@ -329,6 +346,17 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_host_tests
     COMMAND boompi_host_tests
       ${PROJECT_SOURCE_DIR}/protocol/fixtures/protocol-v1-golden.json)
+
+  add_executable(boompi_server_control_tests
+    tests/unit/server_control_tests.cpp)
+  boompi_configure_target(boompi_server_control_tests)
+  target_link_libraries(boompi_server_control_tests
+    PRIVATE
+      boompi_protocol
+      boompi_test_support)
+  add_test(
+    NAME boompi_server_control_tests
+    COMMAND boompi_server_control_tests)
 
   add_executable(boompi_audio_queue_tests
     tests/unit/audio_queue_tests.cpp)
@@ -512,10 +540,27 @@ if(BOOMPI_BUILD_TESTS)
       PROPERTIES
         LABELS "alsa-null-accepted-only"
         TIMEOUT 20)
+
+    if(NOT BOOMPI_TARGET_RV1106)
+      add_executable(boompi_alsa_single_turn_io_smoke
+        tests/smoke/alsa_single_turn_io_smoke.cpp)
+      boompi_configure_target(boompi_alsa_single_turn_io_smoke)
+      target_link_libraries(boompi_alsa_single_turn_io_smoke
+        PRIVATE boompi_platform_alsa)
+      add_test(
+        NAME boompi_alsa_single_turn_io_null_smoke
+        COMMAND boompi_alsa_single_turn_io_smoke)
+      set_tests_properties(
+        boompi_alsa_single_turn_io_null_smoke
+        PROPERTIES
+          LABELS "alsa-null-api-flow-only"
+          TIMEOUT 20)
+    endif()
   endif()
 
   set_tests_properties(
     boompi_host_tests
+    boompi_server_control_tests
     boompi_audio_queue_tests
     boompi_audio_continuity_tests
     boompi_audio_channel_mapper_tests
@@ -568,6 +613,23 @@ if(BOOMPI_ENABLE_WSS_CLIENT)
       set_tests_properties(boompi_cpp_wss_cross_language_smoke PROPERTIES
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/server"
         TIMEOUT 30)
+      if(BOOMPI_ENABLE_ALSA_PLAYBACK)
+        add_test(
+          NAME boompi_cpp_manual_single_turn_cross_language_smoke
+          COMMAND "${CMAKE_COMMAND}" -E env
+            "BOOMPI_CPP_MANUAL_SINGLE_TURN=$<TARGET_FILE:boompi_client>"
+            "GOWORK=off"
+            "GOTOOLCHAIN=local"
+            "GOPROXY=off"
+            "GOSUMDB=off"
+            "${BOOMPI_GO_EXECUTABLE}" test -count=1
+            -run "^TestCppManualSingleTurnHappyPath$" ./internal/app)
+        set_tests_properties(
+          boompi_cpp_manual_single_turn_cross_language_smoke
+          PROPERTIES
+            WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/server"
+            TIMEOUT 30)
+      endif()
     else()
       message(STATUS
         "Go was not found; cross-language WSS smoke test is not registered")

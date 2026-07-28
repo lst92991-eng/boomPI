@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -72,6 +73,7 @@ func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 	input[0], input[1] = 7, 8
 	writePCM(t, webSocket, protocol.PCMHeader{
 		Version: protocol.Version, Kind: protocol.AudioKindUplink, AudioFormat: protocol.AudioFormatPCM16LE,
+		Flags:    protocol.PCMFlagStart | protocol.PCMFlagEnd,
 		Channels: 1, SampleRateHz: 16_000, PayloadLen: uint32(len(input)), Sequence: 0, Epoch: 1,
 		DeviceUUID: deviceUUID, SessionID: helloAck.SessionID, TurnID: 11, StreamID: 12,
 	}, input)
@@ -86,22 +88,34 @@ func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 			t.Fatalf("control type = %q, want %q", got.Type, want)
 		}
 	}
-	messageType, frame, err := webSocket.ReadMessage()
-	if err != nil {
-		t.Fatalf("ReadMessage(PCM) error = %v", err)
+	wantOutput := responsePCMFixture()
+	var output []byte
+	for index, wantFlags := range []uint16{protocol.PCMFlagStart, protocol.PCMFlagEnd} {
+		messageType, frame, err := webSocket.ReadMessage()
+		if err != nil {
+			t.Fatalf("ReadMessage(PCM %d) error = %v", index, err)
+		}
+		if messageType != websocket.BinaryMessage {
+			t.Fatalf("PCM %d WebSocket type = %d", index, messageType)
+		}
+		header, payload, err := protocol.ParsePCMFrame(frame)
+		if err != nil {
+			t.Fatalf("ParsePCMFrame(%d) error = %v", index, err)
+		}
+		if header.Kind != protocol.AudioKindDownlink || header.SampleRateHz != 24_000 ||
+			header.Sequence != uint32(index) || header.Flags != wantFlags {
+			t.Fatalf("downlink header %d = %+v", index, header)
+		}
+		if index == 0 && len(payload) != outputFrameBytes {
+			t.Fatalf("first downlink payload length = %d, want %d", len(payload), outputFrameBytes)
+		}
+		if header.TimestampUS > uint64(time.Minute/time.Microsecond) {
+			t.Fatalf("downlink timestamp_us=%d looks like wall-clock time, want connection-monotonic time", header.TimestampUS)
+		}
+		output = append(output, payload...)
 	}
-	if messageType != websocket.BinaryMessage {
-		t.Fatalf("PCM WebSocket type = %d", messageType)
-	}
-	header, output, err := protocol.ParsePCMFrame(frame)
-	if err != nil {
-		t.Fatalf("ParsePCMFrame() error = %v", err)
-	}
-	if header.Kind != protocol.AudioKindDownlink || header.SampleRateHz != 24_000 || string(output) != string([]byte{1, 2, 3, 4}) {
-		t.Fatalf("downlink header=%+v output=%v", header, output)
-	}
-	if header.TimestampUS > uint64(time.Minute/time.Microsecond) {
-		t.Fatalf("downlink timestamp_us=%d looks like wall-clock time, want connection-monotonic time", header.TimestampUS)
+	if !bytes.Equal(output, wantOutput) {
+		t.Fatalf("downlink output length=%d, want %d", len(output), len(wantOutput))
 	}
 	if got := readControl(t, webSocket); got.Type != "response.done" {
 		t.Fatalf("final control type = %q", got.Type)
@@ -267,15 +281,25 @@ func (s *roundTripSession) SendAudio(_ context.Context, pcm []byte) error {
 
 func (s *roundTripSession) Commit(context.Context) error {
 	s.commits.Add(1)
+	responsePCM := responsePCMFixture()
 	for _, event := range []backend.ConversationEvent{
 		{Type: backend.EventStarted, ResponseID: "response-1"},
 		{Type: backend.EventTextDelta, ResponseID: "response-1", Text: "你好"},
-		{Type: backend.EventAudio, ResponseID: "response-1", PCM: []byte{1, 2, 3, 4}, SampleRateHz: 24_000},
+		{Type: backend.EventAudio, ResponseID: "response-1", PCM: responsePCM[:700], SampleRateHz: 24_000},
+		{Type: backend.EventAudio, ResponseID: "response-1", PCM: responsePCM[700:], SampleRateHz: 24_000},
 		{Type: backend.EventDone, ResponseID: "response-1"},
 	} {
 		s.events <- event
 	}
 	return nil
+}
+
+func responsePCMFixture() []byte {
+	pcm := make([]byte, 1442)
+	for index := range pcm {
+		pcm[index] = byte(index % 251)
+	}
+	return pcm
 }
 
 func (s *roundTripSession) Cancel(context.Context) error             { return nil }
