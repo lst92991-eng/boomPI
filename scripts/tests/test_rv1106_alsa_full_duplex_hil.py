@@ -70,12 +70,14 @@ class FakeHilEnvironment:
         self.base = base.resolve(strict=True)
         self.bin_dir = self.base / "fake-bin"
         self.state_dir = self.base / "fake-state"
+        self.proc_dir = self.base / "fake-proc"
         self.call_log = self.state_dir / "calls.log"
         self.mixer_state = self.state_dir / "mixer-state"
         self.uptime_file = self.state_dir / "uptime"
         self.uptime_ms = self.state_dir / "uptime-ms"
         self.bin_dir.mkdir(parents=True)
         self.state_dir.mkdir(parents=True)
+        self.proc_dir.mkdir(parents=True)
         self.call_log.write_text("", encoding="utf-8")
         self.mixer_state.write_text("2\n", encoding="utf-8")
         self.uptime_file.write_text("1000.00 0.00\n", encoding="utf-8")
@@ -86,6 +88,12 @@ class FakeHilEnvironment:
             raise AssertionError("expected exactly one production uptime read")
         script_text = script_text.replace(
             uptime_read, '<"$BOOMPI_HIL_TEST_UPTIME"'
+        )
+        proc_prefix = "/proc/"
+        if script_text.count(proc_prefix) != 3:
+            raise AssertionError("expected exactly three production proc paths")
+        script_text = script_text.replace(
+            proc_prefix, "${BOOMPI_HIL_TEST_PROC}/"
         )
         self.script_under_test = write_text(
             self.base, "rv1106_alsa_full_duplex-under-test.sh", script_text
@@ -181,6 +189,12 @@ class FakeHilEnvironment:
             + "esac\n"
             + 'printf \'%s\\n\' "$$" > '
             + '"$BOOMPI_HIL_TEST_STATE_DIR/arecord-pid"\n'
+            + 'proc_dir="$BOOMPI_HIL_TEST_PROC/$$"\n'
+            + 'mkdir -p "$proc_dir/fd"\n'
+            + ': > "$proc_dir/fd/3"\n'
+            + 'printf \'%s\\n\' "$$ (fake) S 0" > "$proc_dir/stat"\n'
+            + "mark_reapable() { printf '%s\\n' \"$$ (fake) Z 0\" > \"$proc_dir/stat\"; }\n"
+            + "trap mark_reapable EXIT\n"
             + "output=\n"
             + "consume_next=0\n"
             + "for argument do\n"
@@ -231,6 +245,12 @@ class FakeHilEnvironment:
             + "esac\n"
             + 'printf \'%s\\n\' "$$" > '
             + '"$BOOMPI_HIL_TEST_STATE_DIR/aplay-pid"\n'
+            + 'proc_dir="$BOOMPI_HIL_TEST_PROC/$$"\n'
+            + 'mkdir -p "$proc_dir/fd"\n'
+            + ': > "$proc_dir/fd/3"\n'
+            + 'printf \'%s\\n\' "$$ (fake) S 0" > "$proc_dir/stat"\n'
+            + "mark_reapable() { printf '%s\\n' \"$$ (fake) Z 0\" > \"$proc_dir/stat\"; }\n"
+            + "trap mark_reapable EXIT\n"
             + "input=\n"
             + "for argument do input=$argument; done\n"
             + 'if [ -f "$input" ]; then\n'
@@ -333,8 +353,8 @@ class FakeHilEnvironment:
             + "for argument do last=$argument; done\n"
             + 'case "$last" in\n'
             + '  /dev/snd/pcmC*|/dev/snd/controlC*) printf \'%s\\n\' "$last" ;;\n'
-            + "  /proc/[0-9]*/fd/*)\n"
-            + '    pid=${last#/proc/}\n'
+            + '  "$BOOMPI_HIL_TEST_PROC"/[0-9]*/fd/*)\n'
+            + '    pid=${last#"$BOOMPI_HIL_TEST_PROC"/}\n'
             + '    pid=${pid%%/*}\n'
             + '    capture_pid="$(sed -n \'1p\' '
             + '"$BOOMPI_HIL_TEST_STATE_DIR/arecord-pid" 2>/dev/null || true)"\n'
@@ -358,6 +378,7 @@ class FakeHilEnvironment:
             {
                 "BOOMPI_HIL_TEST_CALL_LOG": str(self.call_log),
                 "BOOMPI_HIL_TEST_STATE_DIR": str(self.state_dir),
+                "BOOMPI_HIL_TEST_PROC": str(self.proc_dir),
                 "BOOMPI_HIL_TEST_UPTIME": str(self.uptime_file),
                 "LC_ALL": "C",
                 "PATH": os.pathsep.join((str(self.bin_dir), environment["PATH"])),
