@@ -63,9 +63,13 @@ class FakeHilEnvironment:
     """A fake command environment that never opens a real ALSA device."""
 
     def __init__(self, base: Path):
-        self.base = base
-        self.bin_dir = base / "fake-bin"
-        self.state_dir = base / "fake-state"
+        # macOS exposes its temporary directory through /var, which is itself
+        # a symlink to /private/var.  The target script deliberately rejects
+        # artifact paths that traverse symlinks, so feed it the canonical test
+        # fixture path instead of weakening that production safety check.
+        self.base = base.resolve(strict=True)
+        self.bin_dir = self.base / "fake-bin"
+        self.state_dir = self.base / "fake-state"
         self.call_log = self.state_dir / "calls.log"
         self.mixer_state = self.state_dir / "mixer-state"
         self.uptime_file = self.state_dir / "uptime"
