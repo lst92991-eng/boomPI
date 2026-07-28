@@ -139,8 +139,10 @@ RV1106 交叉构建，证据见
 这些 target 均不安装、不自动运行，也不证明板端 loader、PCM、全双工或通道布局。
 
 同轮板端 schema v2 只读探针仅看到一个 capture PCM、一个 playback PCM、Rockit、AI/AO
-test 和直接 3A 库存在，并看到 VQE JSON 缺失。探针未打开 PCM 或调用 vendor API；随后
-物理链路断开，因此 raw MPI HIL 只有离线/交叉构建证据，板端执行仍未完成。
+test 和直接 3A 库存在，并看到 VQE JSON 缺失。2026-07-28 SSH 恢复后的专用只读 preflight
+又确认：PCM owner 为 0，但运行中的 `rkipc` 持有 22 个 `/dev/mpi/*` FD，并加载 Rockit/MPP/
+rkaudio；因此 raw MPI HIL 必须阻断，板端 ARM ELF 仍未执行。完整证据见
+[MPI HIL 只读前置验证记录](../test/p0-rockchip-mpi-audio-preflight-20260728.md)。
 
 下一步先运行独立的 direct ALSA 有界工具，不经过现有 production adapter：首轮请求
 48 kHz/S16_LE/2ch、480-frame period 和 4 periods，数字播放固定为全零，并把指定 DAC enum
@@ -154,14 +156,17 @@ target 为 `EXCLUDE_FROM_ALL`，不安装、不进入 CTest，也不被任何普
 48 kHz/vendor 16-bit/stereo、AI 6 秒和 AO 4 秒数字静音；只有 AI/AO 在连续 30 个 100 ms
 bucket 内都出现成功调用，且这些 common bucket 均无任一侧错误，才形成至少 3 秒的本地并发
 证据。AI 只读取 handle、capacity 和 metadata，不复制 PCM。执行前的两次 `/proc/*/fd`
-只读扫描只是 snapshot-only 占用快照，不是排他预留，也不能消除扫描后的竞争；外层仍须
-持有音频服务锁，防止检查后出现新使用者。
+只读扫描现已覆盖配置的 PCM 与全部 `/dev/mpi/*`，避免 `rkipc` 只持 MPI FD 时被错误放行；
+它仍只是 snapshot-only 快照，不是排他预留，也不能消除扫描后的竞争。外层必须提供当前
+镜像上可正向证明的 maintenance/exclusivity，不能把只有 boomPI 遵守的 `flock` 当成服务锁。
 
 探针本地 `probe_status` 只关闭 raw transport、frame/MB ownership、EOS 和 cleanup 事实；
-`full_hil_status` 保持 `not_evaluated`。完整 HIL 还需外层 watchdog、连续可比较的 dmesg 前后
-快照、残留进程/设备状态检查以及明确的板卡和镜像记录。即便完整 HIL 通过，也不得据此宣布
+`full_hil_status` 保持 `not_evaluated`。完整 HIL 还需外层 watchdog、未来已验证的连续
+kernel-log evidence、残留进程/设备状态检查以及明确的板卡和镜像记录。即便完整 HIL 通过，也不得据此宣布
 S16_LE、双麦 packing、reference slot 或可听播放。详细边界见
-[Rockchip MPI 原始音频 HIL 指南](../test/p0-rockchip-mpi-audio-hil-guide.md)。该探针当前尚未上板运行。
+[Rockchip MPI 原始音频 HIL 指南](../test/p0-rockchip-mpi-audio-hil-guide.md)。当前 BusyBox dmesg
+没有 follow，`/dev/kmsg` stream 语义未验证；OEM stop 链又会 killall rkipc/udhcpc 并停止全部
+OEM service，所以当前只能保持 `safe_to_execute=false`，不得自动 stop/start 后强跑探针。
 
 ## Rockchip 3A 候选与未决契约
 

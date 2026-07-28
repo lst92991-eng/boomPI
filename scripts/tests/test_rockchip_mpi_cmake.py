@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from os import environ
 from pathlib import Path
 import re
@@ -1139,6 +1140,14 @@ raise SystemExit(subprocess.run([real_compiler, *filtered], check=False).returnc
                 timeout=5,
             )
             self.assertEqual(dry_run.returncode, 0, dry_run.stdout + dry_run.stderr)
+            dry_run_document = json.loads(dry_run.stdout)
+            self.assertEqual(
+                dry_run_document["occupancy_scan_targets"],
+                "configured_pcm_and_all_dev_mpi",
+            )
+            self.assertFalse(
+                dry_run_document["occupancy_scan_is_exclusive_reservation"]
+            )
             self.assertFalse(sentinel.exists(), "dry-run invoked Rockchip MPI")
             self.assertFalse(
                 dry_run_artifact.exists(), "dry-run created an artifact directory"

@@ -745,8 +745,15 @@ bool IsDecimalName(const char* name) {
   return true;
 }
 
-ProcScan ScanProcForPcmUsers(const std::string& capture_node,
-                            const std::string& playback_node) {
+bool IsMpiDeviceNode(const char* target) {
+  constexpr char kMpiDevicePrefix[] = "/dev/mpi/";
+  return target != nullptr &&
+         std::strncmp(target, kMpiDevicePrefix,
+                      sizeof(kMpiDevicePrefix) - 1U) == 0;
+}
+
+ProcScan ScanProcForPcmOrMpiUsers(const std::string& capture_node,
+                                 const std::string& playback_node) {
   ProcScan result;
   result.attempted = true;
   DIR* proc = opendir("/proc");
@@ -831,7 +838,8 @@ ProcScan ScanProcForPcmUsers(const std::string& capture_node,
         break;
       }
       target[target_length] = '\0';
-      if (capture_node == target || playback_node == target) {
+      if (capture_node == target || playback_node == target ||
+          IsMpiDeviceNode(target)) {
         result.busy = true;
         result.occupied_node = target;
         result.observed_pid = std::strtol(process_entry->d_name, nullptr, 10);
@@ -1466,6 +1474,8 @@ std::string BuildDryRunJson(const Options& options) {
          << "  \"external_dmesg_delta_required\": true,\n"
          << "  \"occupancy_scan_scope\": \"snapshot_only\",\n"
          << "  \"occupancy_scan_method\": \"read_only_proc_fd_snapshot\",\n"
+         << "  \"occupancy_scan_targets\": "
+            "\"configured_pcm_and_all_dev_mpi\",\n"
          << "  \"occupancy_scan_is_exclusive_reservation\": false,\n"
          << "  \"processes_terminated\": 0,\n"
          << "  \"external_audio_service_lock_required\": true,\n"
@@ -1528,6 +1538,8 @@ std::string BuildReportJson(const Options& options, const Report& report) {
          << "  \"mode\": \"execute\",\n"
          << "  \"occupancy_scan_scope\": \"snapshot_only\",\n"
          << "  \"occupancy_scan_method\": \"read_only_proc_fd_snapshot\",\n"
+         << "  \"occupancy_scan_targets\": "
+            "\"configured_pcm_and_all_dev_mpi\",\n"
          << "  \"occupancy_scan_is_exclusive_reservation\": false,\n"
          << "  \"processes_terminated\": 0,\n"
          << "  \"external_audio_service_lock_required\": true,\n"
@@ -1991,8 +2003,10 @@ int Run(int argc, char** argv) {
     report.precondition_status = "fail";
     report.precondition_detail = error;
   } else {
-    report.first_scan = ScanProcForPcmUsers(capture_node, playback_node);
-    report.second_scan = ScanProcForPcmUsers(capture_node, playback_node);
+    report.first_scan =
+        ScanProcForPcmOrMpiUsers(capture_node, playback_node);
+    report.second_scan =
+        ScanProcForPcmOrMpiUsers(capture_node, playback_node);
   }
   if (report.precondition_status == "fail") {
     // Preserve the signal-installation failure selected above.
@@ -2004,7 +2018,8 @@ int Run(int argc, char** argv) {
   } else if (report.first_scan.busy || report.second_scan.busy) {
     report.precondition_status = "fail";
     report.precondition_detail =
-        "target PCM node is already open; no process was terminated";
+        "target PCM node or MPI device node is already open; no process was "
+        "terminated";
   } else if (g_signal_requested != 0) {
     report.precondition_status = "fail";
     report.precondition_detail = "signal received before MPI initialization";

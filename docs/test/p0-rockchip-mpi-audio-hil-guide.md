@@ -2,8 +2,10 @@
 
 本指南对应显式构建的 `boompi_rockchip_mpi_audio_hil`。它只用于关闭当前 RV1106
 `rk_mpi_ai`/`rk_mpi_ao` 的原始传输事实，不是生产音频 backend，也不经过现有
-playback/control/committer/worker。当前只完成实现、离线回归和交叉链接验证，尚未在板端运行
-ARM ELF；**本地探针结果也不等于完整 HIL，更没有证明 raw MPI 全双工、双麦布局或可听播放**。
+playback/control/committer/worker。当前已完成实现、离线回归、交叉链接和板端只读 preflight，
+但 ARM ELF 尚未在板端运行；**只读结果明确阻断当前执行，也没有证明 raw MPI 全双工、双麦布局
+或可听播放**。当前镜像证据见
+[2026-07-28 MPI HIL 只读前置验证记录](p0-rockchip-mpi-audio-preflight-20260728.md)。
 
 ## 构建和自动执行边界
 
@@ -82,11 +84,26 @@ artifact 必须是尚不存在的绝对目录，并使用 owner-only 权限。�
 落盘和显式关闭。`result.json` 的临时文件创建、失败清理和原子发布都相对这个 dirfd 完成：命名空间
 操作只使用 `openat`/`unlinkat`/`renameat`，并分别 `fsync` 文件和目录，避免重新按可变路径查找。
 
-执行模式在首次 MPI 调用前对 `/proc/<pid>/fd` 连做两次只读扫描。它们只是
-**snapshot-only、non-exclusive** 的快照，既不持锁，也不能排除扫描后另一个进程打开 PCM 的竞态；
+执行模式在首次 MPI 调用前对 `/proc/<pid>/fd` 连做两次只读扫描。扫描目标包括配置的
+capture/playback PCM 节点和全部 `/dev/mpi/*`；当前镜像实测 `rkipc` 虽未打开 PCM，却持有
+22 个 MPI FD，因此只扫描 `/dev/snd/*` 会错误放行。任一 PCM/MPI 占用都会在首次 vendor 调用
+前失败。两次扫描仍只是
+**snapshot-only、non-exclusive** 的快照，既不持锁，也不能排除扫描后另一个进程打开 PCM/MPI
+设备的竞态；
 扫描只报告冲突，绝不停止服务或杀进程。因此完整板端 HIL 的外层执行器必须先停止或锁定所有相关
-音频服务，并在探针整个生命周期内保持排他。任一扫描不完整或发现占用都 fail closed。全零 payload
+MPI/音频服务，并在探针整个生命周期内保持可验证的排他。任一扫描不完整或发现占用都 fail closed。
+当前 `rkipc` 不遵守 boomPI 的协作锁，`flock` 不能解决这项冲突。全零 payload
 也不保证模拟链路绝对无 pop，执行前仍要有人值守并确认功放状态安全。
+
+运行任何 HIL 前先执行不会写板卡的固定 preflight：
+
+```sh
+ssh <board-host> sh -s < scripts/probes/rv1106_rockchip_mpi_audio_preflight.sh
+```
+
+只有 `probe_status=complete` 仍不够；当前 schema 有意保持 `safe_to_execute=false`，用于记录
+MPI/PCM owner、init/stop 风险和内核日志能力。Windows PowerShell 应按前置验证记录使用
+`cmd` 二进制 stdin 重定向，避免 `Get-Content | ssh` 注入 BOM/CRLF。
 
 ## 有界性的真实边界
 
@@ -96,9 +113,15 @@ GetFrame/SendFrame/WaitEos 都使用有限正 timeout，普通错误也没有无
 活线程下面的 MPI 资源，也不得使用 `killall`。应停止本轮、检查残留进程和设备状态，必要时重启
 板卡，再继续任何音频测试。
 
-外层 watchdog、音频服务排他和连续 dmesg delta 都不是这个 ELF 自己能够提供的能力。即使
+外层 watchdog、MPI/音频服务排他和连续 kernel-log evidence 都不是这个 ELF 自己能够提供的能力。
+当前 BusyBox `dmesg` 没有 `-w`；`/dev/kmsg` 仅确认存在/可读，stream 语义尚未验证。即使
 `result.json` 的 `probe_status` 和 `transport.status` 为 `pass`，它仍只是一次本地 raw MPI 探针
 结果；缺少上述任一外层证据时，完整 HIL 必须保持 `inconclusive`，不得登记为板端通过。
+
+当前 OEM `S21appinit stop` 会进入包含 `killall rkipc`、`killall udhcpc`、无界等待和全 OEM
+`rcK` 的路径；`start` 也会重跑网络、配置和整组 OEM 初始化。两者都禁止作为 runner 的自动
+stop/restore。当前执行闸门只能通过后续经用户授权的专用 maintenance boot 关闭：必须在 rkipc
+首次启动前跳过它，同时保留 Ethernet/DHCP/SSH，并验证不会 respawn。
 
 ## JSON facet 与禁止推导的结论
 
