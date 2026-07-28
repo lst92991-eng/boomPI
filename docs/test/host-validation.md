@@ -42,6 +42,12 @@ ALSA HIL 的自动测试只使用 fake commands 与临时目录，必须覆盖 d
 连接 Codec 或板卡，不能算作全双工通过。操作边界见
 [直接 ALSA 全双工 HIL 指南](p0-alsa-full-duplex-hil-guide.md)。
 
+raw MPI HIL 的自动测试同样只关闭 CMake/CLI 离线闸门：默认 `OFF`、显式 target 为
+`EXCLUDE_FROM_ALL`、无自动 build/install/CTest/run，并用 fake ABI 验证 dry-run 零 MPI 调用。
+真实 RV1106 交叉构建证明当前 22 个 Rockchip MPI 符号和链接闭包可解析，但没有执行该
+ARM ELF，不能算作板端 raw 全双工通过。证据见
+[2026-07-28 Rockchip MPI HIL 构建验证记录](p0-rockchip-mpi-hil-build-validation-20260728.md)。
+
 Linux 上修改实时队列或 PCM 边界后，还需运行 sanitizer 构建。以下目录都是忽略的
 本地构建产物：
 
@@ -92,9 +98,11 @@ go vet ./...
 go build -trimpath ./cmd/boompi-server
 ```
 
-2026-07-27 22:12:23 +08:00 的最终树已在 clean 临时目录通过 16 个 CTest、47 个
-Python/script 测试，以及 Go 1.26.5 的 `go test ./...` 和 `go vet ./...`。这些是离线
-host/构建回归，不包含付费 provider 请求，也不替代 RV1106 HIL。
+2026-07-28 14:38:40 +08:00 的最终树已在 clean 临时目录通过 16 个 CTest、53 个
+Python/script 测试，以及 Go 1.26.5 的 `go test ./...`、`go vet ./...` 和
+`go build -trimpath ./cmd/boompi-server`。其中 Rockchip MPI 专项为 10/10，通用 vendor
+CMake 专项为 12/12。这些是离线 host/构建回归，不包含付费 provider 请求，也不替代
+RV1106 HIL。
 
 自动测试必须离线运行，不读取真实 `DASHSCOPE_API_KEY`，也不得发起付费 provider 请求。需要真实 Qwen 的测试必须使用单独的显式开关，并在测试报告中记录区域、模型和费用风险。
 
@@ -223,12 +231,16 @@ host/构建回归，不包含付费 provider 请求，也不替代 RV1106 HIL。
   `librkaudio_common.so` 的 `NEEDED` 和三个 `rkaudio_preprocess_*` `UND`；这只证明匹配
   header、库和目标 linker 的符号兼容，不是 host 测试，也没有运行或安装该 ELF。详见
   [2026-07-27 Rockchip 3A 交叉链接验证记录](p0-rockchip-3a-link-validation-20260727.md)。
-- 独立的 RV1106 Debug/tests-off feasibility 构建也已真实链接
-  `boompi_rockchip_mpi_audio_link_check`。最终 ELF 为 ARM EABI5 hard-float/uClibc，保留
+- 2026-07-27 独立的 RV1106 Debug/tests-off feasibility 构建已真实链接
+  `boompi_rockchip_mpi_audio_link_check`。当时最终 ELF 为 ARM EABI5 hard-float/uClibc，保留
   Rockit/MPP/RGA `NEEDED`、21 个 raw SYS/MB/AI/AO `UND`，且无 `RPATH`/`RUNPATH`；临时
-  strip-debug 副本通过完整 ELF verifier。该 ELF 没有安装或执行；同一构建同时启用 MPI
-  与 3A 也只证明两套 CMake 依赖可共存。详见
+  strip-debug 副本通过完整 ELF verifier。详见
   [2026-07-27 Rockchip MPI 音频交叉链接验证记录](p0-rockchip-mpi-link-validation-20260727.md)。
+- 当前 link-check 与显式 `EXCLUDE_FROM_ALL` raw MPI HIL 精确加入 `RK_MPI_MB_GetSize` 后，
+  均以 22 个 Rockchip MPI `UND` 完成匹配 GCC 8.3/uClibc 的真实交叉构建，动态段无
+  `RPATH`/`RUNPATH`；
+  默认 ALL 仍不构建 HIL，且没有安装或执行任一 ARM ELF。详见
+  [2026-07-28 Rockchip MPI HIL 构建验证记录](p0-rockchip-mpi-hil-build-validation-20260728.md)。
 - Host DSP 测试只能证明算法和内存边界；实际通道顺序、CPU 实时率和声音质量仍按
   HIL 闸门验证。
 

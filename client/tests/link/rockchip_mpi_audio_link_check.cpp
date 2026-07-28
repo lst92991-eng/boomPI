@@ -10,6 +10,7 @@ namespace {
 using SysNoArgFunction = RK_S32 (*)(RK_VOID);
 using SysCreateMbFunction = RK_S32 (*)(MB_BLK*, MB_EXT_CONFIG_S*);
 using MbHandleToVirtualAddressFunction = RK_VOID* (*)(MB_BLK);
+using MbGetSizeFunction = RK_U64 (*)(MB_BLK);
 using MbReleaseFunction = RK_S32 (*)(MB_BLK);
 
 using AiSetPublicAttributesFunction =
@@ -46,6 +47,8 @@ static_assert(
     std::is_same_v<decltype(&RK_MPI_SYS_CreateMB), SysCreateMbFunction>);
 static_assert(std::is_same_v<decltype(&RK_MPI_MB_Handle2VirAddr),
                              MbHandleToVirtualAddressFunction>);
+static_assert(
+    std::is_same_v<decltype(&RK_MPI_MB_GetSize), MbGetSizeFunction>);
 static_assert(
     std::is_same_v<decltype(&RK_MPI_MB_ReleaseMB), MbReleaseFunction>);
 
@@ -88,6 +91,7 @@ SysNoArgFunction volatile kSysExitSymbol = &RK_MPI_SYS_Exit;
 SysCreateMbFunction volatile kSysCreateMbSymbol = &RK_MPI_SYS_CreateMB;
 MbHandleToVirtualAddressFunction volatile kMbHandleToVirtualAddressSymbol =
     &RK_MPI_MB_Handle2VirAddr;
+MbGetSizeFunction volatile kMbGetSizeSymbol = &RK_MPI_MB_GetSize;
 MbReleaseFunction volatile kMbReleaseSymbol = &RK_MPI_MB_ReleaseMB;
 
 AiSetPublicAttributesFunction volatile kAiSetPublicAttributesSymbol =
@@ -119,7 +123,8 @@ int main() noexcept {
       kSysInitSymbol != nullptr && kSysExitSymbol != nullptr &&
       kSysCreateMbSymbol != nullptr &&
       kMbHandleToVirtualAddressSymbol != nullptr &&
-      kMbReleaseSymbol != nullptr && kAiSetPublicAttributesSymbol != nullptr &&
+      kMbGetSizeSymbol != nullptr && kMbReleaseSymbol != nullptr &&
+      kAiSetPublicAttributesSymbol != nullptr &&
       kAiEnableSymbol != nullptr && kAiEnableChannelSymbol != nullptr &&
       kAiSetChannelParametersSymbol != nullptr && kAiGetFrameSymbol != nullptr &&
       kAiReleaseFrameSymbol != nullptr &&

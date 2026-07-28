@@ -48,8 +48,8 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 P1 已建立 CMake/Go 构建、配置校验、协议 fixture 和跨平台 CI。P0 已确认匹配 BSP 的
 GCC 8.3/uClibc 工具链；Rockchip 3A 的 tests-off 默认 ALL 交叉链接和三个入口符号解析
-已通过；Rockchip MPI 音频的 tests-off 默认 ALL 交叉链接也已解析 21 个 raw
-SYS/MB/AI/AO 生命周期符号及 Rockit→MPP/RGA 依赖。Snowboy/OpenBLAS 仍是 ABI/链接候选；
+已通过。2026-07-27 的 Rockchip MPI 历史记录解析了 21 个 raw SYS/MB/AI/AO 生命周期符号；
+当前 link-check/HIL 加入精确 `RK_MPI_MB_GetSize` 后为 22 个。Snowboy/OpenBLAS 仍是 ABI/链接候选；
 板端能力仍是部分通过。当前镜像的只读探针只确认 `librockit.so`、AI/AO test、一个
 capture PCM、一个 playback PCM 和直接 3A 库存在，同时确认 VQE JSON 缺失；探针没有
 打开 PCM 或执行 vendor API。raw PCM 的实际参数、AI+AO 同时运行、VQE 资源安装和 3A
@@ -58,7 +58,7 @@ capture PCM、一个 playback PCM 和直接 3A 库存在，同时确认 VQE JSON
 [2026-07-27 vendor 音频证据基线](docs/test/p0-vendor-audio-inventory-20260727.md)。
 3A 交叉链接的命令、ELF 结果和严格边界另见
 [2026-07-27 Rockchip 3A 交叉链接验证记录](docs/test/p0-rockchip-3a-link-validation-20260727.md)。
-MPI 音频的八个头文件 pin、21 个 `UND`、MPP/RGA SONAME 与未运行边界见
+MPI 音频的八个头文件 pin、当时 21 个 `UND`、MPP/RGA SONAME 与未运行边界见
 [2026-07-27 Rockchip MPI 音频交叉链接验证记录](docs/test/p0-rockchip-mpi-link-validation-20260727.md)。
 
 已有 playback renderer/committer/worker/ALSA adapter 及其 host、Linux `null`、RV1106
@@ -190,6 +190,11 @@ Rockchip 候选后，tests-off 默认 ALL 会链接对应的不安装、不自�
 `media/out/lib` 未 strip 链接候选，不能用 OEM stripped 副本替代。详细 cache 输入及安全边界见
 [音频后端契约与依赖闸门](docs/architecture/audio-backends.md)。
 
+`BOOMPI_BUILD_ROCKCHIP_MPI_AUDIO_HIL` 也默认 `OFF`。它只在上述 pinned MPI Debug
+feasibility 环境中创建 `EXCLUDE_FROM_ALL` 的原始 AI/AO 探针，默认 build、CTest、install 和
+启动流程均不会构建或运行它。板端使用前必须阅读
+[Rockchip MPI 原始音频 HIL 指南](docs/test/p0-rockchip-mpi-audio-hil-guide.md)。
+
 准备完成后使用：
 
 ```text
@@ -209,6 +214,10 @@ hard-float/uClibc 产物保留 Rockit/MPP/RGA `NEEDED`、21 个 raw 生命周期
 `RPATH`/`RUNPATH`。该目标同样没有安装或执行；板端只读存在性也不等于全双工功能通过。
 详见 [MPI 音频交叉链接验证记录](docs/test/p0-rockchip-mpi-link-validation-20260727.md)。
 
+2026-07-28 当前 link-check 与显式 raw MPI HIL 已按 22 个精确符号完成真实 RV1106 交叉构建，
+并通过离线闸门；两者均未在板端执行，详见
+[MPI HIL 构建验证记录](docs/test/p0-rockchip-mpi-hil-build-validation-20260728.md)。
+
 恢复板端 SSH 后，可运行不会打开 PCM 或修改系统的脱敏探针：
 
 ```powershell
@@ -218,6 +227,9 @@ Get-Content -Raw scripts/probes/rv1106_p0_probe.sh | ssh <board-host> "sh -s"
 只读盘点和运行库闭包通过后，再按
 [直接 ALSA 全双工 HIL 指南](docs/test/p0-alsa-full-duplex-hil-guide.md)先 dry-run；真正测试必须
 显式确认 PCM I/O、单个 DAC mixer 写入和短录音 artifact。脚本默认不会执行这些操作。
+raw MPI 对照使用独立的
+[Rockchip MPI 原始音频 HIL](docs/test/p0-rockchip-mpi-audio-hil-guide.md)：首轮只发送数字静音、
+记录 AI frame metadata/MB capacity，不保存或分析语音，也不接入现有 production 音频层。
 
 发布前使用 `scripts/probes/verify_rv1106_elf.py` 检查 strip 后的目标 ELF，拒绝
 错误 ARM ABI、glibc、过高 GLIBCXX、RPATH/RUNPATH 和开发机绝对路径。

@@ -4,6 +4,8 @@ option(BOOMPI_ENABLE_ROCKCHIP_3A
   "Enable the pinned Rockchip RV1106 3A feasibility dependency" OFF)
 option(BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO
   "Enable the pinned Rockchip RV1106 MPI audio feasibility dependency" OFF)
+option(BOOMPI_BUILD_ROCKCHIP_MPI_AUDIO_HIL
+  "Build the explicit Rockchip RV1106 MPI audio hardware-in-the-loop probe" OFF)
 option(BOOMPI_ENABLE_SNOWBOY
   "Enable the pinned Snowboy wake-word feasibility dependency" OFF)
 option(BOOMPI_ALLOW_FEASIBILITY_AUDIO_VENDOR_INPUTS
@@ -442,6 +444,105 @@ function(_boompi_configure_rockchip_mpi_audio_dependency)
     BOOMPI_AUDIO_VENDOR_ROCKCHIP_MPI_AUDIO_CONFIGURED TRUE)
 endfunction()
 
+function(_boompi_configure_rockchip_mpi_audio_hil)
+  if(NOT BOOMPI_BUILD_ROCKCHIP_MPI_AUDIO_HIL)
+    return()
+  endif()
+  if(NOT BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO)
+    message(FATAL_ERROR
+      "BOOMPI_BUILD_ROCKCHIP_MPI_AUDIO_HIL requires "
+      "BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO=ON")
+  endif()
+
+  # Keep this gate local as well as at the public entry point. This function is
+  # intentionally callable by isolated fixtures, and no private vendor input
+  # may be inspected until the target ABI and Debug-only feasibility opt-in
+  # have both been established.
+  _boompi_audio_vendor_require_rv1106_environment()
+  _boompi_audio_vendor_require_feasibility_mode()
+
+  get_property(_already_configured GLOBAL PROPERTY
+    BOOMPI_AUDIO_VENDOR_ROCKCHIP_MPI_AUDIO_HIL_CONFIGURED)
+  if(_already_configured)
+    return()
+  endif()
+
+  if(NOT TARGET boompi_vendor::rockchip_rockit)
+    message(FATAL_ERROR
+      "Rockchip MPI audio dependency must be configured before its HIL probe")
+  endif()
+  if(TARGET boompi_rockchip_mpi_audio_hil)
+    message(FATAL_ERROR "Rockchip MPI audio HIL target name collision")
+  endif()
+
+  _boompi_audio_vendor_require_directory(
+    "BOOMPI_ROCKCHIP_MPI_INCLUDE_DIR"
+    "${BOOMPI_ROCKCHIP_MPI_INCLUDE_DIR}"
+    _include_dir)
+
+  set(_hil_source
+    "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../tests/hil/rockchip_mpi_audio_hil.cpp")
+  if(NOT EXISTS "${_hil_source}" OR IS_DIRECTORY "${_hil_source}")
+    message(FATAL_ERROR "Rockchip MPI audio HIL source is missing")
+  endif()
+  file(SHA256 "${_hil_source}" _hil_source_sha256)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_hil_source}")
+
+  # The manifest contains only stable logical names and content pins. In
+  # particular, it must never absorb a workstation, SDK, or sysroot path.
+  string(CONCAT _pinset_manifest
+    "rk_mpi_ai.h=${_BOOMPI_ROCKCHIP_MPI_AI_HEADER_SHA256}\n"
+    "rk_mpi_ao.h=${_BOOMPI_ROCKCHIP_MPI_AO_HEADER_SHA256}\n"
+    "rk_comm_aio.h=${_BOOMPI_ROCKCHIP_MPI_AIO_HEADER_SHA256}\n"
+    "rk_mpi_sys.h=${_BOOMPI_ROCKCHIP_MPI_SYS_HEADER_SHA256}\n"
+    "rk_mpi_mb.h=${_BOOMPI_ROCKCHIP_MPI_MB_HEADER_SHA256}\n"
+    "rk_comm_mb.h=${_BOOMPI_ROCKCHIP_MPI_COMM_MB_HEADER_SHA256}\n"
+    "rk_common.h=${_BOOMPI_ROCKCHIP_MPI_COMMON_HEADER_SHA256}\n"
+    "rk_type.h=${_BOOMPI_ROCKCHIP_MPI_TYPE_HEADER_SHA256}\n"
+    "librockit.so=${_BOOMPI_ROCKCHIP_MPI_ROCKIT_SHA256}\n"
+    "librockchip_mpp.so.1=${_BOOMPI_ROCKCHIP_MPI_MPP_SHA256}\n"
+    "librga.so=${_BOOMPI_ROCKCHIP_MPI_RGA_SHA256}\n")
+  string(SHA256 _pinset_sha256 "${_pinset_manifest}")
+
+  if(NOT TARGET Threads::Threads)
+    find_package(Threads REQUIRED)
+  endif()
+
+  # This probe is deliberately opt-in and must be requested by target name. It
+  # is neither installed nor registered with CTest, and nothing runs it as a
+  # configure/build side effect.
+  add_executable(boompi_rockchip_mpi_audio_hil EXCLUDE_FROM_ALL
+    "${_hil_source}")
+  target_compile_features(boompi_rockchip_mpi_audio_hil PRIVATE cxx_std_17)
+  target_compile_options(boompi_rockchip_mpi_audio_hil PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    "-fdebug-prefix-map=${_include_dir}=boompi-rv1106-mpi-include")
+  if(BOOMPI_STRICT_WARNINGS)
+    target_compile_options(boompi_rockchip_mpi_audio_hil PRIVATE -Werror)
+  endif()
+  target_compile_definitions(boompi_rockchip_mpi_audio_hil PRIVATE
+    "BOOMPI_ROCKCHIP_MPI_HIL_PINSET_SHA256=\"${_pinset_sha256}\""
+    "BOOMPI_ROCKCHIP_MPI_HIL_SOURCE_SHA256=\"${_hil_source_sha256}\"")
+  target_include_directories(boompi_rockchip_mpi_audio_hil PRIVATE
+    "${_include_dir}")
+  target_link_libraries(boompi_rockchip_mpi_audio_hil PRIVATE
+    Threads::Threads
+    boompi_vendor::rockchip_rockit)
+  set_target_properties(boompi_rockchip_mpi_audio_hil PROPERTIES
+    SKIP_BUILD_RPATH TRUE
+    BUILD_RPATH ""
+    INSTALL_RPATH ""
+    BUILD_WITH_INSTALL_RPATH FALSE
+    INSTALL_RPATH_USE_LINK_PATH FALSE)
+
+  unset(_pinset_manifest)
+  set_property(GLOBAL PROPERTY
+    BOOMPI_AUDIO_VENDOR_ROCKCHIP_MPI_AUDIO_HIL_CONFIGURED TRUE)
+endfunction()
+
 function(_boompi_configure_snowboy_dependency)
   get_property(_already_configured GLOBAL PROPERTY
     BOOMPI_AUDIO_VENDOR_SNOWBOY_CONFIGURED)
@@ -510,6 +611,13 @@ function(_boompi_configure_snowboy_dependency)
 endfunction()
 
 function(boompi_configure_audio_vendor_dependencies)
+  if(BOOMPI_BUILD_ROCKCHIP_MPI_AUDIO_HIL AND
+      NOT BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO)
+    message(FATAL_ERROR
+      "BOOMPI_BUILD_ROCKCHIP_MPI_AUDIO_HIL requires "
+      "BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO=ON")
+  endif()
+
   if(NOT BOOMPI_ENABLE_ROCKCHIP_3A AND
       NOT BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO AND
       NOT BOOMPI_ENABLE_SNOWBOY)
@@ -524,6 +632,7 @@ function(boompi_configure_audio_vendor_dependencies)
   endif()
   if(BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO)
     _boompi_configure_rockchip_mpi_audio_dependency()
+    _boompi_configure_rockchip_mpi_audio_hil()
   endif()
   if(BOOMPI_ENABLE_SNOWBOY)
     _boompi_configure_snowboy_dependency()

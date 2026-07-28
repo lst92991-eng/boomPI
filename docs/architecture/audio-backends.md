@@ -10,14 +10,15 @@ playback adapter 继续保留，但暂停增加新抽象或 runtime 组成。它
 下一项实现直接面向匹配 BSP 的 `rk_mpi_ai`/`rk_mpi_ao`、ALSA PCM、Rockchip
 VQE 和 `libaec_bf_process.so` 探针。详细只读证据见
 [P0 vendor 音频证据基线](../test/p0-vendor-audio-inventory-20260727.md)；MPI 头文件、依赖和
-21 个入口的交叉链接证据见
+当时 21 个入口的交叉链接证据见
 [Rockchip MPI 音频交叉链接验证记录](../test/p0-rockchip-mpi-link-validation-20260727.md)。
 
 真实状态必须区分为三层：
 
 1. **核心契约已实现**：固定帧、generation、错误分类和 fail-closed 行为。
 2. **依赖候选可配置**：只有显式启用并通过路径与 SHA-256 检查时才创建 imported target。
-3. **真实 adapter 与 HIL 未完成**：尚未把任何 vendor 函数接入运行时，也未在板端处理音频。
+3. **生产 adapter 与板端 HIL 未完成**：raw MPI 本地探针已完成离线/交叉构建，但尚未接入
+   生产运行时，也未在板端处理音频。
 
 ## 数据流与帧布局
 
@@ -117,7 +118,8 @@ engine 由一个 DSP worker 独占并串行执行：
 `SYS_Init/Exit`；AI 的 `SetPubAttr`、`Enable`、`SetChnParam`、`EnableChn`、`GetFrame`、
 `ReleaseFrame`、`DisableChn`、`Disable`；AO 的 `SetPubAttr`、`Enable`、`SetChnParams`、
 `EnableChn`、`SendFrame`、`WaitEos`、`DisableChn`、`Disable`；以及 AO caller buffer 与
-AI capture frame 访问所需的 `SYS_CreateMB`、`MB_Handle2VirAddr` 和 `MB_ReleaseMB`。`WaitEos` 只服务有限播放
+AI capture frame 访问所需的 `SYS_CreateMB`、`MB_Handle2VirAddr`、`RK_MPI_MB_GetSize` 和
+`MB_ReleaseMB`。`WaitEos` 只服务有限播放
 探针的有界 drain。
 
 这个最小面故意不含 `SYS_Bind/UnBind`、VQE、resample、AMIX/mixer、volume/mute/track、
@@ -127,14 +129,18 @@ VQE、采样率转换和 mixer 只能在独立 HIL 证明需要后显式加入�
 
 `librockit.so` 的链接闭包为 `librockchip_mpp.so.1`、`librga.so`、libstdc++、libgcc 和
 uClibc。CMake 的 MPP/RGA 哈希固定 `media/out/lib` 中的未 strip 链接候选；OEM 中经过
-strip、哈希不同的副本不能作为 CMake 输入。最终 link-check 是 ELF32 ARM EABI5
-hard-float/uClibc，保留 Rockit/MPP/RGA `NEEDED` 与 21 个 `UND`，无 `RPATH/RUNPATH`；
-它不安装、不自动运行，也不证明板端 loader、PCM、全双工或通道布局。完整证据和哈希边界见
+strip、哈希不同的副本不能作为 CMake 输入。2026-07-27 的历史 link-check 是 ELF32 ARM
+EABI5 hard-float/uClibc，保留 Rockit/MPP/RGA `NEEDED` 与 21 个 `UND`，无
+`RPATH/RUNPATH`；完整证据和哈希边界见
 [2026-07-27 MPI 音频交叉链接验证记录](../test/p0-rockchip-mpi-link-validation-20260727.md)。
+当前 link-check 与 HIL 因精确加入 `RK_MPI_MB_GetSize` 扩展为 22 个 `UND`，并已完成真实
+RV1106 交叉构建，证据见
+[2026-07-28 MPI HIL 构建验证记录](../test/p0-rockchip-mpi-hil-build-validation-20260728.md)。
+这些 target 均不安装、不自动运行，也不证明板端 loader、PCM、全双工或通道布局。
 
 同轮板端 schema v2 只读探针仅看到一个 capture PCM、一个 playback PCM、Rockit、AI/AO
 test 和直接 3A 库存在，并看到 VQE JSON 缺失。探针未打开 PCM 或调用 vendor API；随后
-物理链路断开，因此 adapter 与 HIL 状态仍是“未完成”。
+物理链路断开，因此 raw MPI HIL 只有离线/交叉构建证据，板端执行仍未完成。
 
 下一步先运行独立的 direct ALSA 有界工具，不经过现有 production adapter：首轮请求
 48 kHz/S16_LE/2ch、480-frame period 和 4 periods，数字播放固定为全零，并把指定 DAC enum
@@ -142,6 +148,20 @@ test 和直接 3A 库存在，并看到 VQE JSON 缺失。探针未打开 PCM �
 重叠、精确字节数、连续 dmesg delta 和 mixer 恢复。详细契约见
 [直接 ALSA 全双工 HIL 指南](../test/p0-alsa-full-duplex-hil-guide.md)。它尚未在板端运行，
 也不是新的 playback/control/worker 抽象。
+
+raw MPI 对照同样保持为独立的显式探针：`BOOMPI_BUILD_ROCKCHIP_MPI_AUDIO_HIL` 默认关闭，
+target 为 `EXCLUDE_FROM_ALL`，不安装、不进入 CTest，也不被任何普通 target 依赖。首轮固定
+48 kHz/vendor 16-bit/stereo、AI 6 秒和 AO 4 秒数字静音；只有 AI/AO 在连续 30 个 100 ms
+bucket 内都出现成功调用，且这些 common bucket 均无任一侧错误，才形成至少 3 秒的本地并发
+证据。AI 只读取 handle、capacity 和 metadata，不复制 PCM。执行前的两次 `/proc/*/fd`
+只读扫描只是 snapshot-only 占用快照，不是排他预留，也不能消除扫描后的竞争；外层仍须
+持有音频服务锁，防止检查后出现新使用者。
+
+探针本地 `probe_status` 只关闭 raw transport、frame/MB ownership、EOS 和 cleanup 事实；
+`full_hil_status` 保持 `not_evaluated`。完整 HIL 还需外层 watchdog、连续可比较的 dmesg 前后
+快照、残留进程/设备状态检查以及明确的板卡和镜像记录。即便完整 HIL 通过，也不得据此宣布
+S16_LE、双麦 packing、reference slot 或可听播放。详细边界见
+[Rockchip MPI 原始音频 HIL 指南](../test/p0-rockchip-mpi-audio-hil-guide.md)。该探针当前尚未上板运行。
 
 ## Rockchip 3A 候选与未决契约
 
@@ -225,11 +245,12 @@ CMake 对每个输入执行存在性、文件类型和固定 SHA-256 检查，�
 
 显式启用 Rockchip feasibility 输入时，tests-off 默认 ALL 会构建不安装、不自动执行的
 `boompi_rockchip_3a_link_check` 或 `boompi_rockchip_mpi_audio_link_check`。3A target 以匹配
-header 的函数类型引用 init/process/destroy；MPI target 引用上述 21 个 raw 生命周期入口，
+header 的函数类型引用 init/process/destroy；当前 MPI target 引用上述 22 个 raw MPI 入口，
 并显式建模 Rockit→MPP/RGA 依赖。两者在同一 tests-off 默认 ALL 构建中共存通过。target
 均关闭 build RPATH，私有 BSP 路径不进入公共接口；结果仍不证明板端 loader、初始化、音频
-处理或实时率，证据见 [3A 交叉链接验证记录](../test/p0-rockchip-3a-link-validation-20260727.md)
-与 [MPI 音频交叉链接验证记录](../test/p0-rockchip-mpi-link-validation-20260727.md)。
+处理或实时率，证据见 [3A 交叉链接验证记录](../test/p0-rockchip-3a-link-validation-20260727.md)、
+[历史 MPI 音频交叉链接验证记录](../test/p0-rockchip-mpi-link-validation-20260727.md)与
+[当前 MPI HIL 构建验证记录](../test/p0-rockchip-mpi-hil-build-validation-20260728.md)。
 
 当前 OpenBLAS archive 含多线程实现，只完成了 ABI/link 候选验证。发布接入前必须按
 单线程配置重建、记录来源与许可、生成新的 SHA-256，并替换本模块 pin；不得用

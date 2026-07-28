@@ -8,8 +8,10 @@
 [vendor 音频证据基线](p0-vendor-audio-inventory-20260727.md)；
 Rockchip 3A 的 tests-off 交叉链接与符号证据见
 [3A 交叉链接验证记录](p0-rockchip-3a-link-validation-20260727.md)；
-Rockchip MPI raw AI/AO 的 tests-off 交叉链接、21 个符号和板端只读存在性见
+Rockchip MPI raw AI/AO 的 2026-07-27 tests-off 交叉链接、当时 21 个符号和板端只读存在性见
 [MPI 音频交叉链接验证记录](p0-rockchip-mpi-link-validation-20260727.md)；
+当前 22 个符号、raw HIL 离线闸门和真实交叉构建见
+[2026-07-28 MPI HIL 构建验证记录](p0-rockchip-mpi-hil-build-validation-20260728.md)；
 P2f-c-a 的 host/null/交叉链接证据见
 [2026-07-27 ALSA playback adapter 验证记录](p2f-c-a-validation-20260727.md)。
 
@@ -32,10 +34,15 @@ ALSA 的真实全双工、capture layout 和 3A 契约关闭。
   记录一个 capture PCM、一个 playback PCM、Rockit、AI/AO test 和直接 3A 库存在，VQE
   JSON 缺失。板端时钟错误地停留在 2021 年；探针未打开 PCM、未执行 vendor，随后物理
   链路断开。存在性只关闭资源盘点，不是全双工或功能证据。
-- [x] Rockchip MPI 音频的 tests-off 默认 ALL link-check 已用匹配 GCC 8.3/uClibc 工具链
-  完成真实交叉链接；最终 ELF 保留 Rockit/MPP/RGA `NEEDED` 与 21 个 SYS/MB/AI/AO
-  生命周期 `UND`，没有 `RPATH`/`RUNPATH`。该 target 不安装、不自动执行；MPI 与 3A
+- [x] 2026-07-27 Rockchip MPI 音频的 tests-off 默认 ALL link-check 已用匹配
+  GCC 8.3/uClibc 工具链完成真实交叉链接；当时最终 ELF 保留 Rockit/MPP/RGA `NEEDED` 与
+  21 个 SYS/MB/AI/AO 生命周期 `UND`，没有 `RPATH`/`RUNPATH`。该 target 不安装、不自动执行；MPI 与 3A
   两套 pinned inputs 同时启用的默认 ALL 构建也通过，但均不代表板端加载或音频功能通过。
+- [x] 当前 raw MPI HIL 开关默认 `OFF`，显式 target 为 `EXCLUDE_FROM_ALL`，不进入默认
+  build、install、CTest 或启动链；离线 CMake/CLI 闸门已通过。link-check 与 HIL 在精确加入
+  `RK_MPI_MB_GetSize` 后均以 22 个 Rockchip MPI `UND` 完成匹配 GCC 8.3/uClibc 的真实
+  交叉构建，且无 `RPATH`/`RUNPATH`。两个 ARM ELF 均未在板端运行，因此下一项 raw
+  全双工功能闸门仍不勾选。
 - [ ] 用直接 ALSA 与 raw rk_mpi 分别验证 48 kHz S16_LE 2ch 真全双工、有限 timeout、
   明确重叠区间、全部 exit code/录音字节数、停止顺序和 dmesg xrun delta；串行运行不能
   冒充全双工。
