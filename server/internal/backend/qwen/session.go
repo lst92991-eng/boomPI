@@ -1,0 +1,297 @@
+package qwen
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/lst92991-eng/boomPI/server/internal/backend"
+)
+
+var ErrSessionClosed = errors.New("qwen session is closed")
+
+type EventKind uint8
+
+const (
+	EventResponseStarted EventKind = iota + 1
+	EventTextDelta
+	EventAudioDelta
+	EventResponseDone
+	EventProviderError
+)
+
+type Event struct {
+	Kind       EventKind
+	ResponseID string
+	Text       string
+	PCM        []byte
+	Status     string
+	Err        error
+}
+
+type clientEvent struct {
+	Type    string         `json:"type"`
+	Audio   string         `json:"audio,omitempty"`
+	Session *sessionUpdate `json:"session,omitempty"`
+}
+
+type sessionUpdate struct {
+	Modalities        []string `json:"modalities"`
+	Voice             string   `json:"voice"`
+	Instructions      string   `json:"instructions,omitempty"`
+	InputAudioFormat  string   `json:"input_audio_format"`
+	OutputAudioFormat string   `json:"output_audio_format"`
+	TurnDetection     any      `json:"turn_detection"`
+}
+
+type serverEvent struct {
+	Type       string `json:"type"`
+	Delta      string `json:"delta"`
+	ResponseID string `json:"response_id"`
+	Response   struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	} `json:"response"`
+	Error struct {
+		Type    string `json:"type"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+type outboundBatch struct{ events []clientEvent }
+
+type Session struct {
+	config Config
+	conn   *websocket.Conn
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	writes chan outboundBatch
+	events chan Event
+	ready  chan error
+	done   chan struct{}
+
+	readyOnce sync.Once
+	readyOK   atomic.Bool
+	failOnce  sync.Once
+	closeOnce sync.Once
+	wg        sync.WaitGroup
+	errMu     sync.RWMutex
+	fatalErr  error
+}
+
+var _ backend.ConversationSession = (*Session)(nil)
+
+func newSession(config Config, conn *websocket.Conn) *Session {
+	ctx, cancel := context.WithCancel(context.Background())
+	conn.SetReadLimit(maxMessageBytes)
+	return &Session{
+		config: config,
+		conn:   conn,
+		ctx:    ctx,
+		cancel: cancel,
+		writes: make(chan outboundBatch, config.QueueSize),
+		events: make(chan Event, config.QueueSize),
+		ready:  make(chan error, 1),
+		done:   make(chan struct{}),
+	}
+}
+
+func (s *Session) start() {
+	s.wg.Add(2)
+	go s.writer()
+	go s.reader()
+	go func() {
+		s.wg.Wait()
+		close(s.events)
+		close(s.done)
+	}()
+}
+
+func (s *Session) Events() <-chan Event { return s.events }
+
+func (s *Session) SendAudio(ctx context.Context, pcm []byte) error {
+	if len(pcm) == 0 || len(pcm)%2 != 0 {
+		return errors.New("PCM must contain a non-empty whole number of 16-bit samples")
+	}
+	if len(pcm) > maxAudioChunkBytes {
+		return fmt.Errorf("PCM chunk has %d bytes, limit is %d", len(pcm), maxAudioChunkBytes)
+	}
+	audio := base64.StdEncoding.EncodeToString(pcm)
+	return s.enqueue(ctx, outboundBatch{events: []clientEvent{{Type: "input_audio_buffer.append", Audio: audio}}})
+}
+
+func (s *Session) Commit(ctx context.Context) error {
+	return s.enqueue(ctx, outboundBatch{events: []clientEvent{
+		{Type: "input_audio_buffer.commit"},
+		{Type: "response.create"},
+	}})
+}
+
+func (s *Session) Cancel(ctx context.Context) error {
+	return s.enqueue(ctx, outboundBatch{events: []clientEvent{{Type: "response.cancel"}}})
+}
+
+func (s *Session) Close() error {
+	s.closeOnce.Do(func() {
+		s.cancel()
+		_ = s.conn.Close()
+	})
+	timer := time.NewTimer(s.config.Timeout)
+	defer timer.Stop()
+	select {
+	case <-s.done:
+		return nil
+	case <-timer.C:
+		return transportError(context.DeadlineExceeded)
+	}
+}
+
+func (s *Session) enqueue(ctx context.Context, batch outboundBatch) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-s.ctx.Done():
+		return s.closedError()
+	default:
+	}
+	select {
+	case s.writes <- batch:
+		return nil
+	case <-ctx.Done():
+		return transportError(ctx.Err())
+	case <-s.ctx.Done():
+		return s.closedError()
+	}
+}
+
+// writer is the only goroutine allowed to write to the WebSocket.
+func (s *Session) writer() {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case batch := <-s.writes:
+			for _, event := range batch.events {
+				if err := s.conn.SetWriteDeadline(time.Now().Add(s.config.Timeout)); err != nil {
+					s.fail(transportError(err))
+					return
+				}
+				if err := s.conn.WriteJSON(event); err != nil {
+					if s.ctx.Err() == nil {
+						s.fail(transportError(err))
+					}
+					return
+				}
+			}
+		}
+	}
+}
+
+// reader is the only goroutine allowed to read from the WebSocket.
+func (s *Session) reader() {
+	defer s.wg.Done()
+	for {
+		_, payload, err := s.conn.ReadMessage()
+		if err != nil {
+			if s.ctx.Err() == nil {
+				s.fail(transportError(err))
+			}
+			return
+		}
+		var event serverEvent
+		if err := json.Unmarshal(payload, &event); err != nil {
+			s.fail(transportError(err))
+			return
+		}
+		if err := s.handleServerEvent(event); err != nil {
+			s.fail(err)
+			return
+		}
+	}
+}
+
+func (s *Session) handleServerEvent(event serverEvent) error {
+	switch event.Type {
+	case "session.updated":
+		s.signalReady(nil)
+	case "error":
+		err := fmt.Errorf("%w (%s): %s", ErrProvider, event.Error.Code, providerMessage(event))
+		if !s.readyOK.Load() {
+			s.signalReady(err)
+			return err
+		}
+		return s.publish(Event{Kind: EventProviderError, Err: err})
+	case "response.created":
+		return s.publish(Event{Kind: EventResponseStarted, ResponseID: event.Response.ID, Status: event.Response.Status})
+	case "response.text.delta", "response.audio_transcript.delta":
+		return s.publish(Event{Kind: EventTextDelta, ResponseID: event.ResponseID, Text: event.Delta})
+	case "response.audio.delta":
+		pcm, err := base64.StdEncoding.DecodeString(event.Delta)
+		if err != nil {
+			return transportError(err)
+		}
+		return s.publish(Event{Kind: EventAudioDelta, ResponseID: event.ResponseID, PCM: pcm})
+	case "response.done":
+		return s.publish(Event{Kind: EventResponseDone, ResponseID: event.Response.ID, Status: event.Response.Status})
+	}
+	return nil
+}
+
+func providerMessage(event serverEvent) string {
+	if event.Error.Message != "" {
+		return event.Error.Message
+	}
+	if event.Error.Type != "" {
+		return event.Error.Type
+	}
+	return "provider rejected request"
+}
+
+func (s *Session) publish(event Event) error {
+	select {
+	case s.events <- event:
+		return nil
+	default:
+		return transportError(errors.New("qwen event queue is full"))
+	}
+}
+
+func (s *Session) fail(err error) {
+	s.failOnce.Do(func() {
+		s.errMu.Lock()
+		s.fatalErr = err
+		s.errMu.Unlock()
+		s.signalReady(err)
+		s.cancel()
+		_ = s.conn.Close()
+	})
+}
+
+func (s *Session) signalReady(err error) {
+	s.readyOnce.Do(func() {
+		if err == nil {
+			s.readyOK.Store(true)
+		}
+		s.ready <- err
+	})
+}
+
+func (s *Session) closedError() error {
+	s.errMu.RLock()
+	err := s.fatalErr
+	s.errMu.RUnlock()
+	if err != nil {
+		return err
+	}
+	return ErrSessionClosed
+}
