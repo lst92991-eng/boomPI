@@ -1,5 +1,7 @@
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)
+option(BOOMPI_BUILD_RV1106_AUDIO_SMOKE
+  "Build the explicit RV1106 ALSA full-duplex smoke executable" OFF)
 
 set(_boompi_alsa_playback_default OFF)
 if(BOOMPI_TARGET_RV1106)
@@ -45,6 +47,7 @@ boompi_add_library(boompi_config
 target_link_libraries(boompi_config PUBLIC boompi_event)
 
 boompi_add_library(boompi_audio_core
+  src/audio/audio_dsp_frame_bridge.cpp
   src/audio/audio_dsp_engine.cpp
   src/audio/audio_format.cpp
   src/audio/audio_frame.cpp
@@ -62,6 +65,7 @@ boompi_add_library(boompi_audio_core
   src/audio/playback_renderer_24_to_48.cpp
   src/audio/playback_resampler_24_to_48.cpp
   src/audio/playback_worker.cpp
+  src/audio/vad_utterance_controller.cpp
   src/audio/wake_word_engine.cpp)
 target_link_libraries(boompi_audio_core PUBLIC boompi_event)
 
@@ -92,10 +96,52 @@ target_link_libraries(boompi_platform_audio
     boompi_event)
 
 boompi_add_library(boompi_platform_rv1106
-  src/platform/rv1106/build_environment.cpp)
-target_link_libraries(boompi_platform_rv1106 PUBLIC boompi_event)
+  src/platform/rv1106/audio_pcm_transfer.cpp
+  src/platform/rv1106/build_environment.cpp
+  src/platform/rv1106/rockchip_3a_audio_dsp_adapter.cpp)
+target_link_libraries(boompi_platform_rv1106
+  PUBLIC
+    boompi_audio_core
+    boompi_event)
 if(BOOMPI_TARGET_RV1106)
+  find_package(ALSA REQUIRED)
+  target_sources(boompi_platform_rv1106 PRIVATE
+    src/platform/rv1106/alsa_pcm_stream.cpp)
+  target_link_libraries(boompi_platform_rv1106 PRIVATE ALSA::ALSA)
   target_compile_definitions(boompi_platform_rv1106 PRIVATE BOOMPI_TARGET_RV1106=1)
+endif()
+if(BOOMPI_ENABLE_SNOWBOY)
+  add_library(boompi_snowboy_legacy_bridge STATIC
+    src/platform/rv1106/snowboy_legacy_bridge.cpp)
+  boompi_configure_target(boompi_snowboy_legacy_bridge)
+  target_compile_definitions(boompi_snowboy_legacy_bridge
+    PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
+  target_include_directories(boompi_snowboy_legacy_bridge
+    PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/rv1106"
+      "${BOOMPI_SNOWBOY_INCLUDE_DIR}")
+  target_link_libraries(boompi_snowboy_legacy_bridge
+    PRIVATE boompi_vendor::snowboy)
+
+  target_sources(boompi_platform_rv1106 PRIVATE
+    src/platform/rv1106/snowboy_wake_word_engine.cpp)
+  target_include_directories(boompi_platform_rv1106
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/rv1106")
+  target_link_libraries(boompi_platform_rv1106
+    PRIVATE
+      boompi_audio_core
+      boompi_snowboy_legacy_bridge)
+
+  add_executable(boompi_snowboy_offline_probe EXCLUDE_FROM_ALL
+    apps/snowboy_offline_probe/main.cpp)
+  boompi_configure_target(boompi_snowboy_offline_probe)
+  target_link_libraries(boompi_snowboy_offline_probe
+    PRIVATE
+      boompi_audio_core
+      boompi_platform_rv1106)
+  set_target_properties(boompi_snowboy_offline_probe PROPERTIES
+    OUTPUT_NAME "boompi-snowboy-offline-probe"
+    SKIP_BUILD_RPATH TRUE)
 endif()
 
 if(BOOMPI_ENABLE_ALSA_PLAYBACK)
@@ -149,6 +195,37 @@ add_executable(boompi_supervisor apps/boompi_supervisor/main.cpp)
 boompi_configure_target(boompi_supervisor)
 target_link_libraries(boompi_supervisor PRIVATE boompi_update)
 set_target_properties(boompi_supervisor PROPERTIES OUTPUT_NAME "boompi-supervisor")
+
+if(BOOMPI_ENABLE_ROCKCHIP_3A)
+  target_sources(boompi_platform_rv1106 PRIVATE
+    src/platform/rv1106/rockchip_3a_preprocess_session.cpp)
+  target_include_directories(boompi_platform_rv1106
+    PRIVATE "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}")
+  target_link_libraries(boompi_platform_rv1106
+    PRIVATE boompi_vendor::rockchip_3a_aec)
+
+  add_executable(boompi_rockchip_3a_probe EXCLUDE_FROM_ALL
+    apps/rockchip_3a_probe/main.cpp)
+  boompi_configure_target(boompi_rockchip_3a_probe)
+  target_include_directories(boompi_rockchip_3a_probe
+    PRIVATE "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}")
+  target_link_libraries(boompi_rockchip_3a_probe
+    PRIVATE boompi_vendor::rockchip_3a_aec)
+  set_target_properties(boompi_rockchip_3a_probe PROPERTIES
+    OUTPUT_NAME "boompi-rockchip-3a-probe"
+    SKIP_BUILD_RPATH TRUE)
+
+  add_executable(boompi_rockchip_3a_adapter_probe EXCLUDE_FROM_ALL
+    apps/rockchip_3a_adapter_probe/main.cpp)
+  boompi_configure_target(boompi_rockchip_3a_adapter_probe)
+  target_link_libraries(boompi_rockchip_3a_adapter_probe
+    PRIVATE
+      boompi_audio_core
+      boompi_platform_rv1106)
+  set_target_properties(boompi_rockchip_3a_adapter_probe PROPERTIES
+    OUTPUT_NAME "boompi-rockchip-3a-adapter-probe"
+    SKIP_BUILD_RPATH TRUE)
+endif()
 
 install(TARGETS boompi_client RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS boompi_supervisor RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR})
@@ -366,6 +443,67 @@ if(BOOMPI_BUILD_TESTS)
         TIMEOUT 20)
   endif()
 
+  add_executable(boompi_audio_dsp_frame_bridge_tests
+    tests/unit/audio_dsp_frame_bridge_tests.cpp)
+  boompi_configure_target(boompi_audio_dsp_frame_bridge_tests)
+  target_link_libraries(boompi_audio_dsp_frame_bridge_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_dsp_frame_bridge_tests
+    COMMAND boompi_audio_dsp_frame_bridge_tests)
+
+  add_executable(boompi_audio_vad_utterance_controller_tests
+    tests/unit/audio_vad_utterance_controller_tests.cpp)
+  boompi_configure_target(boompi_audio_vad_utterance_controller_tests)
+  target_link_libraries(boompi_audio_vad_utterance_controller_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_vad_utterance_controller_tests
+    COMMAND boompi_audio_vad_utterance_controller_tests)
+
+  add_executable(boompi_rockchip_3a_audio_dsp_adapter_tests
+    tests/unit/rockchip_3a_audio_dsp_adapter_tests.cpp)
+  boompi_configure_target(boompi_rockchip_3a_audio_dsp_adapter_tests)
+  target_link_libraries(boompi_rockchip_3a_audio_dsp_adapter_tests
+    PRIVATE
+      boompi_platform_rv1106
+      boompi_test_support)
+  add_test(
+    NAME boompi_rockchip_3a_audio_dsp_adapter_tests
+    COMMAND boompi_rockchip_3a_audio_dsp_adapter_tests)
+
+  add_executable(boompi_snowboy_wake_word_engine_tests
+    src/platform/rv1106/snowboy_wake_word_engine.cpp
+    tests/fixtures/snowboy_legacy_bridge_fake.cpp
+    tests/unit/snowboy_wake_word_engine_tests.cpp)
+  boompi_configure_target(boompi_snowboy_wake_word_engine_tests)
+  target_include_directories(boompi_snowboy_wake_word_engine_tests
+    PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/rv1106"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+  target_link_libraries(boompi_snowboy_wake_word_engine_tests
+    PRIVATE
+      boompi_audio_core
+      boompi_test_support)
+  add_test(
+    NAME boompi_snowboy_wake_word_engine_tests
+    COMMAND boompi_snowboy_wake_word_engine_tests)
+
+  add_executable(boompi_audio_pcm_transfer_tests
+    tests/unit/audio_pcm_transfer_tests.cpp)
+  boompi_configure_target(boompi_audio_pcm_transfer_tests)
+  target_link_libraries(boompi_audio_pcm_transfer_tests
+    PRIVATE
+      boompi_platform_rv1106
+      boompi_test_support)
+  add_test(
+    NAME boompi_audio_pcm_transfer_tests
+    COMMAND boompi_audio_pcm_transfer_tests)
+
   set_tests_properties(
     boompi_host_tests
     boompi_audio_queue_tests
@@ -383,5 +521,23 @@ if(BOOMPI_BUILD_TESTS)
     boompi_audio_playback_control_tests
     boompi_audio_playback_worker_tests
     boompi_audio_backend_contract_tests
+    boompi_audio_dsp_frame_bridge_tests
+    boompi_audio_vad_utterance_controller_tests
+    boompi_rockchip_3a_audio_dsp_adapter_tests
+    boompi_audio_pcm_transfer_tests
+    boompi_snowboy_wake_word_engine_tests
     PROPERTIES TIMEOUT 20)
+endif()
+
+if(BOOMPI_TARGET_RV1106 AND BOOMPI_BUILD_RV1106_AUDIO_SMOKE)
+  add_executable(boompi_alsa_smoke
+    tests/smoke/rv1106_alsa_smoke.cpp)
+  boompi_configure_target(boompi_alsa_smoke)
+  target_link_libraries(boompi_alsa_smoke
+    PRIVATE
+      boompi_audio_core
+      boompi_platform_rv1106
+      Threads::Threads)
+  set_target_properties(boompi_alsa_smoke PROPERTIES
+    OUTPUT_NAME "boompi-alsa-smoke")
 endif()

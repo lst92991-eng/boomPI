@@ -7,6 +7,10 @@
 playback adapter 继续保留，但暂停增加新抽象或 runtime 组成。它们的 host fake、ALSA
 `null` 和交叉链接结果只证明相应软件边界，不能证明板端 AEC、全双工或实时率。
 
+本次集成还保留了已提交的 `AudioDspFrameBridge16k`、`VadUtteranceController`、
+`Rockchip3aAudioDspAdapter`、Snowboy legacy bridge/adapter，以及 RV1106 ALSA 全双工
+adapter/smoke。它们仍未由 `boompi-client` composition root 组装，不能当作产品运行时已接通。
+
 下一项实现直接面向匹配 BSP 的 `rk_mpi_ai`/`rk_mpi_ao`、ALSA PCM、Rockchip
 VQE 和 `libaec_bf_process.so` 探针。详细只读证据见
 [P0 vendor 音频证据基线](../test/p0-vendor-audio-inventory-20260727.md)；MPI 头文件、依赖和
@@ -17,8 +21,8 @@ VQE 和 `libaec_bf_process.so` 探针。详细只读证据见
 
 1. **核心契约已实现**：固定帧、generation、错误分类和 fail-closed 行为。
 2. **依赖候选可配置**：只有显式启用并通过路径与 SHA-256 检查时才创建 imported target。
-3. **生产 adapter 与板端 HIL 未完成**：raw MPI 本地探针已完成离线/交叉构建，但尚未接入
-   生产运行时，也未在板端处理音频。
+3. **feasibility adapter 已隔离**：raw MPI 仍只有离线/交叉构建；Rockchip 3A 全零输入和
+   Snowboy 正向离线探针已有板端记录，但真实通道、异常安全、产品 worker 与完整 HIL 未完成。
 
 ## 数据流与帧布局
 
@@ -181,10 +185,12 @@ AGC 等模块可能组合启用，因此外层不得叠加同类处理；`wakeup
 - `RKAUDIOParam` ownership、线程限制和释放顺序，以及 file mode 资源的目标安装路径。
 - 算法延迟、CPU/RSS、单帧最坏耗时和持续实时率。
 
-匹配工具链的真实符号 link-check 已通过；它只关闭编译、链接和三个动态入口的解析，详见
-[2026-07-27 Rockchip 3A 交叉链接验证记录](../test/p0-rockchip-3a-link-validation-20260727.md)。
-下一步仍须用脱敏固定输入和板端返回记录逐项关闭上述运行问题。没有证据时状态只能写
-“未验证”。
+匹配工具链的真实符号 link-check 已通过；全零输入 ABI 探针和 platform adapter 换代探针也已
+在板端执行，但只证明固定 16 ms 调用、精确返回长度、destroy/init reset 和受控零输入路径。
+详见 [3A 交叉链接记录](../test/p0-rockchip-3a-link-validation-20260727.md)、
+[3A 离线 ABI 探针](../test/rockchip-3a-offline-probe-20260727.md)和
+[3A adapter 探针](../test/rockchip-3a-adapter-probe-20260727.md)。真实 packing、声学效果、
+持续实时率和完整错误域仍为“未验证”。
 
 ## WakeWordEngine 契约
 
@@ -213,6 +219,11 @@ wake/VAD worker，而不是 engine：
 `UnavailableWakeWordEngine` 对合法输入明确返回 backend unavailable，对非法格式返回
 invalid frame，永远不报告 silence、activity 或 detection。`FakeWakeWordEngine` 只在
 测试 target 中脚本化确定性结果和 reset 错误，不加载模型，也不是生产 fallback。
+
+`VadUtteranceController` 已实现外部 VAD 结果驱动的 500 ms pre-roll、6 秒首次说话等待、
+700 ms 尾静音、60 秒上限及 80/160 ms duck/打断意图，但尚无真实 VAD detector/worker。
+Snowboy adapter 的固定模型正向离线探针已通过；缺失模型会使旧 runtime 直接终止进程，
+因此该 adapter 保持 Debug-only、`EXCLUDE_FROM_ALL` 且不进入产品 runtime。
 
 ## 外部依赖闸门
 
@@ -260,7 +271,7 @@ Snowboy、OpenBLAS、Rockchip 库、资源和模型继续保留在仓库外；�
 SHA-256 和再分发范围全部确认前禁止提交二进制。显式路径不得写入 preset、安装包日志
 或 target 的 PUBLIC 接口。
 
-Snowboy 候选静态库使用旧 libstdc++ 字符串 ABI。未来只能由一个私有 C bridge TU
+Snowboy 候选静态库使用旧 libstdc++ 字符串 ABI。当前实现由一个私有 C bridge TU
 包含 `snowboy-detect.h` 并私有设置 `_GLIBCXX_USE_CXX11_ABI=0`；bridge 外只传固定宽度
 整数、PCM 指针、长度和不透明 handle，不传 `std::string`、异常、RTTI 或 Snowboy
 对象。所有异常必须在 bridge 内转换为错误码，旧 ABI 定义不得扩散到 `boompi_audio_core`
@@ -268,14 +279,10 @@ Snowboy 候选静态库使用旧 libstdc++ 字符串 ABI。未来只能由一个
 
 ## 后续验证顺序
 
-1. rk_mpi 最小生命周期的真实交叉链接已通过；下一步完成 rk_mpi/ALSA 48 kHz 全双工和
-   通道相关性 HIL，确定真实麦克风/reference 输入。
-2. 直接 3A 符号 link-check 已通过；下一步在板端关闭物理 slot 映射、错误恢复、
-   mono 输出、算法延迟、CPU/RSS 和实时率。
-3. 实现私有 Snowboy legacy bridge、启动期模型/格式校验和单线程 wake worker。
-4. 验证目标英文模型的加载、准确率、误唤醒、漏唤醒和最坏帧耗时，再进行至少
-   30 分钟稳定性测试。
-5. 最后接入 500 ms pre-roll、独立 VAD 和播放打断闭环；功能通过前不进行压力测试。
+1. 先用当前可用单麦完成客户端单轮录音、WSS 上行、Qwen 下行和播放的纵向闭环。
+2. 再接入已实现的 VAD/pre-roll 控制核心和三秒连续监听，然后完成 TTS 打断。
+3. 之后把 Snowboy adapter 接入受控 worker，并解决旧 runtime 的异常安全问题。
+4. 最后继续关闭双麦/reference packing、Rockchip 3A 实时率和最终壳体 AEC 声学验证。
 
 真实 adapter 或 HIL 记录完成前，README、UI capability 和测试报告都不得写“DSP 已接通”
 “Snowboy 可用”或“AEC/唤醒已通过”。

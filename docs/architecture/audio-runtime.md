@@ -13,10 +13,11 @@ partial exactly-once committer 和本地 `Drop -> Prepare` cancel ACK 状态机�
 完成了 host 可验证的固定容量 SPSC 控制/结果通道、独立 urgent cancel、producer
 start/stop 与 DSP reset 契约、分槽 EOS/critical 事件，以及 actor-owned exact
 cancellation join。P2f-b-b2 再以不创建线程的 deterministic host worker core 接通
-renderer、committer、mailbox 和有界单步状态推进。实际播放线程/调度、network
-producer/DSP 执行端、ALSA adapter、
-normal-EOS presentation completion、Rockchip 3A/Snowboy adapter、wake/VAD worker、
-AEC reference 消费和打断闭环尚未接入。accepted（包括 EOS accepted）不等于
+ renderer、committer、mailbox 和有界单步状态推进。本次集成加入了 RV1106 ALSA
+ capture/playback adapter、20↔16 ms DSP 帧桥、Rockchip 3A/Snowboy feasibility adapter
+ 和 portable VAD/pre-roll 控制核心。实际播放线程/调度、network/DSP 执行端、
+ normal-EOS presentation completion、wake/VAD worker、AEC reference 消费和打断闭环
+ 仍未接入 `boompi-client`。accepted（包括 EOS accepted）不等于
 presented、played 或 audible。
 Host 测试和交叉编译不能替代真机全双工、capture/reference layout、AEC 或声学验收。
 
@@ -107,11 +108,12 @@ decision/error。可用 score 的规范范围是 0–1000；Snowboy 没有置信
 adapter 必须返回 `score_available=false`、`score_milli=0`，不能用 sensitivity 代替。
 Snowboy 的 `-2` 只表示 detector 的 silence 分类，不是产品 VAD。
 
-generation/continuity gate、500 ms AEC 后 pre-roll 和产品 VAD 属于尚未实现的单线程
-wake/VAD worker。默认 `UnavailableWakeWordEngine` 永不报告 detection；测试 fake
-也不会进入发布 target。直接 3A 的固定 frame/input/output 长度已由匹配 SDK 关闭；
-物理 packing/slot、错误恢复、算法实时率，以及 Snowboy 模型加载与实时率仍未验证，
-不得从接口名称猜实现。详细边界见
+`VadUtteranceController` 已实现 generation/continuity gate、500 ms AEC 后 pre-roll、
+6 秒/700 ms/60 秒分段边界和 80/160 ms 播放打断意图；它由未来单线程 wake/VAD worker
+独占，并依赖外部真实 VAD 结果。默认 `UnavailableWakeWordEngine` 永不报告 detection；
+测试 fake 不进入发布 target。直接 3A 的固定 frame/input/output 长度和全零输入 adapter
+路径已有证据；物理 packing/slot、声学效果和持续实时率仍未验证。Snowboy 正向离线探针
+已通过，但缺失模型会触发旧 runtime 进程终止，因此仍不得进入产品路径。详细边界见
 [音频后端契约与依赖闸门](audio-backends.md)。
 
 两个 vendor 开关默认 `OFF`。当前 pins 只允许在核对 Linux/ARM cross target、固定
@@ -351,6 +353,8 @@ Host CTest 覆盖固定格式、非法 metadata、FIFO、满队列、槽复用�
 饱和、跨帧 FIR、独立参考卷积、频响、舍入、重置、完整采集前端的 generation
 切换、旧帧隔离和错误恢复，播放帧、fence、gate、held lease 和有界 drain，以及
 DSP/唤醒契约的配置校验、POD 结果一致性、unavailable fail-closed 和测试 fake。
+本次集成的既有测试还覆盖 20↔16 ms 帧桥、VAD/pre-roll 控制、Rockchip 3A adapter 映射、
+Snowboy bridge 映射和 RV1106 ALSA transfer 边界；这些结果不替代产品 runtime smoke。
 播放侧还覆盖 65-tap Q31 表再生成、跨帧 bit-exact 插值、频响、wide-int32 overshoot、
 任意合法 EOS prefix+63 drain、音量/扬声器增益、80 ms duck/recovery、limiter
 即时 attack/跨 chunk release、统计量、facade 状态与故障换代。P2f-b-a 进一步覆盖

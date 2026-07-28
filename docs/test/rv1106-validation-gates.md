@@ -13,7 +13,10 @@ Rockchip MPI raw AI/AO 的 2026-07-27 tests-off 交叉链接、当时 21 个符�
 当前 22 个符号、raw HIL 离线闸门和真实交叉构建见
 [2026-07-28 MPI HIL 构建验证记录](p0-rockchip-mpi-hil-build-validation-20260728.md)；
 P2f-c-a 的 host/null/交叉链接证据见
-[2026-07-27 ALSA playback adapter 验证记录](p2f-c-a-validation-20260727.md)。
+[2026-07-27 ALSA playback adapter 验证记录](p2f-c-a-validation-20260727.md)；后续板端证据见
+[ALSA 全双工 smoke](rv1106-alsa-smoke-20260727.md)、[3A 离线 ABI 探针](rockchip-3a-offline-probe-20260727.md)、
+[3A adapter 探针](rockchip-3a-adapter-probe-20260727.md)和
+[Snowboy P0 探针](snowboy-p0-probe-20260727.md)。
 
 ## P0 环境与 ABI
 
@@ -24,9 +27,9 @@ P2f-c-a 的 host/null/交叉链接证据见
 
 ## 音频
 
-当前执行顺序是 vendor backend 最小闭环优先。以下已完成的 playback host/交叉测试继续
-作为证据保留，但其余 playback worker、control 和 runtime 组合项暂停扩展，直到 rk_mpi/
-ALSA 的真实全双工、capture layout 和 3A 契约关闭。
+当前执行顺序以单麦单轮纵向对话优先。以下 host、交叉和受控板端结果继续作为证据保留；
+未进入产品 runtime 的 playback/control 抽象暂停扩展，双麦/reference/3A 声学闸门不再
+阻塞单麦里程碑，但仍是最终产品验收项。
 
 - [x] 只读核对 rk_mpi AI/AO 头文件、raw frame 生命周期、`librockit.so` 依赖、预构建
   test、当前 DTB/codec/ALSA 声明和 3A 候选；这些仍不是板端功能验证。
@@ -59,8 +62,9 @@ ALSA 的真实全双工、capture layout 和 3A 契约关闭。
 - [x] 直接 Rockchip 3A 的 tests-off 默认 ALL link-check 已用匹配 GCC 8.3/uClibc 工具链
   完成真实交叉链接；最终 ELF 保留 AEC/common `NEEDED` 与 init/short/destory 三个 `UND`。
   该 target 不安装、不自动执行，不能作为板端加载或 3A 功能证据。
-- [ ] 在板端验证 16 kHz/S16、2 mic + 1 ref、256-sample 的物理 slot 到交织逻辑输入映射；核对
-  `input_size=768 shorts`、成功 512 bytes、非法尺寸 0、init null，并记录错误恢复、
+- [x] 在板端完成 16 kHz/16 ms 全零输入 ABI 与 adapter 换代探针，确认成功 512-byte mono
+  返回、精确长度检查和 destroy/init reset；该结果不证明真实输入或算法效果。
+- [ ] 用真实双麦/reference 验证物理 slot 到逻辑交织输入的映射，并记录完整错误域、
   CPU/RSS、单帧最坏耗时和持续实时率。
 
 - [x] Host fake 已覆盖 playback adapter 的 mono/stereo、partial、typed errno、写前/写后
@@ -69,8 +73,10 @@ ALSA 的真实全双工、capture layout 和 3A 契约关闭。
 - [x] 匹配 BSP 的 GCC 8.3/uClibc sysroot 已用 ALSA 1.2.8 头/库构建真实 playback
   device adapter，并链接默认 ALL 的 adapter/ALSA/clock 符号检查 executable；该结果不代表
   `boompi-client` composition root 已实例化它，也不代表 executable 已在板端运行。
-- [ ] 记录真实 ALSA card/device、支持格式、period/buffer 和 mixer 控件。
-- [ ] 验证 48 kHz capture/playback 全双工，不用串行播放与录音冒充。
+- [x] 记录本轮真实 ALSA card/device、支持格式、period/buffer 和只读 mixer 基线；这些参数
+  只适用于记录中的板卡与镜像。
+- [x] 完成一次 48 kHz 静音 capture/playback 同时推进 smoke 和迁移后 committer 复测；
+  该结果不证明可听播放、采集内容、四通道布局、极性、reference 或 AEC。
 - [ ] 用真实 ALSA adapter 验证 partial write、would-block/interrupted、xrun/suspend、
   device loss、`drop`/`prepare` 和重新建链；不得重复写出已经 accepted 的 prefix。
 - [ ] 对真实设备和解析后的直接硬件路径回读 exact 48 kHz/S16_LE/RW_INTERLEAVED、playback channels、period、
@@ -110,7 +116,9 @@ ALSA 的真实全双工、capture layout 和 3A 契约关闭。
 ## Snowboy
 
 - [ ] 确认 runtime/model 来源、SHA-256 和再分发许可。
-- [ ] 验证模型初始化、16 kHz mono 连续输入、目标英文唤醒和错误路径。
+- [x] 固定默认模型的 16 kHz mono 离线正向探针已产生一次 keyword 1 并成功 reset。
+- [ ] 让缺失/损坏模型安全返回错误；当前旧 runtime 会直接终止进程，禁止进入产品路径。
+- [ ] 用真实麦克风验证目标英文唤醒。
 - [ ] 记录 CPU、RSS、最坏帧耗时、漏唤醒和误唤醒；功能跑通后再进行至少 30 分钟稳定性测试。
 - [ ] 不兼容时保存证据并请求架构决策，禁止静默换引擎或自行改为多进程。
 

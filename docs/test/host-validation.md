@@ -215,6 +215,8 @@ RV1106 HIL。
 - unavailable wake engine 对合法 16 kHz mono frame 返回 backend unavailable，对非法
   格式返回 invalid frame，永不报告 detection。确定性 wake fake 只进入测试 target，
   不能成为生产 fallback；Snowboy `-2` 不作为 VAD 测试结论。
+- VAD/pre-roll 控制测试使用注入的 speech/silence 结果，不包含假算法；它只验证分段、
+  pre-roll、打断意图、代际隔离和有界队列，不代表真实 VAD 或产品 worker 已接入。
 - vendor CMake 夹具验证 MPI、3A 和 Snowboy 三个 enable 选项默认关闭，并以不存在的显式
   输入确认 OFF 时零访问、零路径泄漏；host 即使伪造 `BOOMPI_TARGET_RV1106=ON` 也不能
   越过 cross Linux/ARM、固定 compiler 和 uClibc sysroot 检查。当前 pins 还要求显式
@@ -254,11 +256,10 @@ adapter 也尚未由 runtime 创建。当前没有实际播放线程/调度、�
 producer endpoint、DSP endpoint、AEC reference
 消费、normal-EOS presentation completion 或壳体声学 HIL。accepted（包括 EOS accepted）
 不等于 presented、played 或 audible，本地 playback cancel ACK 也不等于扬声器静音或
-DSP 历史已经复位。匹配 BSP 已关闭直接 Rockchip 3A 的固定 frame、`input_size` 和成功
-输出长度，目标交叉链接与三个入口的符号解析也已通过；后续仍必须验证真实 packing/slot、
-板端加载、错误恢复与实时率，再实现生产 adapter。
-Snowboy 还需私有 legacy C ABI bridge、模型加载、
-单线程 wake worker、500 ms pre-roll/VAD 和板端准确率/实时率测试。上述工作完成前不得
+DSP 历史已经复位。匹配 BSP 已关闭直接 Rockchip 3A 的固定 frame、`input_size`、成功输出
+长度、符号解析和全零输入 adapter 路径；真实 packing/slot、完整错误域与实时率仍待验证。
+Snowboy 私有 legacy bridge/adapter 和固定模型正向离线探针已存在，但缺失模型错误路径会
+终止进程，且单线程 wake worker、真实 VAD、板端准确率/实时率仍未完成。上述工作完成前不得
 在 host 报告中写“ALSA 播放已接通”“AEC 已接通”“EOS 已播放完成”或“唤醒已通过”。
 
 ## 报告要求

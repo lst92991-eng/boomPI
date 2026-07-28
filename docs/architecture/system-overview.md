@@ -112,6 +112,11 @@ audible 或“播放完成”。Rockchip 3A、Snowboy、真实 capture/reference
 packing/slot、错误恢复、算法实时率和 Snowboy 板端行为仍未验证，不能通过硬编码或 fake
 伪装成已完成。
 
+当前集成分支还包含 20↔16 ms DSP 帧桥、portable VAD/pre-roll 控制核心、Rockchip 3A 与
+Snowboy feasibility adapter、RV1106 ALSA capture/playback adapter。它们尚未由
+`boompi-client` 组装；快速交付阶段先完成可用单麦单轮纵向闭环，再按既定顺序接入 VAD、
+打断、Snowboy 和双麦/AEC。
+
 ## 状态与取消
 
 会话状态和网络状态相互正交。application actor 创建 `turn_id` 和 `epoch`；网络重连、取消或打断后递增 generation，所有迟到帧必须被丢弃。
