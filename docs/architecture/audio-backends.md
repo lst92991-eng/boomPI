@@ -144,12 +144,15 @@ test 和直接 3A 库存在，并看到 VQE JSON 缺失。2026-07-28 SSH 恢复�
 rkaudio；因此 raw MPI HIL 必须阻断，板端 ARM ELF 仍未执行。完整证据见
 [MPI HIL 只读前置验证记录](../test/p0-rockchip-mpi-audio-preflight-20260728.md)。
 
-下一步先运行独立的 direct ALSA 有界工具，不经过现有 production adapter：首轮请求
+独立的 direct ALSA 有界工具已在当前板运行，不经过现有 production adapter：实际接受
 48 kHz/S16_LE/2ch、480-frame period 和 4 periods，数字播放固定为全零，并把指定 DAC enum
-切到 Off 后回读。工具默认 dry-run，板端执行需要三重 opt-in、PCM 两次占用检查、单调时钟
-重叠、精确字节数、连续 dmesg delta 和 mixer 恢复。详细契约见
-[直接 ALSA 全双工 HIL 指南](../test/p0-alsa-full-duplex-hil-guide.md)。它尚未在板端运行，
-也不是新的 playback/control/worker 抽象。
+切到 Off 后回读。两轮均取得约 3.94 秒重叠、精确 capture 长度、精确 playback 输入文件、
+`aplay` 返回 0、clean dmesg delta 和 mixer 恢复。当前板仍运行旧
+`RV1106-Atguigu`/`SingadcL` 镜像；临时 `DiffadcLR` 对照中两个 slot 均出现非恒定且无
+满幅饱和值的样本，但正确自定义 BSP、物理左右/极性和 reference 仍未关闭。详细契约和结果分别见
+[直接 ALSA 全双工 HIL 指南](../test/p0-alsa-full-duplex-hil-guide.md)与
+[2026-07-28 真板验证记录](../test/p0-alsa-full-duplex-validation-20260728.md)。该工具不是新的
+playback/control/worker 抽象。
 
 raw MPI 对照同样保持为独立的显式探针：`BOOMPI_BUILD_ROCKCHIP_MPI_AUDIO_HIL` 默认关闭，
 target 为 `EXCLUDE_FROM_ALL`，不安装、不进入 CTest，也不被任何普通 target 依赖。首轮固定
@@ -273,8 +276,8 @@ Snowboy 候选静态库使用旧 libstdc++ 字符串 ABI。未来只能由一个
 
 ## 后续验证顺序
 
-1. rk_mpi 最小生命周期的真实交叉链接已通过；下一步完成 rk_mpi/ALSA 48 kHz 全双工和
-   通道相关性 HIL，确定真实麦克风/reference 输入。
+1. direct ALSA 48 kHz transport 全双工已通过；先对齐目标自定义 BSP，再完成通道相关性
+   HIL。rk_mpi 最小生命周期的真实交叉链接已通过，但真实执行仍被 `rkipc` owner 阻断。
 2. 直接 3A 符号 link-check 已通过；下一步在板端关闭物理 slot 映射、错误恢复、
    mono 输出、算法延迟、CPU/RSS 和实时率。
 3. 实现私有 Snowboy legacy bridge、启动期模型/格式校验和单线程 wake worker。

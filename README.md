@@ -2,9 +2,10 @@
 
 boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端负责连接 Qwen 新加坡区，板端不保存云端 API Key。
 
-> **P1 工程骨架已完成；当前第一闸门是 vendor 音频最小闭环。** 下一步先用匹配 BSP 的
-> `rk_mpi_ai`/`rk_mpi_ao` 与直接 ALSA 实测 48 kHz 全双工、真实通道布局和 Rockchip
-> VQE/3A，再决定生产模块如何拆分。此前的 renderer、queue、playback control、committer
+> **P1 工程骨架已完成；当前第一闸门是 vendor 音频最小闭环。** direct ALSA 48 kHz
+> transport 真全双工已在当前板通过，但板上仍是旧 `RV1106-Atguigu`/`SingadcL` 镜像；
+> 下一步先对齐目标自定义 BSP，再实测通道/reference、`rk_mpi_ai`/`rk_mpi_ao` 和 Rockchip
+> 3A。此前的 renderer、queue、playback control、committer
 > 和 ALSA adapter 代码及测试保留为 host/交叉链接证据，但暂停扩展，不能冒充板端能力。
 
 ## 系统形态
@@ -29,15 +30,17 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 ### 已有硬件单项结果
 
-- 扬声器播放和双麦基本采集曾在真实板卡上分别跑通。
+- 扬声器播放曾在真实板卡上跑通；历史记录曾把双麦基础采集标为通过，但当前可重复证据
+  只确认临时 `DiffadcLR` 下两个动态 PCM slot，U9/U12 物理映射仍待验证。
 - 以太网、Wi-Fi、ST7789P3、GT911 和 SC3336 已做过单项 bring-up。
 - 双麦机械基线为正面横向 35 mm 中心距；扬声器位于双麦中点下方，推荐中心距 80 mm。
 
-以上结果不代表以下事项已经通过：
+### 当前证据边界
 
-- 48 kHz 真全双工、实际 capture 通道数和数字播放 reference slot。当前 DTB 的
-  `TRCM clk-trcm=1` 只说明 TX/RX 共享 TX 时钟，不证明四通道；vendor VQE 样例选择的 loopback
-  Mode2 也是另一项尚未在本板验证的 mixer 设置。
+- 当前板上的 direct ALSA 48 kHz/S16_LE/2ch transport 真全双工已通过；raw MPI、目标
+  自定义 BSP、实际 capture 物理左右/极性和数字播放 reference slot 尚未通过。当前 DTB 的
+  `TRCM clk-trcm=1` 只说明 TX/RX 共享 TX 时钟，不证明四通道；vendor VQE 样例选择的
+  loopback Mode2 也是另一项尚未在本板验证的 mixer 设置。
 - Rockchip 3A 的板端加载、实际通道契约和 16 kHz 实时率；匹配 SDK 的交叉链接与三个
   入口符号解析已通过，但对应 ELF 尚未在板端执行。
 - Snowboy 的板端模型加载、准确率和实时率；旧 ARM 库的交叉链接候选已核对。
@@ -53,8 +56,9 @@ GCC 8.3/uClibc 工具链；Rockchip 3A 的 tests-off 默认 ALL 交叉链接和�
 当前 link-check/HIL 加入精确 `RK_MPI_MB_GetSize` 后为 22 个。Snowboy/OpenBLAS 仍是 ABI/链接候选；
 板端能力仍是部分通过。当前镜像的只读探针只确认 `librockit.so`、AI/AO test、一个
 capture PCM、一个 playback PCM 和直接 3A 库存在，同时确认 VQE JSON 缺失；探针没有
-打开 PCM 或执行 vendor API。raw PCM 的实际参数、AI+AO 同时运行、VQE 资源安装和 3A
-实时率尚未在当前镜像闭环验证。
+打开 PCM 或执行 vendor API。随后 direct ALSA 已在当前镜像按实际 48 kHz/S16_LE/2ch、
+480-frame period、1920-frame buffer 同时运行；raw MPI AI+AO、VQE 资源安装和 3A 实时率
+仍未闭环验证。
 具体路径、哈希、两个 Mode 的区别和 HIL 顺序见
 [2026-07-27 vendor 音频证据基线](docs/test/p0-vendor-audio-inventory-20260727.md)。
 3A 交叉链接的命令、ELF 结果和严格边界另见
@@ -76,6 +80,13 @@ Qwen，也不会消耗付费额度。
 状态机，也不证明 slot 0 信号质量、声学可听、真全双工、双麦或 AEC。证据与边界见
 [P1 C++ WSS 单轮闭环验证记录](docs/test/p1-cpp-wss-client-validation-20260728.md)和
 [RV1106 手动单轮 HIL 验证记录](docs/test/p1-rv1106-manual-single-turn-hil-validation-20260728.md)。
+
+同日 direct ALSA 有界探针又完成两轮真实全双工：默认 `SingadcL` 时 transport 通过但
+第二 slot 恒为 `-32768`；临时切到 `DiffadcLR` 后两个 slot 均出现非恒定样本，本次 PCM 聚合没有
+`-32768/32767` 饱和值，并在测试后恢复原 mixer 值。板端实际仍是旧 `RV1106-Atguigu`
+镜像，因此该结果不能替代正确自定义 BSP
+复测，也不证明物理左右、极性或 reference。见
+[P0 直接 ALSA 全双工验证记录](docs/test/p0-alsa-full-duplex-validation-20260728.md)。
 
 ## 仓库结构
 
@@ -130,7 +141,8 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 
 同一 Python 入口也使用全 fake ALSA/mixer 环境回归显式 opt-in 的
 [直接 ALSA 全双工 HIL 工具](docs/test/p0-alsa-full-duplex-hil-guide.md)。自动测试不会打开
-真实 PCM；板端物理链路恢复前，该工具只有 dry-run/离线证据，不能写成 48 kHz 已通过。
+真实 PCM；真实执行与边界由独立的
+[板端验证记录](docs/test/p0-alsa-full-duplex-validation-20260728.md)承接。
 
 Windows 使用支持所选编译器的 PowerShell/Developer PowerShell；Linux 和 macOS 使用系统 C++ 工具链。CI 会在 Windows、Linux 和 macOS 上执行同一组 host 检查。
 
@@ -313,8 +325,9 @@ raw MPI 对照使用独立的
 
 ## 路线图
 
-1. **P0 可行性闸门（进行中）**：先完成 rk_mpi/ALSA 48 kHz 全双工、真实 capture
-   layout、Rockchip VQE/3A，再继续 Snowboy、WSS 产品接线、Wi-Fi AP 和 UI backend 探测。
+1. **P0 可行性闸门（进行中）**：direct ALSA transport 全双工已通过；先对齐自定义 BSP，
+   再完成真实 capture/reference layout、raw rk_mpi 和 Rockchip 3A，随后继续 Snowboy、
+   WSS 产品接线、Wi-Fi AP 和 UI backend 探测。
 2. **P1 工程骨架（已完成）**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
 3. **P2 本地音频（进行中）**：现有 host 音频核心保留但冻结扩展；以 vendor raw PCM 最小
    闭环和板端 HIL 为当前入口，实测后再决定哪些已有模块进入 runtime。

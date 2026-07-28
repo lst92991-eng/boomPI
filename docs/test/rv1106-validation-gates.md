@@ -17,7 +17,9 @@ Rockchip MPI raw AI/AO 的 2026-07-27 tests-off 交叉链接、当时 21 个符�
 P2f-c-a 的 host/null/交叉链接证据见
 [2026-07-27 ALSA playback adapter 验证记录](p2f-c-a-validation-20260727.md)；
 三秒单麦手动单轮的真实 ALSA/TLS/WSS 闭环见
-[2026-07-28 RV1106 手动单轮 HIL 记录](p1-rv1106-manual-single-turn-hil-validation-20260728.md)。
+[2026-07-28 RV1106 手动单轮 HIL 记录](p1-rv1106-manual-single-turn-hil-validation-20260728.md)；
+当前 direct ALSA 48 kHz 全双工 transport、旧镜像差异与临时双 ADC 对照见
+[2026-07-28 直接 ALSA 全双工验证记录](p0-alsa-full-duplex-validation-20260728.md)。
 
 ## P0 环境与 ABI
 
@@ -58,13 +60,17 @@ ALSA 的真实全双工、capture layout 和 3A 契约关闭。
 - [ ] 建立当前镜像专用、可验证且保留 Ethernet/DHCP/SSH 的 maintenance boot，在 rkipc
   首次启动前跳过它并证明不会 respawn。禁止调用会 `killall rkipc/udhcpc`、无界等待并执行
   全 OEM `rcK` 的 `S21appinit stop`；启动流程或镜像变更必须先取得用户本次明确授权。
-- [ ] 用直接 ALSA 与 raw rk_mpi 分别验证 48 kHz S16_LE 2ch 真全双工、有限 timeout、
-  明确重叠区间、全部 exit code/录音字节数、停止顺序和 dmesg xrun delta；串行运行不能
-  冒充全双工。
+- [x] 当前板的 direct ALSA 已以实际 48 kHz/S16_LE/RW_INTERLEAVED/2ch、480-frame
+  period、1920-frame buffer 完成 6 秒 capture 与 4 秒数字静音 playback；两轮重叠分别
+  3950/3940 ms；capture 长度精确，playback 输入文件长度精确且 `aplay` 返回 0，dmesg
+  delta clean，mixer 恢复且测试后 PCM closed。
+  当前板仍是旧 `RV1106-Atguigu`/`SingadcL` 镜像，所以目标自定义 BSP 必须复测。
+- [ ] raw rk_mpi 仍须独立验证同率 2ch 真全双工、有限 timeout、重叠、退出和 kernel log；
+  当前被 `rkipc` 的 22 个 `/dev/mpi/*` FD 阻断，direct ALSA 不能替代该项。
 - [x] 已实现默认 dry-run、三重显式 opt-in 的 direct ALSA 有界 HIL 工具和离线 fake 回归；
   它请求 480-frame period/4 periods，保存实际 ALSA verbose 输出，以单调时钟验证重叠，
-  并在可达退出路径尝试恢复、回读单个 DAC enum，恢复失败独立报错。该全双工工具尚未在板端
-  执行，不能勾选上一项；手动串行单轮的成功不能替代它。
+  并在可达退出路径尝试恢复、回读单个 DAC enum，恢复失败独立报错。该工具已按上一项在
+  真板执行；手动串行单轮不是其通过依据。
   操作契约见 [直接 ALSA 全双工 HIL 指南](p0-alsa-full-duplex-hil-guide.md)。
 - [ ] 逐个 `amixer cget` 保存所有将改控件，设置后回读，并在正常/异常退出恢复原值。
   预构建 AI test 会无条件清除 loopback，不能假定原值为 `Disabled`。
@@ -87,7 +93,9 @@ ALSA 的真实全双工、capture layout 和 3A 契约关闭。
 - [x] 已记录实际使用的 `hw:0,0` capture/playback，以及程序精确设置并显式回读的
   48 kHz、2ch、960-frame period、3840-frame buffer；S16_LE/RW_INTERLEAVED 已精确设置。
 - [ ] 枚举硬件支持格式全集、解析后的底层硬件路径和全部相关 mixer 控件。
-- [ ] 验证 48 kHz capture/playback 全双工，不用串行播放与录音冒充。
+- [x] 已在 direct `hw:0,0` 同时运行 48 kHz capture/playback；最小公共打开区间 3940 ms，
+  不是串行录放。该项只关闭当前镜像的 ALSA transport，不关闭 raw MPI、正确 BSP、声学播放
+  或双麦/reference layout。
 - [x] 2026-07-28 已在 `hw:0,0` 以精确 48 kHz/S16_LE/2ch、960-frame period、
   3840-frame buffer 完成三秒单麦手动单轮：150 个 16 kHz 上行帧、96,000 字节、一次
   commit，随后接收 25 个 24 kHz 下行帧并完成 26 个 renderer chunk 的 ALSA playback
