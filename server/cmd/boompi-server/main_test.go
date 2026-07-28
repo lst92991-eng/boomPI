@@ -11,6 +11,7 @@ import (
 
 func TestCheckConfigDoesNotPrintSecret(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "command-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(configPath, []byte("log_level: debug\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
@@ -31,6 +32,7 @@ func TestCheckConfigDoesNotPrintSecret(t *testing.T) {
 
 func TestRunReportsMissingConfig(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "command-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"--config", filepath.Join(t.TempDir(), "missing.yaml")}, &stdout, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), "configuration error") {
@@ -40,6 +42,7 @@ func TestRunReportsMissingConfig(t *testing.T) {
 
 func TestCLIOverrideWinsOverEnvironmentAndYAML(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "command-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	t.Setenv("BOOMPI_WSS_PORT", "70000")
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(configPath, []byte("wss_port: 18001\n"), 0o600); err != nil {

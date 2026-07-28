@@ -23,6 +23,7 @@ var configKeys = []string{
 	"provider",
 	"region",
 	"model",
+	"voice",
 	"search_mode",
 	"system_prompt",
 	"persona",
@@ -63,6 +64,7 @@ type Config struct {
 	Provider             string
 	Region               string
 	Model                string
+	Voice                string
 	SearchMode           string
 	SystemPrompt         string
 	Persona              string
@@ -87,6 +89,7 @@ func Defaults() Config {
 		Provider:             "qwen",
 		Region:               "singapore",
 		Model:                "qwen3.5-omni-plus-realtime",
+		Voice:                "Ethan",
 		SearchMode:           "auto",
 		SystemPrompt:         "You are boomPI, a concise and helpful voice assistant. Reply in Simplified Chinese unless the user asks for another language.",
 		Persona:              "Natural, young, friendly, and not overly cute.",
@@ -198,6 +201,9 @@ func (c Config) Validate() error {
 	if strings.IndexFunc(c.Model, unicode.IsControl) >= 0 {
 		return errors.New("model must not contain control characters")
 	}
+	if strings.TrimSpace(c.Voice) == "" || len(c.Voice) > 64 || strings.IndexFunc(c.Voice, unicode.IsControl) >= 0 {
+		return errors.New("voice must contain 1..64 characters without control characters")
+	}
 	if !oneOf(c.SearchMode, "auto", "off") {
 		return errors.New("search_mode must be auto or off")
 	}
@@ -236,6 +242,9 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.Credentials.apiKey) == "" {
 		return errors.New("API credential is required")
+	}
+	if strings.TrimSpace(c.Credentials.workspaceID) == "" {
+		return errors.New("DASHSCOPE_WORKSPACE_ID is required for the Singapore Qwen endpoint")
 	}
 	return nil
 }
@@ -405,6 +414,8 @@ func applyValue(cfg *Config, key, value string) error {
 		cfg.Region = strings.ToLower(value)
 	case "model":
 		cfg.Model = value
+	case "voice":
+		cfg.Voice = value
 	case "search_mode":
 		cfg.SearchMode = strings.ToLower(value)
 	case "system_prompt":

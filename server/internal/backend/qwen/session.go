@@ -16,25 +16,6 @@ import (
 
 var ErrSessionClosed = errors.New("qwen session is closed")
 
-type EventKind uint8
-
-const (
-	EventResponseStarted EventKind = iota + 1
-	EventTextDelta
-	EventAudioDelta
-	EventResponseDone
-	EventProviderError
-)
-
-type Event struct {
-	Kind       EventKind
-	ResponseID string
-	Text       string
-	PCM        []byte
-	Status     string
-	Err        error
-}
-
 type clientEvent struct {
 	Type    string         `json:"type"`
 	Audio   string         `json:"audio,omitempty"`
@@ -74,17 +55,20 @@ type Session struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	writes chan outboundBatch
-	events chan Event
+	events chan backend.ConversationEvent
 	ready  chan error
 	done   chan struct{}
 
-	readyOnce sync.Once
-	readyOK   atomic.Bool
-	failOnce  sync.Once
-	closeOnce sync.Once
-	wg        sync.WaitGroup
-	errMu     sync.RWMutex
-	fatalErr  error
+	readyOnce         sync.Once
+	readyOK           atomic.Bool
+	failOnce          sync.Once
+	closeOnce         sync.Once
+	wg                sync.WaitGroup
+	errMu             sync.RWMutex
+	fatalErr          error
+	responseMu        sync.Mutex
+	responseRequested bool
+	cancelWait        chan error
 }
 
 var _ backend.ConversationSession = (*Session)(nil)
@@ -98,7 +82,7 @@ func newSession(config Config, conn *websocket.Conn) *Session {
 		ctx:    ctx,
 		cancel: cancel,
 		writes: make(chan outboundBatch, config.QueueSize),
-		events: make(chan Event, config.QueueSize),
+		events: make(chan backend.ConversationEvent, config.QueueSize),
 		ready:  make(chan error, 1),
 		done:   make(chan struct{}),
 	}
@@ -115,7 +99,7 @@ func (s *Session) start() {
 	}()
 }
 
-func (s *Session) Events() <-chan Event { return s.events }
+func (s *Session) Events() <-chan backend.ConversationEvent { return s.events }
 
 func (s *Session) SendAudio(ctx context.Context, pcm []byte) error {
 	if len(pcm) == 0 || len(pcm)%2 != 0 {
@@ -129,14 +113,58 @@ func (s *Session) SendAudio(ctx context.Context, pcm []byte) error {
 }
 
 func (s *Session) Commit(ctx context.Context) error {
-	return s.enqueue(ctx, outboundBatch{events: []clientEvent{
+	s.responseMu.Lock()
+	if s.responseRequested {
+		s.responseMu.Unlock()
+		return errors.New("qwen response is already active")
+	}
+	s.responseRequested = true
+	s.responseMu.Unlock()
+	err := s.enqueue(ctx, outboundBatch{events: []clientEvent{
 		{Type: "input_audio_buffer.commit"},
 		{Type: "response.create"},
 	}})
+	if err != nil {
+		s.responseMu.Lock()
+		s.responseRequested = false
+		s.responseMu.Unlock()
+	}
+	return err
 }
 
 func (s *Session) Cancel(ctx context.Context) error {
-	return s.enqueue(ctx, outboundBatch{events: []clientEvent{{Type: "response.cancel"}}})
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.responseMu.Lock()
+	if !s.responseRequested {
+		s.responseMu.Unlock()
+		return s.enqueue(ctx, outboundBatch{events: []clientEvent{{Type: "input_audio_buffer.clear"}}})
+	}
+	if s.cancelWait != nil {
+		s.responseMu.Unlock()
+		return errors.New("qwen response cancellation is already in progress")
+	}
+	wait := make(chan error, 1)
+	s.cancelWait = wait
+	if err := s.enqueue(ctx, outboundBatch{events: []clientEvent{{Type: "response.cancel"}}}); err != nil {
+		s.cancelWait = nil
+		s.responseMu.Unlock()
+		return err
+	}
+	s.responseMu.Unlock()
+	timer := time.NewTimer(s.config.Timeout)
+	defer timer.Stop()
+	select {
+	case err := <-wait:
+		return err
+	case <-ctx.Done():
+		return transportError(ctx.Err())
+	case <-s.ctx.Done():
+		return s.closedError()
+	case <-timer.C:
+		return transportError(context.DeadlineExceeded)
+	}
 }
 
 func (s *Session) Close() error {
@@ -230,19 +258,27 @@ func (s *Session) handleServerEvent(event serverEvent) error {
 			s.signalReady(err)
 			return err
 		}
-		return s.publish(Event{Kind: EventProviderError, Err: err})
+		if publishErr := s.publish(backend.ConversationEvent{Type: backend.EventError, Err: err}); publishErr != nil {
+			return publishErr
+		}
+		s.finishResponse(err)
+		return nil
 	case "response.created":
-		return s.publish(Event{Kind: EventResponseStarted, ResponseID: event.Response.ID, Status: event.Response.Status})
+		return s.publish(backend.ConversationEvent{Type: backend.EventStarted, ResponseID: event.Response.ID})
 	case "response.text.delta", "response.audio_transcript.delta":
-		return s.publish(Event{Kind: EventTextDelta, ResponseID: event.ResponseID, Text: event.Delta})
+		return s.publish(backend.ConversationEvent{Type: backend.EventTextDelta, ResponseID: event.ResponseID, Text: event.Delta})
 	case "response.audio.delta":
 		pcm, err := base64.StdEncoding.DecodeString(event.Delta)
 		if err != nil {
 			return transportError(err)
 		}
-		return s.publish(Event{Kind: EventAudioDelta, ResponseID: event.ResponseID, PCM: pcm})
+		return s.publish(backend.ConversationEvent{Type: backend.EventAudio, ResponseID: event.ResponseID, PCM: pcm, SampleRateHz: 24_000})
 	case "response.done":
-		return s.publish(Event{Kind: EventResponseDone, ResponseID: event.Response.ID, Status: event.Response.Status})
+		if err := s.publish(backend.ConversationEvent{Type: backend.EventDone, ResponseID: event.Response.ID}); err != nil {
+			return err
+		}
+		s.finishResponse(nil)
+		return nil
 	}
 	return nil
 }
@@ -257,7 +293,7 @@ func providerMessage(event serverEvent) string {
 	return "provider rejected request"
 }
 
-func (s *Session) publish(event Event) error {
+func (s *Session) publish(event backend.ConversationEvent) error {
 	select {
 	case s.events <- event:
 		return nil
@@ -272,9 +308,20 @@ func (s *Session) fail(err error) {
 		s.fatalErr = err
 		s.errMu.Unlock()
 		s.signalReady(err)
+		s.finishResponse(err)
 		s.cancel()
 		_ = s.conn.Close()
 	})
+}
+
+func (s *Session) finishResponse(err error) {
+	s.responseMu.Lock()
+	s.responseRequested = false
+	if s.cancelWait != nil {
+		s.cancelWait <- err
+		s.cancelWait = nil
+	}
+	s.responseMu.Unlock()
 }
 
 func (s *Session) signalReady(err error) {
