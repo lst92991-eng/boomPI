@@ -210,6 +210,33 @@ func TestAuthenticationFailureIsClassified(t *testing.T) {
 	if !errors.Is(err, ErrTransport) {
 		t.Fatalf("Open() error = %v, want transport error", err)
 	}
+	if !strings.Contains(err.Error(), "401 Unauthorized") {
+		t.Fatalf("Open() error = %v, want HTTP status", err)
+	}
+}
+
+func TestHandshakeDiagnosticRedactsAPIKey(t *testing.T) {
+	const apiKey = "test-api-key"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"code":"BadRequest.IllegalEndpoint","message":"invalid workspace for test-api-key"}`))
+	}))
+	defer server.Close()
+
+	cfg := validConfig("ws" + strings.TrimPrefix(server.URL, "http"))
+	cfg.APIKey = apiKey
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	_, err = b.Open(context.Background(), backend.SessionConfig{})
+	if !errors.Is(err, ErrTransport) || !strings.Contains(err.Error(), "BadRequest.IllegalEndpoint") {
+		t.Fatalf("Open() error = %v, want classified provider diagnostic", err)
+	}
+	if strings.Contains(err.Error(), apiKey) || !strings.Contains(err.Error(), "<redacted>") {
+		t.Fatalf("Open() error did not redact API key: %v", err)
+	}
 }
 
 func TestBoundedSendQueueHonorsCancellation(t *testing.T) {

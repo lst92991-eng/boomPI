@@ -98,11 +98,12 @@ host/构建回归，不包含付费 provider 请求，也不替代 RV1106 HIL。
 
 自动测试必须离线运行，不读取真实 `DASHSCOPE_API_KEY`，也不得发起付费 provider 请求。需要真实 Qwen 的测试必须使用单独的显式开关，并在测试报告中记录区域、模型和费用风险。
 
-当前最小 live smoke 仅校验新加坡区 WebSocket 会话建立，不上传 PCM、不触发回答生成：
+当前 opt-in live smoke 默认连接中国北京区，上传一段不超过 10 秒的显式测试 PCM，并验证收到文字或 24 kHz 音频响应：
 
 ```text
 cd server
-BOOMPI_QWEN_LIVE_TEST=1 go test -count=1 -run '^TestLiveOpenSession$' ./internal/backend/qwen
+BOOMPI_LIVE_QWEN=1 BOOMPI_LIVE_PCM=/absolute/path/to/16k-mono-s16le.pcm \
+  go test -count=1 -run '^TestLiveRealtime$' -v ./internal/backend/qwen
 ```
 
 ## P1 最低检查项

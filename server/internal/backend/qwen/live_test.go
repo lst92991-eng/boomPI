@@ -9,42 +9,84 @@ import (
 	"github.com/lst92991-eng/boomPI/server/internal/backend"
 )
 
-func TestLiveOpenSession(t *testing.T) {
-	if os.Getenv("BOOMPI_QWEN_LIVE_TEST") != "1" {
-		t.Skip("set BOOMPI_QWEN_LIVE_TEST=1 for the explicit paid provider smoke")
+// TestLiveRealtime is opt-in because it connects to a paid provider. The PCM
+// input must be 16 kHz, mono, signed 16-bit little-endian audio.
+func TestLiveRealtime(t *testing.T) {
+	if os.Getenv("BOOMPI_LIVE_QWEN") != "1" {
+		t.Skip("set BOOMPI_LIVE_QWEN=1 to run the paid provider test")
 	}
-	apiKey := os.Getenv("DASHSCOPE_API_KEY")
-	workspaceID := os.Getenv("DASHSCOPE_WORKSPACE_ID")
-	if apiKey == "" || workspaceID == "" {
-		t.Fatal("DASHSCOPE_API_KEY and DASHSCOPE_WORKSPACE_ID are required")
+	pcmPath := os.Getenv("BOOMPI_LIVE_PCM")
+	if pcmPath == "" {
+		t.Fatal("BOOMPI_LIVE_PCM is required")
 	}
-	model := os.Getenv("BOOMPI_QWEN_LIVE_MODEL")
-	if model == "" {
-		model = "qwen3.5-omni-plus-realtime"
+	pcm, err := os.ReadFile(pcmPath)
+	if err != nil {
+		t.Fatalf("read live PCM: %v", err)
 	}
-	voice := os.Getenv("BOOMPI_QWEN_LIVE_VOICE")
-	if voice == "" {
-		voice = "Ethan"
+	if len(pcm) == 0 || len(pcm)%2 != 0 || len(pcm) > 320_000 {
+		t.Fatalf("live PCM must contain no more than 10 seconds of non-empty aligned 16 kHz S16_LE mono audio; bytes=%d", len(pcm))
 	}
 
 	provider, err := New(Config{
-		APIKey: apiKey, WorkspaceID: workspaceID, Model: model, Voice: voice,
-		Timeout: 30 * time.Second, QueueSize: 8,
+		APIKey:      os.Getenv("DASHSCOPE_API_KEY"),
+		WorkspaceID: os.Getenv("DASHSCOPE_WORKSPACE_ID"),
+		Region:      RegionChinaBeijing,
+		Model:       "qwen3.5-omni-plus-realtime",
+		Voice:       "Ethan",
+		Timeout:     30 * time.Second,
+		QueueSize:   32,
 	})
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("configure live provider: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	session, err := provider.Open(ctx, backend.SessionConfig{
-		DeviceID:     "00000000-0000-4000-8000-000000000001",
-		SystemPrompt: "Reply briefly in Simplified Chinese.",
-		Persona:      "Natural and concise.",
+	opened, err := provider.Open(ctx, backend.SessionConfig{
+		SystemPrompt: "Reply in one short sentence in Simplified Chinese.",
+		Persona:      "You are boomPI, a concise voice assistant.",
 	})
 	if err != nil {
-		t.Fatalf("Open() error = %v", err)
+		t.Fatalf("open live provider: %v", err)
 	}
-	if err := session.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
+	defer opened.Close()
+
+	const chunkBytes = 3_200
+	for offset := 0; offset < len(pcm); offset += chunkBytes {
+		end := min(offset+chunkBytes, len(pcm))
+		if err := opened.SendAudio(ctx, pcm[offset:end]); err != nil {
+			t.Fatalf("send live PCM at byte %d: %v", offset, err)
+		}
+	}
+	if err := opened.Commit(ctx); err != nil {
+		t.Fatalf("commit live PCM: %v", err)
+	}
+
+	var textBytes, audioBytes int
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("live response timeout: text_bytes=%d audio_bytes=%d", textBytes, audioBytes)
+		case event, ok := <-opened.Events():
+			if !ok {
+				t.Fatalf("live response closed early: text_bytes=%d audio_bytes=%d", textBytes, audioBytes)
+			}
+			switch event.Type {
+			case backend.EventTextDelta:
+				textBytes += len(event.Text)
+			case backend.EventAudio:
+				if event.SampleRateHz != 24_000 {
+					t.Fatalf("live audio sample rate=%d", event.SampleRateHz)
+				}
+				audioBytes += len(event.PCM)
+			case backend.EventError:
+				t.Fatalf("live provider error: %v", event.Err)
+			case backend.EventDone:
+				if textBytes == 0 && audioBytes == 0 {
+					t.Fatal("live response completed without text or audio")
+				}
+				t.Logf("live Qwen response received: text_bytes=%d audio_bytes=%d", textBytes, audioBytes)
+				return
+			}
+		}
 	}
 }

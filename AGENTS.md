@@ -6,7 +6,7 @@
 
 ## 1. 项目目标与第一版边界
 
-boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运行 C++ 客户端，本地电脑运行跨平台 Go 服务端，服务端再访问 Qwen 新加坡区。第一版形态是“小智”式全双工语音聊天机器人。
+boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运行 C++ 客户端，本地电脑运行跨平台 Go 服务端，服务端默认访问 Qwen 中国北京区。第一版面向中国大陆市场，形态是“小智”式全双工语音聊天机器人；服务端自身可以部署在新加坡或其他地区，但 provider region 必须与 Key/Workspace 一致。
 
 第一版必须包含：
 
@@ -322,13 +322,13 @@ Qwen 24 kHz S16_LE mono downlink
 
 Qwen 默认配置：
 
-- region: Singapore
+- region: China (Beijing)，配置值 `china-beijing`；保留 `singapore` 作为显式可选项
 - model: `qwen3.5-omni-plus-realtime`
 - interaction: manual turn detection，由板端 VAD commit
 - input: 16 kHz S16_LE mono PCM
 - output: 24 kHz S16_LE mono PCM（以实时 API 实际事件元数据为准）
 - search: `auto`，允许配置关闭
-- language: 普通话优先并允许中英文混说
+- language: 中国大陆普通话与简体中文优先，遵循大陆表达、单位和日期习惯，并允许中英文混说
 
 Provider 名称、endpoint、模型、voice 和事件字段可能变化，必须封装在 Qwen adapter 内，并在实现时重新核对官方文档。不要把 Qwen event 直接泄漏为板端协议。
 

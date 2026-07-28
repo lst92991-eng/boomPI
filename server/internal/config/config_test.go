@@ -8,6 +8,16 @@ import (
 	"testing"
 )
 
+func TestDefaultsUseChinaBeijingForMainlandMarket(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Region != "china-beijing" {
+		t.Fatalf("Region = %q, want china-beijing", cfg.Region)
+	}
+	if !strings.Contains(cfg.SystemPrompt, "mainland China") || !strings.Contains(cfg.SystemPrompt, "Simplified Chinese") {
+		t.Fatalf("SystemPrompt = %q, want mainland China Simplified Chinese guidance", cfg.SystemPrompt)
+	}
+}
+
 func TestLoadExampleAndEnvironmentCredential(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "dashscope-secret")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "workspace-1")
@@ -94,8 +104,8 @@ func TestLoadPrecedenceCLIEnvironmentYAMLDefaults(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	t.Setenv("BOOMPI_WSS_PORT", "18002")
-	t.Setenv("BOOMPI_REGION", "singapore-env")
-	path := writeConfig(t, "wss_port: 18001\nregion: singapore-yaml\ndiscovery_port: 17807\n")
+	t.Setenv("BOOMPI_REGION", "singapore")
+	path := writeConfig(t, "wss_port: 18001\nregion: china-beijing\ndiscovery_port: 17807\n")
 
 	cfg, err := Load(path, Overrides{"wss_port": "18003"})
 	if err != nil {
@@ -104,7 +114,7 @@ func TestLoadPrecedenceCLIEnvironmentYAMLDefaults(t *testing.T) {
 	if cfg.WSSPort != 18003 {
 		t.Fatalf("WSSPort = %d, want CLI value 18003", cfg.WSSPort)
 	}
-	if cfg.Region != "singapore-env" {
+	if cfg.Region != "singapore" {
 		t.Fatalf("Region = %q, want environment value", cfg.Region)
 	}
 	if cfg.DiscoveryPort != 17807 {
@@ -156,6 +166,15 @@ func TestValidateRejectsControlCharactersInModel(t *testing.T) {
 				t.Fatalf("Validate() error = %v", err)
 			}
 		})
+	}
+}
+
+func TestValidateRejectsUnsupportedRegion(t *testing.T) {
+	cfg := Defaults()
+	cfg.Region = "ap-southeast-1"
+	cfg.Credentials = Credentials{apiKey: "test-secret", workspaceID: "test-workspace"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "china-beijing or singapore") {
+		t.Fatalf("Validate() error = %v", err)
 	}
 }
 

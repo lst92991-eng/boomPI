@@ -33,6 +33,7 @@ func New(cfg config.Config, logger *slog.Logger, identityDirectory string) (*App
 	provider, err := qwen.New(qwen.Config{
 		APIKey:      cfg.Credentials.APIKey(),
 		WorkspaceID: cfg.Credentials.WorkspaceID(),
+		Region:      cfg.Region,
 		Model:       cfg.Model,
 		Voice:       cfg.Voice,
 		Timeout:     cfg.ConnectionTimeout,

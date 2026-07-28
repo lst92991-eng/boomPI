@@ -1,6 +1,6 @@
 # boomPI
 
-boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端负责连接 Qwen 新加坡区，板端不保存云端 API Key。
+boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；产品面向中国大陆市场，服务端默认连接 Qwen 中国北京区，板端不保存云端 API Key。服务端可以部署在新加坡，但 provider region 必须与 Key/Workspace 一致。
 
 > **P1 工程骨架已完成；当前第一闸门是 vendor 音频最小闭环。** 下一步先用匹配 BSP 的
 > `rk_mpi_ai`/`rk_mpi_ao` 与直接 ALSA 实测 48 kHz 全双工、真实通道布局和 Rockchip
@@ -18,7 +18,7 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
               |
        boompi-server（Go）
               |
-       Qwen Singapore API
+       Qwen China (Beijing) API
 ```
 
 第一版目标包括双麦 AEC、Snowboy 英文唤醒、可打断流式 TTS、三秒连续对话、横屏表情与字幕、以太网/Wi-Fi、首次配网与本地服务端配对。SC3336 多模态、在线音乐和长期记忆不属于第一版运行链路。
@@ -175,15 +175,16 @@ Qwen 凭据只能通过当前进程环境提供：
 - `DASHSCOPE_API_KEY`
 - `DASHSCOPE_WORKSPACE_ID`
 
-不要把真实值写进 YAML、`.env`、命令示例、日志、截图或 Git。任何曾出现在聊天或日志中的 Key 都应在控制台吊销并重新生成。默认 provider 计划使用新加坡区 `qwen3.5-omni-plus-realtime`，接入时仍必须重新核对官方 endpoint、事件和音频格式。
+不要把真实值写进 YAML、`.env`、命令示例、日志、截图或 Git。任何曾出现在聊天或日志中的 Key 都应在控制台吊销并重新生成。默认 provider 使用中国北京区 `qwen3.5-omni-plus-realtime`；配置值 `china-beijing`，也可显式切换为 `singapore`。Key、Workspace 与 region 必须一致，接入时仍必须重新核对官方 endpoint、事件和音频格式。
 
-需要显式验证真实 Qwen 凭据和 WebSocket 握手时，在已导出上述变量的同一终端进入 `server/`，执行：
+需要显式验证真实 Qwen 凭据和端到端语音响应时，在已导出上述变量的同一终端进入 `server/`，准备一段不超过 10 秒的 16 kHz、单声道、S16_LE PCM，然后执行：
 
 ```text
-BOOMPI_QWEN_LIVE_TEST=1 go test -count=1 -run '^TestLiveOpenSession$' ./internal/backend/qwen
+BOOMPI_LIVE_QWEN=1 BOOMPI_LIVE_PCM=/absolute/path/to/16k-mono-s16le.pcm \
+  go test -count=1 -run '^TestLiveRealtime$' -v ./internal/backend/qwen
 ```
 
-该测试只建立并关闭会话，不上传音频，也不请求生成回答；默认 `go test ./...` 仍保持离线。
+该测试会上传音频并请求生成回答，可能产生费用；默认 `go test ./...` 仍保持离线。
 
 ## RV1106 交叉编译
 

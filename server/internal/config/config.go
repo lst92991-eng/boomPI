@@ -87,12 +87,12 @@ func Defaults() Config {
 		DiscoveryPort:        17807,
 		LogLevel:             "info",
 		Provider:             "qwen",
-		Region:               "singapore",
+		Region:               "china-beijing",
 		Model:                "qwen3.5-omni-plus-realtime",
 		Voice:                "Ethan",
 		SearchMode:           "auto",
-		SystemPrompt:         "You are boomPI, a concise and helpful voice assistant. Reply in Simplified Chinese unless the user asks for another language.",
-		Persona:              "Natural, young, friendly, and not overly cute.",
+		SystemPrompt:         "You are boomPI, a voice assistant for users in mainland China. Use natural Mandarin and Simplified Chinese by default. Follow mainland Chinese wording, units, dates, and conventions unless the user asks otherwise. Keep spoken answers concise and clear.",
+		Persona:              "Natural, young, friendly, direct, and not overly cute.",
 		HeartbeatInterval:    10 * time.Second,
 		ConnectionTimeout:    30 * time.Second,
 		FirstResponseWarning: 15 * time.Second,
@@ -192,8 +192,8 @@ func (c Config) Validate() error {
 	if c.Provider != "qwen" {
 		return errors.New("provider must be qwen in P1")
 	}
-	if !validIdentifier(c.Region, 32) {
-		return errors.New("region must be a non-empty lowercase identifier")
+	if !oneOf(c.Region, "china-beijing", "singapore") {
+		return errors.New("region must be china-beijing or singapore")
 	}
 	if strings.TrimSpace(c.Model) == "" || len(c.Model) > 128 {
 		return errors.New("model must contain 1..128 characters")
@@ -244,7 +244,7 @@ func (c Config) Validate() error {
 		return errors.New("API credential is required")
 	}
 	if strings.TrimSpace(c.Credentials.workspaceID) == "" {
-		return errors.New("DASHSCOPE_WORKSPACE_ID is required for the Singapore Qwen endpoint")
+		return errors.New("DASHSCOPE_WORKSPACE_ID is required for the selected Qwen region")
 	}
 	return nil
 }
@@ -493,18 +493,6 @@ func validatePort(name string, value int) error {
 
 func validListenAddress(value string) bool {
 	return net.ParseIP(value) != nil
-}
-
-func validIdentifier(value string, maxLength int) bool {
-	if value == "" || len(value) > maxLength {
-		return false
-	}
-	for _, current := range value {
-		if !((current >= 'a' && current <= 'z') || (current >= '0' && current <= '9') || current == '-') {
-			return false
-		}
-	}
-	return true
 }
 
 func validConfigKey(value string) bool {
