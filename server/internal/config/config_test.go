@@ -8,6 +8,16 @@ import (
 	"testing"
 )
 
+func TestDefaultsUseChinaBeijingForMainlandMarket(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Region != "china-beijing" {
+		t.Fatalf("Region = %q, want china-beijing", cfg.Region)
+	}
+	if !strings.Contains(cfg.SystemPrompt, "mainland China") || !strings.Contains(cfg.SystemPrompt, "Simplified Chinese") {
+		t.Fatalf("SystemPrompt = %q, want mainland China Simplified Chinese guidance", cfg.SystemPrompt)
+	}
+}
+
 func TestLoadExampleAndEnvironmentCredential(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "dashscope-secret")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "workspace-1")
@@ -33,6 +43,7 @@ func TestLoadExampleAndEnvironmentCredential(t *testing.T) {
 
 func TestLoadRejectsSecretAndUnknownYAMLKeys(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "environment-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	for _, content := range []string{
 		"api_key: do-not-store-this\n",
 		"unexpected_option: true\n",
@@ -50,6 +61,7 @@ func TestLoadRejectsSecretAndUnknownYAMLKeys(t *testing.T) {
 
 func TestLoadRejectsInvalidAndOversizedConfiguration(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	invalid := writeConfig(t, "wss_port: 70000\n")
 	if _, err := Load(invalid, nil); err == nil || !strings.Contains(err.Error(), "wss_port") {
 		t.Fatalf("invalid port error = %v", err)
@@ -63,6 +75,7 @@ func TestLoadRejectsInvalidAndOversizedConfiguration(t *testing.T) {
 
 func TestLoadRejectsHostNameListenAddress(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	path := writeConfig(t, "listen_address: localhost\n")
 	if _, err := Load(path, nil); err == nil || !strings.Contains(err.Error(), "IPv4 or IPv6") {
 		t.Fatalf("hostname listen address error = %v", err)
@@ -71,17 +84,28 @@ func TestLoadRejectsHostNameListenAddress(t *testing.T) {
 
 func TestLoadRequiresEnvironmentCredential(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	_, err := Load("", nil)
 	if err == nil || !strings.Contains(err.Error(), "DASHSCOPE_API_KEY") {
 		t.Fatalf("missing credential error = %v", err)
 	}
 }
 
+func TestLoadRequiresWorkspaceID(t *testing.T) {
+	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "")
+	_, err := Load("", nil)
+	if err == nil || !strings.Contains(err.Error(), "DASHSCOPE_WORKSPACE_ID") {
+		t.Fatalf("missing workspace ID error = %v", err)
+	}
+}
+
 func TestLoadPrecedenceCLIEnvironmentYAMLDefaults(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	t.Setenv("BOOMPI_WSS_PORT", "18002")
-	t.Setenv("BOOMPI_REGION", "singapore-env")
-	path := writeConfig(t, "wss_port: 18001\nregion: singapore-yaml\ndiscovery_port: 17807\n")
+	t.Setenv("BOOMPI_REGION", "singapore")
+	path := writeConfig(t, "wss_port: 18001\nregion: china-beijing\ndiscovery_port: 17807\n")
 
 	cfg, err := Load(path, Overrides{"wss_port": "18003"})
 	if err != nil {
@@ -90,7 +114,7 @@ func TestLoadPrecedenceCLIEnvironmentYAMLDefaults(t *testing.T) {
 	if cfg.WSSPort != 18003 {
 		t.Fatalf("WSSPort = %d, want CLI value 18003", cfg.WSSPort)
 	}
-	if cfg.Region != "singapore-env" {
+	if cfg.Region != "singapore" {
 		t.Fatalf("Region = %q, want environment value", cfg.Region)
 	}
 	if cfg.DiscoveryPort != 17807 {
@@ -103,6 +127,7 @@ func TestLoadPrecedenceCLIEnvironmentYAMLDefaults(t *testing.T) {
 
 func TestLoadPreservesHashInsidePlainScalars(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	path := writeConfig(t, strings.Join([]string{
 		"model: Qwen-C#-model",
 		"system_prompt: https://example.test/docs/#voice",
@@ -136,11 +161,20 @@ func TestValidateRejectsControlCharactersInModel(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cfg := Defaults()
 			cfg.Model = model
-			cfg.Credentials = Credentials{apiKey: "test-secret"}
+			cfg.Credentials = Credentials{apiKey: "test-secret", workspaceID: "test-workspace"}
 			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "control characters") {
 				t.Fatalf("Validate() error = %v", err)
 			}
 		})
+	}
+}
+
+func TestValidateRejectsUnsupportedRegion(t *testing.T) {
+	cfg := Defaults()
+	cfg.Region = "ap-southeast-1"
+	cfg.Credentials = Credentials{apiKey: "test-secret", workspaceID: "test-workspace"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "china-beijing or singapore") {
+		t.Fatalf("Validate() error = %v", err)
 	}
 }
 

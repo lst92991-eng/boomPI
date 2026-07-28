@@ -106,6 +106,17 @@ RV1106 HIL。
 
 自动测试必须离线运行，不读取真实 `DASHSCOPE_API_KEY`，也不得发起付费 provider 请求。需要真实 Qwen 的测试必须使用单独的显式开关，并在测试报告中记录区域、模型和费用风险。
 
+当前 opt-in live smoke 默认连接中国北京区，上传一段不超过 10 秒的显式测试 PCM，并验证收到文字或 24 kHz 音频响应：
+
+```text
+cd server
+BOOMPI_LIVE_QWEN=1 BOOMPI_LIVE_PCM=/absolute/path/to/16k-mono-s16le.pcm \
+  go test -count=1 -run '^TestLiveRealtime$' -v ./internal/backend/qwen
+```
+
+如需人工回放验证，可额外设置 `BOOMPI_LIVE_OUTPUT_PCM=/absolute/path/to/output.pcm`
+保存 24 kHz、单声道、S16_LE 返回音频；写入只在显式配置时启用，并限制在 60 秒以内。
+
 ## P1 最低检查项
 
 - CMake configure/build/CTest 在 Windows、Linux 和 macOS 上通过。

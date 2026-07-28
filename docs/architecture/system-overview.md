@@ -13,7 +13,7 @@ capture -> DSP -> wake/VAD -> application          boompi-server
    ^                         |                           |
    |                         +---- WSS -----------------+
 playback <- jitter <- network                            |
-UI/touch <- UI model                              Qwen Singapore
+UI/touch <- UI model                         Qwen China (Beijing)
 ```
 
 - RV1106 客户端负责实时音频、唤醒、VAD、打断、本地状态机、显示和触摸。
