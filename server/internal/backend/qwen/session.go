@@ -147,12 +147,15 @@ func (s *Session) Cancel(ctx context.Context) error {
 	}
 	wait := make(chan error, 1)
 	s.cancelWait = wait
+	s.responseMu.Unlock()
 	if err := s.enqueue(ctx, outboundBatch{events: []clientEvent{{Type: "response.cancel"}}}); err != nil {
-		s.cancelWait = nil
+		s.responseMu.Lock()
+		if s.cancelWait == wait {
+			s.cancelWait = nil
+		}
 		s.responseMu.Unlock()
 		return err
 	}
-	s.responseMu.Unlock()
 	timer := time.NewTimer(s.config.Timeout)
 	defer timer.Stop()
 	select {
@@ -274,13 +277,29 @@ func (s *Session) handleServerEvent(event serverEvent) error {
 		}
 		return s.publish(backend.ConversationEvent{Type: backend.EventAudio, ResponseID: event.ResponseID, PCM: pcm, SampleRateHz: 24_000})
 	case "response.done":
-		if err := s.publish(backend.ConversationEvent{Type: backend.EventDone, ResponseID: event.Response.ID}); err != nil {
+		responseErr := responseStatusError(event.Response.Status)
+		eventType := backend.EventDone
+		if responseErr != nil {
+			eventType = backend.EventError
+		}
+		if err := s.publish(backend.ConversationEvent{Type: eventType, ResponseID: event.Response.ID, Err: responseErr}); err != nil {
 			return err
 		}
-		s.finishResponse(nil)
+		s.finishResponse(responseErr)
 		return nil
 	}
 	return nil
+}
+
+func responseStatusError(status string) error {
+	switch status {
+	case "completed", "cancelled":
+		return nil
+	case "failed", "incomplete":
+		return fmt.Errorf("%w: response ended with status %s", ErrProvider, status)
+	default:
+		return fmt.Errorf("%w: response.done has invalid status %q", ErrProvider, status)
+	}
 }
 
 func providerMessage(event serverEvent) string {

@@ -98,6 +98,13 @@ host/构建回归，不包含付费 provider 请求，也不替代 RV1106 HIL。
 
 自动测试必须离线运行，不读取真实 `DASHSCOPE_API_KEY`，也不得发起付费 provider 请求。需要真实 Qwen 的测试必须使用单独的显式开关，并在测试报告中记录区域、模型和费用风险。
 
+当前最小 live smoke 仅校验新加坡区 WebSocket 会话建立，不上传 PCM、不触发回答生成：
+
+```text
+cd server
+BOOMPI_QWEN_LIVE_TEST=1 go test -count=1 -run '^TestLiveOpenSession$' ./internal/backend/qwen
+```
+
 ## P1 最低检查项
 
 - CMake configure/build/CTest 在 Windows、Linux 和 macOS 上通过。

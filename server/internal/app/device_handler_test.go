@@ -94,6 +94,9 @@ func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 	if header.Kind != protocol.AudioKindDownlink || header.SampleRateHz != 24_000 || string(output) != string([]byte{1, 2, 3, 4}) {
 		t.Fatalf("downlink header=%+v output=%v", header, output)
 	}
+	if header.TimestampUS > uint64(time.Minute/time.Microsecond) {
+		t.Fatalf("downlink timestamp_us=%d looks like wall-clock time, want connection-monotonic time", header.TimestampUS)
+	}
 	if got := readControl(t, webSocket); got.Type != "response.done" {
 		t.Fatalf("final control type = %q", got.Type)
 	}
