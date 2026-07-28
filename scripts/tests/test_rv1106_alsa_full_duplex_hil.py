@@ -103,6 +103,18 @@ class FakeHilEnvironment:
 
         write_command(
             self.bin_dir,
+            "wc",
+            "set -u\n"
+            + 'output=$(/usr/bin/wc "$@")\n'
+            + 'if [ "${WC_PAD_OUTPUT:-0}" = 1 ]; then\n'
+            + "  printf '   %s  \\n' \"$output\"\n"
+            + "else\n"
+            + "  printf '%s\\n' \"$output\"\n"
+            + "fi\n",
+        )
+
+        write_command(
+            self.bin_dir,
             "amixer",
             "set -u\n"
             + log_call.replace('"$1"', "amixer").replace('"$2"', '"$*"')
@@ -694,6 +706,31 @@ class Rv1106AlsaFullDuplexHilTest(unittest.TestCase):
             self.assertEqual(capture_file.stat().st_mode & 0o077, 0)
 
             self.assertGreaterEqual(len(fixture.calls("dmesg")), 2)
+
+    def test_bsd_wc_padding_is_accepted(self):
+        with tempfile.TemporaryDirectory(prefix="boompi-hil-bsd-wc-") as temporary:
+            fixture = FakeHilEnvironment(Path(temporary))
+            artifact_dir = fixture.base / "new-artifacts"
+
+            completed = fixture.run(
+                *fixture.base_arguments(artifact_dir),
+                *EXECUTION_OPT_INS,
+                WC_PAD_OUTPUT="1",
+            )
+
+            result_text = (artifact_dir / "result.json").read_text(
+                encoding="utf-8"
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"{completed.stderr}\n{completed.stdout}\n{result_text}",
+            )
+            result = json.loads(result_text)
+            self.assertEqual(result["playback"]["silence_bytes"], PLAYBACK_BYTES)
+            self.assertEqual(result["capture"]["actual_bytes"], CAPTURE_BYTES)
+            self.assertEqual(result["overall"], "pass")
+            self.assertEqual(fixture.mixer_value(), "2")
 
     def test_playback_failure_still_restores_mixer(self):
         with tempfile.TemporaryDirectory(prefix="boompi-hil-play-fail-") as temporary:
