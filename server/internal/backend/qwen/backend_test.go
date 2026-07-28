@@ -105,15 +105,15 @@ func TestSessionHandshakeCommandsAndEventMapping(t *testing.T) {
 		}
 	}
 
-	wantEvents := []Event{
-		{Kind: EventResponseStarted, ResponseID: "resp-1", Status: "in_progress"},
-		{Kind: EventTextDelta, ResponseID: "resp-1", Text: "你好"},
-		{Kind: EventAudioDelta, ResponseID: "resp-1", PCM: []byte{1, 2, 3, 4}},
-		{Kind: EventResponseDone, ResponseID: "resp-1", Status: "completed"},
+	wantEvents := []backend.ConversationEvent{
+		{Type: backend.EventStarted, ResponseID: "resp-1"},
+		{Type: backend.EventTextDelta, ResponseID: "resp-1", Text: "你好"},
+		{Type: backend.EventAudio, ResponseID: "resp-1", PCM: []byte{1, 2, 3, 4}, SampleRateHz: 24_000},
+		{Type: backend.EventDone, ResponseID: "resp-1"},
 	}
 	for _, want := range wantEvents {
 		got := receive(t, session.Events())
-		if got.Kind != want.Kind || got.ResponseID != want.ResponseID || got.Text != want.Text || got.Status != want.Status || string(got.PCM) != string(want.PCM) {
+		if got.Type != want.Type || got.ResponseID != want.ResponseID || got.Text != want.Text || got.SampleRateHz != want.SampleRateHz || string(got.PCM) != string(want.PCM) {
 			t.Fatalf("event = %#v, want %#v", got, want)
 		}
 	}
@@ -139,7 +139,7 @@ func TestProviderErrorAfterHandshakeIsAnEvent(t *testing.T) {
 	session := opened.(*Session)
 	defer session.Close()
 	event := receive(t, session.Events())
-	if event.Kind != EventProviderError || !errors.Is(event.Err, ErrProvider) {
+	if event.Type != backend.EventError || !errors.Is(event.Err, ErrProvider) {
 		t.Fatalf("event = %#v", event)
 	}
 }

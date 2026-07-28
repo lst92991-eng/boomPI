@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/lst92991-eng/boomPI/server/internal/app"
@@ -45,6 +46,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	addOverrideFlag(flags, opts.overrides, "provider", "provider", "override the provider name")
 	addOverrideFlag(flags, opts.overrides, "region", "region", "override the provider region")
 	addOverrideFlag(flags, opts.overrides, "model", "model", "override the provider model")
+	addOverrideFlag(flags, opts.overrides, "voice", "voice", "override the provider voice")
 	addOverrideFlag(flags, opts.overrides, "search-mode", "search_mode", "override search mode (auto or off)")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -73,7 +75,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "logging configuration error: %v\n", err)
 		return 1
 	}
-	application, err := app.New(cfg, logger)
+	absoluteConfigPath, err := filepath.Abs(opts.configPath)
+	if err != nil {
+		logger.Error("resolve configuration path", "error", err)
+		return 1
+	}
+	identityDirectory := filepath.Join(filepath.Dir(absoluteConfigPath), "state")
+	application, err := app.New(cfg, logger, identityDirectory)
 	if err != nil {
 		logger.Error("application initialization failed", "error", err)
 		return 1

@@ -156,6 +156,20 @@ Linux/macOS：
 ./boompi-server --check-config --config configs/config.yaml
 ```
 
+配置检查通过后，直接以前台进程启动最小服务端：
+
+```powershell
+# Windows
+.\boompi-server.exe --config configs/config.yaml
+```
+
+```bash
+# Linux/macOS
+./boompi-server --config configs/config.yaml
+```
+
+当前实现提供单设备 `wss://<host>:17806/ws`、稳定本地 TLS 身份、16 kHz PCM 上行、Qwen Realtime 流式转发、24 kHz PCM/文本下行与响应取消。UDP 发现、六位码配对、设备 Token、自动重连和完整板端联调仍是后续工作；因此当前 WSS 可用于开发联调，但还不是完整的生产信任链。
+
 Qwen 凭据只能通过当前进程环境提供：
 
 - `DASHSCOPE_API_KEY`

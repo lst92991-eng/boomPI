@@ -2,14 +2,14 @@
 
 ## 1. Status and scope
 
-This document is the P1 wire-contract baseline shared by the RV1106 C++ client and the Go server. It defines framing, identifiers, bounds and cancellation semantics. It does **not** claim that discovery, pairing, WSS or streaming is implemented yet.
+This document is the P1 wire-contract baseline shared by the RV1106 C++ client and the Go server. It defines framing, identifiers, bounds and cancellation semantics. The Go MVP implements the WSS and streaming subset listed in section 4.2. Discovery, pairing, device-token authentication, reconnect and flow credit are still pending.
 
 Normative words `MUST`, `MUST NOT`, `SHOULD` and `MAY` are used deliberately. Protocol implementations must reject malformed lengths before allocation or state mutation.
 
 ## 2. Transports
 
 - UDP port `17807`: unauthenticated LAN discovery only.
-- TCP/WSS port `17806`: one persistent authenticated connection carrying UTF-8 JSON text frames and binary PCM frames.
+- TCP/WSS port `17806`: one persistent TLS connection carrying UTF-8 JSON text frames and binary PCM frames. The current server limits this to one device; it is not considered authenticated until pairing and device tokens are implemented.
 - WebSocket ping/pong: default idle ping interval 10 seconds and dead-connection timeout 30 seconds; both are configurable but a finite deadline is mandatory.
 - Application audio is real-time and is never retransmitted after reconnect.
 
@@ -78,6 +78,14 @@ Rules:
 | `error` | either | Stable error code and a safe, non-secret diagnostic message |
 
 Pairing, update and tool payload schemas will be added before those features are implemented. Implementations must not invent ad-hoc production payloads outside this document.
+
+### 4.2 Implemented server MVP subset
+
+The current Go server accepts one device on `wss://<host>:17806/ws`. Its first message must be `hello`, with a canonical persistent `device_id` and all numeric identifiers set to zero. `hello.ack` assigns a nonzero `session_id`, starts at epoch 1, and advertises 16 kHz input, 24 kHz output and 20 ms input frames.
+
+For each manual-VAD turn, the device sends `turn.start` with nonzero `session_id`, `turn_id`, `stream_id` and monotonic `epoch`; its payload is `{"sample_rate_hz":16000}`. Binary uplink frames then use those identifiers and consecutive sequence numbers starting at zero. `turn.commit` ends the input. The server may return `response.start`, `response.text_delta`, `response.audio_start`, binary 24 kHz PCM, and `response.done`. `turn.cancel` and `response.cancel` retire the active epoch and return `response.cancelled`.
+
+This subset deliberately omits discovery, pairing, device tokens, conversation persistence, tools and flow credit. Until pairing lands, the generated stable SPKI digest must be treated as test information rather than a complete production trust flow.
 
 ## 5. Binary audio frame
 
