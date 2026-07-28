@@ -9,6 +9,12 @@ option(BOOMPI_ENABLE_ALSA_PLAYBACK
   "Build the explicit Linux ALSA playback device adapter"
   ${_boompi_alsa_playback_default})
 unset(_boompi_alsa_playback_default)
+option(BOOMPI_ENABLE_WSS_CLIENT
+  "Build the pinned OpenSSL development WSS client" OFF)
+set(BOOMPI_OPENSSL_ROOT "" CACHE PATH
+  "Absolute root of the explicit OpenSSL 3.5.7 package used by WSS")
+set(BOOMPI_GO_EXECUTABLE "" CACHE FILEPATH
+  "Optional Go executable used by the cross-language WSS smoke test")
 
 function(boompi_configure_target target_name)
   target_compile_features(${target_name} PUBLIC cxx_std_17)
@@ -72,6 +78,142 @@ target_link_libraries(boompi_protocol PUBLIC boompi_event)
 
 boompi_add_library(boompi_network
   src/network/reconnect_backoff.cpp)
+if(BOOMPI_ENABLE_WSS_CLIENT)
+  if(BOOMPI_OPENSSL_ROOT STREQUAL "" AND
+     DEFINED ENV{BOOMPI_OPENSSL_ROOT} AND
+     NOT "$ENV{BOOMPI_OPENSSL_ROOT}" STREQUAL "")
+    file(TO_CMAKE_PATH "$ENV{BOOMPI_OPENSSL_ROOT}" _boompi_openssl_root)
+  else()
+    set(_boompi_openssl_root "${BOOMPI_OPENSSL_ROOT}")
+  endif()
+  string(FIND "${_boompi_openssl_root}" ";" _boompi_openssl_semicolon)
+  if(_boompi_openssl_root STREQUAL "" OR
+     NOT _boompi_openssl_semicolon EQUAL -1 OR
+     NOT IS_ABSOLUTE "${_boompi_openssl_root}" OR
+     NOT IS_DIRECTORY "${_boompi_openssl_root}")
+    message(FATAL_ERROR
+      "BOOMPI_OPENSSL_ROOT must name one explicit absolute OpenSSL 3.5.7 package root")
+  endif()
+  file(REAL_PATH "${_boompi_openssl_root}" _boompi_openssl_root)
+  set(BOOMPI_OPENSSL_ROOT "${_boompi_openssl_root}" CACHE PATH
+    "Absolute root of the explicit OpenSSL 3.5.7 package used by WSS" FORCE)
+
+  foreach(_boompi_openssl_file IN ITEMS
+      OpenSSLConfig.cmake
+      OpenSSLConfigVersion.cmake
+      include/openssl/opensslv.h
+      include/openssl/configuration.h
+      libssl.a
+      libcrypto.a)
+    if(NOT EXISTS "${_boompi_openssl_root}/${_boompi_openssl_file}")
+      message(FATAL_ERROR
+        "Pinned OpenSSL package is missing ${_boompi_openssl_file}")
+    endif()
+  endforeach()
+
+  if(BOOMPI_TARGET_RV1106)
+    function(boompi_verify_openssl_sha256 relative_path expected_sha256)
+      file(SHA256 "${_boompi_openssl_root}/${relative_path}" _actual_sha256)
+      if(NOT _actual_sha256 STREQUAL expected_sha256)
+        message(FATAL_ERROR
+          "Pinned RV1106 OpenSSL file failed SHA-256 verification: ${relative_path}")
+      endif()
+    endfunction()
+    boompi_verify_openssl_sha256(libssl.a
+      9d40ee1a49721f880f2b47da71908b231411f713c0db1bd9b64a0713ded864ec)
+    boompi_verify_openssl_sha256(libcrypto.a
+      26d1122294bac0ef8963708e5956bedf62df169360b9e9fe9cb7c682bb326aea)
+    boompi_verify_openssl_sha256(include/openssl/opensslv.h
+      256985d6271826835673eb59dec8369dbbead0b5055864b8b7e69effac426e52)
+    boompi_verify_openssl_sha256(include/openssl/configuration.h
+      25cc4d05c4a6ccd42e1441b40c5804392e588e0d0ff31087f47a926de0ccec96)
+    boompi_verify_openssl_sha256(OpenSSLConfig.cmake
+      cb1444c7d611b7fe9e65352a89c6c4da2a457846df370191fa526e68368b2469)
+    boompi_verify_openssl_sha256(OpenSSLConfigVersion.cmake
+      352f614feee96a22155c0427d8fe64f100ad71dac5fcf1dfb468f7a1060f48d5)
+
+    file(GLOB_RECURSE _boompi_openssl_headers
+      LIST_DIRECTORIES FALSE
+      RELATIVE "${_boompi_openssl_root}/include/openssl"
+      "${_boompi_openssl_root}/include/openssl/*")
+    list(SORT _boompi_openssl_headers)
+    list(LENGTH _boompi_openssl_headers _boompi_openssl_header_count)
+    set(_boompi_openssl_header_manifest "")
+    foreach(_boompi_openssl_header IN LISTS _boompi_openssl_headers)
+      file(SHA256
+        "${_boompi_openssl_root}/include/openssl/${_boompi_openssl_header}"
+        _boompi_openssl_header_sha256)
+      string(APPEND _boompi_openssl_header_manifest
+        "${_boompi_openssl_header}:${_boompi_openssl_header_sha256}\n")
+    endforeach()
+    string(SHA256 _boompi_openssl_header_manifest_sha256
+      "${_boompi_openssl_header_manifest}")
+    if(NOT _boompi_openssl_header_count EQUAL 172 OR
+       NOT _boompi_openssl_header_manifest_sha256 STREQUAL
+           "8b5bdc503105385c25139ee99ea37d0902cc097f3a47ce09f699d07dd822d761")
+      message(FATAL_ERROR
+        "BOOMPI_OPENSSL_HEADER_MANIFEST_MISMATCH: pinned RV1106 include/openssl tree differs")
+    endif()
+  endif()
+
+  if(TARGET OpenSSL::SSL OR TARGET OpenSSL::Crypto)
+    message(FATAL_ERROR
+      "OpenSSL targets were defined before the pinned WSS dependency gate")
+  endif()
+  set(OPENSSL_USE_STATIC_LIBS TRUE)
+  set(OpenSSL_DIR "${_boompi_openssl_root}" CACHE PATH
+    "Pinned OpenSSL package directory" FORCE)
+  find_package(OpenSSL 3.5.7 EXACT CONFIG REQUIRED
+    PATHS "${_boompi_openssl_root}"
+    NO_DEFAULT_PATH
+    NO_CMAKE_FIND_ROOT_PATH)
+  if(NOT OpenSSL_VERSION STREQUAL "3.5.7")
+    message(FATAL_ERROR
+      "boomPI WSS requires exactly OpenSSL 3.5.7; found ${OpenSSL_VERSION}")
+  endif()
+  foreach(_boompi_openssl_target IN ITEMS OpenSSL::SSL OpenSSL::Crypto)
+    if(NOT TARGET "${_boompi_openssl_target}")
+      message(FATAL_ERROR
+        "Pinned OpenSSL package did not define ${_boompi_openssl_target}")
+    endif()
+    get_target_property(_boompi_openssl_imported
+      "${_boompi_openssl_target}" IMPORTED)
+    get_target_property(_boompi_openssl_type
+      "${_boompi_openssl_target}" TYPE)
+    if(NOT _boompi_openssl_imported OR
+       NOT _boompi_openssl_type STREQUAL "STATIC_LIBRARY")
+      message(FATAL_ERROR
+        "${_boompi_openssl_target} must be an imported static library")
+    endif()
+    get_target_property(_boompi_openssl_location
+      "${_boompi_openssl_target}" IMPORTED_LOCATION)
+    if(NOT EXISTS "${_boompi_openssl_location}")
+      message(FATAL_ERROR
+        "${_boompi_openssl_target} has no usable imported archive")
+    endif()
+    file(REAL_PATH "${_boompi_openssl_location}"
+      _boompi_openssl_location)
+    if(_boompi_openssl_target STREQUAL "OpenSSL::SSL")
+      set(_boompi_openssl_expected "${_boompi_openssl_root}/libssl.a")
+    else()
+      set(_boompi_openssl_expected "${_boompi_openssl_root}/libcrypto.a")
+    endif()
+    file(REAL_PATH "${_boompi_openssl_expected}"
+      _boompi_openssl_expected)
+    if(NOT _boompi_openssl_location STREQUAL _boompi_openssl_expected)
+      message(FATAL_ERROR
+        "${_boompi_openssl_target} escaped the pinned OpenSSL package root")
+    endif()
+  endforeach()
+  target_sources(boompi_network PRIVATE
+    src/network/wss_client.cpp)
+  target_link_libraries(boompi_network
+    PUBLIC boompi_event boompi_protocol
+    PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+  if(WIN32)
+    target_link_libraries(boompi_network PRIVATE ws2_32)
+  endif()
+endif()
 
 boompi_add_library(boompi_ui
   src/ui/ui_model.cpp)
@@ -144,6 +286,12 @@ if(BOOMPI_TARGET_RV1106)
   target_compile_definitions(boompi_client PRIVATE BOOMPI_TARGET_RV1106=1)
 endif()
 set_target_properties(boompi_client PROPERTIES OUTPUT_NAME "boompi-client")
+set_target_properties(boompi_client PROPERTIES
+  SKIP_BUILD_RPATH TRUE
+  BUILD_RPATH ""
+  INSTALL_RPATH ""
+  BUILD_WITH_INSTALL_RPATH FALSE
+  INSTALL_RPATH_USE_LINK_PATH FALSE)
 
 add_executable(boompi_supervisor apps/boompi_supervisor/main.cpp)
 boompi_configure_target(boompi_supervisor)
@@ -384,4 +532,45 @@ if(BOOMPI_BUILD_TESTS)
     boompi_audio_playback_worker_tests
     boompi_audio_backend_contract_tests
     PROPERTIES TIMEOUT 20)
+endif()
+if(BOOMPI_ENABLE_WSS_CLIENT)
+  # This executable is intentionally part of ALL. It proves that the selected
+  # target toolchain can resolve the complete static OpenSSL/WSS link closure,
+  # and doubles as the bounded offline integration client.
+  add_executable(boompi_wss_client_smoke
+    tests/smoke/wss_client_smoke.cpp)
+  boompi_configure_target(boompi_wss_client_smoke)
+  target_link_libraries(boompi_wss_client_smoke
+    PRIVATE boompi_network boompi_protocol Threads::Threads)
+  set_target_properties(boompi_wss_client_smoke PROPERTIES
+    OUTPUT_NAME "boompi-wss-client-smoke"
+    SKIP_BUILD_RPATH TRUE
+    BUILD_RPATH ""
+    INSTALL_RPATH ""
+    BUILD_WITH_INSTALL_RPATH FALSE
+    INSTALL_RPATH_USE_LINK_PATH FALSE)
+
+  if(BOOMPI_BUILD_TESTS)
+    if(BOOMPI_GO_EXECUTABLE STREQUAL "")
+      find_program(BOOMPI_GO_EXECUTABLE NAMES go)
+    endif()
+    if(BOOMPI_GO_EXECUTABLE)
+      add_test(
+        NAME boompi_cpp_wss_cross_language_smoke
+        COMMAND "${CMAKE_COMMAND}" -E env
+          "BOOMPI_CPP_WSS_SMOKE=$<TARGET_FILE:boompi_wss_client_smoke>"
+          "GOWORK=off"
+          "GOTOOLCHAIN=local"
+          "GOPROXY=off"
+          "GOSUMDB=off"
+          "${BOOMPI_GO_EXECUTABLE}" test -count=1
+          -run "^TestCppWSSHappyPath$" ./internal/app)
+      set_tests_properties(boompi_cpp_wss_cross_language_smoke PROPERTIES
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/server"
+        TIMEOUT 30)
+    else()
+      message(STATUS
+        "Go was not found; cross-language WSS smoke test is not registered")
+    endif()
+  endif()
 endif()

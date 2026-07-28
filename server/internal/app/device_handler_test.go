@@ -238,7 +238,10 @@ type roundTripBackend struct {
 }
 
 func newRoundTripBackend() *roundTripBackend {
-	return &roundTripBackend{session: &roundTripSession{events: make(chan backend.ConversationEvent, 8)}}
+	return &roundTripBackend{session: &roundTripSession{
+		events: make(chan backend.ConversationEvent, 8),
+		closed: make(chan struct{}),
+	}}
 }
 
 func (b *roundTripBackend) Open(context.Context, backend.SessionConfig) (backend.ConversationSession, error) {
@@ -250,6 +253,8 @@ type roundTripSession struct {
 	mu        sync.Mutex
 	audio     []byte
 	events    chan backend.ConversationEvent
+	closed    chan struct{}
+	commits   atomic.Int32
 	closeOnce sync.Once
 }
 
@@ -261,6 +266,7 @@ func (s *roundTripSession) SendAudio(_ context.Context, pcm []byte) error {
 }
 
 func (s *roundTripSession) Commit(context.Context) error {
+	s.commits.Add(1)
 	for _, event := range []backend.ConversationEvent{
 		{Type: backend.EventStarted, ResponseID: "response-1"},
 		{Type: backend.EventTextDelta, ResponseID: "response-1", Text: "你好"},
@@ -275,7 +281,10 @@ func (s *roundTripSession) Commit(context.Context) error {
 func (s *roundTripSession) Cancel(context.Context) error             { return nil }
 func (s *roundTripSession) Events() <-chan backend.ConversationEvent { return s.events }
 func (s *roundTripSession) Close() error {
-	s.closeOnce.Do(func() { close(s.events) })
+	s.closeOnce.Do(func() {
+		close(s.events)
+		close(s.closed)
+	})
 	return nil
 }
 

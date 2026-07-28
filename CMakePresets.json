@@ -54,6 +54,7 @@
       "name": "rv1106-release",
       "inherits": "rv1106-base",
       "cacheVariables": {
+        "BOOMPI_ENABLE_WSS_CLIENT": "ON",
         "CMAKE_BUILD_TYPE": "Release"
       }
     }

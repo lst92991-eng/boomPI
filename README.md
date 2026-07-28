@@ -14,7 +14,7 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
               |
       RV1106 boompi-client
               |
-      局域网 WSS（服务端已就绪，板端待接入）
+      局域网 WSS（板端离线单轮已通，产品状态机待接入）
               |
        boompi-server（Go）
               |
@@ -42,7 +42,8 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
   入口符号解析已通过，但对应 ELF 尚未在板端执行。
 - Snowboy 的板端模型加载、准确率和实时率；旧 ARM 库的交叉链接候选已核对。
 - 最终壳体下的 AEC、波束形成、双讲、远场和最大音量表现。
-- WSS 配对、断网恢复、端到端 Qwen 会话、长期稳定性和 A/B 回滚。
+- WSS 的正常局域网发现/配对、断网恢复、端到端 Qwen 会话、长期稳定性和 A/B 回滚；
+  固定 OpenSSL 3.5.7 的独立 SPKI 单轮 smoke 已在板端通过。
 
 ### 软件阶段
 
@@ -67,6 +68,11 @@ MPI 音频的八个头文件 pin、当时 21 个 `UND`、MPP/RGA SONAME 与未�
 这些模块现在冻结，不继续增加 runner、mailbox 或控制层；后续首先完成 vendor raw PCM
 最小闭环，再按真实阻塞、通道和时序需求复用或简化现有代码。默认自动测试不会访问真实
 Qwen，也不会消耗付费额度。
+
+2026-07-28 已完成固定 OpenSSL 3.5.7 的 C++ WSS 单轮闭环：Ubuntu 跨语言离线测试和
+RV1106 真机 smoke 都通过，错误 pin 会在 provider 打开前失败。该结果仍是独立测试入口，
+尚未接入产品状态机或真实音频；证据与边界见
+[P1 C++ WSS 单轮闭环验证记录](docs/test/p1-cpp-wss-client-validation-20260728.md)。
 
 ## 仓库结构
 
@@ -168,7 +174,7 @@ Linux/macOS：
 ./boompi-server --config configs/config.yaml
 ```
 
-当前实现提供单设备 `wss://<host>:17806/ws`、稳定本地 TLS 身份、16 kHz PCM 上行、Qwen Realtime 流式转发、24 kHz PCM/文本下行与响应取消。开发阶段要求客户端在 `hello.payload.device_token` 中提交一个环境变量注入的共享令牌；服务端会在打开付费 provider 会话之前验证它。UDP 发现、六位码配对、每设备独立 Token、自动重连和完整板端联调仍是后续工作，因此当前 WSS 仅用于受控局域网开发，不是完整的生产信任链。
+当前实现提供单设备 `wss://<host>:17806/ws`、稳定本地 TLS 身份、16 kHz PCM 上行、Qwen Realtime 流式转发、24 kHz PCM/文本下行与响应取消。开发阶段要求客户端在 `hello.payload.device_token` 中提交一个环境变量注入的共享令牌；服务端会在打开付费 provider 会话之前验证它。UDP 发现、六位码配对、每设备独立 Token、自动重连以及产品状态机和真实音频联调仍是后续工作，因此当前 WSS 仅用于受控局域网开发，不是完整的生产信任链。
 
 Qwen 凭据只能通过当前进程环境提供：
 
@@ -210,13 +216,17 @@ BOOMPI_QWEN_LIVE_TEST=1 go test -count=1 -run '^TestLiveOpenSession$' ./internal
 3. ALSA 开发头文件/库，以及经板端确认的声卡、PCM 和 mixer 参数。
 4. Rockchip MPI/3A 的匹配头文件与二进制库；不得只从板端 `.so` 名称猜 API。
 5. Snowboy runtime/model 的兼容性和再分发许可结论。
-6. 工具链文件要求的 SDK/sysroot 环境变量或 CMake cache 参数；不得把个人绝对路径写入 preset。
+6. 固定 OpenSSL 3.5.7 的 RV1106 静态 package；源码、完整头文件树、CMake config 和
+   archive 必须与仓库闸门一致。
+7. 工具链文件要求的 SDK/sysroot 环境变量或 CMake cache 参数；不得把个人绝对路径写入 preset。
 
 当前工具链文件识别以下显式配置：
 
 - `BOOMPI_RV1106_TOOLCHAIN_ROOT`：必填，目录中包含交叉编译器的 `bin/`。
 - `BOOMPI_RV1106_TOOLCHAIN_PREFIX`：可选；当前默认值为 `arm-rockchip830-linux-uclibcgnueabihf`，必须与实际 SDK 一致。
 - `BOOMPI_RV1106_SYSROOT`：接入目标系统库时必须指向与镜像匹配的 sysroot。
+- `BOOMPI_OPENSSL_ROOT`：`rv1106-release` 必填，指向通过固定哈希和完整头文件 manifest
+  校验的 flat OpenSSL 3.5.7 静态 package root。
 
 `BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO`、`BOOMPI_ENABLE_ROCKCHIP_3A` 和
 `BOOMPI_ENABLE_SNOWBOY` 默认均为 `OFF`。当前 pins
@@ -236,9 +246,14 @@ feasibility 环境中创建 `EXCLUDE_FROM_ALL` 的原始 AI/AO 探针，默认 b
 准备完成后使用：
 
 ```text
+BOOMPI_OPENSSL_ROOT=<pinned-openssl-3.5.7-package> \
 cmake --preset rv1106-release
 cmake --build --preset rv1106-release --parallel
 ```
+
+`rv1106-release` 会显式打开 WSS；缺少或混用旧版 OpenSSL 时必须配置失败，不能通过关闭
+WSS 生成一个冒充发布版的产物。交付验证必须从全新的 build 目录执行 configure→build，
+不能复用曾缓存其他 OpenSSL 路径的旧构建树，也不能在 configure 后替换外部 package 内容。
 
 2026-07-25 已使用与 BSP 匹配的 GCC 8.3.0 Buildroot wrapper 和 uClibc sysroot 成功构建 RV1106 Release 产物，并验证 ELF32 ARM EABI5 hard-float 与 loader；因当时板端管理通道不可用，产物尚未在板端执行。具体证据见 [P0 可行性报告](docs/test/p0-feasibility-report-20260725.md)，完整闸门见 [docs/test/rv1106-validation-gates.md](docs/test/rv1106-validation-gates.md)。刷镜像、改分区、设备树或启动项前必须单独取得用户授权。
 
@@ -296,7 +311,7 @@ raw MPI 对照使用独立的
 ## 路线图
 
 1. **P0 可行性闸门（进行中）**：先完成 rk_mpi/ALSA 48 kHz 全双工、真实 capture
-   layout、Rockchip VQE/3A，再继续 Snowboy、WSS、Wi-Fi AP 和 UI backend 探测。
+   layout、Rockchip VQE/3A，再继续 Snowboy、WSS 产品接线、Wi-Fi AP 和 UI backend 探测。
 2. **P1 工程骨架（已完成）**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
 3. **P2 本地音频（进行中）**：现有 host 音频核心保留但冻结扩展；以 vendor raw PCM 最小
    闭环和板端 HIL 为当前入口，实测后再决定哪些已有模块进入 runtime。
