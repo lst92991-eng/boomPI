@@ -122,6 +122,8 @@ packing/slot、错误恢复、算法实时率和 Snowboy 板端行为仍未验�
 
 设备按“缓存 endpoint、UDP 发现、手动 IP”寻找本地服务端。UDP 发现未经认证；首次连接必须在显式 pairing 状态，以屏幕六位码确认当前 TLS SPKI 和 pairing transcript。之后固定 SPKI，并使用独立 device token。
 
+在完整 pairing 落地前，当前开发服务端要求 `hello` 携带环境变量人工下发的共享设备令牌，并在打开云端 provider 会话前验证；该措施只用于受控局域网联调，不能替代每设备令牌和 SPKI 配对。
+
 WSS 承载 JSON 控制帧和二进制 PCM。协议细节见 `protocol/protocol-v1.md`。断线后当前 turn 失败，实时语音不做应用层重传。
 
 ## 守护与更新

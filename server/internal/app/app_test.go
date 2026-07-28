@@ -16,6 +16,7 @@ import (
 func TestRunStopsWhenContextIsCanceled(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "never-log-this-secret")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
+	t.Setenv("BOOMPI_DEVICE_TOKEN", "0123456789abcdef0123456789abcdef")
 	cfg, err := config.Load("", nil)
 	if err != nil {
 		t.Fatalf("config.Load() error = %v", err)
@@ -51,8 +52,8 @@ func TestRunStopsWhenContextIsCanceled(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Run() did not stop after context cancellation")
 	}
-	if strings.Contains(output.String(), "never-log-this-secret") {
-		t.Fatal("application log leaked the API key")
+	if strings.Contains(output.String(), "never-log-this-secret") || strings.Contains(output.String(), "0123456789abcdef0123456789abcdef") {
+		t.Fatal("application log leaked a credential")
 	}
 	if !strings.Contains(output.String(), "tls_spki_sha256") {
 		t.Fatalf("TLS identity was not logged: %s", output.String())

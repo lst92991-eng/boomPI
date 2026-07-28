@@ -1,13 +1,16 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -20,7 +23,12 @@ import (
 	"github.com/lst92991-eng/boomPI/server/internal/transport"
 )
 
-const inputFrameBytes = 640
+const (
+	inputFrameBytes            = 640
+	helloAuthenticationTimeout = 5 * time.Second
+)
+
+var errDeviceAuthentication = errors.New("device authentication failed")
 
 type deviceHandler struct {
 	cfg      config.Config
@@ -50,9 +58,11 @@ type connectionState struct {
 }
 
 func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connection) error {
-	first, err := connection.Receive(ctx)
+	helloCtx, cancelHello := context.WithTimeout(ctx, helloAuthenticationTimeout)
+	first, err := connection.Receive(helloCtx)
+	cancelHello()
 	if err != nil {
-		return err
+		return fmt.Errorf("receive device hello: %w", err)
 	}
 	if first.Control == nil || first.Control.Type != "hello" {
 		return errors.New("first device message must be hello")
@@ -60,6 +70,9 @@ func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connec
 	hello := *first.Control
 	if hello.SessionID != 0 || hello.TurnID != 0 || hello.StreamID != 0 || hello.Epoch != 0 {
 		return errors.New("hello identifiers must be zero")
+	}
+	if err := authenticateHello(hello.Payload, h.cfg.DeviceToken.Value()); err != nil {
+		return err
 	}
 	deviceUUID, err := protocol.ParseDeviceUUID(hello.DeviceID)
 	if err != nil {
@@ -121,6 +134,49 @@ func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connec
 			return err
 		}
 	}
+}
+
+func authenticateHello(payload json.RawMessage, expectedToken string) error {
+	presentedToken, err := parseHelloDeviceToken(payload)
+	if err != nil {
+		return errDeviceAuthentication
+	}
+	presentedDigest := sha256.Sum256([]byte(presentedToken))
+	expectedDigest := sha256.Sum256([]byte(expectedToken))
+	if subtle.ConstantTimeCompare(presentedDigest[:], expectedDigest[:]) != 1 {
+		return errDeviceAuthentication
+	}
+	return nil
+}
+
+func parseHelloDeviceToken(payload json.RawMessage) (string, error) {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return "", errDeviceAuthentication
+	}
+	if !decoder.More() {
+		return "", errDeviceAuthentication
+	}
+	key, err := decoder.Token()
+	if err != nil || key != "device_token" {
+		return "", errDeviceAuthentication
+	}
+	var token string
+	if err := decoder.Decode(&token); err != nil || token == "" {
+		return "", errDeviceAuthentication
+	}
+	if decoder.More() {
+		return "", errDeviceAuthentication
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return "", errDeviceAuthentication
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return "", errDeviceAuthentication
+	}
+	return token, nil
 }
 
 func (h *deviceHandler) handleControl(ctx context.Context, connection *transport.Connection, actor *session.Actor, state *connectionState, envelope protocol.ControlEnvelope) error {

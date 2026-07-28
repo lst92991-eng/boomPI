@@ -56,6 +56,16 @@ func (c Credentials) String() string {
 
 func (c Credentials) GoString() string { return c.String() }
 
+type DeviceToken struct {
+	value string
+}
+
+func (t DeviceToken) Value() string { return t.value }
+
+func (DeviceToken) String() string { return "<redacted>" }
+
+func (t DeviceToken) GoString() string { return t.String() }
+
 type Config struct {
 	ListenAddress        string
 	WSSPort              int
@@ -78,6 +88,7 @@ type Config struct {
 	PairingCodeTTL       time.Duration
 	PairingMaxAttempts   int
 	Credentials          Credentials
+	DeviceToken          DeviceToken
 }
 
 func Defaults() Config {
@@ -135,6 +146,11 @@ func Load(path string, cli Overrides) (Config, error) {
 		source:      source,
 		workspaceID: strings.TrimSpace(workspaceID),
 	}
+	deviceToken, ok := os.LookupEnv("BOOMPI_DEVICE_TOKEN")
+	if !ok || strings.TrimSpace(deviceToken) == "" {
+		return Config{}, errors.New("missing device credential: set BOOMPI_DEVICE_TOKEN")
+	}
+	cfg.DeviceToken = DeviceToken{value: deviceToken}
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -192,8 +208,8 @@ func (c Config) Validate() error {
 	if c.Provider != "qwen" {
 		return errors.New("provider must be qwen in P1")
 	}
-	if !validIdentifier(c.Region, 32) {
-		return errors.New("region must be a non-empty lowercase identifier")
+	if !oneOf(c.Region, "china-beijing", "singapore") {
+		return errors.New("region must be china-beijing or singapore")
 	}
 	if strings.TrimSpace(c.Model) == "" || len(c.Model) > 128 {
 		return errors.New("model must contain 1..128 characters")
@@ -244,7 +260,16 @@ func (c Config) Validate() error {
 		return errors.New("API credential is required")
 	}
 	if strings.TrimSpace(c.Credentials.workspaceID) == "" {
-		return errors.New("DASHSCOPE_WORKSPACE_ID is required for the Singapore Qwen endpoint")
+		return errors.New("DASHSCOPE_WORKSPACE_ID is required for the selected Qwen region")
+	}
+	trimmedDeviceToken := strings.TrimSpace(c.DeviceToken.value)
+	if len([]byte(trimmedDeviceToken)) < 32 || len([]byte(trimmedDeviceToken)) > 256 {
+		return errors.New("BOOMPI_DEVICE_TOKEN must contain 32..256 bytes")
+	}
+	if trimmedDeviceToken != c.DeviceToken.value || strings.IndexFunc(c.DeviceToken.value, func(current rune) bool {
+		return unicode.IsSpace(current) || unicode.IsControl(current)
+	}) >= 0 {
+		return errors.New("BOOMPI_DEVICE_TOKEN must not contain whitespace or control characters")
 	}
 	return nil
 }
@@ -476,7 +501,7 @@ func applyValue(cfg *Config, key, value string) error {
 			return err
 		}
 		cfg.PairingMaxAttempts = parsed
-	case "api_key", "dashscope_api_key", "workspace_id":
+	case "api_key", "dashscope_api_key", "workspace_id", "device_token":
 		return errors.New("secrets and workspace identifiers must come from environment variables")
 	default:
 		return errors.New("unknown configuration key")
@@ -493,18 +518,6 @@ func validatePort(name string, value int) error {
 
 func validListenAddress(value string) bool {
 	return net.ParseIP(value) != nil
-}
-
-func validIdentifier(value string, maxLength int) bool {
-	if value == "" || len(value) > maxLength {
-		return false
-	}
-	for _, current := range value {
-		if !((current >= 'a' && current <= 'z') || (current >= '0' && current <= '9') || current == '-') {
-			return false
-		}
-	}
-	return true
 }
 
 func validConfigKey(value string) bool {

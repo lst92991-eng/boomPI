@@ -61,7 +61,7 @@ Rules:
 
 | Type | Direction | Required payload purpose |
 | --- | --- | --- |
-| `hello` | device → server | Client version and capabilities; IDs may be zero before assignment |
+| `hello` | device → server | Development device authentication; IDs are zero before assignment |
 | `hello.ack` | server → device | Assigned session/epoch and negotiated capabilities |
 | `turn.start` | device → server | Manual-VAD utterance start and input audio format |
 | `turn.commit` | device → server | End of utterance and total captured samples |
@@ -81,11 +81,11 @@ Pairing, update and tool payload schemas will be added before those features are
 
 ### 4.2 Implemented server MVP subset
 
-The current Go server accepts one device on `wss://<host>:17806/ws`. Its first message must be `hello`, with a canonical persistent `device_id` and all numeric identifiers set to zero. `hello.ack` assigns a nonzero `session_id`, starts at epoch 1, and advertises 16 kHz input, 24 kHz output and 20 ms input frames.
+The current Go server accepts one device on `wss://<host>:17806/ws`. Its first message must arrive within five seconds and must be `hello`, with a canonical persistent `device_id`, all numeric identifiers set to zero, and the exact development payload `{"device_token":"<environment-provisioned token>"}`. Unknown or missing hello payload fields are rejected. The server authenticates this token before opening a provider session. `hello.ack` assigns a nonzero `session_id`, starts at epoch 1, and advertises 16 kHz input, 24 kHz output and 20 ms input frames.
 
 For each manual-VAD turn, the device sends `turn.start` with nonzero `session_id`, `turn_id`, `stream_id` and monotonic `epoch`; its payload is `{"sample_rate_hz":16000}`. Binary uplink frames then use those identifiers and consecutive sequence numbers starting at zero. `turn.commit` ends the input. The server may return `response.start`, `response.text_delta`, `response.audio_start`, binary 24 kHz PCM, and `response.done`. `turn.cancel` and `response.cancel` retire the active epoch and return `response.cancelled`.
 
-This subset deliberately omits discovery, pairing, device tokens, conversation persistence, tools and flow credit. Until pairing lands, the generated stable SPKI digest must be treated as test information rather than a complete production trust flow.
+This subset deliberately omits discovery, pairing, per-device token provisioning, conversation persistence, tools and flow credit. The shared development token is only a fail-closed guard against unauthenticated LAN clients triggering provider calls; it is not a replacement for pairing. Until pairing lands, the generated stable SPKI digest and manually provisioned token must be treated as development information rather than a complete production trust flow.
 
 ## 5. Binary audio frame
 

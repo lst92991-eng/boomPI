@@ -14,7 +14,7 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
               |
       RV1106 boompi-client
               |
-      局域网 WSS（规划中）
+      局域网 WSS（服务端已就绪，板端待接入）
               |
        boompi-server（Go）
               |
@@ -168,14 +168,30 @@ Linux/macOS：
 ./boompi-server --config configs/config.yaml
 ```
 
-当前实现提供单设备 `wss://<host>:17806/ws`、稳定本地 TLS 身份、16 kHz PCM 上行、Qwen Realtime 流式转发、24 kHz PCM/文本下行与响应取消。UDP 发现、六位码配对、设备 Token、自动重连和完整板端联调仍是后续工作；因此当前 WSS 可用于开发联调，但还不是完整的生产信任链。
+当前实现提供单设备 `wss://<host>:17806/ws`、稳定本地 TLS 身份、16 kHz PCM 上行、Qwen Realtime 流式转发、24 kHz PCM/文本下行与响应取消。开发阶段要求客户端在 `hello.payload.device_token` 中提交一个环境变量注入的共享令牌；服务端会在打开付费 provider 会话之前验证它。UDP 发现、六位码配对、每设备独立 Token、自动重连和完整板端联调仍是后续工作，因此当前 WSS 仅用于受控局域网开发，不是完整的生产信任链。
 
 Qwen 凭据只能通过当前进程环境提供：
 
 - `DASHSCOPE_API_KEY`
 - `DASHSCOPE_WORKSPACE_ID`
 
-不要把真实值写进 YAML、`.env`、命令示例、日志、截图或 Git。任何曾出现在聊天或日志中的 Key 都应在控制台吊销并重新生成。默认 provider 计划使用新加坡区 `qwen3.5-omni-plus-realtime`，接入时仍必须重新核对官方 endpoint、事件和音频格式。
+开发设备令牌同样只能通过当前进程环境提供：
+
+- `BOOMPI_DEVICE_TOKEN`：32–256 字节、不得包含空白；第一版客户端与服务端配置相同的随机值
+
+可在 PowerShell 中生成并配置当前终端的临时令牌：
+
+```powershell
+[byte[]]$tokenBytes = New-Object byte[] 32
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+$rng.GetBytes($tokenBytes)
+$rng.Dispose()
+$env:BOOMPI_DEVICE_TOKEN = [Convert]::ToBase64String($tokenBytes)
+```
+
+Linux/macOS 可使用 `export BOOMPI_DEVICE_TOKEN="$(openssl rand -base64 32)"`。这只是首次配对功能落地前的开发保护，不应让多个部署共用同一令牌。
+
+不要把 API Key 或设备令牌的真实值写进 YAML、`.env`、命令示例、日志、截图或 Git。任何曾出现在聊天或日志中的 Key 都应在控制台吊销并重新生成。默认 provider 使用新加坡区 `qwen3.5-omni-plus-realtime`，接入时仍必须重新核对官方 endpoint、事件和音频格式。
 
 需要显式验证真实 Qwen 凭据和 WebSocket 握手时，在已导出上述变量的同一终端进入 `server/`，执行：
 

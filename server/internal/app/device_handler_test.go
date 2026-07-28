@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,11 +19,15 @@ import (
 	"github.com/lst92991-eng/boomPI/server/internal/protocol"
 )
 
-const testDeviceID = "00112233-4455-6677-8899-aabbccddeeff"
+const (
+	testDeviceID    = "00112233-4455-6677-8899-aabbccddeeff"
+	testDeviceToken = "0123456789abcdef0123456789abcdef"
+)
 
 func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
+	t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
 	cfg, err := config.Load("", nil)
 	if err != nil {
 		t.Fatalf("config.Load() error = %v", err)
@@ -43,7 +48,8 @@ func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 	defer webSocket.Close()
 
 	writeControl(t, webSocket, protocol.ControlEnvelope{
-		Version: protocol.Version, Type: "hello", MessageID: "client-1", DeviceID: testDeviceID, Payload: json.RawMessage(`{}`),
+		Version: protocol.Version, Type: "hello", MessageID: "client-1", DeviceID: testDeviceID,
+		Payload: json.RawMessage(`{"device_token":"` + testDeviceToken + `"}`),
 	})
 	helloAck := readControl(t, webSocket)
 	if helloAck.Type != "hello.ack" || helloAck.SessionID == 0 {
@@ -107,6 +113,9 @@ func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 	if len(recorded) != inputFrameBytes || recorded[0] != 7 || recorded[1] != 8 {
 		t.Fatalf("provider input length=%d data=%v", len(recorded), recorded)
 	}
+	if got := provider.openCount.Load(); got != 1 {
+		t.Fatalf("provider Open calls = %d, want 1", got)
+	}
 
 	cancel()
 	select {
@@ -119,13 +128,121 @@ func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 	}
 }
 
-type roundTripBackend struct{ session *roundTripSession }
+func TestDeviceHelloRejectsInvalidTokenBeforeProviderOpen(t *testing.T) {
+	testCases := []struct {
+		name    string
+		payload json.RawMessage
+	}{
+		{name: "wrong token", payload: json.RawMessage(`{"device_token":"fedcba9876543210fedcba9876543210"}`)},
+		{name: "missing token", payload: json.RawMessage(`{}`)},
+		{name: "empty token", payload: json.RawMessage(`{"device_token":""}`)},
+		{name: "unknown field", payload: json.RawMessage(`{"device_token":"` + testDeviceToken + `","extra":true}`)},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
+			t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
+			t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
+			cfg, err := config.Load("", nil)
+			if err != nil {
+				t.Fatalf("config.Load() error = %v", err)
+			}
+			cfg.ListenAddress = "127.0.0.1"
+			cfg.WSSPort = freePort(t)
+			provider := newRoundTripBackend()
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			application, err := newWithBackend(cfg, logger, t.TempDir(), provider)
+			if err != nil {
+				t.Fatalf("newWithBackend() error = %v", err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			serverDone := make(chan error, 1)
+			go func() { serverDone <- application.Run(ctx) }()
+			webSocket := dialTestServer(t, cfg.WSSPort)
+			writeControl(t, webSocket, protocol.ControlEnvelope{
+				Version: protocol.Version, Type: "hello", MessageID: "client-1", DeviceID: testDeviceID,
+				Payload: testCase.payload,
+			})
+			if _, _, err := webSocket.ReadMessage(); err == nil {
+				t.Error("invalid hello remained connected, want connection rejection")
+			}
+			if got := provider.openCount.Load(); got != 0 {
+				t.Errorf("provider Open calls = %d, want 0", got)
+			}
+			_ = webSocket.Close()
+			cancel()
+			select {
+			case err := <-serverDone:
+				if err != nil {
+					t.Fatalf("App.Run() error = %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("server did not stop")
+			}
+		})
+	}
+}
+
+func TestDeviceHelloTimesOutBeforeProviderOpen(t *testing.T) {
+	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
+	t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
+	cfg, err := config.Load("", nil)
+	if err != nil {
+		t.Fatalf("config.Load() error = %v", err)
+	}
+	cfg.ListenAddress = "127.0.0.1"
+	cfg.WSSPort = freePort(t)
+	provider := newRoundTripBackend()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	application, err := newWithBackend(cfg, logger, t.TempDir(), provider)
+	if err != nil {
+		t.Fatalf("newWithBackend() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- application.Run(ctx) }()
+	webSocket := dialTestServer(t, cfg.WSSPort)
+	defer webSocket.Close()
+	_ = webSocket.SetReadDeadline(time.Now().Add(helloAuthenticationTimeout + 2*time.Second))
+
+	started := time.Now()
+	if _, _, err := webSocket.ReadMessage(); err == nil {
+		t.Fatal("connection without hello remained open")
+	}
+	elapsed := time.Since(started)
+	if elapsed < helloAuthenticationTimeout-500*time.Millisecond || elapsed > helloAuthenticationTimeout+2*time.Second {
+		t.Fatalf("unauthenticated connection closed after %s, want approximately %s", elapsed, helloAuthenticationTimeout)
+	}
+	if got := provider.openCount.Load(); got != 0 {
+		t.Fatalf("provider Open calls = %d, want 0", got)
+	}
+
+	cancel()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("App.Run() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop")
+	}
+}
+
+type roundTripBackend struct {
+	session   *roundTripSession
+	openCount atomic.Int32
+}
 
 func newRoundTripBackend() *roundTripBackend {
 	return &roundTripBackend{session: &roundTripSession{events: make(chan backend.ConversationEvent, 8)}}
 }
 
 func (b *roundTripBackend) Open(context.Context, backend.SessionConfig) (backend.ConversationSession, error) {
+	b.openCount.Add(1)
 	return b.session, nil
 }
 

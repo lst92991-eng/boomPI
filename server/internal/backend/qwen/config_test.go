@@ -6,16 +6,25 @@ import (
 	"time"
 )
 
-func TestSingaporeEndpoint(t *testing.T) {
-	endpoint, err := SingaporeEndpoint("ws-test_123")
-	if err != nil {
-		t.Fatalf("SingaporeEndpoint() error = %v", err)
+func TestRegionalEndpoint(t *testing.T) {
+	tests := map[string]string{
+		RegionChinaBeijing: "wss://ws-test_123.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime",
+		RegionSingapore:    "wss://ws-test_123.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime",
 	}
-	if endpoint != "wss://ws-test_123.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime" {
-		t.Fatalf("SingaporeEndpoint() = %q", endpoint)
+	for region, want := range tests {
+		endpoint, err := RegionalEndpoint(region, "ws-test_123")
+		if err != nil {
+			t.Fatalf("RegionalEndpoint(%q) error = %v", region, err)
+		}
+		if endpoint != want {
+			t.Fatalf("RegionalEndpoint(%q) = %q, want %q", region, endpoint, want)
+		}
 	}
-	if _, err := SingaporeEndpoint("bad/id"); err == nil {
-		t.Fatal("SingaporeEndpoint() accepted an invalid workspace ID")
+	if _, err := RegionalEndpoint(RegionSingapore, "bad/id"); err == nil {
+		t.Fatal("RegionalEndpoint() accepted an invalid workspace ID")
+	}
+	if _, err := RegionalEndpoint("unknown", "ws-test_123"); err == nil {
+		t.Fatal("RegionalEndpoint() accepted an unsupported region")
 	}
 }
 

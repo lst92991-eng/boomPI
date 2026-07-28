@@ -3,6 +3,8 @@
 # API credentials are read only from the environment:
 #   DASHSCOPE_API_KEY
 #   DASHSCOPE_WORKSPACE_ID
+# The temporary development device token is also environment-only:
+#   BOOMPI_DEVICE_TOKEN (32..256 bytes, no whitespace)
 # P1 accepts flat key/value scalars only; nested YAML is rejected deliberately.
 # Quote free-form text when it contains YAML comment syntax.
 

@@ -2,8 +2,10 @@ package qwen
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,6 +20,8 @@ import (
 const (
 	maxAudioChunkBytes = 256 * 1024
 	maxMessageBytes    = 8 * 1024 * 1024
+	RegionChinaBeijing = "china-beijing"
+	RegionSingapore    = "singapore"
 )
 
 var workspaceIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
@@ -26,6 +30,7 @@ var workspaceIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 type Config struct {
 	APIKey      string
 	WorkspaceID string
+	Region      string
 	Endpoint    string
 	Model       string
 	Voice       string
@@ -41,7 +46,7 @@ func (c Config) Validate() error {
 		return errors.New("qwen model and voice are required")
 	}
 	if c.Endpoint == "" {
-		if _, err := SingaporeEndpoint(c.WorkspaceID); err != nil {
+		if _, err := RegionalEndpoint(c.Region, c.WorkspaceID); err != nil {
 			return err
 		}
 	} else if err := validateEndpoint(c.Endpoint); err != nil {
@@ -56,13 +61,22 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// SingaporeEndpoint builds the current workspace-specific Model Studio URL.
-func SingaporeEndpoint(workspaceID string) (string, error) {
+// RegionalEndpoint builds a workspace-specific Model Studio Realtime URL.
+func RegionalEndpoint(region, workspaceID string) (string, error) {
 	workspaceID = strings.TrimSpace(workspaceID)
 	if !workspaceIDPattern.MatchString(workspaceID) {
 		return "", errors.New("qwen workspace ID is required and contains invalid characters")
 	}
-	return fmt.Sprintf("wss://%s.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime", workspaceID), nil
+	var domain string
+	switch strings.ToLower(strings.TrimSpace(region)) {
+	case RegionChinaBeijing:
+		domain = "cn-beijing.maas.aliyuncs.com"
+	case RegionSingapore:
+		domain = "ap-southeast-1.maas.aliyuncs.com"
+	default:
+		return "", fmt.Errorf("unsupported qwen region %q", region)
+	}
+	return fmt.Sprintf("wss://%s.%s/api-ws/v1/realtime", workspaceID, domain), nil
 }
 
 var (
@@ -89,6 +103,7 @@ var _ backend.ConversationBackend = (*Backend)(nil)
 func New(config Config) (*Backend, error) {
 	config.APIKey = strings.TrimSpace(config.APIKey)
 	config.WorkspaceID = strings.TrimSpace(config.WorkspaceID)
+	config.Region = strings.ToLower(strings.TrimSpace(config.Region))
 	config.Endpoint = strings.TrimSpace(config.Endpoint)
 	config.Model = strings.TrimSpace(config.Model)
 	config.Voice = strings.TrimSpace(config.Voice)
@@ -111,10 +126,21 @@ func (b *Backend) Open(ctx context.Context, cfg backend.SessionConfig) (backend.
 	header := make(http.Header)
 	header.Set("Authorization", "Bearer "+b.config.APIKey)
 	conn, response, err := b.dialer.DialContext(ctx, endpoint, header)
-	if response != nil && response.Body != nil {
-		_ = response.Body.Close()
+	responseStatus := ""
+	responseDetail := ""
+	if response != nil {
+		responseStatus = safeHTTPStatus(response.StatusCode)
+		if err != nil {
+			responseDetail = readHandshakeError(response.Body, b.config.APIKey)
+		}
 	}
 	if err != nil {
+		if responseStatus != "" {
+			if responseDetail != "" {
+				return nil, fmt.Errorf("%w: Qwen handshake returned %s (%s)", transportError(err), responseStatus, responseDetail)
+			}
+			return nil, fmt.Errorf("%w: Qwen handshake returned %s", transportError(err), responseStatus)
+		}
 		return nil, transportError(err)
 	}
 
@@ -143,11 +169,50 @@ func (b *Backend) Open(ctx context.Context, cfg backend.SessionConfig) (backend.
 	}
 }
 
+func safeHTTPStatus(statusCode int) string {
+	if text := http.StatusText(statusCode); text != "" {
+		return fmt.Sprintf("%d %s", statusCode, text)
+	}
+	return fmt.Sprint(statusCode)
+}
+
+func readHandshakeError(body io.ReadCloser, apiKey string) string {
+	if body == nil {
+		return ""
+	}
+	defer body.Close()
+	data, err := io.ReadAll(io.LimitReader(body, 4*1024))
+	if err != nil {
+		return ""
+	}
+	var response struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		Error   string `json:"error"`
+	}
+	if json.Unmarshal(data, &response) != nil {
+		return ""
+	}
+	message := response.Message
+	if message == "" {
+		message = response.Error
+	}
+	response.Code = strings.ReplaceAll(response.Code, apiKey, "<redacted>")
+	message = strings.ReplaceAll(message, apiKey, "<redacted>")
+	if response.Code != "" && message != "" {
+		return "code=" + response.Code + " message=" + message
+	}
+	if response.Code != "" {
+		return "code=" + response.Code
+	}
+	return message
+}
+
 func (c Config) endpointURL() (string, error) {
 	endpoint := c.Endpoint
 	if endpoint == "" {
 		var err error
-		endpoint, err = SingaporeEndpoint(c.WorkspaceID)
+		endpoint, err = RegionalEndpoint(c.Region, c.WorkspaceID)
 		if err != nil {
 			return "", err
 		}

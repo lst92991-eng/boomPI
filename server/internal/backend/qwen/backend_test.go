@@ -210,6 +210,49 @@ func TestAuthenticationFailureIsClassified(t *testing.T) {
 	if !errors.Is(err, ErrTransport) {
 		t.Fatalf("Open() error = %v, want transport error", err)
 	}
+	if !strings.Contains(err.Error(), "401 Unauthorized") {
+		t.Fatalf("Open() error = %v, want HTTP response status", err)
+	}
+}
+
+func TestSafeHTTPStatusCannotReflectRemoteReasonPhrase(t *testing.T) {
+	const apiKey = "test-api-key"
+	response := http.Response{StatusCode: http.StatusUnauthorized, Status: "401 " + apiKey}
+	status := safeHTTPStatus(response.StatusCode)
+	if status != "401 Unauthorized" {
+		t.Fatalf("safeHTTPStatus() = %q", status)
+	}
+	if strings.Contains(status, apiKey) {
+		t.Fatalf("safeHTTPStatus() reflected remote data: %q", status)
+	}
+}
+
+func TestHandshakeDiagnosticRedactsAPIKey(t *testing.T) {
+	const apiKey = "test-api-key"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":"InvalidApiKey-test-api-key","message":"credential test-api-key was rejected"}`))
+	}))
+	defer server.Close()
+
+	cfg := validConfig("ws" + strings.TrimPrefix(server.URL, "http"))
+	cfg.APIKey = apiKey
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	_, err = b.Open(context.Background(), backend.SessionConfig{})
+	if !errors.Is(err, ErrTransport) {
+		t.Fatalf("Open() error = %v, want transport error", err)
+	}
+	message := err.Error()
+	if !strings.Contains(message, "InvalidApiKey") || !strings.Contains(message, "<redacted>") {
+		t.Fatalf("Open() error = %v, want redacted structured diagnostic", err)
+	}
+	if strings.Contains(message, apiKey) {
+		t.Fatalf("Open() error leaked API key: %v", err)
+	}
 }
 
 func TestBoundedSendQueueHonorsCancellation(t *testing.T) {

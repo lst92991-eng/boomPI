@@ -28,7 +28,8 @@ func TestLiveOpenSession(t *testing.T) {
 	}
 
 	provider, err := New(Config{
-		APIKey: apiKey, WorkspaceID: workspaceID, Model: model, Voice: voice,
+		APIKey: apiKey, WorkspaceID: workspaceID, Region: RegionSingapore,
+		Model: model, Voice: voice,
 		Timeout: 30 * time.Second, QueueSize: 8,
 	})
 	if err != nil {
