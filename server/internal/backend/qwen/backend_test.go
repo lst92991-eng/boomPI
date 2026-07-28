@@ -144,6 +144,39 @@ func TestProviderErrorAfterHandshakeIsAnEvent(t *testing.T) {
 	}
 }
 
+func TestResponseDoneStatusMapping(t *testing.T) {
+	tests := []struct {
+		status  string
+		want    backend.EventType
+		wantErr bool
+	}{
+		{status: "completed", want: backend.EventDone},
+		{status: "cancelled", want: backend.EventDone},
+		{status: "failed", want: backend.EventError, wantErr: true},
+		{status: "incomplete", want: backend.EventError, wantErr: true},
+		{status: "in_progress", want: backend.EventError, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.status, func(t *testing.T) {
+			session := &Session{events: make(chan backend.ConversationEvent, 1)}
+			var event serverEvent
+			event.Type = "response.done"
+			event.Response.ID = "resp-1"
+			event.Response.Status = test.status
+			if err := session.handleServerEvent(event); err != nil {
+				t.Fatalf("handleServerEvent() error = %v", err)
+			}
+			got := receive(t, session.events)
+			if got.Type != test.want || got.ResponseID != "resp-1" {
+				t.Fatalf("event = %#v, want type %d", got, test.want)
+			}
+			if (got.Err != nil) != test.wantErr {
+				t.Fatalf("event error = %v, wantErr=%v", got.Err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestProviderErrorDuringHandshakeFailsOpen(t *testing.T) {
 	endpoint := startProvider(t, func(conn *websocket.Conn) {
 		writeServerJSON(t, conn, map[string]any{"type": "session.created"})
@@ -211,6 +244,41 @@ func TestBoundedSendQueueClassifiesDeadline(t *testing.T) {
 	err := session.SendAudio(callCtx, []byte{1, 2})
 	if !errors.Is(err, ErrTransport) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("SendAudio() error = %v, want transport deadline", err)
+	}
+}
+
+func TestCancelDoesNotHoldResponseLockWhileQueueIsFull(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	session := &Session{
+		config:            Config{Timeout: time.Second},
+		ctx:               ctx,
+		cancel:            cancel,
+		writes:            make(chan outboundBatch, 1),
+		responseRequested: true,
+	}
+	session.writes <- outboundBatch{}
+	callCtx, stopCall := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- session.Cancel(callCtx) }()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		if session.responseMu.TryLock() {
+			waiting := session.cancelWait != nil
+			session.responseMu.Unlock()
+			if waiting {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Cancel held responseMu while waiting for queue capacity")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	stopCall()
+	if err := <-done; !errors.Is(err, ErrCanceled) {
+		t.Fatalf("Cancel() error = %v, want canceled", err)
 	}
 }
 

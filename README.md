@@ -177,6 +177,14 @@ Qwen 凭据只能通过当前进程环境提供：
 
 不要把真实值写进 YAML、`.env`、命令示例、日志、截图或 Git。任何曾出现在聊天或日志中的 Key 都应在控制台吊销并重新生成。默认 provider 计划使用新加坡区 `qwen3.5-omni-plus-realtime`，接入时仍必须重新核对官方 endpoint、事件和音频格式。
 
+需要显式验证真实 Qwen 凭据和 WebSocket 握手时，在已导出上述变量的同一终端进入 `server/`，执行：
+
+```text
+BOOMPI_QWEN_LIVE_TEST=1 go test -count=1 -run '^TestLiveOpenSession$' ./internal/backend/qwen
+```
+
+该测试只建立并关闭会话，不上传音频，也不请求生成回答；默认 `go test ./...` 仍保持离线。
+
 ## RV1106 交叉编译
 
 执行 `rv1106-*` preset 前必须显式准备：
