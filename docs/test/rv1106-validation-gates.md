@@ -12,6 +12,8 @@ Rockchip MPI raw AI/AO 的 2026-07-27 tests-off 交叉链接、当时 21 个符�
 [MPI 音频交叉链接验证记录](p0-rockchip-mpi-link-validation-20260727.md)；
 当前 22 个符号、raw HIL 离线闸门和真实交叉构建见
 [2026-07-28 MPI HIL 构建验证记录](p0-rockchip-mpi-hil-build-validation-20260728.md)；
+当前镜像的 MPI owner、init/stop 风险与只读执行阻断见
+[2026-07-28 MPI HIL 只读前置验证记录](p0-rockchip-mpi-audio-preflight-20260728.md)；
 P2f-c-a 的 host/null/交叉链接证据见
 [2026-07-27 ALSA playback adapter 验证记录](p2f-c-a-validation-20260727.md)。
 
@@ -43,6 +45,14 @@ ALSA 的真实全双工、capture layout 和 3A 契约关闭。
   `RK_MPI_MB_GetSize` 后均以 22 个 Rockchip MPI `UND` 完成匹配 GCC 8.3/uClibc 的真实
   交叉构建，且无 `RPATH`/`RUNPATH`。两个 ARM ELF 均未在板端运行，因此下一项 raw
   全双工功能闸门仍不勾选。
+- [x] 当前镜像已运行固定用途只读 preflight：`/proc` FD 扫描完整，PCM owner 为 0，但
+  `rkipc` 持有 22 个 `/dev/mpi/*` FD；`dmesg` 可读但没有 follow，`/dev/kmsg` stream
+  语义未验证，target 也没有 `timeout`。C++ HIL 已同步扩展为在首次 MPI 调用前拦截配置的
+  PCM 与全部 `/dev/mpi/*` owner。preflight 明确返回 `safe_to_execute=false`，没有运行 ARM
+  ELF、停服务、发 signal、访问 mixer 或写板端文件。
+- [ ] 建立当前镜像专用、可验证且保留 Ethernet/DHCP/SSH 的 maintenance boot，在 rkipc
+  首次启动前跳过它并证明不会 respawn。禁止调用会 `killall rkipc/udhcpc`、无界等待并执行
+  全 OEM `rcK` 的 `S21appinit stop`；启动流程或镜像变更必须先取得用户本次明确授权。
 - [ ] 用直接 ALSA 与 raw rk_mpi 分别验证 48 kHz S16_LE 2ch 真全双工、有限 timeout、
   明确重叠区间、全部 exit code/录音字节数、停止顺序和 dmesg xrun delta；串行运行不能
   冒充全双工。

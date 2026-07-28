@@ -33,6 +33,7 @@ Linux/macOS 还需校验只读 P0 探针和显式 opt-in HIL 脚本：
 
 ```text
 sh -n scripts/probes/rv1106_p0_probe.sh
+sh -n scripts/probes/rv1106_rockchip_mpi_audio_preflight.sh
 sh -n scripts/hil/rv1106_alsa_full_duplex.sh
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 ```
@@ -47,6 +48,12 @@ raw MPI HIL 的自动测试同样只关闭 CMake/CLI 离线闸门：默认 `OFF`
 真实 RV1106 交叉构建证明当前 22 个 Rockchip MPI 符号和链接闭包可解析，但没有执行该
 ARM ELF，不能算作板端 raw 全双工通过。证据见
 [2026-07-28 Rockchip MPI HIL 构建验证记录](p0-rockchip-mpi-hil-build-validation-20260728.md)。
+
+专用 MPI preflight 的 Linux fixture 还必须证明：help/非法参数零探测，无 owner 时仍不会
+给出执行许可，`rkipc` 仅持 `/dev/mpi/*` 也会阻断，PCM owner/扫描不完整/dmesg 无 follow/
+危险 OEM stop 均 fail closed，并且测试前后 fixture 字节不变、没有调用 mixer/PCM/signal/
+service-control 命令。板端只读结果见
+[2026-07-28 MPI HIL 只读前置验证记录](p0-rockchip-mpi-audio-preflight-20260728.md)。
 
 Linux 上修改实时队列或 PCM 边界后，还需运行 sanitizer 构建。以下目录都是忽略的
 本地构建产物：
@@ -241,6 +248,9 @@ RV1106 HIL。
   `RPATH`/`RUNPATH`；
   默认 ALL 仍不构建 HIL，且没有安装或执行任一 ARM ELF。详见
   [2026-07-28 Rockchip MPI HIL 构建验证记录](p0-rockchip-mpi-hil-build-validation-20260728.md)。
+- 同日只读 preflight fixture 9/9、完整 Python/script discovery 62/62 通过；真实板端扫描
+  识别到 `rkipc` 的 22 个 `/dev/mpi/*` FD 并保持 `safe_to_execute=false`。HIL 自身的两次
+  快照也已覆盖配置 PCM 与全部 `/dev/mpi/*`，但快照仍不等于排他。
 - Host DSP 测试只能证明算法和内存边界；实际通道顺序、CPU 实时率和声音质量仍按
   HIL 闸门验证。
 

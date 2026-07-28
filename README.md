@@ -218,10 +218,23 @@ hard-float/uClibc 产物保留 Rockit/MPP/RGA `NEEDED`、21 个 raw 生命周期
 并通过离线闸门；两者均未在板端执行，详见
 [MPI HIL 构建验证记录](docs/test/p0-rockchip-mpi-hil-build-validation-20260728.md)。
 
-恢复板端 SSH 后，可运行不会打开 PCM 或修改系统的脱敏探针：
+同日恢复 SSH 后，专用只读 preflight 完整扫描到 PCM owner 为 0，但运行中的 `rkipc` 持有
+22 个 `/dev/mpi/*` FD；当前 `safe_to_execute=false`。C++ HIL 已同步在首次 MPI 调用前拦截
+配置 PCM 和全部 `/dev/mpi/*` owner，但快照仍不等于排他。当前 OEM stop 链会结束
+`udhcpc` 并停止整组 OEM service，禁止拿来自动跑 HIL；详见
+[MPI HIL 只读前置验证记录](docs/test/p0-rockchip-mpi-audio-preflight-20260728.md)。
+
+板端 SSH 可用时，可运行不会打开 PCM 或修改系统的脱敏探针：
 
 ```powershell
-Get-Content -Raw scripts/probes/rv1106_p0_probe.sh | ssh <board-host> "sh -s"
+cmd /d /s /c "ssh <board-host> sh -s < scripts\probes\rv1106_p0_probe.sh"
+```
+
+Windows PowerShell 的 `Get-Content | ssh` 可能重编码 stdin 并注入 BOM/CRLF，因此这里使用
+`cmd` 的二进制重定向。raw MPI HIL 前还必须运行更严格、同样零写入的专用 preflight：
+
+```powershell
+cmd /d /s /c "ssh <board-host> sh -s < scripts\probes\rv1106_rockchip_mpi_audio_preflight.sh"
 ```
 
 只读盘点和运行库闭包通过后，再按
