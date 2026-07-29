@@ -19,6 +19,7 @@ var ErrSessionClosed = errors.New("qwen session is closed")
 type clientEvent struct {
 	Type    string         `json:"type"`
 	Audio   string         `json:"audio,omitempty"`
+	ItemID  string         `json:"item_id,omitempty"`
 	Session *sessionUpdate `json:"session,omitempty"`
 }
 
@@ -38,7 +39,15 @@ type serverEvent struct {
 	Response   struct {
 		ID     string `json:"id"`
 		Status string `json:"status"`
+		Output []struct {
+			ID   string `json:"id"`
+			Role string `json:"role"`
+		} `json:"output"`
 	} `json:"response"`
+	Item struct {
+		ID   string `json:"id"`
+		Role string `json:"role"`
+	} `json:"item"`
 	Error struct {
 		Type    string `json:"type"`
 		Code    string `json:"code"`
@@ -69,9 +78,11 @@ type Session struct {
 	responseMu        sync.Mutex
 	responseRequested bool
 	cancelWait        chan error
+	lastAssistantItem string
 }
 
 var _ backend.ConversationSession = (*Session)(nil)
+var _ backend.CompletedResponseDiscarder = (*Session)(nil)
 
 func newSession(config Config, conn *websocket.Conn) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -168,6 +179,22 @@ func (s *Session) Cancel(ctx context.Context) error {
 	case <-timer.C:
 		return transportError(context.DeadlineExceeded)
 	}
+}
+
+func (s *Session) DiscardLastResponse(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.responseMu.Lock()
+	itemID := s.lastAssistantItem
+	s.lastAssistantItem = ""
+	s.responseMu.Unlock()
+	if itemID == "" {
+		return nil
+	}
+	return s.enqueue(ctx, outboundBatch{events: []clientEvent{{
+		Type: "conversation.item.delete", ItemID: itemID,
+	}}})
 }
 
 func (s *Session) Close() error {
@@ -268,6 +295,13 @@ func (s *Session) handleServerEvent(event serverEvent) error {
 		return nil
 	case "response.created":
 		return s.publish(backend.ConversationEvent{Type: backend.EventStarted, ResponseID: event.Response.ID})
+	case "response.output_item.added", "conversation.item.created":
+		if event.Item.ID != "" && event.Item.Role == "assistant" {
+			s.responseMu.Lock()
+			s.lastAssistantItem = event.Item.ID
+			s.responseMu.Unlock()
+		}
+		return nil
 	case "response.text.delta", "response.audio_transcript.delta":
 		return s.publish(backend.ConversationEvent{Type: backend.EventTextDelta, ResponseID: event.ResponseID, Text: event.Delta})
 	case "response.audio.delta":
@@ -277,6 +311,13 @@ func (s *Session) handleServerEvent(event serverEvent) error {
 		}
 		return s.publish(backend.ConversationEvent{Type: backend.EventAudio, ResponseID: event.ResponseID, PCM: pcm, SampleRateHz: 24_000})
 	case "response.done":
+		for _, item := range event.Response.Output {
+			if item.ID != "" && item.Role == "assistant" {
+				s.responseMu.Lock()
+				s.lastAssistantItem = item.ID
+				s.responseMu.Unlock()
+			}
+		}
 		responseErr := responseStatusError(event.Response.Status)
 		eventType := backend.EventDone
 		if responseErr != nil {

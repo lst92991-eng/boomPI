@@ -25,7 +25,10 @@ import (
 
 const (
 	inputFrameBytes            = 640
-	outputFrameBytes           = 480 * 2
+	outputSampleRateHz         = 24_000
+	pcmBytesPerSample          = 2
+	outputFrameDurationMS      = 20
+	outputFrameBytes           = outputSampleRateHz * pcmBytesPerSample * outputFrameDurationMS / 1000
 	helloAuthenticationTimeout = 5 * time.Second
 )
 
@@ -250,7 +253,11 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 
 	case "turn.cancel", "response.cancel":
 		if !turn.active {
-			return nil
+			if envelope.TurnID != turn.turnID || envelope.Epoch != turn.epoch ||
+				(envelope.StreamID != turn.uplinkStream && envelope.StreamID != turn.downlinkStream) {
+				return nil
+			}
+			return sendControl(ctx, connection, state, "response.cancelled", turn, map[string]any{"reason": "client_request"})
 		}
 		if envelope.Epoch != turn.epoch {
 			return errors.New("cancel epoch does not match the active turn")
@@ -387,9 +394,8 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 					return err
 				}
 			case backend.EventAudio:
-				if event.SampleRateHz != 24_000 || len(event.PCM) == 0 ||
-					len(event.PCM)%2 != 0 || len(event.PCM) > protocol.MaxPCMPayloadBytes {
-					return errors.New("provider returned invalid 24 kHz mono S16_LE audio")
+				if err := validateProviderAudio(event.SampleRateHz, event.PCM); err != nil {
+					return err
 				}
 				state.mu.Lock()
 				if !sameActiveTurn(state.turn, turn) {
@@ -460,7 +466,20 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 	}
 }
 
+func validateProviderAudio(sampleRateHz int, pcm []byte) error {
+	// A provider delta is not a protocol PCM packet. Qwen may deliver several
+	// wire frames in one delta, so the wire payload limit applies only after
+	// the residual-aware rechunking in forwardEvents.
+	if sampleRateHz != outputSampleRateHz || len(pcm) == 0 || len(pcm)%pcmBytesPerSample != 0 {
+		return errors.New("provider returned invalid 24 kHz mono S16_LE audio")
+	}
+	return nil
+}
+
 func sendDownlinkPCM(ctx context.Context, connection *transport.Connection, state *connectionState, turn activeTurn, payload []byte, final bool) error {
+	if len(payload) == 0 || len(payload) > outputFrameBytes || len(payload)%pcmBytesPerSample != 0 {
+		return fmt.Errorf("downlink PCM payload has %d bytes; want one non-empty aligned frame of at most %d bytes", len(payload), outputFrameBytes)
+	}
 	flags := uint16(0)
 	if turn.outputSequence == 0 {
 		flags |= protocol.PCMFlagStart
@@ -470,7 +489,7 @@ func sendDownlinkPCM(ctx context.Context, connection *transport.Connection, stat
 	}
 	header := protocol.PCMHeader{
 		Version: protocol.Version, Kind: protocol.AudioKindDownlink, Flags: flags,
-		AudioFormat: protocol.AudioFormatPCM16LE, Channels: 1, SampleRateHz: 24_000,
+		AudioFormat: protocol.AudioFormatPCM16LE, Channels: 1, SampleRateHz: outputSampleRateHz,
 		PayloadLen: uint32(len(payload)), Sequence: turn.outputSequence,
 		TimestampUS: state.timestampUS(), Epoch: turn.epoch, DeviceUUID: turn.deviceUUID,
 		SessionID: turn.sessionID, TurnID: turn.turnID, StreamID: turn.downlinkStream,

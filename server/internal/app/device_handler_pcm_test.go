@@ -45,6 +45,17 @@ func TestProviderAudioIsReframedWithTerminalFlagsBeforeDone(t *testing.T) {
 			wantLengths: []int{outputFrameBytes, outputFrameBytes, 82},
 			wantFlags:   []uint16{protocol.PCMFlagStart, 0, protocol.PCMFlagEnd},
 		},
+		{
+			name:        "one large Qwen delta is bounded on the wire",
+			providerPCM: [][]byte{pcmBoundaryFixture(8*outputFrameBytes+82, 0)},
+			wantLengths: []int{
+				outputFrameBytes, outputFrameBytes, outputFrameBytes, outputFrameBytes,
+				outputFrameBytes, outputFrameBytes, outputFrameBytes, outputFrameBytes, 82,
+			},
+			wantFlags: []uint16{
+				protocol.PCMFlagStart, 0, 0, 0, 0, 0, 0, 0, protocol.PCMFlagEnd,
+			},
+		},
 	}
 
 	for _, testCase := range testCases {
@@ -139,6 +150,13 @@ func TestProviderAudioRejectsInvalidPCM(t *testing.T) {
 				t.Fatalf("invalid provider PCM produced WebSocket message type=%d data=%q, want connection rejection", messageType, data)
 			}
 		})
+	}
+}
+
+func TestProviderAudioValidationDoesNotApplyWirePayloadLimit(t *testing.T) {
+	pcm := make([]byte, protocol.MaxPCMPayloadBytes+pcmBytesPerSample)
+	if err := validateProviderAudio(outputSampleRateHz, pcm); err != nil {
+		t.Fatalf("large provider delta validation error = %v", err)
 	}
 }
 

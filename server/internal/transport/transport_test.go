@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,7 +17,11 @@ import (
 	"github.com/lst92991-eng/boomPI/server/internal/protocol"
 )
 
-const testTimeout = 3 * time.Second
+const (
+	testTimeout      = 3 * time.Second
+	testPingInterval = time.Second
+	testPongTimeout  = 3 * time.Second
+)
 
 type receiveResult struct {
 	message Message
@@ -55,6 +60,19 @@ func (handler *blockingHandler) Handle(ctx context.Context, connection *Connecti
 	case <-handler.release:
 		return nil
 	}
+}
+
+type connectionLifetimeHandler struct {
+	connected chan *Connection
+	done      chan error
+}
+
+func (handler *connectionLifetimeHandler) Handle(ctx context.Context, connection *Connection) error {
+	handler.connected <- connection
+	<-ctx.Done()
+	err := context.Cause(ctx)
+	handler.done <- err
+	return err
 }
 
 type sendHandler struct {
@@ -275,6 +293,77 @@ func TestConnectionSendsControlAndPCMThroughWriter(t *testing.T) {
 	}
 }
 
+func TestUnsolicitedPongsSuppressPingsAndThenTimeout(t *testing.T) {
+	handler := &connectionLifetimeHandler{
+		connected: make(chan *Connection, 1),
+		done:      make(chan error, 1),
+	}
+	server, webSocket := startWSS(t, handler)
+	defer stopWSS(server, webSocket)
+	_ = awaitConnection(t, handler.connected)
+
+	var pingCount atomic.Int32
+	webSocket.SetPingHandler(func(string) error {
+		pingCount.Add(1)
+		return nil
+	})
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		for {
+			if _, _, err := webSocket.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	pongTicker := time.NewTicker(200 * time.Millisecond)
+	keepAliveTimer := time.NewTimer(testPongTimeout + 500*time.Millisecond)
+	defer pongTicker.Stop()
+	defer keepAliveTimer.Stop()
+	writePong := func() {
+		t.Helper()
+		if err := webSocket.WriteControl(websocket.PongMessage, []byte("client-heartbeat"), time.Now().Add(time.Second)); err != nil {
+			t.Fatalf("WriteControl(Pong) error = %v", err)
+		}
+	}
+	writePong()
+	for {
+		select {
+		case <-pongTicker.C:
+			writePong()
+		case <-keepAliveTimer.C:
+			pongTicker.Stop()
+			goto keptAlivePastTimeout
+		case err := <-handler.done:
+			t.Fatalf("connection ended while unsolicited Pongs were active: %v", err)
+		}
+	}
+
+keptAlivePastTimeout:
+	if got := pingCount.Load(); got != 0 {
+		t.Fatalf("server Ping count while unsolicited Pongs were active = %d, want 0", got)
+	}
+
+	select {
+	case err := <-handler.done:
+		if err == nil || !strings.Contains(err.Error(), "timeout") {
+			t.Fatalf("connection error after unsolicited Pongs stopped = %v, want timeout", err)
+		}
+	case <-time.After(testPongTimeout + time.Second):
+		t.Fatal("connection did not time out after unsolicited Pongs stopped")
+	}
+	maxPingsAfterStop := int32((testPongTimeout + testPingInterval - 1) / testPingInterval)
+	if got := pingCount.Load(); got == 0 || got > maxPingsAfterStop {
+		t.Fatalf("server Ping count after unsolicited Pongs stopped = %d, want 1..%d", got, maxPingsAfterStop)
+	}
+	select {
+	case <-readDone:
+	case <-time.After(testTimeout):
+		t.Fatal("client reader did not stop after connection timeout")
+	}
+}
+
 func newTestTransportServer(t *testing.T, handler Handler) *Server {
 	t.Helper()
 	server, err := NewServer(Config{
@@ -284,8 +373,8 @@ func newTestTransportServer(t *testing.T, handler Handler) *Server {
 				return nil, errors.New("httptest owns the test certificate")
 			},
 		},
-		PingInterval: time.Second,
-		PongTimeout:  3 * time.Second,
+		PingInterval: testPingInterval,
+		PongTimeout:  testPongTimeout,
 	}, handler)
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)

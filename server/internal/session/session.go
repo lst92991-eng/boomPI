@@ -268,7 +268,21 @@ func (a *Actor) apply(cmd command, state *actorState) error {
 		return nil
 
 	case cancelTurn:
-		if state.phase == idle || cmd.epoch < state.epoch {
+		if state.phase == idle {
+			if cmd.epoch < state.latest {
+				return nil
+			}
+			if cmd.epoch != state.latest {
+				return ErrInvalidTransition
+			}
+			if discarder, ok := a.provider.(backend.CompletedResponseDiscarder); ok {
+				if err := discarder.DiscardLastResponse(cmd.ctx); err != nil {
+					return fmt.Errorf("discard completed response: %w", err)
+				}
+			}
+			return nil
+		}
+		if cmd.epoch < state.epoch {
 			return nil
 		}
 		if cmd.epoch != state.epoch {

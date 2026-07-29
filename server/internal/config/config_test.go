@@ -38,6 +38,11 @@ func TestLoadExampleAndEnvironmentCredential(t *testing.T) {
 	if cfg.DeviceToken.Value() != validTestDeviceToken {
 		t.Fatal("device token was not loaded from BOOMPI_DEVICE_TOKEN")
 	}
+	if cfg.ConversationMode != "intelligence" || cfg.ASRModel != "qwen3-asr-flash" ||
+		cfg.ReasoningModel != "qwen3.7-max" || cfg.TTSModel != "qwen3-tts-flash-realtime" {
+		t.Fatalf("intelligence pipeline config = mode %q, ASR %q, reasoning %q, TTS %q",
+			cfg.ConversationMode, cfg.ASRModel, cfg.ReasoningModel, cfg.TTSModel)
+	}
 	formatted := fmt.Sprintf("%+v", cfg)
 	if strings.Contains(formatted, "dashscope-secret") || strings.Contains(formatted, validTestDeviceToken) {
 		t.Fatal("formatted configuration leaked a credential")

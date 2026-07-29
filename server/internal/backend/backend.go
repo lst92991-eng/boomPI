@@ -52,6 +52,13 @@ type ConversationSession interface {
 	Close() error
 }
 
+// CompletedResponseDiscarder is an optional provider capability used when
+// playback is cancelled after inference has already committed the assistant
+// response to provider-side conversation history.
+type CompletedResponseDiscarder interface {
+	DiscardLastResponse(ctx context.Context) error
+}
+
 type ConversationBackend interface {
 	Open(ctx context.Context, cfg SessionConfig) (ConversationSession, error)
 }

@@ -57,9 +57,10 @@ func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 		t.Fatalf("hello.ack = %+v", helloAck)
 	}
 
+	const currentEpoch uint32 = 2
 	turn := protocol.ControlEnvelope{
 		Version: protocol.Version, MessageID: "client-2", DeviceID: testDeviceID,
-		SessionID: helloAck.SessionID, TurnID: 11, StreamID: 12, Epoch: 1,
+		SessionID: helloAck.SessionID, TurnID: 11, StreamID: 12, Epoch: currentEpoch,
 	}
 	turn.Type = "turn.start"
 	turn.Payload = json.RawMessage(`{"sample_rate_hz":16000}`)
@@ -74,7 +75,7 @@ func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 	writePCM(t, webSocket, protocol.PCMHeader{
 		Version: protocol.Version, Kind: protocol.AudioKindUplink, AudioFormat: protocol.AudioFormatPCM16LE,
 		Flags:    protocol.PCMFlagStart | protocol.PCMFlagEnd,
-		Channels: 1, SampleRateHz: 16_000, PayloadLen: uint32(len(input)), Sequence: 0, Epoch: 1,
+		Channels: 1, SampleRateHz: 16_000, PayloadLen: uint32(len(input)), Sequence: 0, Epoch: currentEpoch,
 		DeviceUUID: deviceUUID, SessionID: helloAck.SessionID, TurnID: 11, StreamID: 12,
 	}, input)
 	turn.Type = "turn.commit"
@@ -82,10 +83,15 @@ func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 	turn.Payload = json.RawMessage(`{}`)
 	writeControl(t, webSocket, turn)
 
+	var downlinkStream uint32
 	wantControls := []string{"response.start", "response.text_delta", "response.audio_start"}
 	for _, want := range wantControls {
-		if got := readControl(t, webSocket); got.Type != want {
+		got := readControl(t, webSocket)
+		if got.Type != want {
 			t.Fatalf("control type = %q, want %q", got.Type, want)
+		}
+		if got.Type == "response.start" {
+			downlinkStream = got.StreamID
 		}
 	}
 	wantOutput := responsePCMFixture()
@@ -119,6 +125,30 @@ func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 	}
 	if got := readControl(t, webSocket); got.Type != "response.done" {
 		t.Fatalf("final control type = %q", got.Type)
+	}
+	if downlinkStream == 0 {
+		t.Fatal("response.start did not provide a downlink stream")
+	}
+
+	cancelEnvelope := protocol.ControlEnvelope{
+		Version: protocol.Version, Type: "response.cancel", MessageID: "client-4", DeviceID: testDeviceID,
+		SessionID: helloAck.SessionID, TurnID: turn.TurnID, StreamID: downlinkStream, Epoch: currentEpoch - 1,
+		Payload: json.RawMessage(`{}`),
+	}
+	writeControl(t, webSocket, cancelEnvelope)
+	cancelEnvelope.MessageID = "client-5"
+	cancelEnvelope.Epoch = currentEpoch
+	writeControl(t, webSocket, cancelEnvelope)
+	ack := readControl(t, webSocket)
+	if ack.Type != "response.cancelled" || ack.SessionID != helloAck.SessionID ||
+		ack.TurnID != turn.TurnID || ack.Epoch != currentEpoch || ack.StreamID == 0 {
+		t.Fatalf("response.cancelled = %+v", ack)
+	}
+	if err := webSocket.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	if _, _, err := webSocket.ReadMessage(); err == nil {
+		t.Fatal("stale generation produced an extra cancellation acknowledgement")
 	}
 
 	provider.session.mu.Lock()

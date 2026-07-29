@@ -22,7 +22,13 @@ var configKeys = []string{
 	"log_level",
 	"provider",
 	"region",
+	"conversation_mode",
 	"model",
+	"asr_model",
+	"reasoning_model",
+	"reasoning_effort",
+	"tts_model",
+	"tts_voice",
 	"voice",
 	"search_mode",
 	"system_prompt",
@@ -73,7 +79,13 @@ type Config struct {
 	LogLevel             string
 	Provider             string
 	Region               string
+	ConversationMode     string
 	Model                string
+	ASRModel             string
+	ReasoningModel       string
+	ReasoningEffort      string
+	TTSModel             string
+	TTSVoice             string
 	Voice                string
 	SearchMode           string
 	SystemPrompt         string
@@ -99,7 +111,13 @@ func Defaults() Config {
 		LogLevel:             "info",
 		Provider:             "qwen",
 		Region:               "singapore",
+		ConversationMode:     "realtime",
 		Model:                "qwen3.5-omni-plus-realtime",
+		ASRModel:             "qwen3-asr-flash",
+		ReasoningModel:       "qwen3.7-max",
+		ReasoningEffort:      "medium",
+		TTSModel:             "qwen3-tts-flash-realtime",
+		TTSVoice:             "Ethan",
 		Voice:                "Ethan",
 		SearchMode:           "auto",
 		SystemPrompt:         "You are boomPI, a concise and helpful voice assistant. Reply in Simplified Chinese unless the user asks for another language.",
@@ -211,11 +229,28 @@ func (c Config) Validate() error {
 	if !oneOf(c.Region, "china-beijing", "singapore") {
 		return errors.New("region must be china-beijing or singapore")
 	}
+	if !oneOf(c.ConversationMode, "realtime", "intelligence") {
+		return errors.New("conversation_mode must be realtime or intelligence")
+	}
 	if strings.TrimSpace(c.Model) == "" || len(c.Model) > 128 {
 		return errors.New("model must contain 1..128 characters")
 	}
 	if strings.IndexFunc(c.Model, unicode.IsControl) >= 0 {
 		return errors.New("model must not contain control characters")
+	}
+	for name, value := range map[string]string{
+		"asr_model":       c.ASRModel,
+		"reasoning_model": c.ReasoningModel,
+		"tts_model":       c.TTSModel,
+		"tts_voice":       c.TTSVoice,
+	} {
+		if strings.TrimSpace(value) == "" || len(value) > 128 ||
+			strings.IndexFunc(value, unicode.IsControl) >= 0 {
+			return fmt.Errorf("%s must contain 1..128 characters without control characters", name)
+		}
+	}
+	if !oneOf(c.ReasoningEffort, "low", "medium", "high") {
+		return errors.New("reasoning_effort must be low, medium, or high")
 	}
 	if strings.TrimSpace(c.Voice) == "" || len(c.Voice) > 64 || strings.IndexFunc(c.Voice, unicode.IsControl) >= 0 {
 		return errors.New("voice must contain 1..64 characters without control characters")
@@ -437,8 +472,20 @@ func applyValue(cfg *Config, key, value string) error {
 		cfg.Provider = strings.ToLower(value)
 	case "region":
 		cfg.Region = strings.ToLower(value)
+	case "conversation_mode":
+		cfg.ConversationMode = strings.ToLower(value)
 	case "model":
 		cfg.Model = value
+	case "asr_model":
+		cfg.ASRModel = value
+	case "reasoning_model":
+		cfg.ReasoningModel = value
+	case "reasoning_effort":
+		cfg.ReasoningEffort = strings.ToLower(value)
+	case "tts_model":
+		cfg.TTSModel = value
+	case "tts_voice":
+		cfg.TTSVoice = value
 	case "voice":
 		cfg.Voice = value
 	case "search_mode":
