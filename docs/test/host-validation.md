@@ -111,6 +111,11 @@ Python/script 测试，以及 Go 1.26.5 的 `go test ./...`、`go vet ./...` 和
 CMake 专项为 12/12。这些是离线 host/构建回归，不包含付费 provider 请求，也不替代
 RV1106 HIL。
 
+2026-07-29 的 Rockchip 3A 固定帧阶段又在 Ubuntu clean 临时树执行全部
+`scripts/tests/test_*.py`，结果为 `69/69` 通过；其中新增 3A HIL 专项为 `6/6`。本轮只覆盖
+离线 fake 生命周期、CMake 安全门和匹配 RV1106 工具链的交叉构建，真实板端 3A API 尚未
+执行，详见 [P0 Rockchip 3A 固定帧 HIL 构建验证](p0-rockchip-3a-hil-build-validation-20260729.md)。
+
 自动测试必须离线运行，不读取真实 `DASHSCOPE_API_KEY`，也不得发起付费 provider 请求。需要真实 Qwen 的测试必须使用单独的显式开关，并在测试报告中记录区域、模型和费用风险。
 
 当前最小 live smoke 仅校验新加坡区 WebSocket 会话建立，不上传 PCM、不触发回答生成：
@@ -240,6 +245,17 @@ BOOMPI_QWEN_LIVE_TEST=1 go test -count=1 -run '^TestLiveOpenSession$' ./internal
   destroy 任一入口时，链接必须失败。独立 MPI 夹具同样验证 tests-off 默认 ALL、无
   `RPATH`/`RUNPATH`，并分别删除代表性的 SYS、MB、AI、AO 入口确认链接失败。合成库只验证
   CMake 回归，不能替代真实 RV1106 交叉链接证据；非 Linux host 明确跳过 `.so` 链接用例。
+- 独立 `test_rockchip_3a_hil.py` 在 Linux 用 fake shared object 验证 HIL 默认关闭、host/
+  feasibility 闸门、`EXCLUDE_FROM_ALL`、非 install/CTest、dry-run 零调用、调试路径变量
+  fail-closed，以及精确 load/init/process/destroy/deinit/unload 顺序。fake constructor 哨兵证明
+  正确清理环境后的 dry-run 与六个调试变量拒绝分支没有主动加载 vendor `.so`；三个 loader
+  override 只由进程内残留检查拒绝继续 `dlopen`，其中真实 `LD_PRELOAD` 反例明确证明 constructor
+  可在 `main()`/退出码 `3` 前运行，因此外层 `env -u` 才是 pre-exec 防线。缺库与缺符号分支还
+  验证了 fail-closed/unload。fixture 逐字段核对 pinned profile，并区分未执行
+  process 时的 guard 未评估状态。success、init-null 和 process mismatch 共用固定
+  768-short/512-byte 契约；这仍不是板端算法证据。2026-07-29 专项结果为
+  6/6，通过记录见
+  [Rockchip 3A HIL 构建验证](p0-rockchip-3a-hil-build-validation-20260729.md)。
 - 独立的 RV1106 Debug/tests-off feasibility 构建已真实链接
   `boompi_rockchip_3a_link_check`。最终 ELF 保留 `libaec_bf_process.so`、
   `librkaudio_common.so` 的 `NEEDED` 和三个 `rkaudio_preprocess_*` `UND`；这只证明匹配

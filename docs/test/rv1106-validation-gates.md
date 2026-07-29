@@ -80,6 +80,10 @@ ALSA 的真实全双工、capture layout 和 3A 契约关闭。
 - [x] 直接 Rockchip 3A 的 tests-off 默认 ALL link-check 已用匹配 GCC 8.3/uClibc 工具链
   完成真实交叉链接；最终 ELF 保留 AEC/common `NEEDED` 与 init/short/destory 三个 `UND`。
   该 target 不安装、不自动执行，不能作为板端加载或 3A 功能证据。
+- [x] 显式 `EXCLUDE_FROM_ALL` 的固定帧 3A HIL 已完成 Linux fake 6/6 与匹配工具链严格
+  交叉构建；固定调用为 `init(16000,16,2,1)` 和一帧 `input_size=768 shorts`，成功结果
+  约束为 512 bytes。它未复制或运行到板端，不关闭物理布局、算法效果或实时率；证据见
+  [2026-07-29 构建验证](p0-rockchip-3a-hil-build-validation-20260729.md)。
 - [ ] 在板端验证 16 kHz/S16、2 mic + 1 ref、256-sample 的物理 slot 到交织逻辑输入映射；核对
   `input_size=768 shorts`、成功 512 bytes、非法尺寸 0、init null，并记录错误恢复、
   CPU/RSS、单帧最坏耗时和持续实时率。

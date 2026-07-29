@@ -41,8 +41,8 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
   自定义 BSP、实际 capture 物理左右/极性和数字播放 reference slot 尚未通过。当前 DTB 的
   `TRCM clk-trcm=1` 只说明 TX/RX 共享 TX 时钟，不证明四通道；vendor VQE 样例选择的
   loopback Mode2 也是另一项尚未在本板验证的 mixer 设置。
-- Rockchip 3A 的板端加载、实际通道契约和 16 kHz 实时率；匹配 SDK 的交叉链接与三个
-  入口符号解析已通过，但对应 ELF 尚未在板端执行。
+- Rockchip 3A 的板端加载、实际通道契约和 16 kHz 实时率；匹配 SDK 的 link-check 与
+  显式单帧 HIL 均已交叉构建，Linux fake 生命周期 6/6 通过，但两个 ELF 均未在板端执行。
 - Snowboy 的板端模型加载、准确率和实时率；旧 ARM 库的交叉链接候选已核对。
 - 最终壳体下的 AEC、波束形成、双讲、远场和最大音量表现。
 - WSS 的正常局域网发现/配对、断网恢复、端到端 Qwen 会话、长期稳定性和 A/B 回滚；
@@ -63,6 +63,8 @@ capture PCM、一个 playback PCM 和直接 3A 库存在，同时确认 VQE JSON
 [2026-07-27 vendor 音频证据基线](docs/test/p0-vendor-audio-inventory-20260727.md)。
 3A 交叉链接的命令、ELF 结果和严格边界另见
 [2026-07-27 Rockchip 3A 交叉链接验证记录](docs/test/p0-rockchip-3a-link-validation-20260727.md)。
+固定 profile、单帧调用顺序、离线 fake 和当前未执行边界另见
+[2026-07-29 Rockchip 3A HIL 构建验证](docs/test/p0-rockchip-3a-hil-build-validation-20260729.md)。
 MPI 音频的八个头文件 pin、当时 21 个 `UND`、MPP/RGA SONAME 与未运行边界见
 [2026-07-27 Rockchip MPI 音频交叉链接验证记录](docs/test/p0-rockchip-mpi-link-validation-20260727.md)。
 
@@ -277,6 +279,14 @@ WSS 生成一个冒充发布版的产物。交付验证必须从全新的 build 
 不代表板端 PCM、通道布局或 3A 效果通过；详见
 [3A 交叉链接验证记录](docs/test/p0-rockchip-3a-link-validation-20260727.md)。
 
+2026-07-29 新增显式 `EXCLUDE_FROM_ALL` 的 Rockchip 3A 固定帧 HIL：固定
+`16 kHz / 256 samples / 2 mic + 1 ref / input_size=768 shorts`，只处理一帧内存合成输入。
+Linux fake 6/6 和匹配 RV1106 严格交叉构建通过；清理 loader override 后，dry-run 不主动加载
+vendor `.so`，真实调用只在双 opt-in 与安全前置检查后从固定 `/oem/usr/lib` 路径解析。产物未
+复制或运行到当前旧镜像，不关闭物理
+slot/reference、AEC 效果或实时率。详见
+[3A HIL 构建验证](docs/test/p0-rockchip-3a-hil-build-validation-20260729.md)。
+
 同日还完成 Rockchip MPI 音频 Debug/tests-off 默认 ALL 交叉链接：ELF32 ARM
 hard-float/uClibc 产物保留 Rockit/MPP/RGA `NEEDED`、21 个 raw 生命周期 `UND`，且没有
 `RPATH`/`RUNPATH`。该目标同样没有安装或执行；板端只读存在性也不等于全双工功能通过。
@@ -326,8 +336,8 @@ raw MPI 对照使用独立的
 ## 路线图
 
 1. **P0 可行性闸门（进行中）**：direct ALSA transport 全双工已通过；先对齐自定义 BSP，
-   再完成真实 capture/reference layout、raw rk_mpi 和 Rockchip 3A，随后继续 Snowboy、
-   WSS 产品接线、Wi-Fi AP 和 UI backend 探测。
+   再完成真实 capture/reference layout、raw rk_mpi 和已交叉构建的 Rockchip 3A HIL 板端
+   验证，随后继续 Snowboy、WSS 产品接线、Wi-Fi AP 和 UI backend 探测。
 2. **P1 工程骨架（已完成）**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
 3. **P2 本地音频（进行中）**：现有 host 音频核心保留但冻结扩展；以 vendor raw PCM 最小
    闭环和板端 HIL 为当前入口，实测后再决定哪些已有模块进入 runtime。

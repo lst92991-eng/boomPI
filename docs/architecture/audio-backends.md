@@ -191,7 +191,15 @@ AGC 等模块可能组合启用，因此外层不得叠加同类处理；`wakeup
 
 匹配工具链的真实符号 link-check 已通过；它只关闭编译、链接和三个动态入口的解析，详见
 [2026-07-27 Rockchip 3A 交叉链接验证记录](../test/p0-rockchip-3a-link-validation-20260727.md)。
-下一步仍须用脱敏固定输入和板端返回记录逐项关闭上述运行问题。没有证据时状态只能写
+显式固定帧 HIL 又把 pinned profile、`init(16000,16,2,1)`、单帧 768-short 输入、
+512-byte 成功返回和 handle→parameter tree 清理顺序固化为不安装、不自动执行的
+`EXCLUDE_FROM_ALL` target。HIL ELF 不直接 `NEEDED` vendor 库；按规定从外层清理 loader override
+后，无参数 dry-run 不主动加载 vendor 库，
+只有双 opt-in 与安全前置检查通过后才从固定 `/oem/usr/lib/libaec_bf_process.so` 路径 `dlopen`
+并解析固定入口；loader override 环境必须为空，运行前仍须单独核对目标文件哈希。Linux fake 6/6
+与匹配 RV1106 交叉构建已通过，详见
+[2026-07-29 构建验证](../test/p0-rockchip-3a-hil-build-validation-20260729.md)。该 ELF 尚未在板端
+执行，下一步仍须在正确镜像和物理 layout 关闭后逐项取得真实返回。没有证据时状态只能写
 “未验证”。
 
 ## WakeWordEngine 契约
@@ -252,11 +260,17 @@ CMake 对每个输入执行存在性、文件类型和固定 SHA-256 检查，�
 实现、模型可以加载或板端实时率已经通过。
 
 显式启用 Rockchip feasibility 输入时，tests-off 默认 ALL 会构建不安装、不自动执行的
-`boompi_rockchip_3a_link_check` 或 `boompi_rockchip_mpi_audio_link_check`。3A target 以匹配
+`boompi_rockchip_3a_link_check` 或 `boompi_rockchip_mpi_audio_link_check`。额外显式开启
+`BOOMPI_BUILD_ROCKCHIP_3A_HIL` 或 MPI HIL 选项只创建对应的 `EXCLUDE_FROM_ALL` target；
+仍须按 target 名构建，且不会 install、注册 CTest 或自动运行。3A link-check 以匹配
 header 的函数类型引用 init/process/destroy；当前 MPI target 引用上述 22 个 raw MPI 入口，
 并显式建模 Rockit→MPP/RGA 依赖。两者在同一 tests-off 默认 ALL 构建中共存通过。target
-均关闭 build RPATH，私有 BSP 路径不进入公共接口；结果仍不证明板端 loader、初始化、音频
+均关闭 build RPATH，私有 BSP 路径不进入公共接口。3A 固定帧 HIL 由已有 direct link-check
+保留链接证据，自身只在执行门后动态解析 vendor 入口；清理 loader override 后的 dry-run 不会
+主动加载 vendor binary。结果
+仍不证明板端 loader、初始化、音频
 处理或实时率，证据见 [3A 交叉链接验证记录](../test/p0-rockchip-3a-link-validation-20260727.md)、
+[3A HIL 构建验证](../test/p0-rockchip-3a-hil-build-validation-20260729.md)、
 [历史 MPI 音频交叉链接验证记录](../test/p0-rockchip-mpi-link-validation-20260727.md)与
 [当前 MPI HIL 构建验证记录](../test/p0-rockchip-mpi-hil-build-validation-20260728.md)。
 
@@ -278,8 +292,8 @@ Snowboy 候选静态库使用旧 libstdc++ 字符串 ABI。未来只能由一个
 
 1. direct ALSA 48 kHz transport 全双工已通过；先对齐目标自定义 BSP，再完成通道相关性
    HIL。rk_mpi 最小生命周期的真实交叉链接已通过，但真实执行仍被 `rkipc` owner 阻断。
-2. 直接 3A 符号 link-check 已通过；下一步在板端关闭物理 slot 映射、错误恢复、
-   mono 输出、算法延迟、CPU/RSS 和实时率。
+2. 直接 3A link-check、固定帧 HIL 的 Linux fake 和目标交叉构建已通过；下一步在正确镜像上
+   关闭物理 slot 映射、真实加载/返回、错误恢复、mono 输出、算法延迟、CPU/RSS 和实时率。
 3. 实现私有 Snowboy legacy bridge、启动期模型/格式校验和单线程 wake worker。
 4. 验证目标英文模型的加载、准确率、误唤醒、漏唤醒和最坏帧耗时，再进行至少
    30 分钟稳定性测试。
