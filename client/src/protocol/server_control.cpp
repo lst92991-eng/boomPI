@@ -18,6 +18,7 @@ constexpr std::size_t kMaximumJsonNodes = 256U;
 constexpr std::size_t kMaximumJsonKeyBytes = 64U;
 constexpr std::size_t kMaximumResponseIdBytes = 128U;
 constexpr std::size_t kMaximumTextDeltaBytes = 4096U;
+constexpr std::size_t kMaximumCancellationReasonBytes = 64U;
 constexpr std::size_t kMaximumErrorCodeBytes = 64U;
 constexpr std::size_t kMaximumErrorMessageBytes = 512U;
 
@@ -288,6 +289,8 @@ class JsonCursor final {
       *output = ServerControlType::kResponseTextDelta;
     } else if (type == "response.audio_start") {
       *output = ServerControlType::kResponseAudioStart;
+    } else if (type == "response.cancelled") {
+      *output = ServerControlType::kResponseCancelled;
     } else if (type == "response.done") {
       *output = ServerControlType::kResponseDone;
     } else if (type == "error") {
@@ -312,6 +315,8 @@ class JsonCursor final {
       case ServerControlType::kResponseStart:
       case ServerControlType::kResponseDone:
         return key == "response_id" ? 0 : -1;
+      case ServerControlType::kResponseCancelled:
+        return key == "reason" ? 0 : -1;
       case ServerControlType::kResponseTextDelta:
         if (key == "response_id") {
           return 0;
@@ -346,6 +351,10 @@ class JsonCursor final {
       case ServerControlType::kResponseDone:
         return EnterNode(2U) &&
                ParseString(&message->response_id, kMaximumResponseIdBytes);
+      case ServerControlType::kResponseCancelled:
+        return EnterNode(2U) &&
+               ParseString(&message->cancellation_reason,
+                           kMaximumCancellationReasonBytes);
       case ServerControlType::kResponseTextDelta:
         if (field == 0) {
           return EnterNode(2U) &&
@@ -389,6 +398,12 @@ class JsonCursor final {
         message.text.empty()) {
       return Fail(StatusCode::kInvalidArgument,
                   "response text delta must not be empty");
+    }
+    if (type == ServerControlType::kResponseCancelled &&
+        !IsVisibleAscii(message.cancellation_reason,
+                        kMaximumCancellationReasonBytes)) {
+      return Fail(StatusCode::kInvalidArgument,
+                  "cancellation reason must contain bounded visible ASCII");
     }
     if (type == ServerControlType::kError) {
       if (!IsVisibleAscii(message.error_code, kMaximumErrorCodeBytes)) {

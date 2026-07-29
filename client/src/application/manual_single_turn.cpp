@@ -833,6 +833,11 @@ class ManualSingleTurnSession final {
     if (!status.ok()) {
       return status;
     }
+    if (message->type == protocol::ServerControlType::kResponseCancelled) {
+      SecureClear(&message->cancellation_reason);
+      return Status::Error(StatusCode::kFailedPrecondition,
+                           "server cancelled the manual response unexpectedly");
+    }
     if (message->response_id != response_id_) {
       return Status::Error(StatusCode::kFailedPrecondition,
                            "response identifier changed during the active turn");
@@ -875,6 +880,7 @@ class ManualSingleTurnSession final {
 
       case protocol::ServerControlType::kHelloAck:
       case protocol::ServerControlType::kResponseStart:
+      case protocol::ServerControlType::kResponseCancelled:
       case protocol::ServerControlType::kError:
         return Status::Error(StatusCode::kFailedPrecondition,
                              "unexpected response control sequence");

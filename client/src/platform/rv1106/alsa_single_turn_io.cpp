@@ -450,6 +450,24 @@ Status AlsaSingleTurnIo::DrainPlayback(const std::uint32_t timeout_ms) {
   }
 }
 
+Status AlsaSingleTurnIo::DropPlayback() {
+  if (!is_open()) {
+    return Status::Error(StatusCode::kFailedPrecondition,
+                         "single-turn playback is unavailable");
+  }
+  snd_pcm_t* const playback = Handle(playback_handle_);
+  int result = snd_pcm_drop(playback);
+  if (result < 0) {
+    return AlsaError("ALSA playback drop", result);
+  }
+  result = snd_pcm_prepare(playback);
+  if (result < 0) {
+    return AlsaError("ALSA playback prepare after drop", result);
+  }
+  playback_interleaved_scratch_.fill(0);
+  return Status::Ok();
+}
+
 void AlsaSingleTurnIo::Abort() noexcept {
   if (capture_handle_ != nullptr) {
     static_cast<void>(snd_pcm_drop(Handle(capture_handle_)));

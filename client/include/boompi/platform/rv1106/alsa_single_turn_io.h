@@ -47,6 +47,9 @@ class AlsaSingleTurnIo final {
   Status WriteMono48k(const std::int16_t* samples,
                       std::uint16_t sample_frames,
                       std::uint32_t timeout_ms);
+  // Stops queued TTS immediately and prepares the same playback handle for
+  // the next response. Capture is deliberately left running for barge-in.
+  Status DropPlayback();
   Status DrainPlayback(std::uint32_t timeout_ms);
 
   // Drops and closes only the two handles owned by this object. It never

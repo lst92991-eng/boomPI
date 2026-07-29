@@ -73,6 +73,16 @@ void TestAcceptedMessages(boompi::test::TestContext& context) {
       message.type == boompi::protocol::ServerControlType::kResponseAudioStart);
   BOOMPI_EXPECT(context, message.sample_rate_hz == 24000U);
 
+  BOOMPI_EXPECT(
+      context,
+      Decodes(Control("response.cancelled",
+                      "{\"reason\":\"client_request\"}"),
+              &message));
+  BOOMPI_EXPECT(
+      context,
+      message.type == boompi::protocol::ServerControlType::kResponseCancelled);
+  BOOMPI_EXPECT(context, message.cancellation_reason == "client_request");
+
   BOOMPI_EXPECT(context,
                 Decodes(Control("response.done",
                                 "{\"response_id\":\"response-1\"}"),
@@ -192,6 +202,9 @@ void TestPayloadRejections(boompi::test::TestContext& context) {
       !Decodes(Control("response.done",
                        "{\"response_id\":\"\\ud800\"}"),
                &message));
+  BOOMPI_EXPECT(
+      context,
+      !Decodes(Control("response.cancelled", "{}"), &message));
   BOOMPI_EXPECT(
       context,
       !Decodes(Control("state.update", "{}"), &message));

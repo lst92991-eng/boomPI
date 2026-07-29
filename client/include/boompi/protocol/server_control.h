@@ -15,6 +15,7 @@ enum class ServerControlType : std::uint8_t {
   kResponseStart,
   kResponseTextDelta,
   kResponseAudioStart,
+  kResponseCancelled,
   kResponseDone,
   kError,
 };
@@ -30,6 +31,7 @@ struct ServerControlMessage final {
   std::string response_id;
   std::string text;
   std::uint32_t sample_rate_hz{0U};
+  std::string cancellation_reason;
 
   std::string error_code;
   std::string error_message;
