@@ -4,14 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/lst92991-eng/boomPI/server/internal/backend"
 )
 
 const maxInputPCMBytes = 60 * 16000 * 2
-const minStreamingTTSUnits = 24
 
 type Backend struct {
 	config Config
@@ -107,7 +108,8 @@ func (s *Session) Commit(ctx context.Context) error {
 	done := make(chan struct{})
 	s.activeCancel = cancel
 	s.activeDone = done
-	go s.run(jobCtx, pcm, done)
+	committedAt := time.Now()
+	go s.run(jobCtx, pcm, done, committedAt)
 	return nil
 }
 
@@ -160,7 +162,14 @@ func (s *Session) Close() error {
 	return nil
 }
 
-func (s *Session) run(ctx context.Context, pcm []byte, done chan struct{}) {
+func (s *Session) run(ctx context.Context, pcm []byte, done chan struct{}, committedAt time.Time) {
+	responseID := eventID()
+	timing := newTurnTiming(s.config.Logger, responseID, committedAt, len(pcm))
+	status := "canceled"
+	failureStage := ""
+	defer func() {
+		timing.log(status, failureStage, time.Now())
+	}()
 	defer func() {
 		s.mu.Lock()
 		if s.activeDone == done {
@@ -171,15 +180,17 @@ func (s *Session) run(ctx context.Context, pcm []byte, done chan struct{}) {
 		close(done)
 	}()
 
-	responseID := eventID()
 	if !s.emit(ctx, backend.ConversationEvent{Type: backend.EventStarted, ResponseID: responseID}) {
+		status, failureStage = turnFailure(ctx, "event_delivery")
 		return
 	}
 	transcript, err := s.http.transcribe(ctx, pcm)
 	if err != nil {
+		status, failureStage = turnFailure(ctx, "asr")
 		s.emitError(ctx, err)
 		return
 	}
+	timing.markASRDone(time.Now())
 
 	s.mu.Lock()
 	history := append([]chatMessage(nil), s.history...)
@@ -195,6 +206,7 @@ func (s *Session) run(ctx context.Context, pcm []byte, done chan struct{}) {
 	ttsResult := make(chan error, 1)
 	go func() {
 		ttsResult <- s.tts.synthesizeStream(ttsCtx, ttsFragments, func(pcm []byte) error {
+			timing.markTTSFirstPCM(time.Now())
 			if !s.emit(ctx, backend.ConversationEvent{
 				Type: backend.EventAudio, ResponseID: responseID,
 				PCM: append([]byte(nil), pcm...), SampleRateHz: 24000,
@@ -208,7 +220,7 @@ func (s *Session) run(ctx context.Context, pcm []byte, done chan struct{}) {
 	ttsFinished := false
 	var ttsErr error
 	sendTTS := func(fragment string) error {
-		if strings.TrimSpace(fragment) == "" {
+		if fragment == "" {
 			return nil
 		}
 		select {
@@ -225,23 +237,20 @@ func (s *Session) run(ctx context.Context, pcm []byte, done chan struct{}) {
 		}
 	}
 
-	speech := &streamingTTSSegmenter{}
 	answer, reasoningErr := s.http.completeStream(ctx, instructions, history, func(delta string) error {
+		timing.markLLMFirstDelta(time.Now())
 		if !s.emit(ctx, backend.ConversationEvent{
 			Type: backend.EventTextDelta, ResponseID: responseID, Text: delta,
 		}) {
 			return ctx.Err()
 		}
-		for _, fragment := range speech.Add(delta) {
+		for _, fragment := range streamingTTSFragments(delta) {
 			if err := sendTTS(fragment); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
-	if reasoningErr == nil {
-		reasoningErr = sendTTS(speech.Flush())
-	}
 	close(ttsFragments)
 	if reasoningErr != nil {
 		stopTTS()
@@ -250,12 +259,14 @@ func (s *Session) run(ctx context.Context, pcm []byte, done chan struct{}) {
 		ttsErr = <-ttsResult
 	}
 	if reasoningErr != nil {
+		status, failureStage = turnFailure(ctx, "llm_stream_or_tts_input")
 		if ctx.Err() == nil {
 			s.emitError(ctx, reasoningErr)
 		}
 		return
 	}
 	if ttsErr != nil {
+		status, failureStage = turnFailure(ctx, "tts")
 		if ctx.Err() == nil {
 			s.emitError(ctx, ttsErr)
 		}
@@ -268,32 +279,133 @@ func (s *Session) run(ctx context.Context, pcm []byte, done chan struct{}) {
 		s.history = append([]chatMessage(nil), s.history[len(s.history)-40:]...)
 	}
 	s.mu.Unlock()
-	s.emit(ctx, backend.ConversationEvent{Type: backend.EventDone, ResponseID: responseID})
-}
-
-type streamingTTSSegmenter struct {
-	pending strings.Builder
-	units   int
-}
-
-func (s *streamingTTSSegmenter) Add(delta string) []string {
-	var fragments []string
-	for _, r := range delta {
-		s.pending.WriteRune(r)
-		s.units += ttsRuneUnits(r)
-		if s.units >= maxTTSFragmentUnits ||
-			(s.units >= minStreamingTTSUnits && isTTSSentenceBoundary(r)) {
-			fragments = append(fragments, s.Flush())
-		}
+	if !s.emit(ctx, backend.ConversationEvent{Type: backend.EventDone, ResponseID: responseID}) {
+		status, failureStage = turnFailure(ctx, "event_delivery")
+		return
 	}
+	status = "completed"
+}
+
+func streamingTTSFragments(delta string) []string {
+	if delta == "" {
+		return nil
+	}
+	var fragments []string
+	start := 0
+	units := 0
+	for index, r := range delta {
+		nextUnits := units + ttsRuneUnits(r)
+		if nextUnits > maxTTSFragmentUnits {
+			fragments = append(fragments, delta[start:index])
+			start = index
+			units = 0
+		}
+		units += ttsRuneUnits(r)
+	}
+	fragments = append(fragments, delta[start:])
 	return fragments
 }
 
-func (s *streamingTTSSegmenter) Flush() string {
-	fragment := s.pending.String()
-	s.pending.Reset()
-	s.units = 0
-	return fragment
+type turnTiming struct {
+	logger       *slog.Logger
+	responseID   string
+	committedAt  time.Time
+	inputAudioMS int64
+
+	mu              sync.Mutex
+	asrDoneAt       time.Time
+	llmFirstDeltaAt time.Time
+	ttsFirstPCMAt   time.Time
+}
+
+func newTurnTiming(logger *slog.Logger, responseID string, committedAt time.Time, inputPCMBytes int) *turnTiming {
+	return &turnTiming{
+		logger:       logger,
+		responseID:   responseID,
+		committedAt:  committedAt,
+		inputAudioMS: int64(inputPCMBytes) * 1000 / (16000 * 2),
+	}
+}
+
+func (t *turnTiming) markASRDone(at time.Time) {
+	t.mu.Lock()
+	if t.asrDoneAt.IsZero() {
+		t.asrDoneAt = at
+	}
+	t.mu.Unlock()
+}
+
+func (t *turnTiming) markLLMFirstDelta(at time.Time) {
+	t.mu.Lock()
+	if t.llmFirstDeltaAt.IsZero() {
+		t.llmFirstDeltaAt = at
+	}
+	t.mu.Unlock()
+}
+
+func (t *turnTiming) markTTSFirstPCM(at time.Time) {
+	t.mu.Lock()
+	if t.ttsFirstPCMAt.IsZero() {
+		t.ttsFirstPCMAt = at
+	}
+	t.mu.Unlock()
+}
+
+func (t *turnTiming) log(status, failureStage string, doneAt time.Time) {
+	if t.logger == nil {
+		return
+	}
+	t.mu.Lock()
+	asrDoneAt := t.asrDoneAt
+	llmFirstDeltaAt := t.llmFirstDeltaAt
+	ttsFirstPCMAt := t.ttsFirstPCMAt
+	t.mu.Unlock()
+
+	attributes := []any{
+		"component", "qwen_pipeline",
+		"response_id", t.responseID,
+		"status", status,
+		"input_audio_ms", t.inputAudioMS,
+		"commit_to_done_ms", elapsedMilliseconds(t.committedAt, doneAt),
+	}
+	if failureStage != "" {
+		attributes = append(attributes, "failure_stage", failureStage)
+	}
+	if !asrDoneAt.IsZero() {
+		attributes = append(attributes,
+			"commit_to_asr_done_ms", elapsedMilliseconds(t.committedAt, asrDoneAt))
+	}
+	if !llmFirstDeltaAt.IsZero() {
+		attributes = append(attributes,
+			"commit_to_llm_first_delta_ms", elapsedMilliseconds(t.committedAt, llmFirstDeltaAt))
+		if !asrDoneAt.IsZero() {
+			attributes = append(attributes,
+				"asr_done_to_llm_first_delta_ms", elapsedMilliseconds(asrDoneAt, llmFirstDeltaAt))
+		}
+	}
+	if !ttsFirstPCMAt.IsZero() {
+		attributes = append(attributes,
+			"commit_to_tts_first_pcm_ms", elapsedMilliseconds(t.committedAt, ttsFirstPCMAt))
+		if !llmFirstDeltaAt.IsZero() {
+			attributes = append(attributes,
+				"llm_first_delta_to_tts_first_pcm_ms", elapsedMilliseconds(llmFirstDeltaAt, ttsFirstPCMAt))
+		}
+	}
+	t.logger.Info("Qwen pipeline turn timing", attributes...)
+}
+
+func elapsedMilliseconds(start, end time.Time) int64 {
+	if start.IsZero() || end.Before(start) {
+		return 0
+	}
+	return end.Sub(start).Milliseconds()
+}
+
+func turnFailure(ctx context.Context, stage string) (string, string) {
+	if ctx.Err() != nil {
+		return "canceled", stage
+	}
+	return "failed", stage
 }
 
 func (s *Session) emit(ctx context.Context, event backend.ConversationEvent) bool {

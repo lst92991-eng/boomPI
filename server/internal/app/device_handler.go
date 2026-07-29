@@ -29,6 +29,10 @@ const (
 	pcmBytesPerSample          = 2
 	outputFrameDurationMS      = 20
 	outputFrameBytes           = outputSampleRateHz * pcmBytesPerSample * outputFrameDurationMS / 1000
+	outputFrameDuration        = time.Duration(outputFrameDurationMS) * time.Millisecond
+	downlinkMaxBufferedBytes   = outputSampleRateHz * pcmBytesPerSample * 1500 / 1000
+	maxProviderAudioDeltaBytes = 64 * 1024
+	downlinkReadResumeBytes    = downlinkMaxBufferedBytes - maxProviderAudioDeltaBytes
 	helloAuthenticationTimeout = 5 * time.Second
 )
 
@@ -54,9 +58,62 @@ type activeTurn struct {
 	inputCommitted bool
 	outputSequence uint32
 	pendingPCM     []byte
-	pendingOutput  []byte
 	outputStarted  bool
+	committedAt    time.Time
 	active         bool
+}
+
+// pacedDownlink is deliberately local to the device handler. Provider audio
+// may arrive much faster than a speaker can consume it, but the wire must not
+// turn that burst into seconds of stale client-side audio. One complete frame
+// is retained as look-ahead so the terminal PCM packet can carry END.
+type pacedDownlink struct {
+	epoch                uint32
+	turnID               uint32
+	responseID           string
+	pending              bytes.Buffer
+	providerDone         bool
+	nextFrameAt          time.Time
+	providerStartedAt    time.Time
+	firstProviderAudioAt time.Time
+	firstDownlinkQueueAt time.Time
+	highWaterBytes       int
+	wireFrames           uint32
+}
+
+func (p *pacedDownlink) reset() {
+	p.epoch = 0
+	p.turnID = 0
+	p.responseID = ""
+	p.pending.Reset()
+	p.providerDone = false
+	p.nextFrameAt = time.Time{}
+	p.providerStartedAt = time.Time{}
+	p.firstProviderAudioAt = time.Time{}
+	p.firstDownlinkQueueAt = time.Time{}
+	p.highWaterBytes = 0
+	p.wireFrames = 0
+}
+
+func (p *pacedDownlink) begin(turn activeTurn, responseID string, now time.Time) {
+	p.reset()
+	p.epoch = turn.epoch
+	p.turnID = turn.turnID
+	p.responseID = responseID
+	p.providerStartedAt = now
+}
+
+func (p *pacedDownlink) belongsTo(turn activeTurn) bool {
+	return p.epoch != 0 && p.epoch == turn.epoch && p.turnID == turn.turnID
+}
+
+func (p *pacedDownlink) matches(turn activeTurn, responseID string) bool {
+	return p.belongsTo(turn) && p.responseID == responseID
+}
+
+func (p *pacedDownlink) frameReady() bool {
+	buffered := p.pending.Len()
+	return buffered > outputFrameBytes || (p.providerDone && buffered != 0)
 }
 
 type connectionState struct {
@@ -227,8 +284,8 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 		turn.inputCommitted = false
 		turn.outputSequence = 0
 		turn.pendingPCM = nil
-		turn.pendingOutput = nil
 		turn.outputStarted = false
+		turn.committedAt = time.Time{}
 		turn.active = true
 		state.mu.Lock()
 		state.turn = turn
@@ -246,6 +303,7 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 			return err
 		}
 		turn.inputCommitted = true
+		turn.committedAt = time.Now()
 		state.mu.Lock()
 		state.turn = turn
 		state.mu.Unlock()
@@ -268,7 +326,6 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 		if sameTurn(state.turn, turn) {
 			state.turn.active = false
 			state.turn.pendingPCM = nil
-			state.turn.pendingOutput = nil
 		}
 		state.mu.Unlock()
 		if err := actor.Cancel(ctx, uint64(turn.epoch)); err != nil {
@@ -276,7 +333,6 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 		}
 		turn.active = false
 		turn.pendingPCM = nil
-		turn.pendingOutput = nil
 		return sendControl(ctx, connection, state, "response.cancelled", turn, map[string]any{"reason": "client_request"})
 	default:
 		return fmt.Errorf("unsupported control type %q", envelope.Type)
@@ -370,11 +426,69 @@ func flushFinalInput(ctx context.Context, actor *session.Actor, turn *activeTurn
 }
 
 func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport.Connection, actor *session.Actor, state *connectionState) error {
+	pacer := &pacedDownlink{}
+	timer := time.NewTimer(time.Hour)
+	stopTimer(timer)
+	defer timer.Stop()
+
 	for {
+		state.mu.Lock()
+		currentTurn := state.turn
+		state.mu.Unlock()
+		if pacer.epoch != 0 && (!currentTurn.active || !pacer.belongsTo(currentTurn)) {
+			pacer.reset()
+		}
+
+		if pacer.providerDone && pacer.pending.Len() == 0 {
+			finished, err := h.finishPacedResponse(ctx, connection, state, pacer)
+			if err != nil {
+				return err
+			}
+			pacer.reset()
+			if finished {
+				continue
+			}
+		}
+
+		var timerC <-chan time.Time
+		if pacer.frameReady() {
+			wait := time.Until(pacer.nextFrameAt)
+			if pacer.nextFrameAt.IsZero() || wait <= 0 {
+				sent, final, err := h.sendNextPacedFrame(ctx, connection, state, pacer)
+				if err != nil {
+					return err
+				}
+				if !sent {
+					pacer.reset()
+					continue
+				}
+				if final {
+					if _, err := h.finishPacedResponse(ctx, connection, state, pacer); err != nil {
+						return err
+					}
+					pacer.reset()
+				}
+				continue
+			}
+			timerC = resetTimer(timer, wait)
+		} else {
+			stopTimer(timer)
+		}
+
+		providerEvents := actor.Events()
+		// Leave enough room for one maximum provider delta. Backpressure remains
+		// inside the bounded server queues instead of becoming seconds of device
+		// playback latency.
+		if pacer.epoch != 0 && pacer.pending.Len() > downlinkReadResumeBytes {
+			providerEvents = nil
+		}
+
 		select {
 		case <-ctx.Done():
 			return nil
-		case event, ok := <-actor.Events():
+		case <-timerC:
+			continue
+		case event, ok := <-providerEvents:
 			if !ok {
 				return nil
 			}
@@ -386,16 +500,29 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 			}
 			switch event.Type {
 			case backend.EventStarted:
+				if pacer.epoch != 0 {
+					return errors.New("provider emitted duplicate response.start")
+				}
+				pacer.begin(turn, event.ResponseID, time.Now())
 				if err := sendControlIfActive(ctx, connection, state, "response.start", turn, map[string]any{"response_id": event.ResponseID}); err != nil {
 					return err
 				}
 			case backend.EventTextDelta:
+				if !pacer.matches(turn, event.ResponseID) {
+					return errors.New("provider text delta does not match the active response")
+				}
 				if err := sendControlIfActive(ctx, connection, state, "response.text_delta", turn, map[string]any{"response_id": event.ResponseID, "text": event.Text}); err != nil {
 					return err
 				}
 			case backend.EventAudio:
 				if err := validateProviderAudio(event.SampleRateHz, event.PCM); err != nil {
 					return err
+				}
+				if !pacer.matches(turn, event.ResponseID) {
+					return errors.New("provider audio arrived before response.start")
+				}
+				if pacer.pending.Len()+len(event.PCM) > downlinkMaxBufferedBytes {
+					return fmt.Errorf("downlink pacing buffer exceeds %d ms", 1500)
 				}
 				state.mu.Lock()
 				if !sameActiveTurn(state.turn, turn) {
@@ -410,42 +537,21 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 					}
 					turn.outputStarted = true
 				}
-				turn.pendingOutput = append(turn.pendingOutput, event.PCM...)
-				for len(turn.pendingOutput) > outputFrameBytes {
-					payload := append([]byte(nil), turn.pendingOutput[:outputFrameBytes]...)
-					copy(turn.pendingOutput, turn.pendingOutput[outputFrameBytes:])
-					turn.pendingOutput = turn.pendingOutput[:len(turn.pendingOutput)-outputFrameBytes]
-					if err := sendDownlinkPCM(ctx, connection, state, turn, payload, false); err != nil {
-						state.mu.Unlock()
-						return err
-					}
-					turn.outputSequence++
-				}
 				state.turn = turn
 				state.mu.Unlock()
+				if pacer.firstProviderAudioAt.IsZero() {
+					pacer.firstProviderAudioAt = time.Now()
+				}
+				_, _ = pacer.pending.Write(event.PCM)
+				if pacer.pending.Len() > pacer.highWaterBytes {
+					pacer.highWaterBytes = pacer.pending.Len()
+				}
 			case backend.EventDone:
-				state.mu.Lock()
-				if !sameActiveTurn(state.turn, turn) {
-					state.mu.Unlock()
-					continue
+				if !pacer.matches(turn, event.ResponseID) {
+					return errors.New("provider response.done arrived before response.start")
 				}
-				turn = state.turn
-				if len(turn.pendingOutput) != 0 {
-					payload := append([]byte(nil), turn.pendingOutput...)
-					if err := sendDownlinkPCM(ctx, connection, state, turn, payload, true); err != nil {
-						state.mu.Unlock()
-						return err
-					}
-					turn.outputSequence++
-					turn.pendingOutput = nil
-				}
-				if err := sendControl(ctx, connection, state, "response.done", turn, map[string]any{"response_id": event.ResponseID}); err != nil {
-					state.mu.Unlock()
-					return err
-				}
-				turn.active = false
-				state.turn = turn
-				state.mu.Unlock()
+				pacer.responseID = event.ResponseID
+				pacer.providerDone = true
 			case backend.EventError:
 				state.mu.Lock()
 				if !sameActiveTurn(state.turn, turn) {
@@ -459,9 +565,102 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 					return err
 				}
 				state.turn.active = false
-				state.turn.pendingOutput = nil
 				state.mu.Unlock()
+				pacer.reset()
 			}
+		}
+	}
+}
+
+func (h *deviceHandler) sendNextPacedFrame(ctx context.Context, connection *transport.Connection, state *connectionState, pacer *pacedDownlink) (bool, bool, error) {
+	buffered := pacer.pending.Len()
+	if buffered == 0 {
+		return false, false, nil
+	}
+	payloadBytes := outputFrameBytes
+	if buffered < payloadBytes {
+		payloadBytes = buffered
+	}
+	final := pacer.providerDone && payloadBytes == buffered
+	payload := pacer.pending.Bytes()[:payloadBytes]
+
+	state.mu.Lock()
+	if !state.turn.active || !pacer.belongsTo(state.turn) {
+		state.mu.Unlock()
+		return false, false, nil
+	}
+	turn := state.turn
+	if err := sendDownlinkPCM(ctx, connection, state, turn, payload, final); err != nil {
+		state.mu.Unlock()
+		return false, false, err
+	}
+	turn.outputSequence++
+	state.turn = turn
+	state.mu.Unlock()
+
+	pacer.pending.Next(payloadBytes)
+	pacer.wireFrames++
+	now := time.Now()
+	if pacer.firstDownlinkQueueAt.IsZero() {
+		pacer.firstDownlinkQueueAt = now
+	}
+	// Preserve the 24 kHz media clock without accumulating normal timer
+	// overshoot. A full-frame stall rebases the deadline instead of sending a
+	// catch-up burst into the client jitter queue.
+	if pacer.nextFrameAt.IsZero() || now.Sub(pacer.nextFrameAt) >= outputFrameDuration {
+		pacer.nextFrameAt = now.Add(outputFrameDuration)
+	} else {
+		pacer.nextFrameAt = pacer.nextFrameAt.Add(outputFrameDuration)
+	}
+	return true, final, nil
+}
+
+func (h *deviceHandler) finishPacedResponse(ctx context.Context, connection *transport.Connection, state *connectionState, pacer *pacedDownlink) (bool, error) {
+	state.mu.Lock()
+	if !state.turn.active || !pacer.belongsTo(state.turn) {
+		state.mu.Unlock()
+		return false, nil
+	}
+	turn := state.turn
+	if err := sendControl(ctx, connection, state, "response.done", turn, map[string]any{"response_id": pacer.responseID}); err != nil {
+		state.mu.Unlock()
+		return false, err
+	}
+	turn.active = false
+	state.turn = turn
+	state.mu.Unlock()
+
+	h.logger.Info("voice response timing",
+		"device_ref", redactedDeviceRef(turn.deviceID),
+		"turn_id", turn.turnID,
+		"commit_to_provider_start_ms", elapsedMilliseconds(turn.committedAt, pacer.providerStartedAt),
+		"commit_to_first_provider_audio_ms", elapsedMilliseconds(turn.committedAt, pacer.firstProviderAudioAt),
+		"commit_to_first_downlink_enqueue_ms", elapsedMilliseconds(turn.committedAt, pacer.firstDownlinkQueueAt),
+		"response_total_ms", elapsedMilliseconds(turn.committedAt, time.Now()),
+		"local_downlink_buffer_high_water_ms", pacer.highWaterBytes*1000/(outputSampleRateHz*pcmBytesPerSample),
+		"downlink_wire_frames", pacer.wireFrames,
+	)
+	return true, nil
+}
+
+func elapsedMilliseconds(start time.Time, end time.Time) int64 {
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		return -1
+	}
+	return end.Sub(start).Milliseconds()
+}
+
+func resetTimer(timer *time.Timer, wait time.Duration) <-chan time.Time {
+	stopTimer(timer)
+	timer.Reset(wait)
+	return timer.C
+}
+
+func stopTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
 		}
 	}
 }
@@ -470,7 +669,7 @@ func validateProviderAudio(sampleRateHz int, pcm []byte) error {
 	// A provider delta is not a protocol PCM packet. Qwen may deliver several
 	// wire frames in one delta, so the wire payload limit applies only after
 	// the residual-aware rechunking in forwardEvents.
-	if sampleRateHz != outputSampleRateHz || len(pcm) == 0 || len(pcm)%pcmBytesPerSample != 0 {
+	if sampleRateHz != outputSampleRateHz || len(pcm) == 0 || len(pcm)%pcmBytesPerSample != 0 || len(pcm) > maxProviderAudioDeltaBytes {
 		return errors.New("provider returned invalid 24 kHz mono S16_LE audio")
 	}
 	return nil

@@ -50,6 +50,57 @@ func TestContinuousTTSSessionUsesServerCommitAndFinish(t *testing.T) {
 	}
 }
 
+func TestContinuousTTSSessionRequiresCompletedResponseAndAudio(t *testing.T) {
+	testCases := []struct {
+		name          string
+		sendAudio     bool
+		sendCompleted bool
+		wantError     string
+	}{
+		{
+			name: "audio_without_completed_response", sendAudio: true,
+			wantError: "without a completed response",
+		},
+		{
+			name: "completed_response_without_audio", sendCompleted: true,
+			wantError: "without PCM audio",
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			serverResult := make(chan error, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				serverResult <- serveIncompleteTTSSession(
+					response, request, testCase.sendAudio, testCase.sendCompleted)
+			}))
+			defer server.Close()
+
+			connection, _, err := websocket.DefaultDialer.Dial(
+				strings.Replace(server.URL, "http://", "ws://", 1), nil)
+			if err != nil {
+				t.Fatalf("dial test TTS server: %v", err)
+			}
+			defer connection.Close()
+
+			fragments := make(chan string, 1)
+			fragments <- "测试"
+			close(fragments)
+			client := &ttsClient{config: Config{TTSVoice: "Cherry", Timeout: 2 * time.Second}}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			err = client.synthesizeConnectedStream(ctx, connection, fragments, func([]byte) error {
+				return nil
+			})
+			if err == nil || !strings.Contains(err.Error(), testCase.wantError) {
+				t.Fatalf("synthesizeConnectedStream() error = %v, want %q", err, testCase.wantError)
+			}
+			if serverErr := <-serverResult; serverErr != nil {
+				t.Fatal(serverErr)
+			}
+		})
+	}
+}
+
 func serveContinuousTTSSession(response http.ResponseWriter, request *http.Request) error {
 	connection, err := (&websocket.Upgrader{}).Upgrade(response, request, nil)
 	if err != nil {
@@ -113,6 +164,61 @@ func serveContinuousTTSSession(response http.ResponseWriter, request *http.Reque
 	return connection.WriteJSON(map[string]any{"type": "session.finished"})
 }
 
+func serveIncompleteTTSSession(
+	response http.ResponseWriter,
+	request *http.Request,
+	sendAudio bool,
+	sendCompleted bool,
+) error {
+	connection, err := (&websocket.Upgrader{}).Upgrade(response, request, nil)
+	if err != nil {
+		return fmt.Errorf("upgrade test TTS connection: %w", err)
+	}
+	defer connection.Close()
+	if err := connection.WriteJSON(map[string]any{"type": "session.created"}); err != nil {
+		return err
+	}
+	var update struct {
+		Type string `json:"type"`
+	}
+	if err := connection.ReadJSON(&update); err != nil {
+		return err
+	}
+	if update.Type != "session.update" {
+		return fmt.Errorf("initial client event = %q, want session.update", update.Type)
+	}
+	if err := connection.WriteJSON(map[string]any{"type": "session.updated"}); err != nil {
+		return err
+	}
+	for _, wantType := range []string{"input_text_buffer.append", "session.finish"} {
+		var event struct {
+			Type string `json:"type"`
+		}
+		if err := connection.ReadJSON(&event); err != nil {
+			return err
+		}
+		if event.Type != wantType {
+			return fmt.Errorf("client event = %q, want %q", event.Type, wantType)
+		}
+	}
+	if sendAudio {
+		if err := connection.WriteJSON(map[string]any{
+			"type":  "response.audio.delta",
+			"delta": base64.StdEncoding.EncodeToString([]byte{1, 2}),
+		}); err != nil {
+			return err
+		}
+	}
+	if sendCompleted {
+		if err := connection.WriteJSON(map[string]any{
+			"type": "response.done", "response": map[string]any{"status": "completed"},
+		}); err != nil {
+			return err
+		}
+	}
+	return connection.WriteJSON(map[string]any{"type": "session.finished"})
+}
+
 func TestSplitTTSFragmentsKeepsTextAndLimit(t *testing.T) {
 	input := strings.Repeat("这是一句很长的中文。", 300) + strings.Repeat("ascii text. ", 100)
 	fragments := splitTTSFragments(input, maxTTSFragmentUnits)
@@ -135,16 +241,30 @@ func TestSplitTTSFragmentsRejectsEmptyInput(t *testing.T) {
 	}
 }
 
-func TestStreamingTTSSegmenterEmitsCompleteSentence(t *testing.T) {
-	segmenter := &streamingTTSSegmenter{}
-	if got := segmenter.Add("这是第一段，还没说完"); len(got) != 0 {
-		t.Fatalf("unexpected early fragments %#v", got)
+func TestStreamingTTSFragmentsSendFirstDeltaImmediately(t *testing.T) {
+	const delta = "你好"
+	fragments := streamingTTSFragments(delta)
+	if len(fragments) != 1 || fragments[0] != delta {
+		t.Fatalf("first delta fragments = %#v, want immediate %q", fragments, delta)
 	}
-	got := segmenter.Add("，现在用一个完整句子结束。下一句")
-	if len(got) != 1 || !strings.HasSuffix(got[0], "。") {
-		t.Fatalf("expected one complete sentence, got %#v", got)
+}
+
+func TestStreamingTTSFragmentsPreserveTextAndBoundSize(t *testing.T) {
+	delta := "  " + strings.Repeat("中", maxTTSFragmentUnits) + " tail "
+	fragments := streamingTTSFragments(delta)
+	if got := strings.Join(fragments, ""); got != delta {
+		t.Fatalf("streaming fragments changed text: got %q", got)
 	}
-	if tail := segmenter.Flush(); tail != "下一句" {
-		t.Fatalf("unexpected tail %q", tail)
+	if len(fragments) < 2 {
+		t.Fatalf("expected a bounded split, got %#v", fragments)
+	}
+	for index, fragment := range fragments {
+		if units := ttsTextUnits(fragment); units > maxTTSFragmentUnits {
+			t.Fatalf("fragment %d has %d units", index, units)
+		}
+	}
+	const whitespace = " \n\t "
+	if fragments := streamingTTSFragments(whitespace); len(fragments) != 1 || fragments[0] != whitespace {
+		t.Fatalf("whitespace-only delta fragments = %#v, want preserved whitespace", fragments)
 	}
 }

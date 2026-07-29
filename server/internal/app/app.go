@@ -31,14 +31,14 @@ func New(cfg config.Config, logger *slog.Logger, identityDirectory string) (*App
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	provider, err := newQwenBackend(cfg)
+	provider, err := newQwenBackend(cfg, logger)
 	if err != nil {
 		return nil, err
 	}
 	return newWithBackend(cfg, logger, identityDirectory, provider)
 }
 
-func newQwenBackend(cfg config.Config) (backend.ConversationBackend, error) {
+func newQwenBackend(cfg config.Config, logger *slog.Logger) (backend.ConversationBackend, error) {
 	if cfg.ConversationMode == "intelligence" {
 		return qwenpipeline.New(qwenpipeline.Config{
 			APIKey:          cfg.Credentials.APIKey(),
@@ -52,6 +52,7 @@ func newQwenBackend(cfg config.Config) (backend.ConversationBackend, error) {
 			SearchMode:      cfg.SearchMode,
 			Timeout:         cfg.FirstResponseTimeout,
 			QueueSize:       64,
+			Logger:          logger,
 		})
 	}
 	return qwen.New(qwen.Config{

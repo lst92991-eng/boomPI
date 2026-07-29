@@ -3,6 +3,7 @@ package qwenpipeline
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ type Config struct {
 	SearchMode      string
 	Timeout         time.Duration
 	QueueSize       int
+	Logger          *slog.Logger
 }
 
 func (c Config) validate() error {

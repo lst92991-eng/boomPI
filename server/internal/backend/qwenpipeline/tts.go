@@ -18,7 +18,11 @@ import (
 
 // DashScope counts CJK characters as two units and other characters as one.
 // Keep some headroom below the provider's 2,000-unit fragment limit.
-const maxTTSFragmentUnits = 1600
+const (
+	maxTTSFragmentUnits         = 1600
+	maxTTSPCMDeltaBytes         = 64 * 1024
+	maxTTSWebSocketMessageBytes = 128 * 1024
+)
 
 type ttsClient struct {
 	config Config
@@ -78,6 +82,7 @@ func (c *ttsClient) synthesizeConnectedStream(
 	fragments <-chan string,
 	emit func([]byte) error,
 ) error {
+	connection.SetReadLimit(maxTTSWebSocketMessageBytes)
 	if err := c.waitFor(ctx, connection, "session.created", nil); err != nil {
 		return err
 	}
@@ -108,6 +113,8 @@ func (c *ttsClient) synthesizeConnectedStream(
 		}
 	}()
 
+	sawCompletedResponse := false
+	audioBytes := 0
 	for {
 		var event struct {
 			Type  string `json:"type"`
@@ -133,23 +140,34 @@ func (c *ttsClient) synthesizeConnectedStream(
 		switch event.Type {
 		case "response.audio.delta":
 			pcm, err := base64.StdEncoding.DecodeString(event.Delta)
-			if err != nil || len(pcm) == 0 || len(pcm)%2 != 0 {
+			if err != nil || len(pcm) == 0 || len(pcm)%2 != 0 || len(pcm) > maxTTSPCMDeltaBytes {
 				return errors.New("Qwen TTS returned invalid PCM")
 			}
 			if err := emit(pcm); err != nil {
 				return err
 			}
+			audioBytes += len(pcm)
 		case "response.done":
 			if event.Response.Status != "completed" {
 				return fmt.Errorf("Qwen TTS response status is %q", event.Response.Status)
 			}
+			sawCompletedResponse = true
 		case "session.finished":
 			select {
 			case err := <-writerDone:
-				return err
+				if err != nil {
+					return err
+				}
 			case <-ctx.Done():
 				return ctx.Err()
 			}
+			if !sawCompletedResponse {
+				return errors.New("Qwen TTS session finished without a completed response")
+			}
+			if audioBytes == 0 {
+				return errors.New("Qwen TTS session finished without PCM audio")
+			}
+			return nil
 		case "error":
 			return fmt.Errorf("Qwen TTS error code=%q message=%q", event.Error.Code, event.Error.Message)
 		}
@@ -175,7 +193,7 @@ func (c *ttsClient) writeContinuousText(
 					"event_id": eventID(), "type": "session.finish",
 				})
 			}
-			if strings.TrimSpace(fragment) == "" {
+			if fragment == "" {
 				continue
 			}
 			if err := c.writeJSON(connection, map[string]any{

@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -153,10 +155,186 @@ func TestProviderAudioRejectsInvalidPCM(t *testing.T) {
 	}
 }
 
-func TestProviderAudioValidationDoesNotApplyWirePayloadLimit(t *testing.T) {
-	pcm := make([]byte, protocol.MaxPCMPayloadBytes+pcmBytesPerSample)
+func TestProviderAudioValidationUsesBoundedProviderDelta(t *testing.T) {
+	pcm := make([]byte, maxProviderAudioDeltaBytes)
 	if err := validateProviderAudio(outputSampleRateHz, pcm); err != nil {
-		t.Fatalf("large provider delta validation error = %v", err)
+		t.Fatalf("maximum provider delta validation error = %v", err)
+	}
+	oversized := make([]byte, maxProviderAudioDeltaBytes+pcmBytesPerSample)
+	if err := validateProviderAudio(outputSampleRateHz, oversized); err == nil {
+		t.Fatal("oversized provider delta unexpectedly succeeded")
+	}
+}
+
+func TestBurstProviderAudioIsPacedAtSpeakerRate(t *testing.T) {
+	const frameCount = 60
+	events := []backend.ConversationEvent{
+		{Type: backend.EventStarted, ResponseID: "response-paced"},
+		{
+			Type:         backend.EventAudio,
+			ResponseID:   "response-paced",
+			PCM:          pcmBoundaryFixture(frameCount*outputFrameBytes, 0),
+			SampleRateHz: outputSampleRateHz,
+		},
+		{Type: backend.EventDone, ResponseID: "response-paced"},
+	}
+	connection := startPCMOutputTest(t, events)
+	if got := readControl(t, connection); got.Type != "response.start" {
+		t.Fatalf("first response type = %q, want response.start", got.Type)
+	}
+	if got := readControl(t, connection); got.Type != "response.audio_start" {
+		t.Fatalf("second response type = %q, want response.audio_start", got.Type)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+
+	var firstAt time.Time
+	var lastAt time.Time
+	var previousTimestampUS uint64
+	for index := 0; index < frameCount; index++ {
+		messageType, frame, err := connection.ReadMessage()
+		if err != nil {
+			t.Fatalf("ReadMessage(PCM %d) error = %v", index, err)
+		}
+		if messageType != websocket.BinaryMessage {
+			t.Fatalf("message %d type = %d, want binary PCM", index, messageType)
+		}
+		header, payload, err := protocol.ParsePCMFrame(frame)
+		if err != nil {
+			t.Fatalf("ParsePCMFrame(%d) error = %v", index, err)
+		}
+		wantFlags := uint16(0)
+		if index == 0 {
+			wantFlags |= protocol.PCMFlagStart
+		}
+		if index+1 == frameCount {
+			wantFlags |= protocol.PCMFlagEnd
+		}
+		if len(payload) != outputFrameBytes || header.Sequence != uint32(index) ||
+			header.Flags != wantFlags {
+			t.Fatalf("paced frame %d: sequence=%d flags=%#x bytes=%d, want sequence=%d flags=%#x bytes=%d",
+				index, header.Sequence, header.Flags, len(payload), index, wantFlags, outputFrameBytes)
+		}
+		if index != 0 {
+			if header.TimestampUS <= previousTimestampUS {
+				t.Fatalf("paced timestamp %d = %d, previous=%d", index, header.TimestampUS, previousTimestampUS)
+			}
+			if delta := header.TimestampUS - previousTimestampUS; delta < 15_000 {
+				t.Fatalf("paced timestamp delta %d = %d us, want at least 15000 us", index, delta)
+			}
+		}
+		previousTimestampUS = header.TimestampUS
+		now := time.Now()
+		if index == 0 {
+			firstAt = now
+		}
+		lastAt = now
+	}
+	span := lastAt.Sub(firstAt)
+	if span < time.Second {
+		t.Fatalf("%d provider frames arrived in %s, want real-time pacing", frameCount, span)
+	}
+	if span > 2500*time.Millisecond {
+		t.Fatalf("%d paced frames took %s, want less than 2.5s", frameCount, span)
+	}
+	if got := readControl(t, connection); got.Type != "response.done" {
+		t.Fatalf("message after paced PCM = %q, want response.done", got.Type)
+	}
+}
+
+func TestActiveResponseCancelPreemptsPacedAudio(t *testing.T) {
+	const (
+		frameCount       = 60
+		framesBeforeStop = 8
+	)
+	var providerCancels atomic.Int32
+	connection := startPCMOutputTestWithCancelCounter(t, []backend.ConversationEvent{
+		{Type: backend.EventStarted, ResponseID: "response-cancel-paced"},
+		{
+			Type:         backend.EventAudio,
+			ResponseID:   "response-cancel-paced",
+			PCM:          pcmBoundaryFixture(frameCount*outputFrameBytes, 0),
+			SampleRateHz: outputSampleRateHz,
+		},
+	}, &providerCancels)
+	started := readControl(t, connection)
+	if started.Type != "response.start" || started.StreamID == 0 {
+		t.Fatalf("first response = %+v, want response.start with stream", started)
+	}
+	if got := readControl(t, connection); got.Type != "response.audio_start" {
+		t.Fatalf("second response type = %q, want response.audio_start", got.Type)
+	}
+
+	for index := 0; index < framesBeforeStop; index++ {
+		messageType, frame, err := connection.ReadMessage()
+		if err != nil {
+			t.Fatalf("ReadMessage(PCM %d) error = %v", index, err)
+		}
+		if messageType != websocket.BinaryMessage {
+			t.Fatalf("message %d type = %d, want binary PCM", index, messageType)
+		}
+		header, _, err := protocol.ParsePCMFrame(frame)
+		if err != nil {
+			t.Fatalf("ParsePCMFrame(%d) error = %v", index, err)
+		}
+		if header.Sequence != uint32(index) {
+			t.Fatalf("paced frame %d sequence=%d", index, header.Sequence)
+		}
+	}
+
+	cancelAt := time.Now()
+	writeControl(t, connection, protocol.ControlEnvelope{
+		Version: protocol.Version, Type: "response.cancel", MessageID: "client-cancel-paced",
+		DeviceID: testDeviceID, SessionID: started.SessionID, TurnID: started.TurnID,
+		StreamID: started.StreamID, Epoch: started.Epoch, Payload: json.RawMessage(`{}`),
+	})
+	if err := connection.SetReadDeadline(cancelAt.Add(250 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline(cancel) error = %v", err)
+	}
+	pcmBeforeAck := 0
+	for {
+		messageType, data, err := connection.ReadMessage()
+		if err != nil {
+			t.Fatalf("wait for response.cancelled: %v", err)
+		}
+		if messageType == websocket.BinaryMessage {
+			pcmBeforeAck++
+			continue
+		}
+		if messageType != websocket.TextMessage {
+			t.Fatalf("message before cancellation ack type=%d", messageType)
+		}
+		ack, err := protocol.DecodeControl(data)
+		if err != nil {
+			t.Fatalf("DecodeControl(cancel ack) error = %v", err)
+		}
+		if ack.Type != "response.cancelled" {
+			t.Fatalf("control before cancellation ack = %q", ack.Type)
+		}
+		if ack.SessionID != started.SessionID || ack.TurnID != started.TurnID ||
+			ack.StreamID != started.StreamID || ack.Epoch != started.Epoch {
+			t.Fatalf("response.cancelled identity = %+v, want active response", ack)
+		}
+		break
+	}
+	if elapsed := time.Since(cancelAt); elapsed > 250*time.Millisecond {
+		t.Fatalf("response.cancelled arrived after %s, want at most 250ms", elapsed)
+	}
+	if pcmBeforeAck > 1 {
+		t.Fatalf("received %d paced PCM frames before cancel ack, want at most 1", pcmBeforeAck)
+	}
+	if got := providerCancels.Load(); got != 1 {
+		t.Fatalf("provider Cancel calls = %d, want 1", got)
+	}
+
+	if err := connection.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline(post-cancel) error = %v", err)
+	}
+	if messageType, data, err := connection.ReadMessage(); err == nil {
+		t.Fatalf("retired response produced message after cancel ack: type=%d bytes=%d", messageType, len(data))
+	} else if networkError, ok := err.(net.Error); !ok || !networkError.Timeout() {
+		t.Fatalf("connection failed after cancel ack instead of remaining idle: %v", err)
 	}
 }
 
@@ -238,6 +416,10 @@ func pcmBoundaryFixture(length int, offset int) []byte {
 }
 
 func startPCMOutputTest(t *testing.T, events []backend.ConversationEvent) *websocket.Conn {
+	return startPCMOutputTestWithCancelCounter(t, events, nil)
+}
+
+func startPCMOutputTestWithCancelCounter(t *testing.T, events []backend.ConversationEvent, cancelCount *atomic.Int32) *websocket.Conn {
 	t.Helper()
 	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
@@ -249,7 +431,9 @@ func startPCMOutputTest(t *testing.T, events []backend.ConversationEvent) *webso
 	cfg.ListenAddress = "127.0.0.1"
 	cfg.WSSPort = freePort(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	application, err := newWithBackend(cfg, logger, t.TempDir(), &pcmBoundaryBackend{events: events})
+	application, err := newWithBackend(cfg, logger, t.TempDir(), &pcmBoundaryBackend{
+		events: events, cancelCount: cancelCount,
+	})
 	if err != nil {
 		t.Fatalf("newWithBackend() error = %v", err)
 	}
@@ -305,19 +489,22 @@ func startPCMOutputTest(t *testing.T, events []backend.ConversationEvent) *webso
 }
 
 type pcmBoundaryBackend struct {
-	events []backend.ConversationEvent
+	events      []backend.ConversationEvent
+	cancelCount *atomic.Int32
 }
 
 func (b *pcmBoundaryBackend) Open(context.Context, backend.SessionConfig) (backend.ConversationSession, error) {
 	return &pcmBoundarySession{
 		eventsToSend: append([]backend.ConversationEvent(nil), b.events...),
 		events:       make(chan backend.ConversationEvent, len(b.events)+1),
+		cancelCount:  b.cancelCount,
 	}, nil
 }
 
 type pcmBoundarySession struct {
 	eventsToSend []backend.ConversationEvent
 	events       chan backend.ConversationEvent
+	cancelCount  *atomic.Int32
 	closeOnce    sync.Once
 }
 
@@ -330,7 +517,12 @@ func (s *pcmBoundarySession) Commit(context.Context) error {
 	return nil
 }
 
-func (*pcmBoundarySession) Cancel(context.Context) error { return nil }
+func (s *pcmBoundarySession) Cancel(context.Context) error {
+	if s.cancelCount != nil {
+		s.cancelCount.Add(1)
+	}
+	return nil
+}
 
 func (s *pcmBoundarySession) Events() <-chan backend.ConversationEvent { return s.events }
 
