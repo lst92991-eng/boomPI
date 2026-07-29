@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -11,6 +12,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <memory>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -27,11 +29,18 @@
 #include "boompi/protocol/audio_packet.h"
 #include "boompi/protocol/server_control.h"
 
+#if defined(BOOMPI_ENABLE_SNOWBOY) && \
+    defined(BOOMPI_ENABLE_ROCKCHIP_3A) && \
+    defined(BOOMPI_ENABLE_WEBRTC_VAD)
+#define BOOMPI_HAS_VOICE_LOOP_VENDOR_PATH 1
+#include "boompi/platform/rv1106/rockchip_voice_dsp.h"
+#include "boompi/platform/rv1106/snowboy_wake_word_engine.h"
+#include "boompi/platform/rv1106/webrtc_vad_gate.h"
+#endif
+
 namespace boompi::application {
 namespace {
 
-constexpr std::uint32_t kTurnId = 1U;
-constexpr std::uint32_t kUplinkStreamId = 1U;
 constexpr std::uint32_t kInputSampleRateHz = 16000U;
 constexpr std::uint32_t kOutputSampleRateHz = 24000U;
 constexpr std::uint32_t kFrameDurationMs = 20U;
@@ -48,6 +57,16 @@ constexpr std::size_t kMaximumResponseTextBytes = 256U * 1024U;
 constexpr std::uint16_t kPcmFlagStart = 0x0001U;
 constexpr std::uint16_t kPcmFlagEnd = 0x0002U;
 constexpr std::uint16_t kPcmFlagDiscontinuity = 0x0004U;
+constexpr std::size_t kPlaybackQueueCapacity = 256U;
+constexpr std::size_t kPlaybackPrebufferFrames = 15U;
+constexpr std::uint32_t kPlaybackEnqueueTimeoutMs = 100U;
+#if defined(BOOMPI_HAS_VOICE_LOOP_VENDOR_PATH)
+constexpr std::size_t kVoicePreRollFrames = 25U;
+constexpr std::uint32_t kFirstSpeechTimeoutFrames = 6000U / kFrameDurationMs;
+constexpr std::uint32_t kFollowUpTimeoutFrames = 3000U / kFrameDurationMs;
+constexpr std::uint32_t kMaximumUtteranceFrames = 60000U / kFrameDurationMs;
+constexpr std::uint64_t kVoiceKeepAliveIntervalUs = 5000000U;
+#endif
 
 void SecureZero(void* const memory, const std::size_t size_bytes) noexcept {
   auto* current = static_cast<volatile std::uint8_t*>(memory);
@@ -88,6 +107,13 @@ struct ManualConfig final {
   std::uint32_t record_ms{3000U};
   std::uint8_t volume_percent{60U};
   std::uint16_t speaker_gain_percent{100U};
+  std::string snowboy_resource_path;
+  std::string snowboy_model_path;
+  std::string snowboy_sensitivity{"0.5"};
+  std::int8_t capture_left_polarity{1};
+  std::int8_t capture_right_polarity{1};
+  bool barge_in_enabled{true};
+  bool legacy_downlink_framing{false};
 };
 
 class CaptureWorkspace final {
@@ -127,6 +153,40 @@ struct SensitiveTtsFrame final {
   }
   audio::TtsPcmFrame24k frame{};
 };
+
+#if defined(BOOMPI_HAS_VOICE_LOOP_VENDOR_PATH)
+using VoiceSamples = platform::rv1106::RockchipVoiceFrame16k;
+
+class VoicePreRoll final {
+ public:
+  ~VoicePreRoll() { Clear(); }
+
+  void Push(const VoiceSamples& samples) noexcept {
+    frames_[write_index_] = samples;
+    write_index_ = (write_index_ + 1U) % frames_.size();
+    count_ = std::min(count_ + 1U, frames_.size());
+  }
+
+  const VoiceSamples& Oldest(const std::size_t offset) const noexcept {
+    const std::size_t first =
+        (write_index_ + frames_.size() - count_) % frames_.size();
+    return frames_[(first + offset) % frames_.size()];
+  }
+
+  std::size_t size() const noexcept { return count_; }
+
+  void Clear() noexcept {
+    SecureZero(frames_.data(), sizeof(frames_));
+    write_index_ = 0U;
+    count_ = 0U;
+  }
+
+ private:
+  std::array<VoiceSamples, kVoicePreRollFrames> frames_{};
+  std::size_t write_index_{0U};
+  std::size_t count_{0U};
+};
+#endif
 
 Status ConfigError(const char* const variable_name) {
   return Status::Error(StatusCode::kInvalidArgument,
@@ -197,6 +257,29 @@ Status ReadEnvironmentUint(const char* const variable_name,
   }
   *output = static_cast<std::uint32_t>(parsed);
   return Status::Ok();
+}
+
+Status ReadEnvironmentPolarity(const char* const variable_name,
+                               const std::int8_t default_value,
+                               std::int8_t* const output) {
+  if (output == nullptr || (default_value != 1 && default_value != -1)) {
+    return Status::Error(StatusCode::kInternal,
+                         "capture polarity destination is invalid");
+  }
+  const char* const value = std::getenv(variable_name);
+  if (value == nullptr || value[0] == '\0') {
+    *output = default_value;
+    return Status::Ok();
+  }
+  if (value[0] == '1' && value[1] == '\0') {
+    *output = 1;
+    return Status::Ok();
+  }
+  if (value[0] == '-' && value[1] == '1' && value[2] == '\0') {
+    *output = -1;
+    return Status::Ok();
+  }
+  return ConfigError(variable_name);
 }
 
 int LowerHexNibble(const char value) noexcept {
@@ -314,15 +397,20 @@ Status LoadManualConfig(ManualConfig* const output) {
   }
   output->capture_mic_slot = static_cast<std::uint8_t>(parsed);
 
-  const char* const polarity = std::getenv("BOOMPI_CAPTURE_MIC_POLARITY");
-  if (polarity == nullptr || polarity[0] == '\0' ||
-      (polarity[0] == '1' && polarity[1] == '\0')) {
-    output->capture_mic_polarity = 1;
-  } else if (polarity[0] == '-' && polarity[1] == '1' &&
-             polarity[2] == '\0') {
-    output->capture_mic_polarity = -1;
-  } else {
-    return ConfigError("BOOMPI_CAPTURE_MIC_POLARITY");
+  status = ReadEnvironmentPolarity("BOOMPI_CAPTURE_MIC_POLARITY", 1,
+                                   &output->capture_mic_polarity);
+  if (!status.ok()) {
+    return status;
+  }
+  status = ReadEnvironmentPolarity("BOOMPI_CAPTURE_LEFT_POLARITY", 1,
+                                   &output->capture_left_polarity);
+  if (!status.ok()) {
+    return status;
+  }
+  status = ReadEnvironmentPolarity("BOOMPI_CAPTURE_RIGHT_POLARITY", 1,
+                                   &output->capture_right_polarity);
+  if (!status.ok()) {
+    return status;
   }
 
   status = ReadEnvironmentUint("BOOMPI_MANUAL_RECORD_MS", 3000U, 20U,
@@ -344,6 +432,39 @@ Status LoadManualConfig(ManualConfig* const output) {
   }
   output->speaker_gain_percent = static_cast<std::uint16_t>(parsed);
 
+  status = ReadEnvironmentUint("BOOMPI_BARGE_IN_ENABLED", 1U, 0U, 1U,
+                               &parsed);
+  if (!status.ok()) {
+    return status;
+  }
+  output->barge_in_enabled = parsed != 0U;
+
+  status = ReadEnvironmentUint("BOOMPI_LEGACY_DOWNLINK_FRAMING", 0U, 0U,
+                               1U, &parsed);
+  if (!status.ok()) {
+    return status;
+  }
+  output->legacy_downlink_framing = parsed != 0U;
+
+  status = ReadEnvironmentString("BOOMPI_SNOWBOY_RESOURCE_FILE", false,
+                                 1024U, &output->snowboy_resource_path);
+  if (!status.ok()) {
+    return status;
+  }
+  status = ReadEnvironmentString("BOOMPI_SNOWBOY_MODEL_FILE", false,
+                                 1024U, &output->snowboy_model_path);
+  if (!status.ok()) {
+    return status;
+  }
+  status = ReadEnvironmentString("BOOMPI_SNOWBOY_SENSITIVITY", false,
+                                 32U, &output->snowboy_sensitivity);
+  if (!status.ok()) {
+    return status;
+  }
+  if (output->snowboy_sensitivity.empty()) {
+    output->snowboy_sensitivity = "0.5";
+  }
+
   network::WssClientConfig wss_config{};
   wss_config.server_ip = output->server_ip;
   wss_config.server_port = output->server_port;
@@ -357,6 +478,16 @@ std::uint64_t MonotonicMicroseconds() noexcept {
   const auto microseconds =
       std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
   return microseconds > 0 ? static_cast<std::uint64_t>(microseconds) : 0U;
+}
+
+std::int16_t ApplyPolarity(const std::int16_t sample,
+                           const std::int8_t polarity) noexcept {
+  if (polarity > 0) {
+    return sample;
+  }
+  return sample == std::numeric_limits<std::int16_t>::min()
+             ? std::numeric_limits<std::int16_t>::max()
+             : static_cast<std::int16_t>(-sample);
 }
 
 void AppendJsonString(const std::string& value, std::string* const output) {
@@ -488,10 +619,15 @@ class ManualSingleTurnSession final {
         watchdog_(&client_) {}
 
   ~ManualSingleTurnSession() {
+#if defined(BOOMPI_HAS_VOICE_LOOP_VENDOR_PATH)
+    StopBargeInCapture();
+    voice_dsp_.Close();
+#endif
     watchdog_.Stop();
     if (!completed_ && turn_started_ && !watchdog_.timed_out()) {
       BestEffortCancel();
     }
+    StopPlaybackConsumer();
     client_.Close();
     io_.Abort();
     pending_pcm_.fill(0);
@@ -502,30 +638,7 @@ class ManualSingleTurnSession final {
   ManualSingleTurnSession& operator=(const ManualSingleTurnSession&) = delete;
 
   Status Run() {
-    audio::PlaybackGainLimiterConfig gain_config{};
-    gain_config.volume_percent = config_.volume_percent;
-    gain_config.speaker_gain_percent = config_.speaker_gain_percent;
-    gain_config.duck_target_percent = 25U;
-    gain_config.duck_ramp_ms = 80U;
-    gain_config.recovery_ramp_ms = 80U;
-    gain_config.limiter_ceiling_percent = 95U;
-    gain_config.limiter_release_ms = 80U;
-    Status status =
-        audio::PlaybackRenderer24To48::Create(gain_config, &renderer_);
-    if (!status.ok()) {
-      return status;
-    }
-
-    status = platform::rv1106::AlsaSingleTurnIo::Open(
-        {config_.capture_pcm, config_.playback_pcm}, &io_);
-    if (!status.ok()) {
-      return status;
-    }
-    status = client_.Connect();
-    if (!status.ok()) {
-      return status;
-    }
-    status = Hello();
+    Status status = Initialize();
     if (!status.ok()) {
       return status;
     }
@@ -545,6 +658,111 @@ class ManualSingleTurnSession final {
     return Status::Ok();
   }
 
+  Status RunVoiceLoop() {
+#if !defined(BOOMPI_HAS_VOICE_LOOP_VENDOR_PATH)
+    return Status::Error(
+        StatusCode::kNotSupported,
+        "voice loop requires Snowboy, Rockchip 3A, and WebRTC VAD");
+#else
+    if (config_.snowboy_resource_path.empty() ||
+        config_.snowboy_model_path.empty()) {
+      return Status::Error(
+          StatusCode::kInvalidArgument,
+          "voice loop requires Snowboy resource and model paths");
+    }
+    Status status = OpenVoiceFrontEnd();
+    if (!status.ok()) {
+      return status;
+    }
+    status = Initialize();
+    if (!status.ok()) {
+      return status;
+    }
+    std::cout << "boompi-client: voice loop ready; wake_word=snowboy"
+              << std::endl;
+
+    bool require_wake = true;
+    bool resume_confirmed_speech = false;
+    for (;;) {
+      bool captured = false;
+      status = CaptureVoiceAndUpload(require_wake, resume_confirmed_speech,
+                                     &captured);
+      resume_confirmed_speech = false;
+      if (!status.ok()) {
+        return status;
+      }
+      if (!captured) {
+        require_wake = true;
+        continue;
+      }
+
+      if (config_.barge_in_enabled) {
+        status = StartBargeInCapture();
+        if (!status.ok()) {
+          return status;
+        }
+      }
+      status = watchdog_.Start();
+      if (!status.ok()) {
+        if (config_.barge_in_enabled) {
+          StopBargeInCapture();
+        }
+        return status;
+      }
+      status = ReceiveResponse();
+      watchdog_.Stop();
+      if (config_.barge_in_enabled) {
+        StopBargeInCapture();
+      }
+      if (!status.ok()) {
+        return status;
+      }
+      const bool interrupted = response_was_cancelled_;
+      status = AdvanceVoiceGeneration();
+      if (!status.ok()) {
+        return status;
+      }
+      require_wake = false;
+      resume_confirmed_speech = interrupted;
+    }
+#endif
+  }
+
+  Status Initialize() {
+    audio::PlaybackGainLimiterConfig gain_config{};
+    gain_config.volume_percent = config_.volume_percent;
+    gain_config.speaker_gain_percent = config_.speaker_gain_percent;
+    gain_config.duck_target_percent = 25U;
+    gain_config.duck_ramp_ms = 80U;
+    gain_config.recovery_ramp_ms = 80U;
+    gain_config.limiter_ceiling_percent = 95U;
+    gain_config.limiter_release_ms = 80U;
+    Status status =
+        audio::PlaybackRenderer24To48::Create(gain_config, &renderer_);
+    if (!status.ok()) {
+      return status;
+    }
+
+    status = platform::rv1106::AlsaSingleTurnIo::Open(
+        {config_.capture_pcm, config_.playback_pcm}, &io_);
+    if (!status.ok()) {
+      return status;
+    }
+    status = StartPlaybackConsumer();
+    if (!status.ok()) {
+      return status;
+    }
+    status = client_.Connect();
+    if (!status.ok()) {
+      return status;
+    }
+    status = Hello();
+    if (!status.ok()) {
+      return status;
+    }
+    return Status::Ok();
+  }
+
   void PrintSummary() const {
     std::cout << "boompi-client: manual single turn completed; "
               << "uplink_frames=" << uplink_frames_
@@ -554,6 +772,797 @@ class ManualSingleTurnSession final {
   }
 
  private:
+  using PlaybackQueue =
+      std::array<audio::PlaybackPcmFrame48k, kPlaybackQueueCapacity>;
+
+  void ClearPlaybackQueueLocked() noexcept {
+    if (playback_queue_ != nullptr) {
+      while (playback_queue_count_ != 0U) {
+        auto& frame = (*playback_queue_)[playback_queue_head_];
+        SecureZero(frame.samples.data(),
+                   frame.samples.size() * sizeof(frame.samples[0]));
+        frame.ResetHeader();
+        playback_queue_head_ =
+            (playback_queue_head_ + 1U) % kPlaybackQueueCapacity;
+        --playback_queue_count_;
+      }
+    }
+    playback_queue_head_ = 0U;
+    playback_queue_tail_ = 0U;
+  }
+
+  Status StartPlaybackConsumer() {
+    playback_queue_.reset(new (std::nothrow) PlaybackQueue{});
+    if (playback_queue_ == nullptr) {
+      return Status::Error(StatusCode::kResourceExhausted,
+                           "playback jitter queue allocation failed");
+    }
+    try {
+      playback_thread_ = std::thread([this]() { PlaybackConsumerLoop(); });
+    } catch (const std::system_error&) {
+      playback_queue_.reset();
+      return Status::Error(StatusCode::kResourceExhausted,
+                           "playback consumer thread could not start");
+    }
+    return Status::Ok();
+  }
+
+  void StopPlaybackConsumer() noexcept {
+    {
+      std::lock_guard<std::mutex> lock(playback_mutex_);
+      playback_stop_ = true;
+      ClearPlaybackQueueLocked();
+    }
+    playback_condition_.notify_all();
+    if (playback_thread_.joinable()) {
+      playback_thread_.join();
+    }
+    playback_queue_.reset();
+  }
+
+  Status BeginPlaybackResponse() {
+    std::lock_guard<std::mutex> lock(playback_mutex_);
+    if (!playback_thread_.joinable() || playback_stop_ ||
+        playback_response_active_ || playback_queue_count_ != 0U) {
+      return Status::Error(StatusCode::kFailedPrecondition,
+                           "playback jitter queue is not ready");
+    }
+    playback_error_ = Status::Ok();
+    playback_producer_done_ = false;
+    playback_drop_requested_ = false;
+    playback_started_ = false;
+    playback_response_complete_ = false;
+    playback_response_active_ = true;
+    return Status::Ok();
+  }
+
+  Status EnqueuePlayback(audio::PlaybackPcmFrame48k* const frame) {
+    if (frame == nullptr || !frame->HasValidLength()) {
+      return Status::Error(StatusCode::kInvalidArgument,
+                           "rendered playback frame is invalid");
+    }
+    std::unique_lock<std::mutex> lock(playback_mutex_);
+    if (!playback_error_.ok()) {
+      return playback_error_;
+    }
+    if (!playback_response_active_ || playback_producer_done_) {
+      return Status::Error(StatusCode::kFailedPrecondition,
+                           "playback response is not accepting audio");
+    }
+    if (playback_queue_count_ == kPlaybackQueueCapacity &&
+        !playback_condition_.wait_for(
+            lock, std::chrono::milliseconds(kPlaybackEnqueueTimeoutMs),
+            [this]() {
+              return playback_stop_ || !playback_error_.ok() ||
+                     !playback_response_active_ ||
+                     playback_queue_count_ < kPlaybackQueueCapacity;
+            })) {
+      return Status::Error(StatusCode::kResourceExhausted,
+                           "playback jitter queue is full");
+    }
+    if (!playback_error_.ok()) {
+      return playback_error_;
+    }
+    if (playback_stop_ || !playback_response_active_ ||
+        playback_producer_done_) {
+      return Status::Error(StatusCode::kFailedPrecondition,
+                           "playback response stopped while enqueueing");
+    }
+    (*playback_queue_)[playback_queue_tail_] = *frame;
+    playback_queue_tail_ =
+        (playback_queue_tail_ + 1U) % kPlaybackQueueCapacity;
+    ++playback_queue_count_;
+    playback_condition_.notify_one();
+    return Status::Ok();
+  }
+
+  Status FinishPlaybackResponse(const bool drop) {
+    std::unique_lock<std::mutex> lock(playback_mutex_);
+    if (!playback_error_.ok()) {
+      return playback_error_;
+    }
+    if (!playback_response_active_) {
+      return drop ? Status::Ok()
+                  : Status::Error(StatusCode::kFailedPrecondition,
+                                  "playback response is not active");
+    }
+    playback_producer_done_ = true;
+    playback_drop_requested_ = drop;
+    if (drop) {
+      ClearPlaybackQueueLocked();
+    }
+    playback_condition_.notify_all();
+    playback_condition_.wait(lock, [this]() {
+      return playback_response_complete_ || playback_stop_;
+    });
+    if (!playback_error_.ok()) {
+      return playback_error_;
+    }
+    return playback_stop_
+               ? Status::Error(StatusCode::kFailedPrecondition,
+                               "playback consumer stopped")
+               : Status::Ok();
+  }
+
+  Status PlaybackError() {
+    std::lock_guard<std::mutex> lock(playback_mutex_);
+    return playback_error_;
+  }
+
+  void PlaybackConsumerLoop() {
+    for (;;) {
+      audio::PlaybackPcmFrame48k frame{};
+      bool write_frame = false;
+      bool drain = false;
+      bool drop = false;
+      {
+        std::unique_lock<std::mutex> lock(playback_mutex_);
+        playback_condition_.wait(lock, [this]() {
+          return playback_stop_ ||
+                 (playback_response_active_ &&
+                  (playback_drop_requested_ ||
+                   (playback_started_ &&
+                    (playback_queue_count_ != 0U || playback_producer_done_)) ||
+                   (!playback_started_ &&
+                    (playback_queue_count_ >= kPlaybackPrebufferFrames ||
+                     playback_producer_done_))));
+        });
+        if (playback_stop_) {
+          return;
+        }
+        if (playback_drop_requested_) {
+          drop = true;
+        } else {
+          playback_started_ = true;
+          if (playback_queue_count_ != 0U) {
+            auto& queued = (*playback_queue_)[playback_queue_head_];
+            frame = queued;
+            SecureZero(queued.samples.data(),
+                       queued.samples.size() * sizeof(queued.samples[0]));
+            queued.ResetHeader();
+            playback_queue_head_ =
+                (playback_queue_head_ + 1U) % kPlaybackQueueCapacity;
+            --playback_queue_count_;
+            playback_condition_.notify_all();
+            write_frame = true;
+          } else {
+            drain = playback_producer_done_;
+          }
+        }
+      }
+
+      Status status = Status::Ok();
+      if (write_frame) {
+        status = io_.WriteMono48k(frame.samples.data(), frame.valid_samples,
+                                  kPlaybackOperationTimeoutMs);
+        if (status.ok()) {
+#if defined(BOOMPI_HAS_VOICE_LOOP_VENDOR_PATH)
+          PublishPlaybackReference48k(frame.samples.data(),
+                                      frame.valid_samples);
+#endif
+          ++playback_chunks_;
+        }
+        SecureZero(frame.samples.data(),
+                   frame.samples.size() * sizeof(frame.samples[0]));
+        if (status.ok()) {
+          continue;
+        }
+      } else if (drop) {
+        status = io_.DropPlayback();
+      } else if (drain) {
+        status = io_.DrainPlayback(kPlaybackDrainTimeoutMs);
+      } else {
+        continue;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(playback_mutex_);
+        if (!status.ok()) {
+          playback_error_ = status;
+        }
+        ClearPlaybackQueueLocked();
+        playback_response_active_ = false;
+        playback_response_complete_ = true;
+      }
+      playback_condition_.notify_all();
+      if (!status.ok()) {
+        client_.RequestStop();
+      }
+    }
+  }
+
+#if defined(BOOMPI_HAS_VOICE_LOOP_VENDOR_PATH)
+  Status OpenVoiceFrontEnd() {
+    if (voice_dsp_.Open() !=
+        platform::rv1106::RockchipVoiceDspStatus::kOk) {
+      return Status::Error(StatusCode::kFailedPrecondition,
+                           "Rockchip voice DSP could not open");
+    }
+    platform::rv1106::WebRtcVadConfig vad_config{};
+    vad_config.mode = 2;
+    vad_config.speech_start_ms = 120U;
+    vad_config.speech_end_ms = 700U;
+    if (!voice_vad_.Open(vad_config)) {
+      return Status::Error(StatusCode::kFailedPrecondition,
+                           "WebRTC VAD could not open");
+    }
+    platform::rv1106::SnowboyWakeWordConfig wake_config{};
+    wake_config.resource_path = config_.snowboy_resource_path;
+    wake_config.model_path = config_.snowboy_model_path;
+    wake_config.sensitivity = config_.snowboy_sensitivity;
+    platform::rv1106::SnowboyWakeWordCreateResult create_result{};
+    wake_engine_ = platform::rv1106::SnowboyWakeWordEngine::Create(
+        wake_config, &create_result);
+    if (!wake_engine_ || !create_result.ok()) {
+      return Status::Error(StatusCode::kFailedPrecondition,
+                           "Snowboy wake-word engine could not open");
+    }
+    ClearPlaybackReference();
+    return Status::Ok();
+  }
+
+  void StorePlaybackReference(const VoiceSamples& samples) noexcept {
+    playback_reference_generation_.fetch_add(1U, std::memory_order_acq_rel);
+    for (std::size_t pair = 0U; pair < playback_reference_atomic_.size();
+         ++pair) {
+      const std::uint32_t low = static_cast<std::uint16_t>(samples[pair * 2U]);
+      const std::uint32_t high =
+          static_cast<std::uint16_t>(samples[pair * 2U + 1U]);
+      playback_reference_atomic_[pair].store(
+          low | (high << 16U), std::memory_order_relaxed);
+    }
+    playback_reference_generation_.fetch_add(1U, std::memory_order_release);
+  }
+
+  void LoadPlaybackReference() noexcept {
+    voice_playback_reference_.fill(0);
+    for (std::uint8_t attempt = 0U; attempt < 3U; ++attempt) {
+      const std::uint32_t before =
+          playback_reference_generation_.load(std::memory_order_acquire);
+      if ((before & 1U) != 0U) {
+        continue;
+      }
+      for (std::size_t pair = 0U; pair < playback_reference_atomic_.size();
+           ++pair) {
+        const std::uint32_t packed =
+            playback_reference_atomic_[pair].load(std::memory_order_relaxed);
+        const std::uint16_t low = static_cast<std::uint16_t>(packed);
+        const std::uint16_t high = static_cast<std::uint16_t>(packed >> 16U);
+        voice_playback_reference_[pair * 2U] =
+            low <= 0x7FFFU
+                ? static_cast<std::int16_t>(low)
+                : static_cast<std::int16_t>(static_cast<std::int32_t>(low) -
+                                            65536);
+        voice_playback_reference_[pair * 2U + 1U] =
+            high <= 0x7FFFU
+                ? static_cast<std::int16_t>(high)
+                : static_cast<std::int16_t>(static_cast<std::int32_t>(high) -
+                                            65536);
+      }
+      const std::uint32_t after =
+          playback_reference_generation_.load(std::memory_order_acquire);
+      if (before == after && (after & 1U) == 0U) {
+        if (after == playback_reference_consumed_generation_) {
+          voice_playback_reference_.fill(0);
+        } else {
+          playback_reference_consumed_generation_ = after;
+        }
+        return;
+      }
+    }
+    voice_playback_reference_.fill(0);
+  }
+
+  void PublishPlaybackReference48k(const std::int16_t* samples,
+                                   const std::uint16_t sample_frames) noexcept {
+    if (samples == nullptr || sample_frames == 0U) {
+      return;
+    }
+    std::size_t source = 0U;
+    while (source < sample_frames) {
+      const std::size_t available =
+          audio::kSamplesPer48k20ms - playback_reference_samples_;
+      const std::size_t copied =
+          std::min<std::size_t>(available, sample_frames - source);
+      std::copy_n(samples + source, copied,
+                  playback_reference_input_[0U].begin() +
+                      playback_reference_samples_);
+      playback_reference_samples_ += copied;
+      source += copied;
+      if (playback_reference_samples_ != audio::kSamplesPer48k20ms) {
+        continue;
+      }
+      const auto transformed = playback_reference_decimator_.Process(
+          playback_reference_input_, &playback_reference_output_);
+      if (transformed.ok()) {
+        VoiceSamples reference{};
+        std::copy(playback_reference_output_[0U].begin(),
+                  playback_reference_output_[0U].end(), reference.begin());
+        StorePlaybackReference(reference);
+      }
+      playback_reference_input_ = {};
+      playback_reference_output_ = {};
+      playback_reference_samples_ = 0U;
+    }
+  }
+
+  void ClearPlaybackReference() noexcept {
+    playback_reference_decimator_.Reset();
+    playback_reference_input_ = {};
+    playback_reference_output_ = {};
+    playback_reference_samples_ = 0U;
+    VoiceSamples silence{};
+    StorePlaybackReference(silence);
+  }
+
+  Status CaptureProcessedVoice(audio::Mono16kFrame* const output,
+                               const bool apply_voice_dsp = true) {
+    if (output == nullptr || !wake_engine_ || !voice_dsp_.is_open()) {
+      return Status::Error(StatusCode::kFailedPrecondition,
+                           "voice capture front end is unavailable");
+    }
+    Status status = io_.Capture20Ms(&workspace_.capture_period,
+                                    kCaptureOperationTimeoutMs);
+    if (!status.ok()) {
+      return status;
+    }
+    for (std::size_t sample = 0U; sample < audio::kSamplesPer48k20ms;
+         ++sample) {
+      const std::size_t offset =
+          sample * platform::rv1106::AlsaSingleTurnIo::kChannels;
+      workspace_.input_planes[0U][sample] = ApplyPolarity(
+          workspace_.capture_period[offset], config_.capture_left_polarity);
+      workspace_.input_planes[1U][sample] = ApplyPolarity(
+          workspace_.capture_period[offset + 1U],
+          config_.capture_right_polarity);
+      workspace_.input_planes[2U][sample] = 0;
+      workspace_.input_planes[3U][sample] = 0;
+    }
+    const audio::SampleTransformResult transform = workspace_.decimator.Process(
+        workspace_.input_planes, &workspace_.output_planes);
+    if (!transform.ok()) {
+      return Status::Error(StatusCode::kInternal,
+                           "dual-microphone decimation failed");
+    }
+    std::copy(workspace_.output_planes[0U].begin(),
+              workspace_.output_planes[0U].end(), voice_mic_left_.begin());
+    std::copy(workspace_.output_planes[1U].begin(),
+              workspace_.output_planes[1U].end(), voice_mic_right_.begin());
+    platform::rv1106::RockchipVoiceDspStatus dsp_status =
+        platform::rv1106::RockchipVoiceDspStatus::kOk;
+    if (apply_voice_dsp) {
+      LoadPlaybackReference();
+      dsp_status = voice_dsp_.Process(
+          voice_mic_left_, voice_mic_right_, voice_playback_reference_,
+          &voice_dsp_output_);
+    }
+    SecureZero(workspace_.capture_period.data(),
+               workspace_.capture_period.size() *
+                   sizeof(workspace_.capture_period[0]));
+    SecureZero(workspace_.input_planes.data(), sizeof(workspace_.input_planes));
+    SecureZero(workspace_.output_planes.data(),
+               sizeof(workspace_.output_planes));
+    if (dsp_status != platform::rv1106::RockchipVoiceDspStatus::kOk) {
+      return Status::Error(StatusCode::kInternal,
+                           "Rockchip voice DSP rejected a capture frame");
+    }
+    output->format = {kInputSampleRateHz, kFrameDurationMs, 1U,
+                      audio::SampleFormat::kPcmS16Le};
+    output->metadata.monotonic_timestamp_us = MonotonicMicroseconds();
+    output->metadata.sequence = voice_capture_sequence_;
+    output->metadata.stream_id = uplink_stream_id_;
+    output->metadata.turn_id = turn_started_ ? turn_id_ : 0U;
+    output->metadata.epoch = epoch_;
+    output->metadata.discontinuity = false;
+    output->samples_per_channel = audio::kSamplesPer16k20ms;
+    const VoiceSamples& selected =
+        apply_voice_dsp ? voice_dsp_output_ : voice_mic_left_;
+    std::copy(selected.begin(), selected.end(), output->samples.begin());
+    if (!output->HasValidLength() ||
+        output->metadata.monotonic_timestamp_us == 0U ||
+        voice_capture_sequence_ == std::numeric_limits<std::uint32_t>::max()) {
+      return Status::Error(StatusCode::kResourceExhausted,
+                           "voice capture metadata exhausted");
+    }
+    ++voice_capture_sequence_;
+    return Status::Ok();
+  }
+
+  std::string NextVoiceMessageId() {
+    return "voice-" + std::to_string(voice_message_sequence_++);
+  }
+
+  Status StartVoiceTurn(const std::uint64_t first_timestamp_us) {
+    SensitiveString control;
+    const std::string message_id = NextVoiceMessageId();
+    control.value = BuildControl(
+        "turn.start", message_id.c_str(), config_.device_id, session_id_,
+        turn_id_, uplink_stream_id_, epoch_,
+        "{\"sample_rate_hz\":16000}");
+    Status status = client_.SendControl(control.value);
+    if (!status.ok()) {
+      return status;
+    }
+    turn_started_ = true;
+    completed_ = false;
+    voice_uplink_sequence_ = 0U;
+    voice_first_timestamp_us_ = first_timestamp_us;
+    return Status::Ok();
+  }
+
+  Status SendVoicePcm(const VoiceSamples& samples,
+                      const bool start,
+                      const bool end) {
+    SensitiveUplinkPayload payload;
+    for (std::size_t sample = 0U; sample < samples.size(); ++sample) {
+      const auto encoded = static_cast<std::uint16_t>(samples[sample]);
+      payload.bytes[sample * 2U] =
+          static_cast<std::uint8_t>(encoded & 0xFFU);
+      payload.bytes[sample * 2U + 1U] =
+          static_cast<std::uint8_t>((encoded >> 8U) & 0xFFU);
+    }
+    protocol::AudioPacketHeader header{};
+    header.kind = protocol::AudioPacketKind::kUplink;
+    header.flags = static_cast<std::uint16_t>(
+        (start ? kPcmFlagStart : 0U) | (end ? kPcmFlagEnd : 0U));
+    header.sample_rate_hz = kInputSampleRateHz;
+    header.payload_length_bytes = static_cast<std::uint32_t>(payload.bytes.size());
+    header.sequence = voice_uplink_sequence_;
+    header.monotonic_timestamp_us =
+        voice_first_timestamp_us_ +
+        static_cast<std::uint64_t>(voice_uplink_sequence_) * 20000U;
+    header.epoch = epoch_;
+    header.device_uuid = config_.device_uuid;
+    header.session_id = session_id_;
+    header.turn_id = turn_id_;
+    header.stream_id = uplink_stream_id_;
+    Status status = client_.SendPcm(header, payload.bytes.data(),
+                                    payload.bytes.size());
+    if (!status.ok()) {
+      return status;
+    }
+    if (voice_uplink_sequence_ == std::numeric_limits<std::uint32_t>::max()) {
+      return Status::Error(StatusCode::kResourceExhausted,
+                           "voice uplink sequence exhausted");
+    }
+    ++voice_uplink_sequence_;
+    ++uplink_frames_;
+    return Status::Ok();
+  }
+
+  Status CommitVoiceTurn() {
+    SensitiveString control;
+    const std::string message_id = NextVoiceMessageId();
+    control.value = BuildControl(
+        "turn.commit", message_id.c_str(), config_.device_id, session_id_,
+        turn_id_, uplink_stream_id_, epoch_, "{}");
+    return client_.SendControl(control.value);
+  }
+
+  Status MaybeSendVoiceKeepAlive() {
+    const std::uint64_t now_us = MonotonicMicroseconds();
+    if (now_us == 0U) {
+      return Status::Error(StatusCode::kInternal,
+                           "voice keepalive timestamp is invalid");
+    }
+    if (voice_keepalive_timestamp_us_ == 0U) {
+      voice_keepalive_timestamp_us_ = now_us;
+      return Status::Ok();
+    }
+    if (now_us - voice_keepalive_timestamp_us_ < kVoiceKeepAliveIntervalUs) {
+      return Status::Ok();
+    }
+    Status status = client_.SendKeepAlivePong();
+    if (status.ok()) {
+      voice_keepalive_timestamp_us_ = now_us;
+    }
+    return status;
+  }
+
+  Status CaptureVoiceAndUpload(const bool require_wake,
+                               const bool resume_confirmed_speech,
+                               bool* const captured) {
+    if (captured == nullptr) {
+      return Status::Error(StatusCode::kInvalidArgument,
+                           "voice turn result is null");
+    }
+    *captured = false;
+    VoicePreRoll local_pre_roll;
+    VoicePreRoll* pre_roll = resume_confirmed_speech
+                                 ? &barge_pre_roll_
+                                 : &local_pre_roll;
+    bool listening_for_speech = !require_wake;
+    std::uint32_t wait_frames = 0U;
+    if (!resume_confirmed_speech) {
+      voice_vad_.Reset();
+      if (require_wake) {
+        const auto reset = wake_engine_->Reset(
+            audio::WakeWordResetReason::kGenerationActivated);
+        if (!reset.valid() || !reset.reset) {
+          return Status::Error(StatusCode::kInternal,
+                               "Snowboy reset failed");
+        }
+      }
+      for (;;) {
+        audio::Mono16kFrame frame{};
+        Status status =
+            CaptureProcessedVoice(&frame, listening_for_speech);
+        if (!status.ok()) {
+          return status;
+        }
+        status = MaybeSendVoiceKeepAlive();
+        if (!status.ok()) {
+          return status;
+        }
+        VoiceSamples samples{};
+        std::copy_n(frame.samples.begin(), samples.size(), samples.begin());
+        pre_roll->Push(samples);
+        if (!listening_for_speech) {
+          audio::Mono16kFrame wake_frame = frame;
+          std::copy(voice_mic_left_.begin(), voice_mic_left_.end(),
+                    wake_frame.samples.begin());
+          const auto wake = wake_engine_->Process(wake_frame);
+          SecureZero(wake_frame.samples.data(),
+                     wake_frame.samples.size() *
+                         sizeof(wake_frame.samples[0]));
+          if (!wake.valid()) {
+            return Status::Error(StatusCode::kInternal,
+                                 "Snowboy processing failed");
+          }
+          if (!wake.detected()) {
+            continue;
+          }
+          std::cout << "boompi-client: Snowboy wake detected" << std::endl;
+          listening_for_speech = true;
+          wait_frames = 0U;
+          voice_vad_.Reset();
+        }
+        const auto vad = voice_vad_.Process(frame);
+        if (!vad.valid) {
+          return Status::Error(StatusCode::kInternal,
+                               "WebRTC VAD processing failed");
+        }
+        if (vad.speech_started) {
+          std::cout << "boompi-client: VAD speech started" << std::endl;
+          break;
+        }
+        ++wait_frames;
+        const std::uint32_t timeout_frames =
+            require_wake ? kFirstSpeechTimeoutFrames
+                         : kFollowUpTimeoutFrames;
+        if (wait_frames >= timeout_frames) {
+          pre_roll->Clear();
+          return Status::Ok();
+        }
+      }
+    }
+
+    const std::uint64_t now_us = MonotonicMicroseconds();
+    const std::uint64_t pre_roll_us =
+        pre_roll->size() > 0U
+            ? static_cast<std::uint64_t>(pre_roll->size() - 1U) * 20000U
+            : 0U;
+    if (now_us == 0U || now_us < pre_roll_us) {
+      return Status::Error(StatusCode::kInternal,
+                           "voice pre-roll timestamp is invalid");
+    }
+    Status status = StartVoiceTurn(now_us - pre_roll_us);
+    if (!status.ok()) {
+      return status;
+    }
+    VoiceSamples held{};
+    bool have_held = false;
+    for (std::size_t index = 0U; index < pre_roll->size(); ++index) {
+      if (have_held) {
+        status = SendVoicePcm(held, voice_uplink_sequence_ == 0U, false);
+        if (!status.ok()) {
+          return status;
+        }
+      }
+      held = pre_roll->Oldest(index);
+      have_held = true;
+    }
+    pre_roll->Clear();
+    if (!have_held) {
+      return Status::Error(StatusCode::kInternal,
+                           "voice utterance has no pre-roll frame");
+    }
+
+    std::uint32_t utterance_frames = 0U;
+    for (;;) {
+      audio::Mono16kFrame frame{};
+      status = CaptureProcessedVoice(&frame);
+      if (!status.ok()) {
+        return status;
+      }
+      status = MaybeSendVoiceKeepAlive();
+      if (!status.ok()) {
+        return status;
+      }
+      status = SendVoicePcm(held, voice_uplink_sequence_ == 0U, false);
+      if (!status.ok()) {
+        return status;
+      }
+      std::copy_n(frame.samples.begin(), held.size(), held.begin());
+      ++utterance_frames;
+      const auto vad = voice_vad_.Process(frame);
+      if (!vad.valid) {
+        return Status::Error(StatusCode::kInternal,
+                             "WebRTC VAD processing failed");
+      }
+      if (vad.speech_ended) {
+        std::cout << "boompi-client: VAD speech ended" << std::endl;
+        break;
+      }
+      if (utterance_frames >= kMaximumUtteranceFrames) {
+        break;
+      }
+    }
+    status = SendVoicePcm(held, voice_uplink_sequence_ == 0U, true);
+    if (!status.ok()) {
+      return status;
+    }
+    status = CommitVoiceTurn();
+    if (!status.ok()) {
+      return status;
+    }
+    std::cout << "boompi-client: voice turn committed" << std::endl;
+    *captured = true;
+    return Status::Ok();
+  }
+
+  Status StartBargeInCapture() {
+    StopBargeInCapture();
+    barge_stop_.store(false, std::memory_order_release);
+    barge_duck_.store(false, std::memory_order_release);
+    barge_confirmed_.store(false, std::memory_order_release);
+    barge_capture_failed_.store(false, std::memory_order_release);
+    barge_pre_roll_.Clear();
+    voice_vad_.Reset();
+    try {
+      barge_thread_ = std::thread([this]() { RunBargeInCapture(); });
+    } catch (const std::system_error&) {
+      return Status::Error(StatusCode::kResourceExhausted,
+                           "barge-in capture thread could not start");
+    }
+    return Status::Ok();
+  }
+
+  void StopBargeInCapture() noexcept {
+    barge_stop_.store(true, std::memory_order_release);
+    if (barge_thread_.joinable()) {
+      barge_thread_.join();
+    }
+  }
+
+  void RunBargeInCapture() noexcept {
+    std::uint32_t consecutive_speech_ms = 0U;
+    while (!barge_stop_.load(std::memory_order_acquire)) {
+      audio::Mono16kFrame frame{};
+      const Status status = CaptureProcessedVoice(&frame);
+      if (!status.ok()) {
+        barge_capture_failed_.store(true, std::memory_order_release);
+        client_.RequestStop();
+        return;
+      }
+      VoiceSamples samples{};
+      std::copy_n(frame.samples.begin(), samples.size(), samples.begin());
+      barge_pre_roll_.Push(samples);
+      const auto vad = voice_vad_.Process(frame);
+      if (!vad.valid) {
+        barge_capture_failed_.store(true, std::memory_order_release);
+        client_.RequestStop();
+        return;
+      }
+      consecutive_speech_ms = vad.speech_now
+                                  ? consecutive_speech_ms + kFrameDurationMs
+                                  : 0U;
+      if (consecutive_speech_ms >= 80U) {
+        barge_duck_.store(true, std::memory_order_release);
+      }
+      if (consecutive_speech_ms >= 160U) {
+        barge_confirmed_.store(true, std::memory_order_release);
+        return;
+      }
+    }
+  }
+
+  Status ApplyPendingBargeIn() {
+    if (barge_capture_failed_.load(std::memory_order_acquire)) {
+      return Status::Error(StatusCode::kInternal,
+                           "barge-in capture failed");
+    }
+    if (barge_duck_.load(std::memory_order_acquire) && response_started_ &&
+        !duck_applied_) {
+      const Status duck_status = renderer_.SetDucked(true);
+      if (!duck_status.ok()) {
+        return duck_status;
+      }
+      duck_applied_ = true;
+    }
+    if (!barge_confirmed_.load(std::memory_order_acquire) ||
+        cancel_requested_) {
+      return Status::Ok();
+    }
+    std::cout << "boompi-client: barge-in confirmed" << std::endl;
+    Status status = FinishPlaybackResponse(true);
+    if (!status.ok()) {
+      return status;
+    }
+    renderer_.Disarm();
+    pending_pcm_.fill(0);
+    pending_samples_ = 0U;
+    SensitiveString control;
+    const std::string message_id = NextVoiceMessageId();
+    const bool cancel_response = response_started_;
+    const std::uint32_t cancel_stream =
+        cancel_response ? downlink_stream_id_ : uplink_stream_id_;
+    control.value = BuildControl(
+        cancel_response ? "response.cancel" : "turn.cancel",
+        message_id.c_str(), config_.device_id,
+        session_id_, turn_id_, cancel_stream, epoch_, "{}");
+    status = client_.SendControl(control.value);
+    if (status.ok()) {
+      cancel_requested_ = true;
+      std::cout << "boompi-client: barge-in cancel sent; type="
+                << (cancel_response ? "response.cancel" : "turn.cancel")
+                << std::endl;
+    }
+    return status;
+  }
+
+  Status AdvanceVoiceGeneration() {
+    if (epoch_ == std::numeric_limits<std::uint32_t>::max() ||
+        turn_id_ == std::numeric_limits<std::uint32_t>::max() ||
+        uplink_stream_id_ == std::numeric_limits<std::uint32_t>::max()) {
+      return Status::Error(StatusCode::kResourceExhausted,
+                           "voice generation identifiers exhausted");
+    }
+    ++epoch_;
+    ++turn_id_;
+    ++uplink_stream_id_;
+    downlink_stream_id_ = 0U;
+    downlink_frames_ = 0U;
+    playback_sequence_ = 0U;
+    playback_timestamp_us_ = 0U;
+    pending_pcm_.fill(0);
+    pending_samples_ = 0U;
+    downlink_bytes_ = 0U;
+    text_delta_bytes_ = 0U;
+    response_id_.clear();
+    turn_started_ = false;
+    response_started_ = false;
+    audio_started_ = false;
+    audio_ended_ = false;
+    completed_ = true;
+    cancel_requested_ = false;
+    response_was_cancelled_ = false;
+    duck_applied_ = false;
+    ClearPlaybackReference();
+    return Status::Ok();
+  }
+#endif
+
   static network::WssClientConfig MakeWssConfig(
       const ManualConfig& config) {
     network::WssClientConfig output{};
@@ -639,7 +1648,7 @@ class ManualSingleTurnSession final {
   Status CaptureAndUpload() {
     SensitiveString control;
     control.value = BuildControl("turn.start", "manual-2", config_.device_id,
-                                 session_id_, kTurnId, kUplinkStreamId, epoch_,
+                                 session_id_, turn_id_, uplink_stream_id_, epoch_,
                                  "{\"sample_rate_hz\":16000}");
     Status status = client_.SendControl(control.value);
     if (!status.ok()) {
@@ -683,15 +1692,8 @@ class ManualSingleTurnSession final {
             config_.capture_mic_slot;
         const std::int16_t captured =
             workspace_.capture_period[interleaved_index];
-        if (config_.capture_mic_polarity > 0) {
-          workspace_.input_planes[0U][sample] = captured;
-        } else if (captured == std::numeric_limits<std::int16_t>::min()) {
-          workspace_.input_planes[0U][sample] =
-              std::numeric_limits<std::int16_t>::max();
-        } else {
-          workspace_.input_planes[0U][sample] =
-              static_cast<std::int16_t>(-captured);
-        }
+        workspace_.input_planes[0U][sample] =
+            ApplyPolarity(captured, config_.capture_mic_polarity);
       }
       const audio::SampleTransformResult transform = workspace_.decimator.Process(
           workspace_.input_planes, &workspace_.output_planes);
@@ -730,8 +1732,8 @@ class ManualSingleTurnSession final {
       header.epoch = epoch_;
       header.device_uuid = config_.device_uuid;
       header.session_id = session_id_;
-      header.turn_id = kTurnId;
-      header.stream_id = kUplinkStreamId;
+      header.turn_id = turn_id_;
+      header.stream_id = uplink_stream_id_;
       status = client_.SendPcm(header, payload.bytes.data(),
                                payload.bytes.size());
       SecureZero(workspace_.capture_period.data(),
@@ -754,8 +1756,8 @@ class ManualSingleTurnSession final {
     workspace_.decimator.Reset();
 
     control.value = BuildControl("turn.commit", "manual-3",
-                                 config_.device_id, session_id_, kTurnId,
-                                 kUplinkStreamId, epoch_, "{}");
+                                 config_.device_id, session_id_, turn_id_,
+                                 uplink_stream_id_, epoch_, "{}");
     return client_.SendControl(control.value);
   }
 
@@ -763,7 +1765,7 @@ class ManualSingleTurnSession final {
       const protocol::ServerControlMessage& message,
       const bool allow_new_stream) const {
     const auto& envelope = message.envelope;
-    if (envelope.session_id != session_id_ || envelope.turn_id != kTurnId ||
+    if (envelope.session_id != session_id_ || envelope.turn_id != turn_id_ ||
         envelope.epoch != epoch_ || envelope.stream_id == 0U) {
       return Status::Error(StatusCode::kFailedPrecondition,
                            "response control identity does not match the active turn");
@@ -786,7 +1788,7 @@ class ManualSingleTurnSession final {
     }
     downlink_stream_id_ = message.envelope.stream_id;
     response_id_ = message.response_id;
-    const audio::PlaybackGeneration generation{epoch_, kTurnId,
+    const audio::PlaybackGeneration generation{epoch_, turn_id_,
                                                downlink_stream_id_};
     status = renderer_.Arm(generation);
     if (!status.ok()) {
@@ -825,6 +1827,20 @@ class ManualSingleTurnSession final {
     if (message->type == protocol::ServerControlType::kResponseStart) {
       return StartResponse(*message);
     }
+    if (message->type == protocol::ServerControlType::kResponseCancelled) {
+      if (!cancel_requested_ || message->envelope.session_id != session_id_ ||
+          message->envelope.turn_id != turn_id_ ||
+          message->envelope.epoch != epoch_ ||
+          message->envelope.stream_id == 0U) {
+        SecureClear(&message->cancellation_reason);
+        return Status::Error(StatusCode::kFailedPrecondition,
+                             "unexpected response cancellation acknowledgement");
+      }
+      SecureClear(&message->cancellation_reason);
+      response_was_cancelled_ = true;
+      *response_done = true;
+      return Status::Ok();
+    }
     if (!response_started_) {
       return Status::Error(StatusCode::kFailedPrecondition,
                            "response control arrived before response.start");
@@ -832,11 +1848,6 @@ class ManualSingleTurnSession final {
     Status status = ValidateResponseEnvelope(*message, false);
     if (!status.ok()) {
       return status;
-    }
-    if (message->type == protocol::ServerControlType::kResponseCancelled) {
-      SecureClear(&message->cancellation_reason);
-      return Status::Error(StatusCode::kFailedPrecondition,
-                           "server cancelled the manual response unexpectedly");
     }
     if (message->response_id != response_id_) {
       return Status::Error(StatusCode::kFailedPrecondition,
@@ -860,13 +1871,26 @@ class ManualSingleTurnSession final {
           return Status::Error(StatusCode::kFailedPrecondition,
                                "response audio contract is invalid");
         }
+        status = BeginPlaybackResponse();
+        if (!status.ok()) {
+          renderer_.Disarm();
+          return status;
+        }
         audio_started_ = true;
         return Status::Ok();
 
       case protocol::ServerControlType::kResponseDone:
         if (audio_started_ && !audio_ended_) {
-          return Status::Error(StatusCode::kFailedPrecondition,
-                               "response.done arrived before the PCM end marker");
+          if (!config_.legacy_downlink_framing || pending_samples_ == 0U) {
+            return Status::Error(
+                StatusCode::kFailedPrecondition,
+                "response.done arrived before the PCM end marker");
+          }
+          status = RenderPending(true);
+          if (!status.ok()) {
+            return status;
+          }
+          audio_ended_ = true;
         }
         if (audio_started_ && downlink_bytes_ == 0U) {
           return Status::Error(StatusCode::kFailedPrecondition,
@@ -919,7 +1943,7 @@ class ManualSingleTurnSession final {
         static_cast<std::uint64_t>(playback_sequence_) * 20000U;
     input.frame.metadata.sequence = playback_sequence_;
     input.frame.metadata.stream_id = downlink_stream_id_;
-    input.frame.metadata.turn_id = kTurnId;
+    input.frame.metadata.turn_id = turn_id_;
     input.frame.metadata.epoch = epoch_;
     input.frame.valid_source_samples =
         static_cast<std::uint16_t>(pending_samples_);
@@ -940,16 +1964,13 @@ class ManualSingleTurnSession final {
       return Status::Error(StatusCode::kInternal,
                            "24 kHz response rendering failed");
     }
-    Status status = io_.WriteMono48k(output.samples.data(),
-                                    output.valid_samples,
-                                    kPlaybackOperationTimeoutMs);
+    Status status = EnqueuePlayback(&output);
     SecureZero(output.samples.data(),
                output.samples.size() * sizeof(output.samples[0]));
     if (!status.ok()) {
       renderer_.Disarm();
       return status;
     }
-    ++playback_chunks_;
 
     if (end_of_stream) {
       output = {};
@@ -962,14 +1983,12 @@ class ManualSingleTurnSession final {
         return Status::Error(StatusCode::kInternal,
                              "24 kHz response renderer drain failed");
       }
-      status = io_.WriteMono48k(output.samples.data(), output.valid_samples,
-                                kPlaybackOperationTimeoutMs);
+      status = EnqueuePlayback(&output);
       SecureZero(output.samples.data(),
                  output.samples.size() * sizeof(output.samples[0]));
       if (!status.ok()) {
         return status;
       }
-      ++playback_chunks_;
     }
 
     pending_pcm_.fill(0);
@@ -994,7 +2013,7 @@ class ManualSingleTurnSession final {
     context.device_uuid = config_.device_uuid;
     context.epoch = epoch_;
     context.session_id = session_id_;
-    context.turn_id = kTurnId;
+    context.turn_id = turn_id_;
     context.stream_id = downlink_stream_id_;
     context.expected_sequence = downlink_frames_;
     Status status = protocol::ValidateAudioPacketContext(header, context);
@@ -1003,7 +2022,11 @@ class ManualSingleTurnSession final {
     }
     if (header.payload_length_bytes != inbound.pcm_payload.size() ||
         inbound.pcm_payload.empty() ||
-        inbound.pcm_payload.size() > kMaximumDownlinkPacketBytes ||
+        inbound.pcm_payload.size() >
+            (config_.legacy_downlink_framing
+                 ? static_cast<std::size_t>(
+                       protocol::kMaximumAudioPayloadBytes)
+                 : kMaximumDownlinkPacketBytes) ||
         inbound.pcm_payload.size() % 2U != 0U) {
       return Status::Error(StatusCode::kInvalidArgument,
                            "downlink PCM payload violates the 20 ms bound");
@@ -1011,7 +2034,10 @@ class ManualSingleTurnSession final {
     const bool start = (header.flags & kPcmFlagStart) != 0U;
     const bool end = (header.flags & kPcmFlagEnd) != 0U;
     if ((header.flags & kPcmFlagDiscontinuity) != 0U ||
-        start != (downlink_frames_ == 0U)) {
+        (!config_.legacy_downlink_framing &&
+         start != (downlink_frames_ == 0U)) ||
+        (config_.legacy_downlink_framing && start &&
+         downlink_frames_ != 0U)) {
       return Status::Error(StatusCode::kFailedPrecondition,
                            "downlink PCM flags break stream continuity");
     }
@@ -1051,6 +2077,10 @@ class ManualSingleTurnSession final {
       network::WssInboundMessage inbound{};
       Status status = client_.Receive(&inbound);
       if (!status.ok()) {
+        const Status playback_error = PlaybackError();
+        if (!playback_error.ok()) {
+          return playback_error;
+        }
         if (watchdog_.timed_out()) {
           return Status::Error(StatusCode::kResourceExhausted,
                                "server response was inactive for 30 seconds");
@@ -1065,7 +2095,20 @@ class ManualSingleTurnSession final {
                              "server response was inactive for 30 seconds");
       }
 
+#if defined(BOOMPI_HAS_VOICE_LOOP_VENDOR_PATH)
+      status = ApplyPendingBargeIn();
+      if (!status.ok()) {
+        SecureClear(&inbound.control_json);
+        SecureZero(inbound.pcm_payload.data(), inbound.pcm_payload.size());
+        return status;
+      }
+#endif
+
       if (inbound.type == network::WssInboundMessageType::kPcm24k) {
+        if (cancel_requested_) {
+          SecureZero(inbound.pcm_payload.data(), inbound.pcm_payload.size());
+          continue;
+        }
         status = HandlePcm(inbound);
         SecureZero(inbound.pcm_payload.data(), inbound.pcm_payload.size());
         if (!status.ok()) {
@@ -1084,6 +2127,13 @@ class ManualSingleTurnSession final {
       if (!status.ok()) {
         return status;
       }
+      if (cancel_requested_ &&
+          decoded.type != protocol::ServerControlType::kResponseCancelled &&
+          decoded.type != protocol::ServerControlType::kError) {
+        SecureClear(&decoded.text);
+        SecureClear(&decoded.error_message);
+        continue;
+      }
       bool response_done = false;
       status = HandleControl(&decoded, &response_done);
       SecureClear(&decoded.text);
@@ -1092,8 +2142,8 @@ class ManualSingleTurnSession final {
         return status;
       }
       if (response_done) {
-        if (audio_started_) {
-          status = io_.DrainPlayback(kPlaybackDrainTimeoutMs);
+        if (audio_started_ && !response_was_cancelled_) {
+          status = FinishPlaybackResponse(false);
           if (!status.ok()) {
             return status;
           }
@@ -1112,11 +2162,11 @@ class ManualSingleTurnSession final {
     try {
       const bool cancel_response = response_started_;
       const std::uint32_t stream_id =
-          cancel_response ? downlink_stream_id_ : kUplinkStreamId;
+          cancel_response ? downlink_stream_id_ : uplink_stream_id_;
       SensitiveString control;
       control.value = BuildControl(
           cancel_response ? "response.cancel" : "turn.cancel", "manual-4",
-          config_.device_id, session_id_, kTurnId, stream_id, epoch_, "{}");
+          config_.device_id, session_id_, turn_id_, stream_id, epoch_, "{}");
       static_cast<void>(client_.SendControl(control.value));
     } catch (...) {
       // Cleanup remains best effort; Close below is the final cancellation.
@@ -1129,11 +2179,27 @@ class ManualSingleTurnSession final {
   network::WssClient client_;
   ResponseWatchdog watchdog_;
   audio::PlaybackRenderer24To48 renderer_;
+  std::unique_ptr<PlaybackQueue> playback_queue_;
+  std::mutex playback_mutex_;
+  std::condition_variable playback_condition_;
+  std::thread playback_thread_;
+  Status playback_error_{};
+  std::size_t playback_queue_head_{0U};
+  std::size_t playback_queue_tail_{0U};
+  std::size_t playback_queue_count_{0U};
+  bool playback_stop_{false};
+  bool playback_response_active_{false};
+  bool playback_producer_done_{false};
+  bool playback_drop_requested_{false};
+  bool playback_started_{false};
+  bool playback_response_complete_{false};
   std::array<std::int16_t, audio::TtsPcmFrame24k::kFrameSamples>
       pending_pcm_{};
   std::string response_id_;
   std::uint32_t session_id_{0U};
   std::uint32_t epoch_{0U};
+  std::uint32_t turn_id_{1U};
+  std::uint32_t uplink_stream_id_{1U};
   std::uint32_t downlink_stream_id_{0U};
   std::uint32_t uplink_frames_{0U};
   std::uint32_t downlink_frames_{0U};
@@ -1148,6 +2214,40 @@ class ManualSingleTurnSession final {
   bool audio_started_{false};
   bool audio_ended_{false};
   bool completed_{false};
+  bool cancel_requested_{false};
+  bool response_was_cancelled_{false};
+  bool duck_applied_{false};
+#if defined(BOOMPI_HAS_VOICE_LOOP_VENDOR_PATH)
+  platform::rv1106::RockchipVoiceDsp voice_dsp_;
+  platform::rv1106::WebRtcVadGate voice_vad_;
+  std::unique_ptr<platform::rv1106::SnowboyWakeWordEngine> wake_engine_;
+  VoiceSamples voice_mic_left_{};
+  VoiceSamples voice_mic_right_{};
+  VoiceSamples voice_playback_reference_{};
+  VoiceSamples voice_dsp_output_{};
+  VoicePreRoll barge_pre_roll_;
+  std::thread barge_thread_;
+  std::atomic<bool> barge_stop_{true};
+  std::atomic<bool> barge_duck_{false};
+  std::atomic<bool> barge_confirmed_{false};
+  std::atomic<bool> barge_capture_failed_{false};
+  audio::FirDecimator48To16 playback_reference_decimator_;
+  audio::CapturePlanes48k playback_reference_input_{};
+  audio::CapturePlanes16k playback_reference_output_{};
+  static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
+                "voice playback reference requires lock-free 32-bit atomics");
+  std::array<std::atomic<std::uint32_t>,
+             platform::rv1106::kRockchipVoiceFrameSamples16k / 2U>
+      playback_reference_atomic_{};
+  std::atomic<std::uint32_t> playback_reference_generation_{0U};
+  std::uint32_t playback_reference_consumed_generation_{0U};
+  std::size_t playback_reference_samples_{0U};
+  std::uint32_t voice_capture_sequence_{0U};
+  std::uint32_t voice_uplink_sequence_{0U};
+  std::uint64_t voice_first_timestamp_us_{0U};
+  std::uint64_t voice_keepalive_timestamp_us_{0U};
+  std::uint64_t voice_message_sequence_{1U};
+#endif
 };
 
 }  // namespace
@@ -1175,6 +2275,27 @@ Status RunManualSingleTurnFromEnvironment() {
   } catch (...) {
     return Status::Error(StatusCode::kInternal,
                          "manual single-turn failed unexpectedly");
+  }
+}
+
+Status RunVoiceLoopFromEnvironment() {
+  try {
+    ManualConfig config;
+    Status status = LoadManualConfig(&config);
+    if (!status.ok()) {
+      return status;
+    }
+    ManualSingleTurnSession session(config);
+    return session.RunVoiceLoop();
+  } catch (const std::bad_alloc&) {
+    return Status::Error(StatusCode::kResourceExhausted,
+                         "voice loop memory allocation failed");
+  } catch (const std::system_error&) {
+    return Status::Error(StatusCode::kInternal,
+                         "voice loop system operation failed");
+  } catch (...) {
+    return Status::Error(StatusCode::kInternal,
+                         "voice loop failed unexpectedly");
   }
 }
 

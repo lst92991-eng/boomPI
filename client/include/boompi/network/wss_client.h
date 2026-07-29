@@ -54,6 +54,7 @@ class WssClient final {
   Status SendPcm(const protocol::AudioPacketHeader& header,
                  const std::uint8_t* payload,
                  std::size_t payload_size_bytes);
+  Status SendKeepAlivePong();
   Status Receive(WssInboundMessage* output);
   void RequestStop() noexcept;
   void Close() noexcept;

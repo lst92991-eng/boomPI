@@ -499,6 +499,7 @@ class WssClient::Impl final {
   Status SendPcm(const protocol::AudioPacketHeader& header,
                  const std::uint8_t* payload,
                  std::size_t payload_size_bytes);
+  Status SendKeepAlivePong();
   Status Receive(WssInboundMessage* output);
   void RequestStop() noexcept;
   void Close() noexcept;
@@ -1179,6 +1180,16 @@ Status WssClient::Impl::SendPcm(
   return SendFrame(kOpcodeBinary, frame.data(), frame.size(), deadline);
 }
 
+Status WssClient::Impl::SendKeepAlivePong() {
+  if (!connected_) {
+    return Status::Error(StatusCode::kFailedPrecondition,
+                         "WSS client is not connected");
+  }
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(config_.write_timeout_ms);
+  return SendFrame(kOpcodePong, nullptr, 0U, deadline);
+}
+
 Status WssClient::Impl::Receive(WssInboundMessage* const output) {
   if (output == nullptr) {
     return Status::Error(StatusCode::kInvalidArgument,
@@ -1288,6 +1299,10 @@ Status WssClient::SendPcm(const protocol::AudioPacketHeader& header,
                           const std::uint8_t* const payload,
                           const std::size_t payload_size_bytes) {
   return impl_->SendPcm(header, payload, payload_size_bytes);
+}
+
+Status WssClient::SendKeepAlivePong() {
+  return impl_->SendKeepAlivePong();
 }
 
 Status WssClient::Receive(WssInboundMessage* const output) {

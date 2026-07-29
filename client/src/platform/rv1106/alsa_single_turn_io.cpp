@@ -12,6 +12,8 @@
 namespace boompi::platform::rv1106 {
 namespace {
 
+constexpr std::uint32_t kMaximumPlaybackRecoveries = 3U;
+
 snd_pcm_t* Handle(void* const handle) noexcept {
   return static_cast<snd_pcm_t*>(handle);
 }
@@ -218,7 +220,8 @@ Status OpenExactPcm(const std::string& device_name,
   }
   const snd_pcm_uframes_t start_threshold =
       stream == SND_PCM_STREAM_CAPTURE ? 1U
-                                       : AlsaSingleTurnIo::kPeriodFrames;
+                                       : AlsaSingleTurnIo::kBufferFrames -
+                                             AlsaSingleTurnIo::kPeriodFrames;
   if (error >= 0) {
     error = snd_pcm_sw_params_set_start_threshold(handle, software,
                                                   start_threshold);
@@ -321,6 +324,7 @@ Status AlsaSingleTurnIo::Capture20Ms(CapturePeriod* const output,
   }
 
   std::uint32_t offset_frames = 0U;
+  std::uint8_t recovery_count = 0U;
   while (offset_frames < kPeriodFrames) {
     const snd_pcm_sframes_t result = snd_pcm_readi(
         capture, output->data() +
@@ -338,6 +342,28 @@ Status AlsaSingleTurnIo::Capture20Ms(CapturePeriod* const output,
     if (result == 0) {
       return Status::Error(StatusCode::kInternal,
                            "ALSA capture made zero progress");
+    }
+    if ((result == -EPIPE || result == -ESTRPIPE) &&
+        recovery_count < 3U) {
+      const int recovery =
+          snd_pcm_recover(capture, static_cast<int>(result), 1);
+      if (recovery < 0) {
+        return AlsaError("ALSA capture recover", recovery);
+      }
+      const snd_pcm_state_t state = snd_pcm_state(capture);
+      if (state == SND_PCM_STATE_PREPARED) {
+        const int restart = snd_pcm_start(capture);
+        if (restart < 0) {
+          return AlsaError("ALSA capture restart", restart);
+        }
+      } else if (state != SND_PCM_STATE_RUNNING) {
+        return Status::Error(StatusCode::kInternal,
+                             "ALSA capture recovered to an invalid state");
+      }
+      output->fill(0);
+      offset_frames = 0U;
+      ++recovery_count;
+      continue;
     }
     if (result != -EAGAIN && result != -EINTR) {
       return AlsaError("ALSA capture read", static_cast<int>(result));
@@ -386,6 +412,7 @@ Status AlsaSingleTurnIo::WriteMono48k(const std::int16_t* const samples,
 
   snd_pcm_t* const playback = Handle(playback_handle_);
   std::uint32_t offset_frames = 0U;
+  std::uint32_t recovery_count = 0U;
   while (offset_frames < sample_frames) {
     const snd_pcm_sframes_t result = snd_pcm_writei(
         playback,
@@ -404,6 +431,18 @@ Status AlsaSingleTurnIo::WriteMono48k(const std::int16_t* const samples,
     if (result == 0) {
       return Status::Error(StatusCode::kInternal,
                            "ALSA playback made zero progress");
+    }
+    if (result == -EPIPE || result == -ESTRPIPE) {
+      if (recovery_count >= kMaximumPlaybackRecoveries) {
+        return AlsaError("ALSA playback write", static_cast<int>(result));
+      }
+      const int recovery =
+          snd_pcm_recover(playback, static_cast<int>(result), 1);
+      if (recovery < 0) {
+        return AlsaError("ALSA playback recover", recovery);
+      }
+      ++recovery_count;
+      continue;
     }
     if (result != -EAGAIN && result != -EINTR) {
       return AlsaError("ALSA playback write", static_cast<int>(result));
@@ -428,10 +467,18 @@ Status AlsaSingleTurnIo::DrainPlayback(const std::uint32_t timeout_ms) {
                          "single-turn drain timeout is invalid");
   }
   snd_pcm_t* const playback = Handle(playback_handle_);
+  const auto prepare_next_response = [this, playback]() -> Status {
+    const int prepare = snd_pcm_prepare(playback);
+    if (prepare < 0) {
+      return AlsaError("ALSA playback prepare after drain", prepare);
+    }
+    playback_interleaved_scratch_.fill(0);
+    return Status::Ok();
+  };
   for (;;) {
     const int result = snd_pcm_drain(playback);
     if (result == 0) {
-      return Status::Ok();
+      return prepare_next_response();
     }
     if (result != -EAGAIN && result != -EINTR) {
       return AlsaError("ALSA playback drain", result);
@@ -443,7 +490,7 @@ Status AlsaSingleTurnIo::DrainPlayback(const std::uint32_t timeout_ms) {
       // finishes draining and transitions from DRAINING to SETUP. SETUP here
       // means every pending playback frame was consumed, not an xrun.
       if (snd_pcm_state(playback) == SND_PCM_STATE_SETUP) {
-        return Status::Ok();
+        return prepare_next_response();
       }
       return wait_status;
     }

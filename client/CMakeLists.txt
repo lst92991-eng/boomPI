@@ -11,10 +11,16 @@ option(BOOMPI_ENABLE_ALSA_PLAYBACK
 unset(_boompi_alsa_playback_default)
 option(BOOMPI_ENABLE_WSS_CLIENT
   "Build the pinned OpenSSL development WSS client" OFF)
+option(BOOMPI_ENABLE_WEBRTC_VAD
+  "Build the fixed 16 kHz WebRTC VAD gate for the RV1106 voice loop" OFF)
 set(BOOMPI_OPENSSL_ROOT "" CACHE PATH
   "Absolute root of the explicit OpenSSL 3.5.7 package used by WSS")
 set(BOOMPI_GO_EXECUTABLE "" CACHE FILEPATH
   "Optional Go executable used by the cross-language WSS smoke test")
+set(BOOMPI_WEBRTC_VAD_INCLUDE_DIR "" CACHE PATH
+  "Directory containing the external webrtc_vad.h header")
+set(BOOMPI_WEBRTC_VAD_LIBRARY "" CACHE FILEPATH
+  "External RV1106 WebRTC VAD static library")
 
 function(boompi_configure_target target_name)
   target_compile_features(${target_name} PUBLIC cxx_std_17)
@@ -240,6 +246,40 @@ target_link_libraries(boompi_platform_rv1106 PUBLIC boompi_event)
 if(BOOMPI_TARGET_RV1106)
   target_compile_definitions(boompi_platform_rv1106 PRIVATE BOOMPI_TARGET_RV1106=1)
 endif()
+if(BOOMPI_ENABLE_ROCKCHIP_3A)
+  target_sources(boompi_platform_rv1106 PRIVATE
+    src/platform/rv1106/rockchip_voice_dsp.cpp)
+  target_include_directories(boompi_platform_rv1106 PRIVATE
+    "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}")
+  target_link_libraries(boompi_platform_rv1106 PRIVATE
+    boompi_vendor::rockchip_3a_aec)
+endif()
+if(BOOMPI_ENABLE_WEBRTC_VAD)
+  if(NOT BOOMPI_TARGET_RV1106)
+    message(FATAL_ERROR
+      "BOOMPI_ENABLE_WEBRTC_VAD requires BOOMPI_TARGET_RV1106=ON")
+  endif()
+  if(NOT IS_ABSOLUTE "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}" OR
+     NOT EXISTS "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}/webrtc_vad.h")
+    message(FATAL_ERROR
+      "BOOMPI_WEBRTC_VAD_INCLUDE_DIR must contain webrtc_vad.h")
+  endif()
+  if(NOT IS_ABSOLUTE "${BOOMPI_WEBRTC_VAD_LIBRARY}" OR
+     NOT EXISTS "${BOOMPI_WEBRTC_VAD_LIBRARY}")
+    message(FATAL_ERROR
+      "BOOMPI_WEBRTC_VAD_LIBRARY must name the RV1106 static library")
+  endif()
+  add_library(boompi_vendor_webrtc_vad STATIC IMPORTED GLOBAL)
+  set_target_properties(boompi_vendor_webrtc_vad PROPERTIES
+    IMPORTED_LOCATION "${BOOMPI_WEBRTC_VAD_LIBRARY}")
+  add_library(boompi_vendor::webrtc_vad ALIAS boompi_vendor_webrtc_vad)
+  target_sources(boompi_platform_rv1106 PRIVATE
+    src/platform/rv1106/webrtc_vad_gate.cpp)
+  target_include_directories(boompi_platform_rv1106 PRIVATE
+    "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}")
+  target_link_libraries(boompi_platform_rv1106 PRIVATE
+    boompi_vendor::webrtc_vad)
+endif()
 if(BOOMPI_ENABLE_SNOWBOY)
   add_library(boompi_snowboy_legacy_bridge STATIC
     src/platform/rv1106/snowboy_legacy_bridge.cpp)
@@ -330,6 +370,15 @@ if(BOOMPI_ENABLE_WSS_CLIENT AND BOOMPI_ENABLE_ALSA_PLAYBACK)
     boompi_network
     boompi_protocol
     Threads::Threads)
+endif()
+if(BOOMPI_ENABLE_SNOWBOY)
+  target_compile_definitions(boompi_client PRIVATE BOOMPI_ENABLE_SNOWBOY=1)
+endif()
+if(BOOMPI_ENABLE_ROCKCHIP_3A)
+  target_compile_definitions(boompi_client PRIVATE BOOMPI_ENABLE_ROCKCHIP_3A=1)
+endif()
+if(BOOMPI_ENABLE_WEBRTC_VAD)
+  target_compile_definitions(boompi_client PRIVATE BOOMPI_ENABLE_WEBRTC_VAD=1)
 endif()
 if(BOOMPI_TARGET_RV1106)
   target_compile_definitions(boompi_client PRIVATE BOOMPI_TARGET_RV1106=1)

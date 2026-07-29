@@ -23,15 +23,15 @@ int ReportFailure(const char* const operation, const boompi::Status& status) {
 int main(const int argc, char* argv[]) {
   if (argc > 2) {
     std::cerr << "usage: boompi-client "
-                 "[--check-config|--run-once|--manual-single-turn]\n";
+                 "[--check-config|--run-once|--manual-single-turn|--voice-loop]\n";
     return EXIT_FAILURE;
   }
 
   const std::string_view argument = argc == 2 ? argv[1] : "--run-once";
   if (argument != "--check-config" && argument != "--run-once" &&
-      argument != "--manual-single-turn") {
+      argument != "--manual-single-turn" && argument != "--voice-loop") {
     std::cerr << "usage: boompi-client "
-                 "[--check-config|--run-once|--manual-single-turn]\n";
+                 "[--check-config|--run-once|--manual-single-turn|--voice-loop]\n";
     return EXIT_FAILURE;
   }
 
@@ -60,9 +60,11 @@ int main(const int argc, char* argv[]) {
   }
 
   boompi::Status run_status = boompi::Status::Ok();
-  if (argument == "--manual-single-turn") {
+  if (argument == "--manual-single-turn" || argument == "--voice-loop") {
 #if defined(BOOMPI_ENABLE_MANUAL_SINGLE_TURN)
-    run_status = boompi::application::RunManualSingleTurnFromEnvironment();
+    run_status = argument == "--voice-loop"
+                     ? boompi::application::RunVoiceLoopFromEnvironment()
+                     : boompi::application::RunManualSingleTurnFromEnvironment();
 #else
     std::cerr << "boompi-client: manual single turn is unavailable in this "
                  "build\n";
@@ -74,7 +76,9 @@ int main(const int argc, char* argv[]) {
   }
   const auto stop_status = runtime.Stop();
   if (!run_status.ok()) {
-    return ReportFailure("manual single turn", run_status);
+    return ReportFailure(argument == "--voice-loop" ? "voice loop"
+                                                    : "manual single turn",
+                         run_status);
   }
   if (!stop_status.ok()) {
     return ReportFailure("runtime stop", stop_status);
