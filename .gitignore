@@ -35,6 +35,7 @@ CMakeUserPresets.json
 *.py[cod]
 
 # Runtime configuration and secrets
+.scp_voice_config
 .env
 .env.*
 !.env.example

@@ -2,11 +2,10 @@
 
 boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端负责连接 Qwen 新加坡区，板端不保存云端 API Key。
 
-> **P1 工程骨架已完成；当前第一闸门是 vendor 音频最小闭环。** direct ALSA 48 kHz
-> transport 真全双工已在当前板通过，但板上仍是旧 `RV1106-Atguigu`/`SingadcL` 镜像；
-> 下一步先对齐目标自定义 BSP，再实测通道/reference、`rk_mpi_ai`/`rk_mpi_ao` 和 Rockchip
-> 3A。此前的 renderer、queue、playback control、committer
-> 和 ALSA adapter 代码及测试保留为 host/交叉链接证据，但暂停扩展，不能冒充板端能力。
+> **当前已有真实 Qwen 纵向语音闭环 HIL 候选，但不是发布版。** 第三块 RV1106 板已观察到
+> Snowboy 唤醒、VAD 起止、语音 turn 提交、Qwen ASR/LLM/TTS 和扬声器回答；当前仍存在
+> 输入丢帧与接收/首音延迟高的问题，根因尚未定位。双麦 AEC、打断、三秒追问和播放稳定性
+> 也未完成产品验收，不能因一次听到回答就标为通过。
 
 ## 系统形态
 
@@ -15,7 +14,7 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
               |
       RV1106 boompi-client
               |
-      目标：局域网 WSS（当前 reverse-tunnel 离线单轮已通）
+      目标：局域网 WSS（当前开发链路经 Windows SSH tunnel）
               |
        boompi-server（Go）
               |
@@ -41,24 +40,22 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
   自定义 BSP、实际 capture 物理左右/极性和数字播放 reference slot 尚未通过。当前 DTB 的
   `TRCM clk-trcm=1` 只说明 TX/RX 共享 TX 时钟，不证明四通道；vendor VQE 样例选择的
   loopback Mode2 也是另一项尚未在本板验证的 mixer 设置。
-- Rockchip 3A 的板端加载、实际通道契约和 16 kHz 实时率；匹配 SDK 的 link-check 与
-  显式单帧 HIL 均已交叉构建，Linux fake 生命周期 6/6 通过，但两个 ELF 均未在板端执行。
-- Snowboy 的板端模型加载、准确率和实时率；旧 ARM 库的交叉链接候选已核对。
+- Rockchip 3A 已在 `voice9` 板端路径中初始化并参与固定帧处理，但输入连续性、实际通道契约、
+  AEC 效果和 16 kHz 实时率尚未验收；raw MPI 与数字播放 reference slot 也仍未闭环。
+- Snowboy 已在第三块板加载模型并多次检测到唤醒；误唤醒、漏唤醒、准确率和长期 CPU/RSS
+  尚未形成可重复基线。
 - 最终壳体下的 AEC、波束形成、双讲、远场和最大音量表现。
-- WSS 的正常局域网发现/配对、断网恢复、端到端 Qwen 会话、长期稳定性和 A/B 回滚；
-  固定 OpenSSL 3.5.7 的独立 SPKI 单轮 smoke 已在板端通过。
+- 经 Windows SSH tunnel 的 WSS 真实 Qwen 语音闭环曾跑通，服务端已切到连续
+  `server_commit` TTS；正常局域网发现/配对、断网恢复、输入丢帧、首音延迟、播放稳定性、
+  长期运行和 A/B 回滚仍未通过。
 
 ### 软件阶段
 
 P1 已建立 CMake/Go 构建、配置校验、协议 fixture 和跨平台 CI。P0 已确认匹配 BSP 的
-GCC 8.3/uClibc 工具链；Rockchip 3A 的 tests-off 默认 ALL 交叉链接和三个入口符号解析
-已通过。2026-07-27 的 Rockchip MPI 历史记录解析了 21 个 raw SYS/MB/AI/AO 生命周期符号；
-当前 link-check/HIL 加入精确 `RK_MPI_MB_GetSize` 后为 22 个。Snowboy/OpenBLAS 仍是 ABI/链接候选；
-板端能力仍是部分通过。当前镜像的只读探针只确认 `librockit.so`、AI/AO test、一个
-capture PCM、一个 playback PCM 和直接 3A 库存在，同时确认 VQE JSON 缺失；探针没有
-打开 PCM 或执行 vendor API。随后 direct ALSA 已在当前镜像按实际 48 kHz/S16_LE/2ch、
-480-frame period、1920-frame buffer 同时运行；raw MPI AI+AO、VQE 资源安装和 3A 实时率
-仍未闭环验证。
+GCC 8.3/uClibc 工具链；direct ALSA 48 kHz 全双工、Rockchip 3A 链接、Snowboy 链接与模型
+加载均已进入真实板端验证。2026-07-29 的 `voice9` 为 Debug + `-O2` HIL 候选，真实 Qwen
+纵向链路曾跑通；它同时暴露了输入丢帧、首音延迟高、历史 ALSA `EPIPE` 和播放队列满等
+未关闭问题。raw MPI AI+AO、VQE 资源安装、真实 reference、AEC 效果和 3A 实时率仍未闭环。
 具体路径、哈希、两个 Mode 的区别和 HIL 顺序见
 [2026-07-27 vendor 音频证据基线](docs/test/p0-vendor-audio-inventory-20260727.md)。
 3A 交叉链接的命令、ELF 结果和严格边界另见
@@ -82,6 +79,10 @@ Qwen，也不会消耗付费额度。
 状态机，也不证明 slot 0 信号质量、声学可听、真全双工、双麦或 AEC。证据与边界见
 [P1 C++ WSS 单轮闭环验证记录](docs/test/p1-cpp-wss-client-validation-20260728.md)和
 [RV1106 手动单轮 HIL 验证记录](docs/test/p1-rv1106-manual-single-turn-hil-validation-20260728.md)。
+
+2026-07-29 的真实 Qwen 常驻语音闭环、连续 TTS 服务端、`voice9` 二进制哈希和未解决问题见
+[Qwen Voice Loop HIL 快照](docs/test/qwen-voice-loop-hil-snapshot-20260729.md)。该记录明确标为
+HIL 调试快照，不是 production release。
 
 同日 direct ALSA 有界探针又完成两轮真实全双工：默认 `SingadcL` 时 transport 通过但
 第二 slot 恒为 `-32768`；临时切到 `DiffadcLR` 后两个 slot 均出现非恒定样本，本次 PCM 聚合没有
