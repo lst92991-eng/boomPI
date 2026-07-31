@@ -29,7 +29,7 @@ func TestContinuousTTSSessionUsesLowLatencyCommitAndFinish(t *testing.T) {
 	defer connection.Close()
 
 	fragments := make(chan string, 2)
-	fragments <- "第一句。"
+	fragments <- "第一句 **正确**。"
 	fragments <- "第二句。"
 	close(fragments)
 	client := &ttsClient{config: Config{TTSVoice: "Cherry", Timeout: 2 * time.Second}}
@@ -129,7 +129,7 @@ func serveContinuousTTSSession(response http.ResponseWriter, request *http.Reque
 		return err
 	}
 
-	for index, wantText := range []string{"第一句。", "第二句。"} {
+	for index, wantText := range []string{"第一句 正确。", "第二句。"} {
 		var appendEvent struct {
 			Type string `json:"type"`
 			Text string `json:"text"`

@@ -18,6 +18,7 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t kPreRollFrames = 25U;
+constexpr unsigned kFollowUpNearFrames = 6U;
 
 class EventQueue final {
  public:
@@ -168,7 +169,7 @@ class Client final {
       case InboundKind::kDone:
         std::cout << std::endl;
         if (audio_.playing() && !audio_.EndPlayback()) LoseConnection("playback finish failed");
-        else if (audio_.playback_done()) FinishTurn(true); else state_ = State::kDrain;
+        else state_ = State::kDrain;
         break;
       case InboundKind::kCancelled:
         if (state_ == State::kBarge) ResumeAfterBarge();
@@ -186,12 +187,16 @@ class Client final {
   }
 
   void FinishTurn(bool normal) {
-    audio_.Duck(false); near_frames_ = 0U; pre_head_ = pre_count_ = 0U;
+    // Keep the last 500 ms across playback -> follow-up. Speech can begin in
+    // the final sub-160 ms playback window without reaching the barge gate.
+    audio_.Duck(false); if (!normal) near_frames_ = 0U;
+    const bool carry_speech = normal && near_frames_ != 0U;
     barge_ended_ = finish_after_start_ = false;
     if (!normal) audio_.DropPlayback();
     if (!AdvanceTurn()) return;
-    ResetListener();
+    if (!carry_speech) ResetListener();
     state_ = State::kFollowUp; deadline_ = Clock::now() + std::chrono::seconds(3);
+    if (normal && near_frames_ >= kFollowUpNearFrames) StartTurn();
   }
 
   void ResumeAfterBarge() {
@@ -216,6 +221,16 @@ class Client final {
   }
 
   bool StartTurn() {
+    const std::size_t buffered = pre_count_;
+    const std::uint64_t first_sequence = buffered == 0U
+        ? 0U : pre_[pre_head_].sequence;
+    for (std::size_t i = 1U; i < buffered; ++i) {
+      const auto previous = pre_[(pre_head_ + i - 1U) % pre_.size()].sequence;
+      const auto current = pre_[(pre_head_ + i) % pre_.size()].sequence;
+      if (current != previous + 1U) {
+        LoseConnection("pre-roll capture sequence gap"); return false;
+      }
+    }
     if (ids_.session == 0U ||
         !SendControl(ControlKind::kTurnStart, ids_)) {
       LoseConnection("turn.start failed"); return false;
@@ -225,8 +240,14 @@ class Client final {
       if (!SendAudio(pre_[(pre_head_ + i) % pre_.size()], false)) {
         LoseConnection("pre-roll upload failed"); return false;
       }
+    const std::uint64_t last_sequence = buffered == 0U
+        ? 0U : pre_[(pre_head_ + buffered - 1U) % pre_.size()].sequence;
     pre_head_ = pre_count_ = 0U;
-    std::cout << "boompi-client: VAD speech started" << std::endl; return true;
+    std::cout << "boompi-client: VAD speech started; pre_roll_frames="
+              << buffered << "; pre_roll_ms=" << buffered * 20U
+              << "; capture_sequence=" << first_sequence << '-'
+              << last_sequence << std::endl;
+    return true;
   }
 
   void Commit(const CaptureFrame& frame) {
@@ -288,7 +309,13 @@ class Client final {
           ResetListener();
         }
         break;
-      case State::kWaitSpeech: case State::kFollowUp: if (frame.vad_started) StartTurn(); break;
+      case State::kWaitSpeech:
+        if (frame.vad_started) StartTurn();
+        break;
+      case State::kFollowUp:
+        if (!frame.near_voice) near_frames_ = 0U;
+        else if (++near_frames_ >= kFollowUpNearFrames) StartTurn();
+        break;
       case State::kCapture:
         if (finish_after_start_ || frame.vad_ended ||
             turn_frames_ >= 2999U) {
@@ -298,7 +325,12 @@ class Client final {
         break;
       case State::kSpeak: HandleBarge(frame, true); break;
       case State::kBarge: if (frame.vad_ended) barge_ended_ = true; break;
-      case State::kDrain: if (audio_.playback_done()) FinishTurn(true); else HandleBarge(frame, false); break;
+      case State::kDrain:
+        if (audio_.playback_done()) {
+          if (!frame.near_voice) near_frames_ = 0U; else ++near_frames_;
+          FinishTurn(true);
+        } else HandleBarge(frame, false);
+        break;
       default: break;
     }
   }

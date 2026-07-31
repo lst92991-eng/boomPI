@@ -183,6 +183,7 @@ func (c *ttsClient) writeContinuousText(
 	fragments <-chan string,
 ) error {
 	synthesized := false
+	filter := newTTSTextFilter()
 	var pending strings.Builder
 	pendingUnits := 0
 	timer := time.NewTimer(time.Hour)
@@ -232,6 +233,9 @@ func (c *ttsClient) writeContinuousText(
 			}
 		case fragment, ok := <-fragments:
 			if !ok {
+				tail := filter.Finish()
+				pending.WriteString(tail)
+				pendingUnits += ttsTextUnits(tail)
 				if err := flush(); err != nil {
 					return err
 				}
@@ -245,9 +249,13 @@ func (c *ttsClient) writeContinuousText(
 			if fragment == "" {
 				continue
 			}
-			pending.WriteString(fragment)
-			pendingUnits += ttsTextUnits(fragment)
-			if containsTTSSentenceBoundary(fragment) ||
+			text := filter.Write(fragment)
+			if text == "" {
+				continue
+			}
+			pending.WriteString(text)
+			pendingUnits += ttsTextUnits(text)
+			if containsTTSSentenceBoundary(text) ||
 				pendingUnits >= ttsCommitMaxUnits {
 				if err := flush(); err != nil {
 					return err

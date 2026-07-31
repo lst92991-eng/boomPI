@@ -30,6 +30,7 @@ constexpr std::size_t kCapture48Frames = 960U, kVoice16Frames = 320U;
 constexpr std::size_t kTts24Frames = 480U, kTtsSlots = 75U;
 constexpr std::size_t kReferenceSlots = 16U, kReferenceLead = 3U;
 constexpr std::uint32_t kFrameMs = 20U;
+constexpr std::uint32_t kBargeWarmupFrames = 600U / kFrameMs;
 
 int OpenPcm(const std::string& name, snd_pcm_stream_t stream, snd_pcm_t** output, const char** stage) noexcept {
   constexpr int flags = SND_PCM_NO_AUTO_RESAMPLE | SND_PCM_NO_AUTO_CHANNELS | SND_PCM_NO_AUTO_FORMAT;
@@ -108,7 +109,7 @@ struct AudioEngine::Impl final {
   std::size_t ref_head{0U}, ref_tail{0U}, ref_count{0U}, ref48_used{0U};
   std::uint64_t capture_sequence{0U}, next_tts_sequence{0U};
   std::uint32_t vad_speech_ms{0U}, vad_silence_ms{0U};
-  std::uint32_t echo_tail{0U}, echo_calibration{0U}, echo_hold{0U};
+  std::uint32_t echo_tail{0U}, echo_calibration{0U}, echo_hold{0U}, barge_warmup{0U};
   std::uint8_t echo_votes{0U};
   double previous_mic{0.0}, previous_ref{0.0}, ref_envelope{0.0};
   double mic_ratio{0.0}, output_ratio{0.0}, output_floor{1.0};
@@ -145,11 +146,21 @@ struct AudioEngine::Impl final {
     return swr_convert(swr, out, output_frames, in, input_frames) >= 0;
   }
 
-  bool ResetListener() noexcept {
-    int reset = 0;
-    if (boompi_snowboy_legacy_reset(snowboy, &reset) != BOOMPI_SNOWBOY_LEGACY_OK || WebRtcVad_Init(vad) != 0 || WebRtcVad_set_mode(vad, config.vad_mode) != 0) return false;
+  bool ResetVad() noexcept {
+    if (WebRtcVad_Init(vad) != 0 || WebRtcVad_set_mode(vad, config.vad_mode) != 0) return false;
     vad_speech_ms = vad_silence_ms = 0U; vad_in_speech = false;
     return true;
+  }
+
+  bool ResetListener() noexcept {
+    int reset = 0;
+    return boompi_snowboy_legacy_reset(snowboy, &reset) == BOOMPI_SNOWBOY_LEGACY_OK && ResetVad();
+  }
+
+  void ResetEchoWindow() noexcept {
+    echo_tail = echo_calibration = echo_hold = 0U; echo_votes = 0U;
+    previous_mic = previous_ref = ref_envelope = mic_ratio = output_ratio = 0.0;
+    previous_valid = previous_ref_aligned = false;
   }
 
   bool ResetFrontEnd() noexcept {
@@ -157,9 +168,7 @@ struct AudioEngine::Impl final {
     if (!ResetSwr(capture_swr, capture48.data(), kCapture48Frames, kVoice16Frames, capture16.data())) return false;
     dsp.Close();
     if (dsp.Open() != platform::rv1106::RockchipVoiceDspStatus::kOk || !ResetListener()) return false;
-    echo_tail = echo_calibration = echo_hold = 0U; echo_votes = 0U;
-    previous_mic = previous_ref = ref_envelope = mic_ratio = output_ratio = 0.0;
-    output_floor = 1.0; previous_valid = previous_ref_aligned = false;
+    barge_warmup = 0U; ResetEchoWindow(); output_floor = 1.0;
     return true;
   }
 
@@ -414,6 +423,16 @@ bool AudioEngine::Capture(CaptureFrame* frame) noexcept {
   frame->wake = detection > 0;
   if (!impl_->UpdateVad(frame)) { impl_->SetError("WebRTC VAD processing failed"); return false; }
   impl_->UpdateEcho(aligned, frame);
+  if (impl_->barge_warmup != 0U) {
+    frame->near_voice = false;
+    if (!impl_->is_playing.load(std::memory_order_acquire)) {
+      impl_->barge_warmup = 0U;
+      if (!impl_->ResetVad()) { impl_->SetError("barge-in VAD reset failed"); return false; }
+    } else if ((aligned || impl_->barge_warmup < kBargeWarmupFrames) &&
+        --impl_->barge_warmup == 0U && !impl_->ResetVad()) {
+      impl_->SetError("barge-in VAD reset failed"); return false;
+    }
+  }
   frame->pcm = impl_->processed;
   return true;
 }
@@ -456,12 +475,13 @@ bool AudioEngine::BeginPlayback() noexcept {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (impl_->active) return false;
   impl_->ClearQueue(); impl_->ClearReferences(false); impl_->ref_broken = false;
+  impl_->ResetEchoWindow();
   impl_->playback24.fill(0); impl_->reference48.fill(0);
   if (!impl_->ResetSwr(impl_->playback_swr, impl_->playback24.data(), kTts24Frames, impl_->playback48.size(), impl_->playback48.data()) ||
       !impl_->ResetSwr(impl_->reference_swr, impl_->reference48.data(), kCapture48Frames, kVoice16Frames, impl_->reference.data())) {
     impl_->SetError("playback resampler reset failed"); return false;
   }
-  impl_->sequence_set = impl_->ending = impl_->drop = false; impl_->active = true;
+  impl_->sequence_set = impl_->ending = impl_->drop = false; impl_->active = true; impl_->barge_warmup = kBargeWarmupFrames;
   impl_->is_playing.store(true, std::memory_order_release); impl_->is_done.store(false, std::memory_order_release);
   return true;
 }
