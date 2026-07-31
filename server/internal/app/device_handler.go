@@ -12,10 +12,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/lst92991-eng/boomPI/server/internal/backend"
 	"github.com/lst92991-eng/boomPI/server/internal/config"
 	"github.com/lst92991-eng/boomPI/server/internal/protocol"
@@ -123,7 +125,15 @@ type connectionState struct {
 	monotonicStart time.Time
 }
 
-func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connection) error {
+func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connection) (result error) {
+	deviceRef := "unidentified"
+	sessionCtx := ctx
+	defer func() {
+		if errorCode, report := deviceSessionErrorCode(sessionCtx, result); report {
+			h.logger.Warn("device session ended with error", "device_ref", deviceRef,
+				"error_code", errorCode)
+		}
+	}()
 	helloCtx, cancelHello := context.WithTimeout(ctx, helloAuthenticationTimeout)
 	first, err := connection.Receive(helloCtx)
 	cancelHello()
@@ -167,11 +177,12 @@ func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connec
 	}); err != nil {
 		return err
 	}
-	deviceRef := redactedDeviceRef(hello.DeviceID)
+	deviceRef = redactedDeviceRef(hello.DeviceID)
 	h.logger.Info("device connected", "device_ref", deviceRef)
 	defer h.logger.Info("device disconnected", "device_ref", deviceRef)
 
 	workerCtx, stopWorker := context.WithCancelCause(ctx)
+	sessionCtx = workerCtx
 	workerDone := make(chan error, 1)
 	go func() {
 		err := h.forwardEvents(workerCtx, connection, actor, state)
@@ -200,6 +211,41 @@ func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connec
 			return err
 		}
 	}
+}
+
+func deviceSessionErrorCode(ctx context.Context, result error) (string, bool) {
+	if result == nil {
+		return "", false
+	}
+	errorToClassify := result
+	if errors.Is(result, context.Canceled) && ctx != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			errorToClassify = cause
+		}
+	}
+	if errors.Is(errorToClassify, context.Canceled) ||
+		errors.Is(errorToClassify, io.EOF) {
+		return "", false
+	}
+	var closeError *websocket.CloseError
+	if errors.As(errorToClassify, &closeError) {
+		if closeError.Code == websocket.CloseNormalClosure ||
+			closeError.Code == websocket.CloseGoingAway {
+			return "", false
+		}
+		return "peer_disconnected", true
+	}
+	if errors.Is(errorToClassify, context.DeadlineExceeded) {
+		return "timeout", true
+	}
+	var networkError net.Error
+	if errors.As(errorToClassify, &networkError) {
+		if networkError.Timeout() {
+			return "network_timeout", true
+		}
+		return "network_error", true
+	}
+	return "session_error", true
 }
 
 func authenticateHello(payload json.RawMessage, expectedToken string) error {

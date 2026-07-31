@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -273,6 +274,64 @@ func TestDeviceHelloTimesOutBeforeProviderOpen(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server did not stop")
+	}
+}
+
+func TestDeviceSessionErrorCode(t *testing.T) {
+	abnormalClose := &websocket.CloseError{
+		Code: websocket.CloseAbnormalClosure,
+		Text: "private peer details",
+	}
+	workerFailureCtx, cancelWorkerFailure := context.WithCancelCause(context.Background())
+	cancelWorkerFailure(abnormalClose)
+	cleanupCtx, cancelCleanup := context.WithCancelCause(context.Background())
+	cancelCleanup(context.Canceled)
+
+	testCases := []struct {
+		name       string
+		ctx        context.Context
+		err        error
+		wantCode   string
+		wantReport bool
+	}{
+		{name: "nil result", ctx: context.Background()},
+		{name: "normal cancellation", ctx: cleanupCtx, err: context.Canceled},
+		{name: "EOF", ctx: context.Background(), err: fmt.Errorf("receive: %w", io.EOF)},
+		{
+			name: "normal WebSocket close", ctx: context.Background(),
+			err: &websocket.CloseError{Code: websocket.CloseNormalClosure, Text: "normal"},
+		},
+		{
+			name: "WebSocket going away", ctx: context.Background(),
+			err: &websocket.CloseError{Code: websocket.CloseGoingAway, Text: "restart"},
+		},
+		{
+			name: "worker cause recovered from canceled receive", ctx: workerFailureCtx,
+			err:      fmt.Errorf("receive: %w", context.Canceled),
+			wantCode: "peer_disconnected", wantReport: true,
+		},
+		{
+			name: "actual close is not masked by cleanup cancellation", ctx: cleanupCtx,
+			err: abnormalClose, wantCode: "peer_disconnected", wantReport: true,
+		},
+		{
+			name: "deadline", ctx: context.Background(), err: context.DeadlineExceeded,
+			wantCode: "timeout", wantReport: true,
+		},
+		{
+			name: "generic failure", ctx: context.Background(), err: errors.New("private internal details"),
+			wantCode: "session_error", wantReport: true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			gotCode, gotReport := deviceSessionErrorCode(testCase.ctx, testCase.err)
+			if gotCode != testCase.wantCode || gotReport != testCase.wantReport {
+				t.Fatalf("deviceSessionErrorCode() = (%q, %t), want (%q, %t)",
+					gotCode, gotReport, testCase.wantCode, testCase.wantReport)
+			}
+		})
 	}
 }
 
