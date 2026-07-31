@@ -114,12 +114,12 @@ func Defaults() Config {
 		ConversationMode:     "realtime",
 		Model:                "qwen3.5-omni-plus-realtime",
 		ASRModel:             "qwen3-asr-flash",
-		ReasoningModel:       "qwen3.7-max",
-		ReasoningEffort:      "medium",
+		ReasoningModel:       "qwen3.6-flash",
+		ReasoningEffort:      "none",
 		TTSModel:             "qwen3-tts-flash-realtime",
 		TTSVoice:             "Ethan",
 		Voice:                "Ethan",
-		SearchMode:           "auto",
+		SearchMode:           "off",
 		SystemPrompt:         "You are boomPI, a concise and helpful voice assistant. Reply in Simplified Chinese unless the user asks for another language.",
 		Persona:              "Natural, young, friendly, and not overly cute.",
 		HeartbeatInterval:    10 * time.Second,
@@ -249,8 +249,8 @@ func (c Config) Validate() error {
 			return fmt.Errorf("%s must contain 1..128 characters without control characters", name)
 		}
 	}
-	if !oneOf(c.ReasoningEffort, "low", "medium", "high") {
-		return errors.New("reasoning_effort must be low, medium, or high")
+	if !oneOf(c.ReasoningEffort, "none", "minimal", "low", "medium", "high") {
+		return errors.New("reasoning_effort must be none, minimal, low, medium, or high")
 	}
 	if strings.TrimSpace(c.Voice) == "" || len(c.Voice) > 64 || strings.IndexFunc(c.Voice, unicode.IsControl) >= 0 {
 		return errors.New("voice must contain 1..64 characters without control characters")

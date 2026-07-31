@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"time"
 )
 
 const maxProviderResponseBytes = 8 * 1024 * 1024
@@ -27,10 +29,30 @@ type httpClients struct {
 }
 
 func newHTTPClients(config Config) *httpClients {
-	return &httpClients{config: config, client: &http.Client{Timeout: config.Timeout}}
+	dialTimeout := config.Timeout
+	if dialTimeout > 10*time.Second {
+		dialTimeout = 10 * time.Second
+	}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          32,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   dialTimeout,
+		ResponseHeaderTimeout: config.Timeout,
+		ExpectContinueTimeout: time.Second,
+	}
+	// Do not put a whole-request timeout on a streaming response. The header
+	// deadline bounds first response latency; provider activity and the device
+	// watchdog bound stalls while allowing a healthy long answer to continue.
+	return &httpClients{config: config, client: &http.Client{Transport: transport}}
 }
 
 func (c *httpClients) transcribe(ctx context.Context, pcm []byte) (string, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
+	defer cancel()
 	wav, err := pcm16MonoWAV(pcm, 16000)
 	if err != nil {
 		return "", err
@@ -62,7 +84,7 @@ func (c *httpClients) transcribe(ctx context.Context, pcm []byte) (string, error
 			} `json:"message"`
 		} `json:"choices"`
 	}
-	if err := c.postJSON(ctx, c.config.compatibleBaseURL()+"/chat/completions", payload, &response); err != nil {
+	if err := c.postJSON(requestCtx, c.config.compatibleBaseURL()+"/chat/completions", payload, &response); err != nil {
 		return "", fmt.Errorf("Qwen ASR: %w", err)
 	}
 	if len(response.Choices) == 0 || strings.TrimSpace(response.Choices[0].Message.Content) == "" {
@@ -72,6 +94,8 @@ func (c *httpClients) transcribe(ctx context.Context, pcm []byte) (string, error
 }
 
 func (c *httpClients) complete(ctx context.Context, instructions string, history []chatMessage) (string, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
+	defer cancel()
 	payload := struct {
 		Model        string        `json:"model"`
 		Instructions string        `json:"instructions"`
@@ -98,7 +122,7 @@ func (c *httpClients) complete(ctx context.Context, instructions string, history
 			} `json:"content"`
 		} `json:"output"`
 	}
-	if err := c.postJSON(ctx, c.config.compatibleBaseURL()+"/responses", payload, &response); err != nil {
+	if err := c.postJSON(requestCtx, c.config.compatibleBaseURL()+"/responses", payload, &response); err != nil {
 		return "", fmt.Errorf("Qwen reasoning: %w", err)
 	}
 	var answer strings.Builder

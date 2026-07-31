@@ -15,18 +15,20 @@ const (
 )
 
 type Config struct {
-	APIKey          string
-	WorkspaceID     string
-	Region          string
-	ASRModel        string
-	ReasoningModel  string
-	ReasoningEffort string
-	TTSModel        string
-	TTSVoice        string
-	SearchMode      string
-	Timeout         time.Duration
-	QueueSize       int
-	Logger          *slog.Logger
+	APIKey           string
+	WorkspaceID      string
+	Region           string
+	ASRModel         string
+	ReasoningModel   string
+	ReasoningEffort  string
+	TTSModel         string
+	TTSVoice         string
+	SearchMode       string
+	Timeout          time.Duration
+	QueueSize        int
+	MaxTurns         int
+	MaxContextTokens int
+	Logger           *slog.Logger
 }
 
 func (c Config) validate() error {
@@ -44,8 +46,10 @@ func (c Config) validate() error {
 			return fmt.Errorf("%s is required", name)
 		}
 	}
-	if c.ReasoningEffort != "low" && c.ReasoningEffort != "medium" && c.ReasoningEffort != "high" {
-		return errors.New("reasoning effort must be low, medium, or high")
+	if c.ReasoningEffort != "none" && c.ReasoningEffort != "minimal" &&
+		c.ReasoningEffort != "low" && c.ReasoningEffort != "medium" &&
+		c.ReasoningEffort != "high" {
+		return errors.New("reasoning effort must be none, minimal, low, medium, or high")
 	}
 	if c.SearchMode != "auto" && c.SearchMode != "off" {
 		return errors.New("search mode must be auto or off")
@@ -55,6 +59,12 @@ func (c Config) validate() error {
 	}
 	if c.QueueSize < 8 || c.QueueSize > 4096 {
 		return errors.New("pipeline queue size must be between 8 and 4096")
+	}
+	if c.MaxTurns < 1 || c.MaxTurns > 100 {
+		return errors.New("pipeline max turns must be between 1 and 100")
+	}
+	if c.MaxContextTokens < 1024 || c.MaxContextTokens > 1_000_000 {
+		return errors.New("pipeline max context tokens must be between 1024 and 1000000")
 	}
 	return nil
 }

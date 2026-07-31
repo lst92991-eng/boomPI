@@ -22,7 +22,10 @@ const (
 	maxTTSFragmentUnits         = 1600
 	maxTTSPCMDeltaBytes         = 64 * 1024
 	maxTTSWebSocketMessageBytes = 128 * 1024
+	ttsCommitMaxUnits           = 80
 )
+
+const ttsCommitIdle = 120 * time.Millisecond
 
 type ttsClient struct {
 	config Config
@@ -90,7 +93,7 @@ func (c *ttsClient) synthesizeConnectedStream(
 		"event_id": eventID(),
 		"type":     "session.update",
 		"session": map[string]any{
-			"voice": c.config.TTSVoice, "mode": "server_commit",
+			"voice": c.config.TTSVoice, "mode": "commit",
 			"language_type": "Chinese", "response_format": "pcm",
 			"sample_rate": 24000,
 		},
@@ -180,12 +183,58 @@ func (c *ttsClient) writeContinuousText(
 	fragments <-chan string,
 ) error {
 	synthesized := false
+	var pending strings.Builder
+	pendingUnits := 0
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+	var timerC <-chan time.Time
+	armTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(ttsCommitIdle)
+		timerC = timer.C
+	}
+	flush := func() error {
+		text := pending.String()
+		pending.Reset()
+		pendingUnits = 0
+		timerC = nil
+		if strings.TrimSpace(text) == "" {
+			return nil
+		}
+		if err := c.writeJSON(connection, map[string]any{
+			"event_id": eventID(), "type": "input_text_buffer.append", "text": text,
+		}); err != nil {
+			return err
+		}
+		if err := c.writeJSON(connection, map[string]any{
+			"event_id": eventID(), "type": "input_text_buffer.commit",
+		}); err != nil {
+			return err
+		}
+		synthesized = true
+		return nil
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-timerC:
+			if err := flush(); err != nil {
+				return err
+			}
 		case fragment, ok := <-fragments:
 			if !ok {
+				if err := flush(); err != nil {
+					return err
+				}
 				if !synthesized {
 					return errors.New("Qwen TTS input text is empty")
 				}
@@ -196,14 +245,27 @@ func (c *ttsClient) writeContinuousText(
 			if fragment == "" {
 				continue
 			}
-			if err := c.writeJSON(connection, map[string]any{
-				"event_id": eventID(), "type": "input_text_buffer.append", "text": fragment,
-			}); err != nil {
-				return err
+			pending.WriteString(fragment)
+			pendingUnits += ttsTextUnits(fragment)
+			if containsTTSSentenceBoundary(fragment) ||
+				pendingUnits >= ttsCommitMaxUnits {
+				if err := flush(); err != nil {
+					return err
+				}
+			} else {
+				armTimer()
 			}
-			synthesized = true
 		}
 	}
+}
+
+func containsTTSSentenceBoundary(text string) bool {
+	for _, value := range text {
+		if isTTSSentenceBoundary(value) {
+			return true
+		}
+	}
+	return false
 }
 
 func splitTTSFragments(text string, maxUnits int) []string {

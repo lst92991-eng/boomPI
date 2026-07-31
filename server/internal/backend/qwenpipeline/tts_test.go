@@ -14,7 +14,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func TestContinuousTTSSessionUsesServerCommitAndFinish(t *testing.T) {
+func TestContinuousTTSSessionUsesLowLatencyCommitAndFinish(t *testing.T) {
 	serverResult := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		serverResult <- serveContinuousTTSSession(response, request)
@@ -121,7 +121,7 @@ func serveContinuousTTSSession(response http.ResponseWriter, request *http.Reque
 	if err := connection.ReadJSON(&update); err != nil {
 		return err
 	}
-	if update.Type != "session.update" || update.Session.Mode != "server_commit" ||
+	if update.Type != "session.update" || update.Session.Mode != "commit" ||
 		update.Session.ResponseFormat != "pcm" || update.Session.SampleRate != 24000 {
 		return fmt.Errorf("unexpected session.update: %+v", update)
 	}
@@ -139,6 +139,15 @@ func serveContinuousTTSSession(response http.ResponseWriter, request *http.Reque
 		}
 		if appendEvent.Type != "input_text_buffer.append" || appendEvent.Text != wantText {
 			return fmt.Errorf("append event %d = %+v", index, appendEvent)
+		}
+		var commitEvent struct {
+			Type string `json:"type"`
+		}
+		if err := connection.ReadJSON(&commitEvent); err != nil {
+			return err
+		}
+		if commitEvent.Type != "input_text_buffer.commit" {
+			return fmt.Errorf("commit event %d = %+v", index, commitEvent)
 		}
 		pcm := []byte{byte(index*2 + 1), byte(index*2 + 2)}
 		if err := connection.WriteJSON(map[string]any{
@@ -190,7 +199,7 @@ func serveIncompleteTTSSession(
 	if err := connection.WriteJSON(map[string]any{"type": "session.updated"}); err != nil {
 		return err
 	}
-	for _, wantType := range []string{"input_text_buffer.append", "session.finish"} {
+	for _, wantType := range []string{"input_text_buffer.append", "input_text_buffer.commit", "session.finish"} {
 		var event struct {
 			Type string `json:"type"`
 		}

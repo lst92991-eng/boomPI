@@ -41,18 +41,20 @@ func New(cfg config.Config, logger *slog.Logger, identityDirectory string) (*App
 func newQwenBackend(cfg config.Config, logger *slog.Logger) (backend.ConversationBackend, error) {
 	if cfg.ConversationMode == "intelligence" {
 		return qwenpipeline.New(qwenpipeline.Config{
-			APIKey:          cfg.Credentials.APIKey(),
-			WorkspaceID:     cfg.Credentials.WorkspaceID(),
-			Region:          cfg.Region,
-			ASRModel:        cfg.ASRModel,
-			ReasoningModel:  cfg.ReasoningModel,
-			ReasoningEffort: cfg.ReasoningEffort,
-			TTSModel:        cfg.TTSModel,
-			TTSVoice:        cfg.TTSVoice,
-			SearchMode:      cfg.SearchMode,
-			Timeout:         cfg.FirstResponseTimeout,
-			QueueSize:       64,
-			Logger:          logger,
+			APIKey:           cfg.Credentials.APIKey(),
+			WorkspaceID:      cfg.Credentials.WorkspaceID(),
+			Region:           cfg.Region,
+			ASRModel:         cfg.ASRModel,
+			ReasoningModel:   cfg.ReasoningModel,
+			ReasoningEffort:  cfg.ReasoningEffort,
+			TTSModel:         cfg.TTSModel,
+			TTSVoice:         cfg.TTSVoice,
+			SearchMode:       cfg.SearchMode,
+			Timeout:          cfg.FirstResponseTimeout,
+			QueueSize:        64,
+			MaxTurns:         cfg.MaxTurns,
+			MaxContextTokens: cfg.MaxContextTokens,
+			Logger:           logger,
 		})
 	}
 	return qwen.New(qwen.Config{
@@ -101,6 +103,8 @@ func (a *App) Run(ctx context.Context) error {
 		"conversation_mode", a.cfg.ConversationMode,
 		"model", a.cfg.Model,
 		"reasoning_model", a.cfg.ReasoningModel,
+		"reasoning_effort", a.cfg.ReasoningEffort,
+		"search_mode", a.cfg.SearchMode,
 		"voice", a.cfg.Voice,
 		"credential_source", a.cfg.Credentials.Source(),
 		"tls_spki_sha256", a.spkiPin,
