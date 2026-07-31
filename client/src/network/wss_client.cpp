@@ -234,10 +234,16 @@ bool ConnectIsInProgress() {
 Status WaitForSocket(const NativeSocket socket,
                      const bool wait_for_read,
                      const Deadline deadline,
-                     const std::atomic<bool>& stop_requested) {
+                     const std::atomic<bool>& stop_requested,
+                     std::atomic<bool>* const interrupt_requested = nullptr) {
   for (;;) {
     if (stop_requested.load(std::memory_order_acquire)) {
       return CancelledStatus();
+    }
+    if (interrupt_requested != nullptr &&
+        interrupt_requested->exchange(false, std::memory_order_acq_rel)) {
+      return Status::Error(StatusCode::kInterrupted,
+                           "network receive interrupted");
     }
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
@@ -246,10 +252,12 @@ Status WaitForSocket(const NativeSocket socket,
     }
     const auto remaining_us =
         std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
+    const auto wait_us =
+        std::min(remaining_us, std::chrono::microseconds(20000));
 #if defined(_WIN32)
     timeval timeout{};
-    timeout.tv_sec = static_cast<long>(remaining_us.count() / 1000000);
-    timeout.tv_usec = static_cast<long>(remaining_us.count() % 1000000);
+    timeout.tv_sec = static_cast<long>(wait_us.count() / 1000000);
+    timeout.tv_usec = static_cast<long>(wait_us.count() % 1000000);
 
     fd_set read_set;
     fd_set write_set;
@@ -268,11 +276,16 @@ Status WaitForSocket(const NativeSocket socket,
     descriptor.fd = socket;
     descriptor.events = wait_for_read ? POLLIN : POLLOUT;
     const auto timeout_ms =
-        static_cast<int>((remaining_us.count() + 999) / 1000);
+        static_cast<int>((wait_us.count() + 999) / 1000);
     const int result = poll(&descriptor, 1U, timeout_ms);
 #endif
     if (stop_requested.load(std::memory_order_acquire)) {
       return CancelledStatus();
+    }
+    if (interrupt_requested != nullptr &&
+        interrupt_requested->exchange(false, std::memory_order_acq_rel)) {
+      return Status::Error(StatusCode::kInterrupted,
+                           "network receive interrupted");
     }
     if (result > 0) {
 #if !defined(_WIN32)
@@ -284,8 +297,7 @@ Status WaitForSocket(const NativeSocket socket,
       return Status::Ok();
     }
     if (result == 0) {
-      return Status::Error(StatusCode::kResourceExhausted,
-                           "network operation timed out");
+      continue;
     }
 #if !defined(_WIN32)
     if (errno == EINTR) {
@@ -501,6 +513,7 @@ class WssClient::Impl final {
                  std::size_t payload_size_bytes);
   Status SendKeepAlivePong();
   Status Receive(WssInboundMessage* output);
+  void RequestReceiveInterrupt() noexcept;
   void RequestStop() noexcept;
   void Close() noexcept;
   bool connected() const noexcept { return connected_; }
@@ -515,7 +528,8 @@ class WssClient::Impl final {
                   const Deadline deadline);
   Status ReadTls(std::uint8_t* data,
                  std::size_t data_size,
-                 const Deadline deadline);
+                 const Deadline deadline,
+                 bool allow_interrupt = false);
   Status SendFrame(std::uint8_t opcode,
                    const std::uint8_t* payload,
                    std::size_t payload_size,
@@ -532,7 +546,11 @@ class WssClient::Impl final {
   SSL* tls_{nullptr};
   bool connected_{false};
   std::atomic<bool> stop_requested_{false};
+  std::atomic<bool> receive_interrupt_requested_{false};
   std::mutex socket_lifetime_mutex_;
+  std::mutex write_mutex_;
+  std::vector<std::uint8_t> pcm_message_;
+  std::vector<std::uint8_t> write_frame_;
 };
 
 Status WssClient::Impl::Connect() {
@@ -542,6 +560,7 @@ Status WssClient::Impl::Connect() {
                          "WSS client is already connected");
   }
   stop_requested_.store(false, std::memory_order_release);
+  receive_interrupt_requested_.store(false, std::memory_order_release);
   const auto config_status = ValidateWssClientConfig(config_);
   if (!config_status.ok()) {
     return config_status;
@@ -908,7 +927,8 @@ Status WssClient::Impl::WriteTls(const std::uint8_t* data,
 
 Status WssClient::Impl::ReadTls(std::uint8_t* data,
                                 const std::size_t data_size,
-                                const Deadline deadline) {
+                                const Deadline deadline,
+                                const bool allow_interrupt) {
 #if !defined(_WIN32)
   ScopedSigpipeBlock sigpipe_block;
   if (!sigpipe_block.ready()) {
@@ -920,6 +940,12 @@ Status WssClient::Impl::ReadTls(std::uint8_t* data,
   while (offset < data_size) {
     if (stop_requested_.load(std::memory_order_acquire)) {
       return CancelledStatus();
+    }
+    if (allow_interrupt && offset == 0U &&
+        receive_interrupt_requested_.exchange(false,
+                                              std::memory_order_acq_rel)) {
+      return Status::Error(StatusCode::kInterrupted,
+                           "network receive interrupted");
     }
     const auto remaining = std::min<std::size_t>(
         data_size - offset, static_cast<std::size_t>(std::numeric_limits<int>::max()));
@@ -942,7 +968,10 @@ Status WssClient::Impl::ReadTls(std::uint8_t* data,
     }
     const auto wait_status =
         WaitForSocket(socket_, error == SSL_ERROR_WANT_READ, deadline,
-                      stop_requested_);
+                      stop_requested_,
+                      allow_interrupt && offset == 0U
+                          ? &receive_interrupt_requested_
+                          : nullptr);
     if (!wait_status.ok()) {
       return wait_status;
     }
@@ -967,10 +996,11 @@ Status WssClient::Impl::SendFrame(const std::uint8_t opcode,
                          "WebSocket control payload exceeds 125 bytes");
   }
 
-  std::vector<std::uint8_t> frame;
+  std::lock_guard<std::mutex> write_lock(write_mutex_);
   const std::size_t length_bytes =
       payload_size < 126U ? 0U : (payload_size <= 0xFFFFU ? 2U : 8U);
-  frame.resize(2U + length_bytes + 4U + payload_size);
+  write_frame_.resize(2U + length_bytes + 4U + payload_size);
+  auto& frame = write_frame_;
   frame[0] = static_cast<std::uint8_t>(0x80U | opcode);
   std::size_t cursor = 2U;
   if (length_bytes == 0U) {
@@ -1006,7 +1036,7 @@ Status WssClient::Impl::ReadFrame(WebSocketFrame* const output,
                          "WebSocket frame output must not be null");
   }
   std::array<std::uint8_t, 2> header{};
-  auto status = ReadTls(header.data(), header.size(), deadline);
+  auto status = ReadTls(header.data(), header.size(), deadline, true);
   if (!status.ok()) {
     return status;
   }
@@ -1173,11 +1203,17 @@ Status WssClient::Impl::SendPcm(
   if (!status.ok()) {
     return status;
   }
-  std::vector<std::uint8_t> frame(encoded_header.begin(), encoded_header.end());
-  frame.insert(frame.end(), payload, payload + payload_size_bytes);
+  pcm_message_.resize(encoded_header.size() + payload_size_bytes);
+  std::copy(encoded_header.begin(), encoded_header.end(), pcm_message_.begin());
+  if (payload_size_bytes != 0U) {
+    std::copy_n(payload, payload_size_bytes,
+                pcm_message_.begin() +
+                    static_cast<std::ptrdiff_t>(encoded_header.size()));
+  }
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(config_.write_timeout_ms);
-  return SendFrame(kOpcodeBinary, frame.data(), frame.size(), deadline);
+  return SendFrame(kOpcodeBinary, pcm_message_.data(), pcm_message_.size(),
+                   deadline);
 }
 
 Status WssClient::Impl::SendKeepAlivePong() {
@@ -1245,6 +1281,10 @@ void WssClient::Impl::RequestStop() noexcept {
   ShutdownSocket(socket_);
 }
 
+void WssClient::Impl::RequestReceiveInterrupt() noexcept {
+  receive_interrupt_requested_.store(true, std::memory_order_release);
+}
+
 void WssClient::Impl::Close() noexcept {
   if (connected_ && tls_ != nullptr &&
       !stop_requested_.load(std::memory_order_acquire)) {
@@ -1267,6 +1307,7 @@ void WssClient::Impl::Close() noexcept {
 
 void WssClient::Impl::Reset() noexcept {
   connected_ = false;
+  receive_interrupt_requested_.store(false, std::memory_order_release);
   if (tls_ != nullptr) {
     SSL_free(tls_);
     tls_ = nullptr;
@@ -1307,6 +1348,10 @@ Status WssClient::SendKeepAlivePong() {
 
 Status WssClient::Receive(WssInboundMessage* const output) {
   return impl_->Receive(output);
+}
+
+void WssClient::RequestReceiveInterrupt() noexcept {
+  impl_->RequestReceiveInterrupt();
 }
 
 void WssClient::RequestStop() noexcept { impl_->RequestStop(); }

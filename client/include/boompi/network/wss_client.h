@@ -38,9 +38,11 @@ struct WssInboundMessage final {
 
 // Development transport for the single-turn vertical slice. One network owner
 // must serialize Connect/Send/Receive/Close calls; the class starts no threads.
-// RequestStop is the only method that may be called concurrently. It aborts an
-// established connection so blocked I/O wakes; the owner must then
-// Close/reconnect.
+// RequestStop and RequestReceiveInterrupt may be called concurrently.
+// RequestStop aborts the connection. RequestReceiveInterrupt only wakes a
+// Receive that has not consumed any bytes of its next WebSocket frame, so the
+// network owner can send a latency-sensitive control message without breaking
+// framing or reconnecting.
 class WssClient final {
  public:
   explicit WssClient(WssClientConfig config);
@@ -56,6 +58,7 @@ class WssClient final {
                  std::size_t payload_size_bytes);
   Status SendKeepAlivePong();
   Status Receive(WssInboundMessage* output);
+  void RequestReceiveInterrupt() noexcept;
   void RequestStop() noexcept;
   void Close() noexcept;
   bool connected() const noexcept;

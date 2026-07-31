@@ -11,6 +11,7 @@ enum class StatusCode : std::uint8_t {
   kInvalidArgument,
   kFailedPrecondition,
   kResourceExhausted,
+  kInterrupted,
   kNotSupported,
   kInternal,
 };

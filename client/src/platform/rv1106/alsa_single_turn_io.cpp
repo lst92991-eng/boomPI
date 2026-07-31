@@ -97,7 +97,11 @@ int RemainingWaitMs(const std::uint64_t deadline_ms) noexcept {
 
 Status WaitForPcm(snd_pcm_t* const handle,
                   const std::uint64_t deadline_ms,
-                  const char* const operation) {
+                  const char* const operation,
+                  int* const alsa_error = nullptr) {
+  if (alsa_error != nullptr) {
+    *alsa_error = 0;
+  }
   for (;;) {
     const int remaining_ms = RemainingWaitMs(deadline_ms);
     if (remaining_ms <= 0) {
@@ -113,6 +117,9 @@ Status WaitForPcm(snd_pcm_t* const handle,
                            std::string(operation) + " timed out");
     }
     if (result != -EINTR) {
+      if (alsa_error != nullptr) {
+        *alsa_error = result;
+      }
       return AlsaError(operation, result);
     }
   }
@@ -173,7 +180,11 @@ Status OpenExactPcm(const std::string& device_name,
     error = snd_pcm_hw_params_set_period_size_near(
         handle, hardware, &period_frames, &direction);
   }
-  snd_pcm_uframes_t buffer_frames = AlsaSingleTurnIo::kBufferFrames;
+  const snd_pcm_uframes_t required_buffer_frames =
+      stream == SND_PCM_STREAM_CAPTURE
+          ? AlsaSingleTurnIo::kCaptureBufferFrames
+          : AlsaSingleTurnIo::kPlaybackBufferFrames;
+  snd_pcm_uframes_t buffer_frames = required_buffer_frames;
   if (error >= 0) {
     error = snd_pcm_hw_params_set_buffer_size_near(handle, hardware,
                                                    &buffer_frames);
@@ -204,11 +215,15 @@ Status OpenExactPcm(const std::string& device_name,
   if (actual_rate != AlsaSingleTurnIo::kSampleRateHz ||
       actual_channels != AlsaSingleTurnIo::kChannels ||
       period_frames != AlsaSingleTurnIo::kPeriodFrames ||
-      buffer_frames != AlsaSingleTurnIo::kBufferFrames) {
+      buffer_frames != required_buffer_frames) {
     close_handle();
     return Status::Error(
         StatusCode::kNotSupported,
-        "ALSA PCM did not accept the exact 48 kHz stereo 960/3840 contract");
+        stream == SND_PCM_STREAM_CAPTURE
+            ? "ALSA capture PCM did not accept the exact 48 kHz stereo "
+              "960/3840 contract"
+            : "ALSA playback PCM did not accept the exact 48 kHz stereo "
+              "960/3840 contract");
   }
 
   snd_pcm_sw_params_t* software = nullptr;
@@ -220,7 +235,7 @@ Status OpenExactPcm(const std::string& device_name,
   }
   const snd_pcm_uframes_t start_threshold =
       stream == SND_PCM_STREAM_CAPTURE ? 1U
-                                       : AlsaSingleTurnIo::kBufferFrames -
+                                       : required_buffer_frames -
                                              AlsaSingleTurnIo::kPeriodFrames;
   if (error >= 0) {
     error = snd_pcm_sw_params_set_start_threshold(handle, software,
@@ -303,11 +318,14 @@ Status AlsaSingleTurnIo::Open(const AlsaSingleTurnConfig& config,
 }
 
 Status AlsaSingleTurnIo::Capture20Ms(CapturePeriod* const output,
-                                     const std::uint32_t timeout_ms) {
-  if (!is_open() || output == nullptr || capture_finished_) {
+                                     const std::uint32_t timeout_ms,
+                                     AlsaCaptureReadResult* const capture_result) {
+  if (!is_open() || output == nullptr || capture_result == nullptr ||
+      capture_finished_) {
     return Status::Error(StatusCode::kFailedPrecondition,
                          "single-turn capture is unavailable");
   }
+  *capture_result = {};
   std::uint64_t deadline_ms = 0U;
   if (!MakeDeadline(timeout_ms, &deadline_ms)) {
     return Status::Error(StatusCode::kInvalidArgument,
@@ -325,6 +343,33 @@ Status AlsaSingleTurnIo::Capture20Ms(CapturePeriod* const output,
 
   std::uint32_t offset_frames = 0U;
   std::uint8_t recovery_count = 0U;
+  const auto recover_capture =
+      [capture, output, capture_result, &offset_frames,
+       &recovery_count](const int error) -> Status {
+    if (recovery_count >= 3U) {
+      return AlsaError("ALSA capture", error);
+    }
+    const int recovery = snd_pcm_recover(capture, error, 1);
+    if (recovery < 0) {
+      return AlsaError("ALSA capture recover", recovery);
+    }
+    const snd_pcm_state_t state = snd_pcm_state(capture);
+    if (state == SND_PCM_STATE_PREPARED) {
+      const int restart = snd_pcm_start(capture);
+      if (restart < 0) {
+        return AlsaError("ALSA capture restart", restart);
+      }
+    } else if (state != SND_PCM_STATE_RUNNING) {
+      return Status::Error(StatusCode::kInternal,
+                           "ALSA capture recovered to an invalid state");
+    }
+    output->fill(0);
+    offset_frames = 0U;
+    ++recovery_count;
+    ++capture_result->recovery_count;
+    capture_result->discontinuity = true;
+    return Status::Ok();
+  };
   while (offset_frames < kPeriodFrames) {
     const snd_pcm_sframes_t result = snd_pcm_readi(
         capture, output->data() +
@@ -343,34 +388,28 @@ Status AlsaSingleTurnIo::Capture20Ms(CapturePeriod* const output,
       return Status::Error(StatusCode::kInternal,
                            "ALSA capture made zero progress");
     }
-    if ((result == -EPIPE || result == -ESTRPIPE) &&
-        recovery_count < 3U) {
-      const int recovery =
-          snd_pcm_recover(capture, static_cast<int>(result), 1);
-      if (recovery < 0) {
-        return AlsaError("ALSA capture recover", recovery);
+    if (result == -EPIPE || result == -ESTRPIPE) {
+      const Status recovery_status =
+          recover_capture(static_cast<int>(result));
+      if (!recovery_status.ok()) {
+        return recovery_status;
       }
-      const snd_pcm_state_t state = snd_pcm_state(capture);
-      if (state == SND_PCM_STATE_PREPARED) {
-        const int restart = snd_pcm_start(capture);
-        if (restart < 0) {
-          return AlsaError("ALSA capture restart", restart);
-        }
-      } else if (state != SND_PCM_STATE_RUNNING) {
-        return Status::Error(StatusCode::kInternal,
-                             "ALSA capture recovered to an invalid state");
-      }
-      output->fill(0);
-      offset_frames = 0U;
-      ++recovery_count;
       continue;
     }
     if (result != -EAGAIN && result != -EINTR) {
       return AlsaError("ALSA capture read", static_cast<int>(result));
     }
-    const Status wait_status =
-        WaitForPcm(capture, deadline_ms, "ALSA capture wait");
+    int wait_error = 0;
+    const Status wait_status = WaitForPcm(
+        capture, deadline_ms, "ALSA capture wait", &wait_error);
     if (!wait_status.ok()) {
+      if (wait_error == -EPIPE || wait_error == -ESTRPIPE) {
+        const Status recovery_status = recover_capture(wait_error);
+        if (!recovery_status.ok()) {
+          return recovery_status;
+        }
+        continue;
+      }
       return wait_status;
     }
   }
@@ -393,12 +432,14 @@ Status AlsaSingleTurnIo::FinishCapture() {
 
 Status AlsaSingleTurnIo::WriteMono48k(const std::int16_t* const samples,
                                       const std::uint16_t sample_frames,
-                                      const std::uint32_t timeout_ms) {
+                                      const std::uint32_t timeout_ms,
+                                      bool* const recovered_xrun) {
   if (!is_open() || samples == nullptr || sample_frames == 0U ||
-      sample_frames > kPeriodFrames) {
+      sample_frames > kPeriodFrames || recovered_xrun == nullptr) {
     return Status::Error(StatusCode::kInvalidArgument,
                          "single-turn playback frame is invalid");
   }
+  *recovered_xrun = false;
   std::uint64_t deadline_ms = 0U;
   if (!MakeDeadline(timeout_ms, &deadline_ms)) {
     return Status::Error(StatusCode::kInvalidArgument,
@@ -413,6 +454,21 @@ Status AlsaSingleTurnIo::WriteMono48k(const std::int16_t* const samples,
   snd_pcm_t* const playback = Handle(playback_handle_);
   std::uint32_t offset_frames = 0U;
   std::uint32_t recovery_count = 0U;
+  const auto recover_playback =
+      [playback, recovered_xrun, &offset_frames,
+       &recovery_count](const int error) -> Status {
+    if (recovery_count >= kMaximumPlaybackRecoveries) {
+      return AlsaError("ALSA playback", error);
+    }
+    const int recovery = snd_pcm_recover(playback, error, 1);
+    if (recovery < 0) {
+      return AlsaError("ALSA playback recover", recovery);
+    }
+    offset_frames = 0U;
+    ++recovery_count;
+    *recovered_xrun = true;
+    return Status::Ok();
+  };
   while (offset_frames < sample_frames) {
     const snd_pcm_sframes_t result = snd_pcm_writei(
         playback,
@@ -433,23 +489,27 @@ Status AlsaSingleTurnIo::WriteMono48k(const std::int16_t* const samples,
                            "ALSA playback made zero progress");
     }
     if (result == -EPIPE || result == -ESTRPIPE) {
-      if (recovery_count >= kMaximumPlaybackRecoveries) {
-        return AlsaError("ALSA playback write", static_cast<int>(result));
+      const Status recovery_status =
+          recover_playback(static_cast<int>(result));
+      if (!recovery_status.ok()) {
+        return recovery_status;
       }
-      const int recovery =
-          snd_pcm_recover(playback, static_cast<int>(result), 1);
-      if (recovery < 0) {
-        return AlsaError("ALSA playback recover", recovery);
-      }
-      ++recovery_count;
       continue;
     }
     if (result != -EAGAIN && result != -EINTR) {
       return AlsaError("ALSA playback write", static_cast<int>(result));
     }
-    const Status wait_status =
-        WaitForPcm(playback, deadline_ms, "ALSA playback wait");
+    int wait_error = 0;
+    const Status wait_status = WaitForPcm(
+        playback, deadline_ms, "ALSA playback wait", &wait_error);
     if (!wait_status.ok()) {
+      if (wait_error == -EPIPE || wait_error == -ESTRPIPE) {
+        const Status recovery_status = recover_playback(wait_error);
+        if (!recovery_status.ok()) {
+          return recovery_status;
+        }
+        continue;
+      }
       return wait_status;
     }
   }

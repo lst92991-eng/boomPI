@@ -466,6 +466,45 @@ int main(const int argc, char* argv[]) {
     return FailMessage("deterministic response path is incomplete");
   }
 
+  std::atomic<bool> interrupt_receive_entered{false};
+  std::atomic<bool> interrupt_receive_done{false};
+  boompi::Status interrupted_receive = boompi::Status::Error(
+      boompi::StatusCode::kInternal, "receive interrupt smoke did not run");
+  std::thread interrupt_receiver(
+      [&client, &interrupted_receive, &interrupt_receive_entered,
+       &interrupt_receive_done]() {
+        interrupt_receive_entered.store(true, std::memory_order_release);
+        boompi::network::WssInboundMessage ignored{};
+        interrupted_receive = client.Receive(&ignored);
+        interrupt_receive_done.store(true, std::memory_order_release);
+      });
+  const auto interrupt_enter_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+  while (!interrupt_receive_entered.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < interrupt_enter_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  const auto interrupt_started = std::chrono::steady_clock::now();
+  client.RequestReceiveInterrupt();
+  const auto interrupt_deadline =
+      interrupt_started + std::chrono::milliseconds(250);
+  while (!interrupt_receive_done.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < interrupt_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (!interrupt_receive_done.load(std::memory_order_acquire)) {
+    std::cerr << "boompi-wss-client-smoke: receive interrupt did not wake\n";
+    std::_Exit(EXIT_FAILURE);
+  }
+  interrupt_receiver.join();
+  if (interrupted_receive.code() != boompi::StatusCode::kInterrupted ||
+      interrupted_receive.message() != "network receive interrupted" ||
+      !client.connected()) {
+    client.Close();
+    return FailMessage("receive interrupt damaged the live connection");
+  }
+
   std::atomic<bool> receive_entered{false};
   std::atomic<bool> receive_done{false};
   boompi::Status blocked_receive = boompi::Status::Error(

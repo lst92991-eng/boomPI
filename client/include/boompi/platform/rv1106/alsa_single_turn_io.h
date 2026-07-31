@@ -15,16 +15,22 @@ struct AlsaSingleTurnConfig final {
   std::string playback_device_name;
 };
 
+struct AlsaCaptureReadResult final {
+  std::uint32_t recovery_count{0U};
+  bool discontinuity{false};
+};
+
 // Concrete, bounded ALSA I/O for the manual single-turn milestone. This is
 // deliberately not a generic capture/playback interface and owns no threads.
-// Both handles negotiate the board-proven 48 kHz, S16_LE, stereo,
+// Both handles negotiate the board-enforced 48 kHz, S16_LE, stereo,
 // 960-frame-period/3840-frame-buffer contract exactly.
 class AlsaSingleTurnIo final {
  public:
   static constexpr std::uint32_t kSampleRateHz = 48000U;
   static constexpr std::uint8_t kChannels = 2U;
   static constexpr std::uint32_t kPeriodFrames = 960U;
-  static constexpr std::uint32_t kBufferFrames = 3840U;
+  static constexpr std::uint32_t kCaptureBufferFrames = 3840U;
+  static constexpr std::uint32_t kPlaybackBufferFrames = 3840U;
   static constexpr std::size_t kCaptureInterleavedSamples =
       static_cast<std::size_t>(kPeriodFrames) * kChannels;
   using CapturePeriod =
@@ -40,13 +46,21 @@ class AlsaSingleTurnIo final {
   static Status Open(const AlsaSingleTurnConfig& config,
                      AlsaSingleTurnIo* output);
 
-  Status Capture20Ms(CapturePeriod* output, std::uint32_t timeout_ms);
+  // A successful call may still report a recovered xrun. The caller must
+  // treat that frame as discontinuous and must not publish it as contiguous
+  // capture audio.
+  Status Capture20Ms(CapturePeriod* output,
+                     std::uint32_t timeout_ms,
+                     AlsaCaptureReadResult* result);
   // Stops this turn's capture stream before response playback begins. The
   // capture handle stays owned until Abort(), but no further reads are valid.
   Status FinishCapture();
+  // Reports a recovered playback xrun so the caller can invalidate any
+  // software echo reference derived from the pre-recovery stream.
   Status WriteMono48k(const std::int16_t* samples,
                       std::uint16_t sample_frames,
-                      std::uint32_t timeout_ms);
+                      std::uint32_t timeout_ms,
+                      bool* recovered_xrun);
   // Stops queued TTS immediately and prepares the same playback handle for
   // the next response. Capture is deliberately left running for barge-in.
   Status DropPlayback();
