@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstring>
 #include <new>
 #include <type_traits>
 
@@ -57,27 +56,6 @@ void ReleaseParameters(RKAUDIOParam* const parameters) noexcept {
 }
 
 bool PrepareParameters(RKAUDIOParam* const parameters) noexcept {
-  static constexpr float kLimitRatio[2][3] = {
-      {2.0F, 1.5F, 1.0F},
-      {1.5F, 1.2F, 1.0F},
-  };
-  static constexpr short kThdSplitFreq[4][2] = {
-      {0, 0}, {1500, 2000}, {2000, 6000}, {6000, 8000}};
-  static constexpr float kThdSupDegree[4][10] = {
-      {0.01F, 0.01F, 0.005F, 0.005F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
-       0.0F},
-      {0.0005F, 0.0005F, 0.0005F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
-       0.0F, 0.0F},
-      {0.001F, 0.001F, 0.001F, 0.001F, 0.001F, 0.001F, 0.0F, 0.0F,
-       0.0F, 0.0F},
-      {0.001F, 0.001F, 0.001F, 0.001F, 0.001F, 0.001F, 0.0F, 0.0F,
-       0.0F, 0.0F},
-  };
-  static constexpr short kHardSplitFreq[5][2] = {
-      {100, 500}, {0, 0}, {0, 0}, {0, 0}, {500, 3000}};
-  static constexpr float kHardThreshold[4] = {0.35F, 0.15F, 0.35F,
-                                               0.15F};
-
   parameters->model_en = kMainFeatureMask;
   parameters->read_size = kVendorBlockSamples;
   parameters->aec_param = rkaudio_aec_param_init();
@@ -91,15 +69,11 @@ bool PrepareParameters(RKAUDIOParam* const parameters) noexcept {
   if (aec->delay_para == nullptr) {
     return false;
   }
+  // Software reference alignment is the only AEC setting that differs from
+  // the pinned SDK initializer.
   aec->pos = 1;
-  // boomPI supplies a software playback reference. Rockchip requires its
-  // delay estimator for a software reference to align it with microphone
-  // capture before linear echo cancellation.
   aec->model_aec_en = EN_DELAY;
   aec->drop_ref_channel = 0;
-  aec->delay_len = 0;
-  aec->look_ahead = 0;
-  aec->filter_len = 2;
 
   auto* const beamforming =
       static_cast<SKVPreprocessParam*>(parameters->bf_param);
@@ -108,83 +82,35 @@ bool PrepareParameters(RKAUDIOParam* const parameters) noexcept {
   beamforming->ref_pos = 1;
   beamforming->num_ref_channel = kReferenceChannels;
   beamforming->drop_ref_channel = 0;
-  if (beamforming->dereverb_para == nullptr ||
-      beamforming->aes_para == nullptr || beamforming->anr_para == nullptr ||
-      beamforming->agc_para == nullptr || beamforming->howl_para == nullptr) {
+  if (beamforming->dereverb_para == nullptr || beamforming->aes_para == nullptr ||
+      beamforming->anr_para == nullptr || beamforming->agc_para == nullptr ||
+      beamforming->howl_para == nullptr) {
     return false;
   }
 
   auto* const dereverb =
       static_cast<RKAudioDereverbParam*>(beamforming->dereverb_para);
-  dereverb->rlsLg = 4;
   dereverb->curveLg = 20;
-  dereverb->delay = 2;
-  dereverb->forgetting = 0.98F;
   dereverb->T60 = 0.4F;
-  dereverb->coCoeff = 1.0F;
 
-  auto* const aes =
-      static_cast<RKAudioAESParameter*>(beamforming->aes_para);
-  aes->Beta_Up = 0.002F;
-  aes->Beta_Down = 0.001F;
+  auto* const aes = static_cast<RKAudioAESParameter*>(beamforming->aes_para);
   aes->Beta_Up_Low = 0.005F;
-  aes->Beta_Down_Low = 0.001F;
-  aes->low_freq = 500;
-  aes->high_freq = 3750;
   aes->THD_Flag = 0;
   aes->HARD_Flag = 0;
-  std::memcpy(aes->LimitRatio, kLimitRatio, sizeof(kLimitRatio));
-  std::memcpy(aes->ThdSplitFreq, kThdSplitFreq, sizeof(kThdSplitFreq));
-  std::memcpy(aes->ThdSupDegree, kThdSupDegree, sizeof(kThdSupDegree));
-  std::memcpy(aes->HardSplitFreq, kHardSplitFreq, sizeof(kHardSplitFreq));
-  std::memcpy(aes->HardThreshold, kHardThreshold, sizeof(kHardThreshold));
 
   auto* const anr = static_cast<SKVANRParam*>(beamforming->anr_para);
-  anr->noiseFactor = 0.88F;
   anr->swU = 1;
-  anr->PsiMin = 0.02F;
-  anr->PsiMax = 0.516F;
   anr->fGmin = 0.01F;
-  anr->Sup_Freq1 = -3588;
-  anr->Sup_Freq2 = -3588;
-  anr->Sup_Energy1 = 10000.0F;
-  anr->Sup_Energy2 = 10000.0F;
   anr->InterV = 1;
-  anr->BiasMin = 1.67F;
-  anr->UpdateFrm = 15;
-  anr->NPreGammaThr = 4.6F;
-  anr->NPreZetaThr = 1.67F;
-  anr->SabsGammaThr0 = 1.0F;
-  anr->SabsGammaThr1 = 3.0F;
-  anr->InfSmooth = 0.8F;
-  anr->ProbSmooth = 0.7F;
-  anr->CompCoeff = 1.4F;
-  anr->PrioriMin = 0.0316F;
-  anr->PostMax = 40.0F;
-  anr->PrioriRatio = 0.95F;
-  anr->PrioriRatioLow = 0.95F;
-  anr->SplitBand = 20;
-  anr->PrioriSmooth = 0.7F;
-  anr->TranMode = 0;
 
   auto* const agc = static_cast<RKAGCParam*>(beamforming->agc_para);
   agc->attack_time = 200.0F;
-  agc->release_time = 200.0F;
-  agc->attenuate_time = 1000.0F;
   agc->max_gain = 25.0F;
   agc->max_peak = -1.0F;
   agc->fRth0 = -55.0F;
   agc->fRth1 = -45.0F;
   agc->fRth2 = -30.0F;
-  agc->fRk0 = 2.0F;
-  agc->fRk1 = 0.8F;
-  agc->fRk2 = 0.4F;
-  agc->fLineGainDb = -25.0F;
   agc->swSmL0 = 40;
-  agc->swSmL1 = 80;
-  agc->swSmL2 = 80;
-  agc->fs = kSampleRateHz;
-  agc->frmlen = kVendorBlockSamples;
 
   static_cast<RKHOWLParam*>(beamforming->howl_para)->howlMode = 4;
   return true;

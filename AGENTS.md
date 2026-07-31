@@ -45,6 +45,23 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
 - 网络断开时丢弃当前轮次，不缓存并补发过期语音；本地唤醒、UI 和离线提示仍工作。
 - 默认女声方向是自然、年轻、不过度卖萌。具体 Qwen voice 必须在真实扬声器上试听至少三个候选后再固化。
 
+## 2.1 当前板端实现边界（2026-07-31，优先于后文路线图）
+
+现役 `boompi-client` 自写生产 C++ 的硬上限是 2000 ELOC；当前基线为 15 个文件、1904
+ELOC，精确范围见 `docs/test/client-under-2000-refactor-20260731.md`。后文关于完整目录、
+supervisor、UI、update、target 分层和发布架构的内容是后续路线图，不授权提前恢复占位层。
+
+- 生产目标只由 `voice/client` 状态机、`voice/audio_engine`、`voice/transport`、环境配置、
+  `Status`、Rockchip 3A 薄适配、Snowboy C ABI 桥和 `main` 组成。
+- 禁止恢复已删除的 `manual_single_turn`、自写 WebSocket/TLS/JSON、重复 wire protocol、
+  通用 capture/playback/control/committer/worker、host fake 音频和未接入产品的 UI/update
+  占位实现。
+- WebSocketpp、Boost、OpenSSL、ALSA、libswresample、Rockchip 3A、Snowboy 和 WebRTC VAD
+  作为外部实现使用；不得复制它们的功能到自写生产层，也不得把自写业务代码移进
+  `third_party/` 规避计数。
+- 增加生产代码前必须先删减或用实测证明必要性，且保持总量低于 2000 ELOC。未来 UI、
+  配网和 supervisor 按实际硬件阶段单独核定预算，不能无声挤入当前语音客户端。
+
 ## 3. 硬件基线与事实来源
 
 目标板是 RV1106 Linux/Buildroot 自研板，已完成扬声器、双麦基本采集、以太网、Wi-Fi、ST7789P3、GT911 和 SC3336 的单项 bring-up。单项通过不代表四通道全双工 AEC、量产声学或长时间稳定性已经通过。
@@ -62,7 +79,7 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
 - 先接通并测量幸狐/Rockchip BSP 已提供的 `rk_mpi_ai`/`rk_mpi_ao`、ALSA PCM、
   Rockchip VQE 和 `libaec_bf_process.so` 的 `rkaudio_preprocess_*`，再决定生产模块边界。不得继续为尚未验证的行为增加
   playback/control/committer/worker 等通用层。
-- 2026-07-31 已删除未进入板端客户端的 queue、playback control/committer/worker、通用
+- 2026-07-31 已删除未进入板端客户端的通用 queue、playback control/committer/worker、
   capture/DSP 前端和旧 ALSA adapter；历史验证记录可保留，但不得恢复这些生产抽象来承接
   未经实测的行为，也不得把 host fake、ALSA `null` 或交叉链接写成板端能力。
 - 第一项板端闭环是同一时刻运行的 48 kHz capture/playback，其后用可辨识信号确认实际

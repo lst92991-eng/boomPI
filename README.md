@@ -2,10 +2,10 @@
 
 boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端负责连接 Qwen 新加坡区，板端不保存云端 API Key。
 
-> **当前已有真实 Qwen 纵向语音闭环 HIL 候选，但不是发布版。** 第三块 RV1106 板已观察到
-> Snowboy 唤醒、VAD 起止、语音 turn 提交、Qwen ASR/LLM/TTS 和扬声器回答；当前仍存在
-> 输入丢帧与接收/首音延迟高的问题，根因尚未定位。双麦 AEC、打断、三秒追问和播放稳定性
-> 也未完成产品验收，不能因一次听到回答就标为通过。
+> **当前已有 1904 ELOC 的真实板端语音候选，但不是发布版。** 第三块 RV1106 板已运行
+> Snowboy、双麦 Rockchip 3A/AEC、VAD、持久 WSS、流式播放、打断和三秒追问链路，并成功
+> 进入 `secure session ready`。旧版的丢帧、高延迟、`EPIPE` 和 jitter queue 记录仍作为回归
+> 风险保留；精简候选尚需真人完成唤醒、问答、连续对话和播放中打断验收。
 
 ## 系统形态
 
@@ -51,11 +51,16 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 ### 软件阶段
 
-P1 已建立 CMake/Go 构建、配置校验、协议 fixture 和跨平台 CI。P0 已确认匹配 BSP 的
-GCC 8.3/uClibc 工具链；direct ALSA 48 kHz 全双工、Rockchip 3A 链接、Snowboy 链接与模型
-加载均已进入真实板端验证。2026-07-29 的 `voice9` 为 Debug + `-O2` HIL 候选，真实 Qwen
-纵向链路曾跑通；它同时暴露了输入丢帧、首音延迟高、历史 ALSA `EPIPE` 和播放队列满等
-未关闭问题。raw MPI AI+AO、VQE 资源安装、真实 reference、AEC 效果和 3A 实时率仍未闭环。
+2026-07-31 板端生产目标已从约一万行的自写分层实现收敛为 15 个 C++ 文件、1904 ELOC。
+现役 `boompi-client` 直接组合 ALSA/libswresample、Rockchip 3A、Snowboy、WebRTC VAD、
+WebSocketpp/Boost/OpenSSL 和一个显式语音状态机；不再保留自写 WSS、重复 wire protocol、
+通用 playback/capture 框架或未接入的 supervisor/UI/update 占位实现。精确范围、哈希、回滚
+位置和板端启动证据见
+[1904 ELOC 客户端收敛记录](docs/test/client-under-2000-refactor-20260731.md)。
+
+P0 已确认匹配 BSP 的 GCC 8.3/uClibc 工具链；direct ALSA 48 kHz 全双工、Rockchip 3A、
+Snowboy 和现有 Go/Qwen 服务端均已进入真实板端链路。raw MPI AI+AO、最终壳体 AEC 效果、
+远场指标和长期稳定性仍是独立 HIL 项，不能由本次源码收敛代替。
 具体路径、哈希、两个 Mode 的区别和 HIL 顺序见
 [2026-07-27 vendor 音频证据基线](docs/test/p0-vendor-audio-inventory-20260727.md)。
 3A 交叉链接的命令、ELF 结果和严格边界另见
@@ -65,10 +70,9 @@ GCC 8.3/uClibc 工具链；direct ALSA 48 kHz 全双工、Rockchip 3A 链接、S
 MPI 音频的八个头文件 pin、当时 21 个 `UND`、MPP/RGA SONAME 与未运行边界见
 [2026-07-27 Rockchip MPI 音频交叉链接验证记录](docs/test/p0-rockchip-mpi-link-validation-20260727.md)。
 
-2026-07-31 已删除从未进入板端客户端的 playback control/committer/worker、通用 capture/DSP
-前端和旧 ALSA playback adapter。当前链路直接使用 `AlsaSingleTurnIo`、Rockchip 3A、Snowboy
-及已实测的 renderer/resampler/gain 组件；不再为历史 host 抽象保留生产代码。旧 adapter 的
-验证结果仅作为历史证据保留在
+2026-07-31 已删除旧 `manual_single_turn`、自写 WSS/协议层、`AlsaSingleTurnIo`、独立
+renderer/resampler/gain 组件和相应失效测试。当前只有 `AudioEngine`、`Transport`、
+`Client` 状态机及薄配置/vendor 适配进入目标 ELF。旧 adapter 的验证结果仅作为历史证据保留在
 [2026-07-27 ALSA playback adapter 验证记录](docs/test/p2f-c-a-validation-20260727.md)。
 默认自动测试不会访问真实 Qwen，也不会消耗付费额度。
 
@@ -94,7 +98,7 @@ HIL 调试快照，不是 production release。
 ## 仓库结构
 
 ```text
-client/                 RV1106 C++17 客户端与 host 可测核心
+client/                 RV1106 C++17 板端客户端与 vendor HIL 探针
 server/                 跨平台 Go 服务端
 protocol/               板端/服务端共同遵守的 v1 wire contract 与 fixture
 docs/architecture/      架构、边界和状态说明
@@ -105,35 +109,15 @@ third_party/            第三方接入说明；不提交未获许可的 vendor/
 
 ## Host 构建与测试
 
-前置条件：
-
-- Git。
-- 支持 C++17 的编译器。
-- CMake 3.21 或更高版本；如果主动选择 Ninja 生成器，还需安装 Ninja。
-- Go 1.26.x，与 `server/go.mod` 一致。
-- Python 3，用于校验共享协议 fixture；脚本只使用标准库。
-
-标准入口：
+`boompi-client` 当前是 RV1106/vendor-only 目标，host CMake 不再编译一套与真板不同的假音频
+框架。Host 侧继续运行 Go 服务端测试、共享协议 fixture 校验和不打开硬件的 BSP 探针测试；
+客户端验收使用匹配 GCC 8.3/uClibc 的交叉构建与真板 HIL。
 
 ```text
-cmake --preset host-debug
-cmake --build --preset host-debug --parallel
-ctest --preset host-debug --output-on-failure
 python scripts/verify_protocol_fixtures.py
-python scripts/dsp/generate_fir_decimator_48_to_16.py --check client/src/audio/fir_decimator_48_to_16.cpp --quiet
-python scripts/dsp/generate_playback_resampler_24_to_48.py --check client/src/audio/playback_resampler_24_to_48.cpp --quiet
+python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+cd server && go test ./...
 ```
-
-Linux 安装 ALSA 开发包（Debian/Ubuntu 为 `libasound2-dev`）后，可显式启用 ALSA，
-并用丢弃数字 PCM 的 `null` 插件验证 API/accepted 边界：
-
-```text
-cmake --preset host-debug -DBOOMPI_ENABLE_ALSA_PLAYBACK=ON
-cmake --build --preset host-debug --parallel
-ctest --preset host-debug --output-on-failure --no-tests=error -L alsa-null-api-flow-only
-```
-
-该 smoke 不连接 Codec、DAC 或扬声器，不能写成 played/audible。
 
 Linux/macOS 还会运行 P0 探针的离线脱敏回归：
 
@@ -147,14 +131,8 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 真实 PCM；真实执行与边界由独立的
 [板端验证记录](docs/test/p0-alsa-full-duplex-validation-20260728.md)承接。
 
-Windows 使用支持所选编译器的 PowerShell/Developer PowerShell；Linux 和 macOS 使用系统 C++ 工具链。CI 会在 Windows、Linux 和 macOS 上执行同一组 host 检查。
-
-Windows 如果 CMake 自动选择 Visual Studio 这类多配置生成器，构建和测试时显式选择 Debug：
-
-```text
-cmake --build --preset host-debug --parallel --config Debug
-ctest --preset host-debug --output-on-failure -C Debug
-```
+客户端 CI 应将纯协议/服务逻辑放在 Go/Python host 测试，把 vendor C++ 编译固定到匹配的
+RV1106 交叉环境；不再维护一份 Windows/Linux 假设备客户端 target。
 
 ## Go 服务端
 
@@ -192,7 +170,7 @@ Linux/macOS：
 ./boompi-server --config configs/config.yaml
 ```
 
-当前实现提供单设备 `wss://<host>:17806/ws`、稳定本地 TLS 身份、16 kHz PCM 上行、Qwen Realtime 流式转发、24 kHz PCM/文本下行与响应取消。开发阶段要求客户端在 `hello.payload.device_token` 中提交一个环境变量注入的共享令牌；服务端会在打开付费 provider 会话之前验证它。受控 reverse-tunnel 下的手动串行真实 ALSA 单轮已通过；UDP 发现、六位码配对、每设备独立 Token、自动重连、产品状态机、真全双工和双麦/AEC 联调仍是后续工作，因此当前 WSS 不是完整的生产信任链。
+当前实现提供单设备 `wss://<host>:17806/ws`、稳定本地 TLS 身份、16 kHz PCM 上行、Qwen Realtime 流式转发、24 kHz PCM/文本下行与响应取消。开发阶段要求客户端在 `hello.payload.device_token` 中提交一个环境变量注入的共享令牌；服务端会在打开付费 provider 会话之前验证它。受控 reverse-tunnel 下的持久 WSS、真全双工、自动重连和板端语音状态机已接通；UDP 发现、六位码配对、每设备独立 Token、最终声学验收和完整生产信任链仍是后续工作。
 
 Qwen 凭据只能通过当前进程环境提供：
 
@@ -236,15 +214,17 @@ BOOMPI_QWEN_LIVE_TEST=1 go test -count=1 -run '^TestLiveOpenSession$' ./internal
 5. Snowboy runtime/model 的兼容性和再分发许可结论。
 6. 固定 OpenSSL 3.5.7 的 RV1106 静态 package；源码、完整头文件树、CMake config 和
    archive 必须与仓库闸门一致。
-7. 工具链文件要求的 SDK/sysroot 环境变量或 CMake cache 参数；不得把个人绝对路径写入 preset。
+7. Boost 1.74 兼容头文件；WebSocketpp 0.8.2 已以源码形式固定在 `third_party/websocketpp/`。
+8. 工具链文件要求的 SDK/sysroot 环境变量或 CMake cache 参数；不得把个人绝对路径写入 preset。
 
 当前工具链文件识别以下显式配置：
 
 - `BOOMPI_RV1106_TOOLCHAIN_ROOT`：必填，目录中包含交叉编译器的 `bin/`。
 - `BOOMPI_RV1106_TOOLCHAIN_PREFIX`：可选；当前默认值为 `arm-rockchip830-linux-uclibcgnueabihf`，必须与实际 SDK 一致。
 - `BOOMPI_RV1106_SYSROOT`：接入目标系统库时必须指向与镜像匹配的 sysroot。
-- `BOOMPI_OPENSSL_ROOT`：`rv1106-release` 必填，指向通过固定哈希和完整头文件 manifest
+- `BOOMPI_OPENSSL_ROOT`：当前 RV1106 语音候选必填，指向通过固定哈希和完整头文件 manifest
   校验的 flat OpenSSL 3.5.7 静态 package root。
+- `BOOMPI_BOOST_INCLUDE_DIR`：必填，指向 Boost 头文件根目录，不链接目标机 `libboost_system`。
 
 `BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO`、`BOOMPI_ENABLE_ROCKCHIP_3A` 和
 `BOOMPI_ENABLE_SNOWBOY` 默认均为 `OFF`。当前 pins
@@ -261,17 +241,11 @@ feasibility 环境中创建 `EXCLUDE_FROM_ALL` 的原始 AI/AO 探针，默认 b
 启动流程均不会构建或运行它。板端使用前必须阅读
 [Rockchip MPI 原始音频 HIL 指南](docs/test/p0-rockchip-mpi-audio-hil-guide.md)。
 
-准备完成后使用：
-
-```text
-BOOMPI_OPENSSL_ROOT=<pinned-openssl-3.5.7-package> \
-cmake --preset rv1106-release
-cmake --build --preset rv1106-release --parallel
-```
-
-`rv1106-release` 会显式打开 WSS；缺少或混用旧版 OpenSSL 时必须配置失败，不能通过关闭
-WSS 生成一个冒充发布版的产物。交付验证必须从全新的 build 目录执行 configure→build，
-不能复用曾缓存其他 OpenSSL 路径的旧构建树，也不能在 configure 后替换外部 package 内容。
+准备完成后从全新 build 目录配置 Debug + `-O2` feasibility 候选，并显式传入上面列出的
+toolchain/sysroot、Boost、OpenSSL、Rockchip 3A、Snowboy 和 WebRTC VAD 路径。当前 vendor pin
+闸门刻意拒绝 Release；不得通过关闭 WSS/3A/Snowboy 生成一个冒充候选版的产物。已验证的
+完整参数与结果见
+[1904 ELOC 客户端收敛记录](docs/test/client-under-2000-refactor-20260731.md)。
 
 2026-07-25 已使用与 BSP 匹配的 GCC 8.3.0 Buildroot wrapper 和 uClibc sysroot 成功构建 RV1106 Release 产物，并验证 ELF32 ARM EABI5 hard-float 与 loader；因当时板端管理通道不可用，产物尚未在板端执行。具体证据见 [P0 可行性报告](docs/test/p0-feasibility-report-20260725.md)，完整闸门见 [docs/test/rv1106-validation-gates.md](docs/test/rv1106-validation-gates.md)。刷镜像、改分区、设备树或启动项前必须单独取得用户授权。
 

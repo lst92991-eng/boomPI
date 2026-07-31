@@ -9,10 +9,7 @@ namespace boompi {
 enum class StatusCode : std::uint8_t {
   kOk = 0,
   kInvalidArgument,
-  kFailedPrecondition,
   kResourceExhausted,
-  kInterrupted,
-  kNotSupported,
   kInternal,
 };
 
@@ -24,7 +21,6 @@ class Status final {
   static Status Error(StatusCode code, std::string message);
 
   bool ok() const noexcept;
-  StatusCode code() const noexcept;
   const std::string& message() const noexcept;
 
  private:

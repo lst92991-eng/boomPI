@@ -1,6 +1,7 @@
 # CMake and native build output
 /build*/
 /cmake-build-*/
+/client/out/
 **/CMakeFiles/
 **/CMakeCache.txt
 **/cmake_install.cmake

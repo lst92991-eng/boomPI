@@ -1,93 +1,88 @@
 # 音频运行时边界
 
-## 当前状态
+## 当前实现
 
-当前产品路径是一个已经在 RV1106 上运行过的纵向闭环，不再围绕预想中的通用
-playback/capture 框架组织代码。2026-07-31 已删除未进入最终 ELF 的 control、committer、
-worker、通用 DSP frontend、软件 ledger 和旧 ALSA adapter；其历史测试不能代表当前运行时。
+2026-07-31 的板端候选只保留三个产品对象：
 
-现役组件为：
+- `Client`：语音状态机、重连、唤醒、VAD、turn 和打断。
+- `AudioEngine`：ALSA 全双工、重采样、Rockchip 3A、Snowboy、WebRTC VAD、播放和参考路径。
+- `Transport`：持久 WSS、TLS SPKI 固定、协议校验和收发。
 
-- `AlsaSingleTurnIo`：48 kHz 双声道 capture/playback 句柄和 bounded ALSA I/O。
-- `RockchipVoiceDsp`：匹配 BSP 的 16 kHz 固定帧 3A 调用。
-- `SnowboyWakeWordEngine` 与 `WebRtcVadGate`：本地唤醒和语音起止。
-- `PlaybackRenderer24To48`：24 kHz 下行到 48 kHz 播放帧，并执行 gain/limiter。
-- `WssClient`、`ServerControlDecoder`：音频和 turn 控制协议。
-- `ManualSingleTurnSession`：当前纵向状态机、队列和线程所有者。
-
-`manual_single_turn` 是历史命名；当前实现已经包含常驻唤醒、追问和打断，但尚未拆成稳定的
-产品状态机。后续只有在真实阻塞或所有权问题证明需要时才拆分，不以文件长度为理由增加
-空壳 worker。
+整套自写生产 C++ 共 15 个文件、1904 ELOC。旧 `manual_single_turn`、独立 capture pump、
+通用 EventBus、自写 WSS/parser、renderer/resampler/gain 框架和 playback
+control/committer/worker 已删除；不得为了恢复历史测试结构重新引入。
 
 ## 实际数据流
 
 ```text
-ALSA capture: 48 kHz / S16_LE / 2 ch / 20 ms
-  -> capture pump（固定 8 帧，即 160 ms 队列）
-  -> 48 -> 16 kHz
+ALSA capture: 48 kHz / S16_LE / stereo / 20 ms
+  -> 48 -> 16 kHz stereo
+  -> left mic + right mic + aligned playback reference
   -> Rockchip 3A
-  -> Snowboy + VAD
-  -> WSS 16 kHz mono uplink
+  -> Snowboy + WebRTC VAD
+  -> WSS: 16 kHz / S16_LE / mono
 
 WSS TTS: 24 kHz / S16_LE / mono
-  -> 24 -> 48 kHz renderer
-  -> gain + limiter
-  -> 64 帧有界 jitter queue（首播预缓冲 6 帧，即 120 ms）
-  -> ALSA playback
-  -> 最终播放 PCM 降采样为 16 kHz 软件 reference
-  -> Rockchip 3A + 打断判定
+  -> fixed 1.5 s queue
+  -> 24 -> 48 kHz
+  -> gain + limiter + optional duck
+  -> ALSA playback: 48 kHz / S16_LE / stereo
+  -> final played PCM -> 16 kHz aligned reference -> Rockchip 3A
 ```
 
-当前 capture 只有两个物理输入 slot。双麦左右、极性和软件 reference 的声学对齐以真实板端
-结果为准；不能从 `TRCM`、Mode2 示例或变量名推断硬件具备四路数字回采。
+ALSA 精确协商为 960 frame/period、3840 frame buffer。采集控制线程阻塞读取完整 20 ms
+帧，不再经过中间 capture 队列；重连和云端等待期间仍持续读取，避免硬件 overrun。
 
-## 固定帧与有界缓存
+## 固定容量
 
-- capture/playback 硬件边界：48 kHz、S16_LE、2 ch、960 frame/period、20 ms。
-- 上行、VAD、Snowboy：16 kHz、S16_LE、mono、320 samples/20 ms。
-- Qwen 下行：24 kHz、S16_LE、mono；单个协议包不超过 960 bytes。
-- capture bridge：8 帧/160 ms。满时不得阻塞 ALSA producer；当前 turn 标记 discontinuity，
-  前端 reset 前持续排空旧帧。
-- playback jitter queue：64 帧，硬上限 1.28 s；enqueue 最多等待 100 ms。
-- playback reference queue：16 帧；开始消费前保留 3 帧/60 ms lead。
-- 唤醒与打断 pre-roll：唤醒前 500 ms；已确认打断最多保留 3 s 新用户语音。
+- 唤醒前卷：25 帧，即 500 ms。
+- 网络事件环：64 项；溢出视为连接失效，不覆盖旧事件。
+- TTS 队列：75 × 20 ms，即 1.5 s；满时当前连接失败，不无限堆积。
+- 播放参考环：16 帧；正常以 3 帧，即 60 ms lead 开始消费。
+- 单个上行 PCM：最多 640 bytes；单个下行 PCM：最多 960 bytes。
+- WebSocket 消息：最多 64 KiB 加协议头，发送端同时检查库内待发送字节数。
 
-所有容量、采样率和超时必须保持显式单位。实时循环中不做文件 I/O；调试录音只能由明确
-opt-in 工具产生，不能进入默认路径。
+实时 PCM 路径使用对象内固定数组，不做逐帧 heap 分配。控制 JSON 和 WebSocket 库内部
+仍可分配内存，但不在 ALSA 逐帧处理内创建无界容器。
 
-## 线程和所有权
+## 执行上下文与所有权
 
-`ManualSingleTurnSession` 独占 turn 状态。网络回调只提交有界数据和控制结果，不直接切换
-会话状态。
+当前源码只创建两个工作线程，加上调用 `Client::Run` 的主线程，共三个客户端自有长期执行
+上下文：
 
-- capture pump 只负责持续 `Capture20Ms` 和入队；不能被 END PCM、`turn.commit` 或服务端
-  等待阻塞。
-- voice consumer 在唤醒、普通录音和播放打断阶段接管同一 capture 队列。消费者切换前先
-  建立下一接收者；出现队列溢出后，以 sticky discontinuity 阻止旧帧跨代进入 DSP。
-- playback consumer 独占 ALSA write、jitter queue 出队和最终软件 reference 生成。
-- response watchdog 只负责有界超时；它不能重启服务端或偷偷创建第二条会话。
+| 上下文 | 独占职责 |
+| --- | --- |
+| 控制/采集线程 | ALSA capture、DSP、Snowboy/VAD、状态机、turn 和重连调度 |
+| 播放线程 | TTS 队列、重采样、gain/limiter、ALSA playback 和 reference 发布 |
+| WebSocket service 线程 | TLS/WSS I/O；回调只向 64 项事件环提交结果 |
 
-停止顺序是：停止新 turn/网络生产，停止 capture pump，停止并清空 playback，重置 DSP 和
-唤醒历史，最后关闭 ALSA/WSS。不得用固定 `sleep` 猜测线程已经退出。
+真板进程当前观测为 4 个线程；额外一个由链接依赖内部创建，不拥有 boomPI 业务状态。若后续
+出现更多依赖线程，必须重新记录来源、优先级和退出行为。
 
-## 打断与回声门
+业务状态只由控制/采集线程修改。播放线程不切换 turn，网络回调不直接调用状态机。
+`Close` 先通知工作线程退出并 join，再释放 ALSA、DSP、Snowboy、VAD 和 WSS 资源。
 
-播放期间 capture 保持运行。最终送入扬声器的 48 kHz PCM 被降采样并延迟对齐后作为软件
-reference；收到的原始 TTS 包不能直接作为 reference。
+## 唤醒、追问与打断
 
-当前轻量门控只做每帧能量、固定一帧 vendor 延迟对齐、600 ms 校准、500 ms echo tail 和
-2-of-3 证据；确认窗口为 160 ms。确认后立即 `DropPlayback`、发送 cancel，并把预卷作为新
-utterance 开头。它是对 vendor AEC 后残余回声的保护，不是 AEC 替代品。
+- Snowboy 命中后重置 Snowboy/VAD 历史，最多等待 6 s 用户开口。
+- VAD 连续静音 700 ms 后提交；单轮语音硬上限 60 s。
+- 正常回复结束后进入 3 s 免唤醒追问。
+- 播放时近端语音累计 80 ms 先 duck，累计 160 ms 后 `DropPlayback`、清空本地 TTS、
+  向服务端发送 cancel，并把已经采集的近端语音继续作为新 utterance。
 
-已知限制：正常 TTS 结束后的 3 s follow-up 仅在前 500 ms 受 echo tail 保护；嘈杂或 AGC
-抬噪环境仍可能误触发或持续到 utterance 上限。该问题尚未完成产品验收，不能在文档中写成
-已修复。
+播放 reference 来自最终写入 ALSA 的 PCM，不使用未播放的原始 TTS 包。能量门只抑制
+残余回声造成的误打断，是 vendor AEC 的保护层，不替代 AEC。
+
+## 故障语义
+
+- capture/playback xrun、重采样错位或 reference 不连续都会建立 discontinuity，并重置
+  前端历史，旧音频不得跨 turn 继续发送。
+- WSS 断线使当前 turn 失败；重连退避为 1、2、4、8、16、30 s，连接动作不阻塞采集。
+- PCM 序号、turn/stream/response/epoch 或采样率不匹配时拒绝数据，不做实时音频重传。
+- 正常结束 drain；打断或错误 drop，避免旧 TTS 在下一轮继续播放。
 
 ## 验证边界
 
-Host 测试保留 renderer/resampler/gain、continuity、Snowboy adapter、协议与 WSS 的确定性
-检查。Linux `alsa-null-api-flow-only` 只验证现役 `AlsaSingleTurnIo` 的 API 流程；真实
-capture、全双工、AEC、打断、扬声器首声和长期稳定性必须在目标板上验收。
-
-历史 `PcmPlaybackSink48k`、`PlaybackCommitter`、`PlaybackWorker` 和通用
-`AudioDspEngine` 的验证记录可以保留追溯，但对应代码已删除，不得列入当前测试矩阵。
+交叉构建、板端加载、Rockchip 3A/Snowboy 初始化、持久 WSS 和空闲运行已经通过。真人
+首轮问答、3 s 追问、长回复、播放中打断、噪声误触发及断网恢复仍以目标板人工验收为准。
+当前证据见 [板端客户端 2000 ELOC 收敛与启动记录](../test/client-under-2000-refactor-20260731.md)。

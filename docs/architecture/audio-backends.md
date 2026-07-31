@@ -7,8 +7,9 @@
 ledger 和旧 ALSA playback adapter；历史 host 与交叉链接结果仍保存在测试记录中，但不再
 构成当前架构。
 
-当前板端运行链路只保留真实使用的边界：`AlsaSingleTurnIo`、`RockchipVoiceDsp`、
-`SnowboyWakeWordEngine`、WebRTC VAD、24→48 kHz renderer/resampler/gain 与 WSS 协议。
+当前板端运行链路只保留真实使用的边界：一个 `AudioEngine` 内聚直接 ALSA、
+`RockchipVoiceDsp`、Snowboy legacy bridge、WebRTC VAD、24→48 kHz 重采样、gain/limiter
+和播放 reference；`Client` 与 `Transport` 分别负责状态机和 WSS 协议。
 raw `rk_mpi_ai`/`rk_mpi_ao` 仍是独立 HIL 候选，不接入产品进程。详细只读证据见
 [P0 vendor 音频证据基线](../test/p0-vendor-audio-inventory-20260727.md)；MPI 头文件、依赖和
 当时 21 个入口的交叉链接证据见
@@ -30,16 +31,15 @@ Mode2 是独立 mixer 选择。物理 slot、极性、reference 数量和 packin
 
 ## 直接 ALSA 全双工边界
 
-`AlsaSingleTurnIo` 同时拥有 capture/playback 两个 nonblocking handle，并精确协商
-48 kHz、S16_LE、2 ch、960-frame period 和 3840-frame buffer。它不选择声卡、不改 mixer、
-不拥有线程；`manual_single_turn.cpp` 负责 capture pump、播放和 turn 生命周期。
+`AudioEngine` 直接拥有 capture/playback 两个 blocking handle，并精确协商 48 kHz、S16_LE、
+2 ch、960-frame period 和 3840-frame buffer。控制/采集线程读取完整 20 ms 帧；独立播放
+线程从固定 1.5 s 队列消费 TTS。不存在 capture pump 或中间采集队列。
 
-- `Capture20Ms` 只发布完整 20 ms period；恢复过 xrun 的帧显式标为 discontinuity。
-- `WriteMono48k` 在固定 scratch 中复制为双声道，处理 bounded wait/partial write，并限制
-  playback recovery 次数。
-- `DropPlayback` 用于打断，`DrainPlayback` 用于正常结束；两者都有明确超时或错误路径。
-- Linux host 的 `alsa-null-api-flow-only` 只证明这条现役 API 流程可打开、读写和收尾；
-  `null` 不证明 Codec、I2S、扬声器、时钟或声学表现。
+- capture xrun 恢复后显式报告 discontinuity，并重置 DSP、Snowboy 和 VAD 历史。
+- playback 在固定 scratch 中转换为双声道，处理 partial write；xrun 同步打断 reference 连续性。
+- `DropPlayback` 用于打断或失败；`EndPlayback` 用于正常 EOS，最终由播放线程有界收尾。
+- 这条生产路径只在匹配 RV1106 BSP 的交叉工具链和真板上构建运行，不提供虚假的 host
+  ALSA null 等价实现。
 
 旧 `PcmPlaybackSink48k`/`AlsaPcmPlaybackDevice` 与配套 control/committer/worker 已从生产
 树和测试矩阵删除。其 2026-07-27 结果仅是历史实现证据。

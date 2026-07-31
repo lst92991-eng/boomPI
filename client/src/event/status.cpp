@@ -19,8 +19,6 @@ Status Status::Error(const StatusCode code, std::string message) {
 
 bool Status::ok() const noexcept { return code_ == StatusCode::kOk; }
 
-StatusCode Status::code() const noexcept { return code_; }
-
 const std::string& Status::message() const noexcept { return message_; }
 
 }  // namespace boompi
