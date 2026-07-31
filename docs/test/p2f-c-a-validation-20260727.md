@@ -1,5 +1,10 @@
 # P2f-c-a ALSA playback adapter 验证记录（2026-07-27）
 
+> 历史状态：本记录对应的 `PcmPlaybackSink48k`、`AlsaPcmPlaybackDevice`、link-check 和
+> `alsa-null-accepted-only` smoke 已于 2026-07-31 随未进入真实客户端 ELF 的通用播放层
+> 一并删除。下列命令和 target 仅用于追溯当时证据，不属于当前构建或测试矩阵；现役路径是
+> `AlsaSingleTurnIo` 和 `alsa-null-api-flow-only`。
+
 - 时间：2026-07-27 19:58（Asia/Shanghai，UTC+08:00）
 - 范围：`PcmPlaybackSink48k`、`AlsaPcmPlaybackDevice`、Linux `null` accepted-only
   smoke，以及 RV1106 tests-off 交叉链接检查。

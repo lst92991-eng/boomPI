@@ -57,23 +57,15 @@ boompi_add_library(boompi_config
 target_link_libraries(boompi_config PUBLIC boompi_event)
 
 boompi_add_library(boompi_audio_core
-  src/audio/audio_dsp_engine.cpp
   src/audio/audio_format.cpp
   src/audio/audio_frame.cpp
-  src/audio/capture_dsp_frontend.cpp
-  src/audio/capture_channel_mapper.cpp
   src/audio/fir_decimator_48_to_16.cpp
   src/audio/frame_continuity_gate.cpp
-  src/audio/pcm_playback_sink.cpp
-  src/audio/playback_buffer.cpp
-  src/audio/playback_committer.cpp
-  src/audio/playback_control.cpp
   src/audio/playback_frame.cpp
   src/audio/playback_gain_limiter.cpp
   src/audio/playback_generation.cpp
   src/audio/playback_renderer_24_to_48.cpp
   src/audio/playback_resampler_24_to_48.cpp
-  src/audio/playback_worker.cpp
   src/audio/wake_word_engine.cpp)
 target_link_libraries(boompi_audio_core PUBLIC boompi_event)
 
@@ -233,13 +225,6 @@ target_link_libraries(boompi_update PUBLIC boompi_event)
 boompi_add_library(boompi_platform_posix
   src/platform/posix/monotonic_clock.cpp)
 
-boompi_add_library(boompi_platform_audio
-  src/platform/audio_pcm_playback.cpp)
-target_link_libraries(boompi_platform_audio
-  PUBLIC
-    boompi_audio_core
-    boompi_event)
-
 boompi_add_library(boompi_platform_rv1106
   src/platform/rv1106/build_environment.cpp)
 target_link_libraries(boompi_platform_rv1106 PUBLIC boompi_event)
@@ -320,24 +305,15 @@ if(BOOMPI_ENABLE_ALSA_PLAYBACK)
   endif()
   find_package(ALSA REQUIRED)
   boompi_add_library(boompi_platform_alsa
-    src/platform/rv1106/alsa_pcm_playback.cpp
     src/platform/rv1106/alsa_single_turn_io.cpp)
   target_link_libraries(boompi_platform_alsa
-    PUBLIC boompi_platform_audio
+    PUBLIC boompi_event
     PRIVATE ALSA::ALSA)
   if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
     target_compile_definitions(boompi_platform_alsa PRIVATE
       BOOMPI_ALLOW_ALSA_NULL_TEST_PCM=1)
   endif()
 
-  # This target is intentionally part of ALL even when tests are disabled. It
-  # makes the target linker resolve the adapter's ALSA and clock symbols before
-  # the runtime composition root starts constructing the adapter.
-  add_executable(boompi_alsa_playback_link_check
-    tests/link/alsa_playback_link_check.cpp)
-  boompi_configure_target(boompi_alsa_playback_link_check)
-  target_link_libraries(boompi_alsa_playback_link_check
-    PRIVATE boompi_platform_alsa)
 endif()
 
 boompi_add_library(boompi_application
@@ -401,8 +377,6 @@ install(TARGETS boompi_supervisor RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR})
 
 if(BOOMPI_BUILD_TESTS)
   add_library(boompi_test_support STATIC
-    tests/support/scripted_pcm_playback_sink.cpp
-    tests/support/fake_audio_engines.cpp
     tests/support/test_context.cpp)
   target_include_directories(boompi_test_support
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/include)
@@ -439,18 +413,6 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_server_control_tests
     COMMAND boompi_server_control_tests)
 
-  add_executable(boompi_audio_queue_tests
-    tests/unit/audio_queue_tests.cpp)
-  boompi_configure_target(boompi_audio_queue_tests)
-  target_link_libraries(boompi_audio_queue_tests
-    PRIVATE
-      boompi_audio_core
-      boompi_test_support
-      Threads::Threads)
-  add_test(
-    NAME boompi_audio_queue_tests
-    COMMAND boompi_audio_queue_tests)
-
   add_executable(boompi_audio_continuity_tests
     tests/unit/audio_continuity_tests.cpp)
   boompi_configure_target(boompi_audio_continuity_tests)
@@ -462,17 +424,6 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_audio_continuity_tests
     COMMAND boompi_audio_continuity_tests)
 
-  add_executable(boompi_audio_channel_mapper_tests
-    tests/unit/audio_channel_mapper_tests.cpp)
-  boompi_configure_target(boompi_audio_channel_mapper_tests)
-  target_link_libraries(boompi_audio_channel_mapper_tests
-    PRIVATE
-      boompi_audio_core
-      boompi_test_support)
-  add_test(
-    NAME boompi_audio_channel_mapper_tests
-    COMMAND boompi_audio_channel_mapper_tests)
-
   add_executable(boompi_audio_fir_decimator_tests
     tests/unit/audio_fir_decimator_tests.cpp)
   boompi_configure_target(boompi_audio_fir_decimator_tests)
@@ -483,29 +434,6 @@ if(BOOMPI_BUILD_TESTS)
   add_test(
     NAME boompi_audio_fir_decimator_tests
     COMMAND boompi_audio_fir_decimator_tests)
-
-  add_executable(boompi_audio_capture_dsp_frontend_tests
-    tests/unit/audio_capture_dsp_frontend_tests.cpp)
-  boompi_configure_target(boompi_audio_capture_dsp_frontend_tests)
-  target_link_libraries(boompi_audio_capture_dsp_frontend_tests
-    PRIVATE
-      boompi_audio_core
-      boompi_test_support)
-  add_test(
-    NAME boompi_audio_capture_dsp_frontend_tests
-    COMMAND boompi_audio_capture_dsp_frontend_tests)
-
-  add_executable(boompi_audio_playback_buffer_tests
-    tests/unit/audio_playback_buffer_tests.cpp)
-  boompi_configure_target(boompi_audio_playback_buffer_tests)
-  target_link_libraries(boompi_audio_playback_buffer_tests
-    PRIVATE
-      boompi_audio_core
-      boompi_test_support
-      Threads::Threads)
-  add_test(
-    NAME boompi_audio_playback_buffer_tests
-    COMMAND boompi_audio_playback_buffer_tests)
 
   add_executable(boompi_audio_playback_resampler_tests
     tests/unit/audio_playback_resampler_tests.cpp)
@@ -540,73 +468,6 @@ if(BOOMPI_BUILD_TESTS)
     NAME boompi_audio_playback_renderer_tests
     COMMAND boompi_audio_playback_renderer_tests)
 
-  add_executable(boompi_audio_pcm_playback_sink_tests
-    tests/unit/audio_pcm_playback_sink_tests.cpp)
-  boompi_configure_target(boompi_audio_pcm_playback_sink_tests)
-  target_link_libraries(boompi_audio_pcm_playback_sink_tests
-    PRIVATE
-      boompi_audio_core
-      boompi_test_support)
-  add_test(
-    NAME boompi_audio_pcm_playback_sink_tests
-    COMMAND boompi_audio_pcm_playback_sink_tests)
-
-  add_executable(boompi_audio_pcm_playback_adapter_tests
-    tests/unit/audio_pcm_playback_adapter_tests.cpp)
-  boompi_configure_target(boompi_audio_pcm_playback_adapter_tests)
-  target_link_libraries(boompi_audio_pcm_playback_adapter_tests
-    PRIVATE
-      boompi_platform_audio
-      boompi_test_support)
-  add_test(
-    NAME boompi_audio_pcm_playback_adapter_tests
-    COMMAND boompi_audio_pcm_playback_adapter_tests)
-
-  add_executable(boompi_audio_playback_committer_tests
-    tests/unit/audio_playback_committer_tests.cpp)
-  boompi_configure_target(boompi_audio_playback_committer_tests)
-  target_link_libraries(boompi_audio_playback_committer_tests
-    PRIVATE
-      boompi_audio_core
-      boompi_test_support)
-  add_test(
-    NAME boompi_audio_playback_committer_tests
-    COMMAND boompi_audio_playback_committer_tests)
-
-  add_executable(boompi_audio_playback_control_tests
-    tests/unit/audio_playback_control_tests.cpp)
-  boompi_configure_target(boompi_audio_playback_control_tests)
-  target_link_libraries(boompi_audio_playback_control_tests
-    PRIVATE
-      boompi_audio_core
-      boompi_test_support
-      Threads::Threads)
-  add_test(
-    NAME boompi_audio_playback_control_tests
-    COMMAND boompi_audio_playback_control_tests)
-
-  add_executable(boompi_audio_playback_worker_tests
-    tests/unit/audio_playback_worker_tests.cpp)
-  boompi_configure_target(boompi_audio_playback_worker_tests)
-  target_link_libraries(boompi_audio_playback_worker_tests
-    PRIVATE
-      boompi_audio_core
-      boompi_test_support)
-  add_test(
-    NAME boompi_audio_playback_worker_tests
-    COMMAND boompi_audio_playback_worker_tests)
-
-  add_executable(boompi_audio_backend_contract_tests
-    tests/unit/audio_backend_contract_tests.cpp)
-  boompi_configure_target(boompi_audio_backend_contract_tests)
-  target_link_libraries(boompi_audio_backend_contract_tests
-    PRIVATE
-      boompi_audio_core
-      boompi_test_support)
-  add_test(
-    NAME boompi_audio_backend_contract_tests
-    COMMAND boompi_audio_backend_contract_tests)
-
   add_executable(boompi_snowboy_wake_word_engine_tests
     src/platform/rv1106/snowboy_wake_word_engine.cpp
     tests/fixtures/snowboy_legacy_bridge_fake.cpp
@@ -625,20 +486,6 @@ if(BOOMPI_BUILD_TESTS)
     COMMAND boompi_snowboy_wake_word_engine_tests)
 
   if(BOOMPI_ENABLE_ALSA_PLAYBACK)
-    add_executable(boompi_alsa_null_playback_smoke
-      tests/smoke/alsa_null_playback_smoke.cpp)
-    boompi_configure_target(boompi_alsa_null_playback_smoke)
-    target_link_libraries(boompi_alsa_null_playback_smoke
-      PRIVATE boompi_platform_alsa)
-    add_test(
-      NAME boompi_alsa_null_playback_accepted_only
-      COMMAND boompi_alsa_null_playback_smoke)
-    set_tests_properties(
-      boompi_alsa_null_playback_accepted_only
-      PROPERTIES
-        LABELS "alsa-null-accepted-only"
-        TIMEOUT 20)
-
     if(NOT BOOMPI_TARGET_RV1106)
       add_executable(boompi_alsa_single_turn_io_smoke
         tests/smoke/alsa_single_turn_io_smoke.cpp)
@@ -659,21 +506,11 @@ if(BOOMPI_BUILD_TESTS)
   set_tests_properties(
     boompi_host_tests
     boompi_server_control_tests
-    boompi_audio_queue_tests
     boompi_audio_continuity_tests
-    boompi_audio_channel_mapper_tests
     boompi_audio_fir_decimator_tests
-    boompi_audio_capture_dsp_frontend_tests
-    boompi_audio_playback_buffer_tests
     boompi_audio_playback_resampler_tests
     boompi_audio_playback_gain_limiter_tests
     boompi_audio_playback_renderer_tests
-    boompi_audio_pcm_playback_sink_tests
-    boompi_audio_pcm_playback_adapter_tests
-    boompi_audio_playback_committer_tests
-    boompi_audio_playback_control_tests
-    boompi_audio_playback_worker_tests
-    boompi_audio_backend_contract_tests
     boompi_snowboy_wake_word_engine_tests
     PROPERTIES TIMEOUT 20)
 endif()

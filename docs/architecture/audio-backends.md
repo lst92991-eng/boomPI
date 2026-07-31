@@ -2,23 +2,17 @@
 
 ## 本阶段状态
 
-当前方向是 vendor backend 先接通、最小闭环、再按实测拆分。此前建立的
-`AudioDspEngine`/`WakeWordEngine`、renderer、playback control/committer/worker 和 ALSA
-playback adapter 继续保留，但暂停增加新抽象或 runtime 组成。它们的 host fake、ALSA
-`null` 和交叉链接结果只证明相应软件边界，不能证明板端 AEC、全双工或实时率。
+当前方向是 vendor backend 先接通、最小闭环、再按实测拆分。2026-07-31 已删除未进入
+真实 `boompi-client` 的通用 capture/DSP 前端、playback control/committer/worker、软件
+ledger 和旧 ALSA playback adapter；历史 host 与交叉链接结果仍保存在测试记录中，但不再
+构成当前架构。
 
-下一项实现直接面向匹配 BSP 的 `rk_mpi_ai`/`rk_mpi_ao`、ALSA PCM、Rockchip
-VQE 和 `libaec_bf_process.so` 探针。详细只读证据见
+当前板端运行链路只保留真实使用的边界：`AlsaSingleTurnIo`、`RockchipVoiceDsp`、
+`SnowboyWakeWordEngine`、WebRTC VAD、24→48 kHz renderer/resampler/gain 与 WSS 协议。
+raw `rk_mpi_ai`/`rk_mpi_ao` 仍是独立 HIL 候选，不接入产品进程。详细只读证据见
 [P0 vendor 音频证据基线](../test/p0-vendor-audio-inventory-20260727.md)；MPI 头文件、依赖和
 当时 21 个入口的交叉链接证据见
 [Rockchip MPI 音频交叉链接验证记录](../test/p0-rockchip-mpi-link-validation-20260727.md)。
-
-真实状态必须区分为三层：
-
-1. **核心契约已实现**：固定帧、generation、错误分类和 fail-closed 行为。
-2. **依赖候选可配置**：只有显式启用并通过路径与 SHA-256 检查时才创建 imported target。
-3. **生产 adapter 与板端 HIL 未完成**：raw MPI 本地探针已完成离线/交叉构建，但尚未接入
-   生产运行时，也未在板端处理音频。
 
 ## 数据流与帧布局
 
@@ -30,87 +24,32 @@ rk_mpi or ALSA: 48 kHz / S16_LE / measured channel count
   -> 16 kHz mono for VAD / wake / uplink
 ```
 
-现有 `CaptureDspFrontend`/`DspCaptureFrame16k` 实现了四逻辑平面候选，但不再将其视为
-生产输入前提。当前 DTB 的 `TRCM clk-trcm=1` 只是共享 TX 时钟；vendor AI VQE 样例请求的
-loopback Mode2 是独立 mixer 选择。物理 slot、极性、reference 数量和 packing 必须由
-板端相关性测试确定后再适配，不能把某一路麦克风伪装成 AEC 后 mono。
+当前 DTB 的 `TRCM clk-trcm=1` 只是共享 TX 时钟；vendor AI VQE 样例请求的 loopback
+Mode2 是独立 mixer 选择。物理 slot、极性、reference 数量和 packing 必须由板端相关性
+测试确定，不能从示例或类型名推断。
 
-## ALSA playback adapter
+## 直接 ALSA 全双工边界
 
-本节记录已经完成的历史实现和审计边界；vendor 最小闭环完成前不继续为它增加 runner、
-mailbox、control 或 worker 层。
+`AlsaSingleTurnIo` 同时拥有 capture/playback 两个 nonblocking handle，并精确协商
+48 kHz、S16_LE、2 ch、960-frame period 和 3840-frame buffer。它不选择声卡、不改 mixer、
+不拥有线程；`manual_single_turn.cpp` 负责 capture pump、播放和 turn 生命周期。
 
-P2f-c-a 增加了两层播放平台边界：跨平台 `PcmPlaybackSink48k` 只负责设备状态校验、
-mono 到显式一/二声道的固定 scratch 映射和 portable result；Linux
-`AlsaPcmPlaybackDevice` 独占一个以 `SND_PCM_NONBLOCK` 打开的 playback handle。
-设备名、声道、period、buffer、start threshold 和 avail-min 都由冷路径配置提供；
-adapter 不选择示例板号、不改 mixer，并关闭 libasound 的 automatic resample/channel/format
-转换。exact 回读只约束所打开 named PCM 的 API 边界；如果配置选择 `default`、`plug`、
-`plughw` 或其他插件，插件内部仍可能转换。产品 HIL 必须另行记录解析后的直接硬件路径，
-不能把 named-PCM exact 冒充 Codec/I2S 硬件路径 exact。
+- `Capture20Ms` 只发布完整 20 ms period；恢复过 xrun 的帧显式标为 discontinuity。
+- `WriteMono48k` 在固定 scratch 中复制为双声道，处理 bounded wait/partial write，并限制
+  playback recovery 次数。
+- `DropPlayback` 用于打断，`DrainPlayback` 用于正常结束；两者都有明确超时或错误路径。
+- Linux host 的 `alsa-null-api-flow-only` 只证明这条现役 API 流程可打开、读写和收尾；
+  `null` 不证明 Codec、I2S、扬声器、时钟或声学表现。
 
-每次写入固定按以下顺序推进：
+旧 `PcmPlaybackSink48k`/`AlsaPcmPlaybackDevice` 与配套 control/committer/worker 已从生产
+树和测试矩阵删除。其 2026-07-27 结果仅是历史实现证据。
 
-1. 写前 status 必须是 PREPARED 或 RUNNING，delay 在 0–1.5 秒边界内。
-2. 最多调用一次 `snd_pcm_writei`，正返回的 partial prefix 立即成为不可逆事实。
-3. 正返回后从同一 device 取得 `CLOCK_MONOTONIC` write-complete 时间，再取一次 status。
-4. 只有写后状态为 RUNNING、单调时钟域一致，且 status timestamp 位于 write-complete
-   与 status-return 后观测时间之间时，才把 timing 标为 `kAlsaStatus`；写后仍是 PREPARED
-   表示尚未跨过 start threshold，不能预言起播时间。
-5. 任一写后错误都保留正 accepted count，返回 intentionally malformed positive result，
-   由 committer 精确推进一次后取消；不发布伪 AEC reference，也绝不重放该 prefix。
+## Rockchip 3A 运行边界
 
-`EAGAIN/EINTR/EPIPE/ESTRPIPE/ENODEV|ENXIO|ENOTTY` 分别映射为 would-block、
-interrupted、xrun、suspended 和 device-lost，原负 errno 保留用于有界诊断。热路径禁止
-调用 `snd_pcm_recover`：恢复不能绕过 PCM incarnation；xrun/suspend 统一由 actor 推进
-fence 后执行现有 `Drop -> incarnation++ -> Prepare` 事务。
-
-`BOOMPI_ENABLE_ALSA_PLAYBACK` 在普通 host 默认关闭、RV1106 target 默认开启。启用后，
-默认 ALL 构建会链接一个不安装、不自动执行的 `boompi_alsa_playback_link_check`，以便在
-tests-off 的交叉构建中也解析 adapter、ALSA 和单调时钟符号；它只证明链接兼容。Linux
-还可显式运行 `alsa-null-accepted-only` smoke；`null` 会丢弃数字 PCM，只能证明
-libasound API 与 accepted 边界，不能证明 hardware presentation、played 或 audible。
-当前 composition root 还没有创建该 device/sink，也没有实际 playback runner。
-
-## AudioDspEngine 契约
-
-`AudioDspEngineConfig` 必须显式选择一种 reference source 和一种 layout：
-
-- `kHardwareCapture`：reference 来自经 HIL 确认的 Codec/I2S/TDM 数字回采平面。
-- `kSoftwarePlayback`：reference 来自最终播放链路中已被 playback sink 接受的数字 PCM。
-- layout 只能是 mono-left、mono-right 或 stereo，具体选择必须来自真实 API 和硬件证据。
-
-同一时刻只能启用一种 reference source。软件 reference 不能使用收到的原始 TTS 包，
-必须位于 jitter、重采样、音量、duck、混音和 limiter 之后；partial device write 只能
-贡献已接受的 prefix，不能补零伪装成完整帧。P2f-b-a 的 `AcceptedRenderQueue` 只提供
-portable accepted ledger；P2f-c-a 的真实 ALSA adapter 尚未由 runtime 组成，也未接到
-AEC consumer。accepted 也不
-等于 presented、played 或 audible，预计 presentation 时间不能冒充硬件完成证据。
-adapter 若返回 malformed positive count，committer 会把请求范围内可能已接受的样本
-保守推进且不重放，但禁止用不可信 timing 发布 reference，并要求取消。control result
-的零初始化值必须是 invalid/unset；accepted sequence 不得回绕，耗尽后即使完成
-`Drop`/`Prepare` 也只能请求 terminal runtime restart。
-
-v1 配置要求一次性启用完整的 AEC、NS、BF 和 AGC feature mask。这一约束只防止外层
-遗漏或重复叠加处理，不代表已经知道 Rockchip 库内部的算法顺序，也不证明四项能力
-能用当前候选库同时工作。
-
-engine 由一个 DSP worker 独占并串行执行：
-
-- `Configure` 只用于冷路径，失败不得形成半配置状态。
-- `Arm(epoch, stream_id)` 要求非零 epoch 严格大于该实例曾接受的全部 epoch，且
-  `stream_id` 非零；成功后清除 backend 历史。epoch 耗尽时必须重建 engine。
-- 相同或更旧 epoch 即使更换 stream 也不能通过重复 `Arm` 清除 fault。
-- `Disarm` 使历史失效；旧 epoch/stream 帧必须在调用 backend 前被丢弃。
-- `Process` 只接受四平面 16 kHz 输入，成功时产生一个 metadata 原样继承的
-  `Mono16kFrame`。
-- 非成功返回时输出 header 无效，调用方不得读取 PCM。
-- discontinuity 或 backend failure 会要求 application actor 换新 generation，不能
-  继续发送伪连续音频。
-
-`UnavailableAudioDspEngine` 是默认失败关闭实现：配置和 Arm 明确返回不支持，处理时
-从不输出未经处理的麦克风 PCM。`FakeAudioDspEngine` 只编入测试 target；它用于验证
-编排、generation 和错误恢复，不实现 AEC/NS/BF/AGC，也不得进入发布产物。
+`RockchipVoiceDsp` 是当前唯一产品 3A adapter。它使用匹配 BSP 的固定 16 kHz 帧配置和
+真实 vendor ABI；外层不再维护通用 `AudioDspEngine`、channel mapper 或 capture frontend。
+输入布局、reference 来源、延迟与功能位仍必须由目标板 HIL 确认。discontinuity、xrun 或
+turn 取消时，运行时必须重置 vendor 历史，不能继续发送伪连续音频。
 
 ## Rockchip MPI raw AI/AO 候选与链接边界
 

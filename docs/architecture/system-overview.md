@@ -38,79 +38,37 @@ UI/touch <- UI model                              Qwen Singapore
 
 跨线程 PCM 使用预分配有界队列；控制消息使用有界 EventBus。业务状态只能由 application actor 修改。实时音频路径不做文件或网络 I/O，不允许每帧动态分配或无界等待。
 
-帧槽、SPSC lease、sequence/discontinuity 和 consumer gate 的具体 ownership 见
-[音频运行时边界](audio-runtime.md)；DSP/Snowboy 接口、失败关闭和 vendor 依赖闸门见
+有界队列、discontinuity barrier 和 consumer handoff 的具体 ownership 见
+[音频运行时边界](audio-runtime.md)；Rockchip 3A/Snowboy 与 vendor 依赖闸门见
 [音频后端契约与依赖闸门](audio-backends.md)。
 
 ## 音频边界
 
-目标硬件链路是 48 kHz 全双工。实际 capture layout 可能是双麦、麦克风加数字播放
-reference，或双麦加一个/多个 reference；必须先由 rk_mpi/ALSA HIL 测得，不能预设四通道。
-Rockchip 3A 按已核对的 16 kHz/16 ms 候选接入，处理后的 16 kHz mono 同时供
-Snowboy、VAD 和服务端上行使用。Qwen 下行默认按 24 kHz mono 标记，板端转为 48 kHz
-后再执行音量、提示音混合和限幅。
+当前真实运行路径由 `AlsaSingleTurnIo` 直接打开 48 kHz/S16_LE/2 ch capture 和 playback。
+20 ms capture 经 48→16 kHz 处理后进入 `RockchipVoiceDsp`，输出 mono 同时供 Snowboy、
+VAD 和服务端上行。Qwen 下行是 24 kHz mono，经 renderer/resampler/gain 变为 48 kHz，
+随后写入同一 ALSA playback handle；最终播放 PCM 的软件 reference 再送入 3A 和打断门控。
 
-下列事项仍是 P0 验证闸门：
+运行时使用 160 ms capture bridge、1.28 s 上限的 playback jitter queue、120 ms 首播预缓冲
+和有界 playback reference queue。capture producer 在录音结束、提交网络 turn 和 TTS 播放
+期间持续运行；消费者先交接再执行阻塞控制操作。队列溢出或 ALSA recovery 会建立 sticky
+discontinuity，直到 DSP reset 和下一消费者就绪，旧帧不得跨 turn 继续发送。
 
-- 48 kHz AI/AO 真全双工、实际通道数、顺序、极性、数字 reference 位置与时钟关系。
-- 固定 `TRCM clk-trcm=1`（TX 时钟源）时，各个 `I2STDM Digital Loopback Mode` mixer
-  枚举的真实 frame 布局；二者是不同控制面。
-- Rockchip 3A ABI、帧布局和算法能力。
-- Snowboy 与目标 libc/libstdc++/ARM ABI 的兼容性。
+2026-07-31 已删除从未进入真实客户端 ELF 的通用 capture/DSP frontend、playback
+control/committer/worker、软件 ledger 和旧 ALSA adapter。当前取消直接由会话状态机执行：
+确认近端语音后 `DropPlayback`、清空 jitter queue、发送云端 cancel，并把预卷作为下一轮
+utterance 开头。不得为了恢复历史测试结构重新引入这些抽象。
 
-没有可靠硬件 reference 时只能进入有记录的软件参考方案评审，不能同时混用硬件和软件
-reference。
+下列事项仍需目标板验收：
 
-P2 当前已实现 48 kHz capture/16 kHz mono 的固定帧契约、预分配 SPSC ownership、
-producer sequence、consumer continuity gate、可配置四通道解交织/极性、四路
-48→16 kHz FIR、generation-safe 采集前端，以及 24 kHz TTS/48 kHz reference 固定帧、
-actor 授权的 playback epoch fence/代际门禁和有界软件 drain。P2f-a 已实现 pre-ALSA
-24→48 kHz renderer；P2f-b-a 已实现 portable `PcmPlaybackSink` 契约、64 槽
-`AcceptedRenderQueue` ledger 和不拥有线程的非阻塞 `PlaybackCommitter`。committer 对
-partial write 精确记账，required-software-reference 模式先取得 ledger 容量再写 sink，
-并在 cancel/write 竞态中保留不可逆的 accepted prefix。本地 cancel 只有在 actor 已推进
-fence、generation 精确匹配且 `Drop`、PCM incarnation 换代和 `Prepare` 均成功后才 ACK；
-结果分别标识 retired 与 prepared PCM incarnation，prepared identity 在 `Prepare` 成功前
-保持 0。sink control 与 committer 公共结果的 aggregate `{}` 都是 invalid/unset，不会
-零初始化成成功。malformed positive
-write 仍按请求范围保守推进且绝不重放，但不发布不可信 timing reference，并强制取消。
-accepted sequence 耗尽后须先 `Drop`/`Prepare`，随后仍是 terminal restart-required，不能
-假恢复。该本地 ACK 不证明声学静音或 DSP/reference 已复位。核心层还定义了 `AudioDspEngine` 和
-`WakeWordEngine`、unavailable fail-closed 实现、测试 target 专用 fake，以及默认关闭并
-要求真实交叉 target、显式路径/固定 SHA-256 的 vendor 依赖闸门。当前 pins 只允许显式
-opt-in 的 Debug feasibility probe，Release 配置拒绝。
+- 两个 capture slot 的物理左右、极性和最终壳体下的双麦声学表现。
+- 软件 playback reference 的固定延迟、残余回声、double-talk 与最大音量表现。
+- Rockchip 3A 的算法实时率和错误恢复；raw MPI 仍只是独立 HIL 候选。
+- 正常 TTS 结束后 3 s follow-up 在嘈杂/AGC 环境中的误触发问题。
 
-P2f-b-b1 已把 playback 控制面收敛为 host 可验证的固定容量值拷贝 SPSC 通道：normal
-lifecycle 与 urgent cancel 分槽，local cancel completion 不受普通结果背压影响；producer
-start/stop、DSP/reference reset、EOS accepted 与 critical stream event 也各有明确契约。
-network producer 的执行规则是 Stop 优先，并在启用 Start、获取 write lease 及每次 publish
-前重验 fence/授权。P2f-b-b2 的 deterministic host worker core 已接通 renderer、committer
-和 playback mailbox，并以有界单步推进；critical 槽满时保留精确事件、停止普通
-ingress/render/commit 并优先重试，不能覆盖或静默丢弃，同时 urgent cancel 始终可执行
-teardown。该 core 不创建实际线程。
-
-application actor 独占精确 cancellation join。active cancel 只有汇合 producer stop、
-本地 `Drop -> Prepare`、producer 已停后的稳定 ingress 空观察、按 retired PCM incarnation
-完成的 DSP reset，以及 worker `ConfirmReferenceReset` 后，才允许 Arm 下一代际。
-never-armed 与 renderer-only/no-sink 路径只有在严格证明未进入 sink、没有 accepted PCM
-的情况下才可跳过 DSP reset，且仍需 producer stop 和稳定 ingress 空。
-
-这些内容已进入 host 可构建边界。P2f-c-a 新增的 `PcmPlaybackSink48k` 与 Linux
-`AlsaPcmPlaybackDevice` 已分别通过 fake-device 故障注入、ALSA `null` accepted-only smoke
-和 RV1106 sysroot 交叉构建；设备名、声道、period、buffer、start threshold 与 avail-min
-都必须显式提供。它们尚未由 composition root 创建，也没有接入实际播放线程。实际线程/
-调度、network producer endpoint、DSP endpoint、accepted ledger 到 AEC 的组装/消费、
-normal-EOS presentation completion、wake/VAD worker 和 500 ms pre-roll 均属于后续集成。accepted
-（包括 EOS accepted）只表示 sink 接受的数字 PCM 前缀，不等于 presented、played、
-audible 或“播放完成”。Rockchip 3A、Snowboy、真实 capture/reference slot、实时率和声学行为仍需
-板端 HIL；通过依赖 configure 或 host fake 不代表 adapter、模型或硬件运行成功。
-
-现有 host DSP 候选输入固定为 `MIC-L`、`MIC-R`、`REF-L`、`REF-R` 四个 16 kHz 平面，
-但生产链路不再预设板端一定提供四槽。reference 必须显式选择硬件回采或最终软件播放
-路径，不能混用。直接 3A 的固定 16 ms frame、2 mic + 1 ref 时
-`input_size=768` shorts、BF mono 成功返回 512 bytes 已由匹配 SDK 契约关闭；物理
-packing/slot、错误恢复、算法实时率和 Snowboy 板端行为仍未验证，不能通过硬编码或 fake
-伪装成已完成。
+当前 DTB 的 `TRCM clk-trcm=1` 只表示共享 TX 时钟，vendor Mode2 是独立 mixer 控制；两者
+都不证明四通道数字 reference。通过 host fake、依赖 configure 或一次听到声音，也不能替代
+上述 HIL。
 
 ## 状态与取消
 

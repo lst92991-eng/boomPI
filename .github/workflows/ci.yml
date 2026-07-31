@@ -71,7 +71,7 @@ jobs:
           sh -n scripts/probes/rv1106_p0_probe.sh
           python -m unittest discover -s scripts/tests -p 'test_*.py' -v
 
-      - name: Configure C++ host build with ALSA null smoke
+      - name: Configure C++ host build with ALSA single-turn smoke
         if: runner.os == 'Linux'
         run: cmake --preset host-debug -DBOOMPI_ENABLE_ALSA_PLAYBACK=ON
 
@@ -91,9 +91,9 @@ jobs:
         if: runner.os != 'Windows'
         run: ctest --preset host-debug --output-on-failure
 
-      - name: Require ALSA null accepted-only smoke
+      - name: Require ALSA single-turn API-flow smoke
         if: runner.os == 'Linux'
-        run: ctest --preset host-debug --output-on-failure --no-tests=error -L alsa-null-accepted-only
+        run: ctest --preset host-debug --output-on-failure --no-tests=error -L alsa-null-api-flow-only
 
       - name: Run C++ host tests (Windows multi-config)
         if: runner.os == 'Windows'

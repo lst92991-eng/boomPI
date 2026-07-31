@@ -65,12 +65,12 @@ GCC 8.3/uClibc 工具链；direct ALSA 48 kHz 全双工、Rockchip 3A 链接、S
 MPI 音频的八个头文件 pin、当时 21 个 `UND`、MPP/RGA SONAME 与未运行边界见
 [2026-07-27 Rockchip MPI 音频交叉链接验证记录](docs/test/p0-rockchip-mpi-link-validation-20260727.md)。
 
-已有 playback renderer/committer/worker/ALSA adapter 及其 host、Linux `null`、RV1106
-交叉链接结果不会删除，详细证据保留在
+2026-07-31 已删除从未进入板端客户端的 playback control/committer/worker、通用 capture/DSP
+前端和旧 ALSA playback adapter。当前链路直接使用 `AlsaSingleTurnIo`、Rockchip 3A、Snowboy
+及已实测的 renderer/resampler/gain 组件；不再为历史 host 抽象保留生产代码。旧 adapter 的
+验证结果仅作为历史证据保留在
 [2026-07-27 ALSA playback adapter 验证记录](docs/test/p2f-c-a-validation-20260727.md)。
-这些模块现在冻结，不继续增加 runner、mailbox 或控制层；后续首先完成 vendor raw PCM
-最小闭环，再按真实阻塞、通道和时序需求复用或简化现有代码。默认自动测试不会访问真实
-Qwen，也不会消耗付费额度。
+默认自动测试不会访问真实 Qwen，也不会消耗付费额度。
 
 2026-07-28 已完成固定 OpenSSL 3.5.7 的 C++ WSS 单轮闭环和真实板端手动单轮：RV1106
 从 `hw:0,0` 以 48 kHz/2ch 采集 slot 0，流式降采样到 16 kHz 后发送给离线 Go fake，
@@ -130,7 +130,7 @@ Linux 安装 ALSA 开发包（Debian/Ubuntu 为 `libasound2-dev`）后，可显�
 ```text
 cmake --preset host-debug -DBOOMPI_ENABLE_ALSA_PLAYBACK=ON
 cmake --build --preset host-debug --parallel
-ctest --preset host-debug --output-on-failure --no-tests=error -L alsa-null-accepted-only
+ctest --preset host-debug --output-on-failure --no-tests=error -L alsa-null-api-flow-only
 ```
 
 该 smoke 不连接 Codec、DAC 或扬声器，不能写成 played/audible。
@@ -340,8 +340,8 @@ raw MPI 对照使用独立的
    再完成真实 capture/reference layout、raw rk_mpi 和已交叉构建的 Rockchip 3A HIL 板端
    验证，随后继续 Snowboy、WSS 产品接线、Wi-Fi AP 和 UI backend 探测。
 2. **P1 工程骨架（已完成）**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
-3. **P2 本地音频（进行中）**：现有 host 音频核心保留但冻结扩展；以 vendor raw PCM 最小
-   闭环和板端 HIL 为当前入口，实测后再决定哪些已有模块进入 runtime。
+3. **P2 本地音频（进行中）**：只保留已进入真实客户端或直接支撑 HIL 的音频代码；以
+   vendor raw PCM 最小闭环和板端实测为边界，不预建通用 worker/control 层。
 4. **P3 服务端**：discovery、pairing、Qwen adapter、Session Actor 和 ToolRegistry。
 5. **P4 端到端对话**：流式文字/音频、取消、上下文、断网和延迟测量。
 6. **P5 UI 与配网**：表情、字幕、触摸、二维码和网络优先级。

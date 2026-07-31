@@ -62,9 +62,9 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
 - 先接通并测量幸狐/Rockchip BSP 已提供的 `rk_mpi_ai`/`rk_mpi_ao`、ALSA PCM、
   Rockchip VQE 和 `libaec_bf_process.so` 的 `rkaudio_preprocess_*`，再决定生产模块边界。不得继续为尚未验证的行为增加
   playback/control/committer/worker 等通用层。
-- 已提交的 renderer、queue、playback control、committer 和 ALSA adapter 代码及测试
-  作为历史实现和 host 证据保留，但在 vendor 最小闭环完成前冻结扩展；不得把 host fake、
-  ALSA `null` 或交叉链接写成板端能力。
+- 2026-07-31 已删除未进入板端客户端的 queue、playback control/committer/worker、通用
+  capture/DSP 前端和旧 ALSA adapter；历史验证记录可保留，但不得恢复这些生产抽象来承接
+  未经实测的行为，也不得把 host fake、ALSA `null` 或交叉链接写成板端能力。
 - 第一项板端闭环是同一时刻运行的 48 kHz capture/playback，其后用可辨识信号确认实际
   通道数、双麦 slot、数字 reference slot、极性、延迟和时钟关系，最后才接 16 kHz 3A。
 - 过去文档把“Mode1 四通道”写成一个假设，现已拆开：当前 DTB 的
@@ -238,7 +238,7 @@ rk_mpi_ai/rk_mpi_ao or direct ALSA 48 kHz full duplex
        candidate B: microphone + digital playback reference (vendor Mode2 sample)
        candidate C: MIC-L, MIC-R, REF-L, REF-R
   -> deinterleave + anti-alias resample 48 kHz -> 16 kHz
-  -> Rockchip AudioDspEngine once: configured AEC/NS/BF/AGC processing
+  -> Rockchip 3A adapter once: configured AEC/NS/BF/AGC processing
   -> VAD + Snowboy + 16 kHz S16_LE mono uplink
 
 Qwen 24 kHz S16_LE mono downlink
@@ -260,7 +260,9 @@ Qwen 24 kHz S16_LE mono downlink
   经过 jitter、重采样、音量和混音。
 - 硬件 Codec 回采和软件播放参考同一时刻只能启用一种，禁止把两种 reference 叠加后交给 AEC。
 - AEC、NS、BF、AGC 每一级只运行一次。若 Rockchip 3A 内部已经组合实现，外层不得再叠加同类处理。
-- 核心层只定义 `AudioDspEngine` 的输入、输出、帧连续性和延迟契约；Rockchip adapter 负责 vendor 实际算法顺序，不得把推测的内部顺序写成事实。
+- `RockchipVoiceDsp` 只暴露板端实测所需的固定帧输入、输出和重置边界；vendor 实际算法顺序
+  由匹配 BSP 的 adapter 负责，不得为统一接口重建未使用的通用 DSP engine 层，也不得把
+  推测的内部顺序写成事实。
 - 第一版板端到服务端使用 16 kHz、16-bit、mono 原始 PCM，不使用 Opus。播放下行按 provider 实际格式标记，默认 Qwen 24 kHz PCM，板端统一转 48 kHz。
 - Snowboy 和上行网络消费同一份 AEC 后 16 kHz 音频，但必须各自使用独立有界队列，网络阻塞不得影响唤醒。
 - Snowboy 必须通过 `WakeWordEngine` adapter 隔离，并先检查 ARM ISA、hard/soft float、动态加载器、libc、libstdc++/`GLIBCXX`、模型加载和实时率。功能跑通后再做至少 30 分钟稳定性及 CPU/RSS/最坏帧耗时测试。失败时停止该里程碑、记录证据并请求用户选择更换引擎、进程隔离或调整系统 ABI；不得偷偷换引擎或自行改成多进程。
