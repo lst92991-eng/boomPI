@@ -360,8 +360,11 @@ bool PrepareParameters(RKAUDIOParam* parameters) {
   }
 
   auto* aec = static_cast<SKVAECParameter*>(parameters->aec_param);
+  if (aec->delay_para == nullptr) {
+    return false;
+  }
   aec->pos = 1;
-  aec->model_aec_en = 0;
+  aec->model_aec_en = EN_DELAY;
   aec->drop_ref_channel = 0;
   aec->delay_len = 0;
   aec->look_ahead = 0;

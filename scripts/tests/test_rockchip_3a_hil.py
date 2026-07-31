@@ -313,6 +313,7 @@ raise SystemExit(subprocess.run([real_compiler, *filtered], check=False).returnc
 
 #define RKAUDIO_EN_AEC (1 << 0)
 #define RKAUDIO_EN_BF (1 << 1)
+#define EN_DELAY (1 << 0)
 #define EN_Fastaec 1
 #define EN_Dereverberation 4
 #define EN_AES 16
@@ -447,6 +448,11 @@ static inline void* rkaudio_aec_param_init(void) {
   SKVAECParameter* parameters =
       (SKVAECParameter*)calloc(1, sizeof(SKVAECParameter));
   if (parameters != NULL) {
+    parameters->delay_para = calloc(1, 1);
+    if (parameters->delay_para == NULL) {
+      free(parameters);
+      return NULL;
+    }
     rkaudio_fake_record("aec_param_init");
   }
   return parameters;
@@ -492,7 +498,11 @@ static inline void rkaudio_param_deinit(RKAUDIOParam* parameters) {
     free(beamforming->howl_para);
     free(beamforming);
   }
-  free(parameters->aec_param);
+  SKVAECParameter* aec = (SKVAECParameter*)parameters->aec_param;
+  if (aec != NULL) {
+    free(aec->delay_para);
+  }
+  free(aec);
   parameters->aec_param = NULL;
   parameters->bf_param = NULL;
   rkaudio_fake_record("param_deinit");
@@ -567,7 +577,8 @@ bool pinned_profile_matches(const RKAUDIOParam* parameters) {
       *static_cast<const SKVAECParameter*>(parameters->aec_param);
   const auto& g_bf_parameters =
       *static_cast<const SKVPreprocessParam*>(parameters->bf_param);
-  if (g_bf_parameters.dereverb_para == nullptr ||
+  if (g_aec_parameters.delay_para == nullptr ||
+      g_bf_parameters.dereverb_para == nullptr ||
       g_bf_parameters.aes_para == nullptr ||
       g_bf_parameters.anr_para == nullptr ||
       g_bf_parameters.agc_para == nullptr ||
@@ -600,7 +611,7 @@ bool pinned_profile_matches(const RKAUDIOParam* parameters) {
 
   return g_aec_parameters.pos == 1 &&
       g_aec_parameters.drop_ref_channel == 0 &&
-      g_aec_parameters.model_aec_en == 0 &&
+      g_aec_parameters.model_aec_en == EN_DELAY &&
       g_aec_parameters.delay_len == 0 &&
       g_aec_parameters.look_ahead == 0 &&
       g_aec_parameters.filter_len == 2 &&

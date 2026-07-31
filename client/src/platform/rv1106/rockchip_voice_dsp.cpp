@@ -42,6 +42,7 @@ static_assert(std::is_same<decltype(&rkaudio_preprocess_destory),
               "unexpected rkaudio_preprocess_destory signature");
 static_assert(RKAUDIO_EN_AEC == (1 << 0), "unexpected AEC feature bit");
 static_assert(RKAUDIO_EN_BF == (1 << 1), "unexpected BF feature bit");
+static_assert(EN_DELAY == (1 << 0), "unexpected AEC delay-estimator bit");
 static_assert(EN_Agc == (1 << 5), "unexpected AGC feature bit");
 static_assert(EN_Anr == (1 << 6), "unexpected ANR feature bit");
 static_assert(EN_Fix == (1 << 9), "unexpected fixed-beam feature bit");
@@ -87,8 +88,14 @@ bool PrepareParameters(RKAUDIOParam* const parameters) noexcept {
   }
 
   auto* const aec = static_cast<SKVAECParameter*>(parameters->aec_param);
+  if (aec->delay_para == nullptr) {
+    return false;
+  }
   aec->pos = 1;
-  aec->model_aec_en = 0;
+  // boomPI supplies a software playback reference. Rockchip requires its
+  // delay estimator for a software reference to align it with microphone
+  // capture before linear echo cancellation.
+  aec->model_aec_en = EN_DELAY;
   aec->drop_ref_channel = 0;
   aec->delay_len = 0;
   aec->look_ahead = 0;
