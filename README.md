@@ -2,10 +2,12 @@
 
 boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端负责连接 Qwen 新加坡区，板端不保存云端 API Key。
 
-> **当前已有 1904 ELOC 的真实板端语音候选，但不是发布版。** 第三块 RV1106 板已运行
-> Snowboy、双麦 Rockchip 3A/AEC、VAD、持久 WSS、流式播放、打断和三秒追问链路，并成功
-> 进入 `secure session ready`。旧版的丢帧、高延迟、`EPIPE` 和 jitter queue 记录仍作为回归
-> 风险保留；精简候选尚需真人完成唤醒、问答、连续对话和播放中打断验收。
+> **语音链路的关键能力已经分别在第三块 RV1106 上运行，但当前职责重排候选仍不是发布版。**
+> 历史证据覆盖 Snowboy、Rockchip 3A、VAD、持久 WSS 和真实 Qwen 流式播放；AEC 声学效果、
+> 打断与三秒追问仍以本轮组合验收为准。当前候选为 17 个生产 C++ 文件、2285 ELOC；扣除
+> 439 ELOC 的 Rockchip/Snowboy vendor 集成后，
+> 产品核心为 1846 ELOC。旧版的丢帧、高延迟、`EPIPE` 和 jitter queue 记录仍作为回归风险
+> 保留；当前候选须重新完成交叉构建、板端启动与真人语音验收。
 
 ## 系统形态
 
@@ -36,12 +38,20 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 ### 当前证据边界
 
-- 当前板上的 direct ALSA 48 kHz/S16_LE/2ch transport 真全双工已通过；raw MPI、目标
-  自定义 BSP、实际 capture 物理左右/极性和数字播放 reference slot 尚未通过。当前 DTB 的
-  `TRCM clk-trcm=1` 只说明 TX/RX 共享 TX 时钟，不证明四通道；vendor VQE 样例选择的
-  loopback Mode2 也是另一项尚未在本板验证的 mixer 设置。
-- Rockchip 3A 已在 `voice9` 板端路径中初始化并参与固定帧处理，但输入连续性、实际通道契约、
-  AEC 效果和 16 kHz 实时率尚未验收；raw MPI 与数字播放 reference slot 也仍未闭环。
+- 当前板已验证 Mode1 下 direct ALSA `48 kHz/S16_LE` 真全双工：capture 为
+  `[mic0,mic1,refL,refR]` 四通道，period/buffer 为 `960/1920`；playback 为双通道，
+  period/buffer 为 `960/3840`，测试窗口无 xrun。997 Hz→`refL`、1499 Hz→`refR` 的相关系数
+  均为 `0.9983`；物理扬声器主要使用 DAC-L，声学到达约 `14–17 ms`（阈值法近似）。
+- direct Rockchip 3A 已在板端以 `init(16000,16,2,2)`、`[mic0,mic1,refL,refR]`、
+  1024-short 输入和 512-byte 输出通过固定帧调用。生产链路使用 Mode1 硬件参考，不再维护
+  软件 reference ring/60 ms lead；最终壳体 AEC、真人 double-talk 和长期实时率仍未验收。
+- 当前生产 DSP profile 为 mask `1109`（FastAEC、AES、ANR、Dereverberation、STDT，vendor
+  AGC 关闭），`ALC31/ref2/delay0` 仍是候选而非最终参数。同类无人声/嘈杂环境回归中，AGC
+  开启 `n=5` 得到 `confirmed=4/5`、`follow=5/5`、`attempts=119`；关闭 AGC 累计 `n=10`
+  得到 `confirmed=2/10`、`follow=3/10`、`attempts=43`。AGC OFF 明显改善但没有解决误触发。
+- 播放期的主动硬参考探针通过硬静音、等待 reference 降低和二次 VAD 确认来抑制自激；这是
+  产品侧 containment 候选，不是 AEC 效果证明。当前环境仍嘈杂，真人双讲和可控噪声条件下的
+  打断验收待完成。
 - Snowboy 已在第三块板加载模型并多次检测到唤醒；误唤醒、漏唤醒、准确率和长期 CPU/RSS
   尚未形成可重复基线。
 - 最终壳体下的 AEC、波束形成、双讲、远场和最大音量表现。
@@ -51,12 +61,18 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 ### 软件阶段
 
-2026-07-31 板端生产目标已从约一万行的自写分层实现收敛为 15 个 C++ 文件、1904 ELOC。
-现役 `boompi-client` 直接组合 ALSA/libswresample、Rockchip 3A、Snowboy、WebRTC VAD、
-WebSocketpp/Boost/OpenSSL 和一个显式语音状态机；不再保留自写 WSS、重复 wire protocol、
-通用 playback/capture 框架或未接入的 supervisor/UI/update 占位实现。精确范围、哈希、回滚
-位置和板端启动证据见
-[1904 ELOC 客户端收敛记录](docs/test/client-under-2000-refactor-20260731.md)。
+2026-08-01 板端生产目标按仓库既定职责整理为 17 个 C++ 文件、2285 ELOC；其中
+Rockchip/Snowboy vendor 集成为 439 ELOC，产品核心为 1846 ELOC：
+`application` 是会话状态机，`audio` 是有界播放编排，`network` 是持久 WSS/TLS，
+`platform/rv1106` 是 ALSA/libswresample、Rockchip 3A、Snowboy 和 WebRTC VAD。它们直接组合
+外部库，不再保留自写 WSS、重复 wire protocol、
+通用 playback/capture 框架或未接入的 supervisor/UI/update 占位实现。精确范围、计数口径、
+回滚位置和当前验证结果见
+[语音客户端职责重排记录](docs/test/client-responsibility-layout-20260801.md)。
+
+Mode1 四通道相关性、2 mic + 2 ref 的 direct 3A ABI、算法 profile、启动/退出和仍未关闭的
+真人声学边界见
+[P0 Mode1 硬件播放参考验证记录](docs/test/p0-mode1-hard-reference-validation-20260801.md)。
 
 P0 已确认匹配 BSP 的 GCC 8.3/uClibc 工具链；direct ALSA 48 kHz 全双工、Rockchip 3A、
 Snowboy 和现有 Go/Qwen 服务端均已进入真实板端链路。raw MPI AI+AO、最终壳体 AEC 效果、
@@ -71,8 +87,8 @@ MPI 音频的八个头文件 pin、当时 21 个 `UND`、MPP/RGA SONAME 与未�
 [2026-07-27 Rockchip MPI 音频交叉链接验证记录](docs/test/p0-rockchip-mpi-link-validation-20260727.md)。
 
 2026-07-31 已删除旧 `manual_single_turn`、自写 WSS/协议层、`AlsaSingleTurnIo`、独立
-renderer/resampler/gain 组件和相应失效测试。当前只有 `AudioEngine`、`Transport`、
-`Client` 状态机及薄配置/vendor 适配进入目标 ELF。旧 adapter 的验证结果仅作为历史证据保留在
+renderer/resampler/gain 组件和相应失效测试。当前只有 `VoiceClient`、`AudioEngine`、
+`VoiceTransport`、`AudioBackend` 及薄配置/vendor 适配进入目标 ELF。旧 adapter 的验证结果仅作为历史证据保留在
 [2026-07-27 ALSA playback adapter 验证记录](docs/test/p2f-c-a-validation-20260727.md)。
 默认自动测试不会访问真实 Qwen，也不会消耗付费额度。
 
@@ -245,7 +261,7 @@ feasibility 环境中创建 `EXCLUDE_FROM_ALL` 的原始 AI/AO 探针，默认 b
 toolchain/sysroot、Boost、OpenSSL、Rockchip 3A、Snowboy 和 WebRTC VAD 路径。当前 vendor pin
 闸门刻意拒绝 Release；不得通过关闭 WSS/3A/Snowboy 生成一个冒充候选版的产物。已验证的
 完整参数与结果见
-[1904 ELOC 客户端收敛记录](docs/test/client-under-2000-refactor-20260731.md)。
+[语音客户端职责重排记录](docs/test/client-responsibility-layout-20260801.md)。
 
 2026-07-25 已使用与 BSP 匹配的 GCC 8.3.0 Buildroot wrapper 和 uClibc sysroot 成功构建 RV1106 Release 产物，并验证 ELF32 ARM EABI5 hard-float 与 loader；因当时板端管理通道不可用，产物尚未在板端执行。具体证据见 [P0 可行性报告](docs/test/p0-feasibility-report-20260725.md)，完整闸门见 [docs/test/rv1106-validation-gates.md](docs/test/rv1106-validation-gates.md)。刷镜像、改分区、设备树或启动项前必须单独取得用户授权。
 
@@ -261,6 +277,10 @@ vendor `.so`，真实调用只在双 opt-in 与安全前置检查后从固定 `/
 复制或运行到当前旧镜像，不关闭物理
 slot/reference、AEC 效果或实时率。详见
 [3A HIL 构建验证](docs/test/p0-rockchip-3a-hil-build-validation-20260729.md)。
+
+2026-08-01 当前生产 profile 和 HIL 已升级为 `2 mic + 2 ref`，并在第三块板以
+`init(16000,16,2,2)`、1024-short 输入和 512-byte 输出完成 direct vendor 调用。上段
+`2 mic + 1 ref` 只保留为 2026-07-29 历史构建证据，不再描述现行生产布局。
 
 同日还完成 Rockchip MPI 音频 Debug/tests-off 默认 ALL 交叉链接：ELF32 ARM
 hard-float/uClibc 产物保留 Rockit/MPP/RGA `NEEDED`、21 个 raw 生命周期 `UND`，且没有
@@ -310,9 +330,9 @@ raw MPI 对照使用独立的
 
 ## 路线图
 
-1. **P0 可行性闸门（进行中）**：direct ALSA transport 全双工已通过；先对齐自定义 BSP，
-   再完成真实 capture/reference layout、raw rk_mpi 和已交叉构建的 Rockchip 3A HIL 板端
-   验证，随后继续 Snowboy、WSS 产品接线、Wi-Fi AP 和 UI backend 探测。
+1. **P0 可行性闸门（进行中）**：direct ALSA Mode1 四通道全双工、capture/reference layout
+   和 2 mic + 2 ref direct Rockchip 3A 板端调用已通过；继续关闭 raw rk_mpi、真人 double-talk、
+   最终壳体声学、长期实时率，以及 Wi-Fi AP/UI backend 探测。
 2. **P1 工程骨架（已完成）**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
 3. **P2 本地音频（进行中）**：只保留已进入真实客户端或直接支撑 HIL 的音频代码；以
    vendor raw PCM 最小闭环和板端实测为边界，不预建通用 worker/control 层。

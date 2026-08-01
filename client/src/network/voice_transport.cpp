@@ -1,4 +1,5 @@
-#include "boompi/voice/transport.h"
+/// @file WSS/TLS 驱动及当前 v1 wire 校验；不包含对话状态转换。
+#include "boompi/network/voice_transport.h"
 
 #include <algorithm>
 #include <atomic>
@@ -21,7 +22,7 @@
 #include <websocketpp/client.hpp>
 #include <websocketpp/config/asio_client.hpp>
 
-namespace boompi::voice {
+namespace boompi::network {
 namespace {
 
 constexpr std::size_t kHeaderBytes = 64;
@@ -51,7 +52,11 @@ std::uint64_t Get64(const std::uint8_t* p) {
 bool SameTurn(const WireIds& a, const WireIds& b) {
   return a.session == b.session && a.turn == b.turn && a.epoch == b.epoch;
 }
+bool SameIds(const WireIds& a, const WireIds& b) {
+  return SameTurn(a, b) && a.stream == b.stream;
+}
 std::string Quote(const std::string& value) {
+  // 控制帧仍由本模块构造，但所有字符串都经过完整 JSON escaping，禁止直接拼原值。
   std::string out(1, '"');
   constexpr char hex[] = "0123456789abcdef";
   for (const char byte : value) {
@@ -77,7 +82,7 @@ bool ParseUuid(const std::string& value, std::array<std::uint8_t, 16>* out) {
 
 }  // namespace
 
-class Transport::Impl final {
+class VoiceTransport::Impl final {
   using Client = websocketpp::client<websocketpp::config::asio_tls_client>;
   using Hdl = websocketpp::connection_hdl;
   using Tls = websocketpp::lib::shared_ptr<websocketpp::lib::asio::ssl::context>;
@@ -85,16 +90,26 @@ class Transport::Impl final {
   ~Impl() { Close(); }
 
   bool Connect(TransportConfig c, InboundHandler in, ErrorHandler err, CloseHandler close) {
+    // UUID 与 SPKI pin 在启动线程前一次性验证；普通连接绝不降级为明文或 VERIFY_NONE。
     if (thread_.joinable() || c.host.empty() || !ParseUuid(c.device_id, &uuid_) ||
         !DecodePin(c.spki_sha256_base64) || c.port == 0 || c.connect_timeout_ms == 0 ||
         c.maximum_message_bytes < kHeaderBytes || c.maximum_message_bytes > kHeaderBytes + kMaxPcmBytes ||
-        c.maximum_buffered_bytes < c.maximum_message_bytes) return false;
+        c.maximum_buffered_bytes < kHeaderBytes + kMaxUplinkPcmBytes) return false;
     config_ = std::move(c); inbound_ = std::move(in); error_ = std::move(err); closed_ = std::move(close);
     client_.clear_access_channels(websocketpp::log::alevel::all);
     client_.clear_error_channels(websocketpp::log::elevel::all);
     client_.init_asio(); client_.start_perpetual();
     client_.set_tls_init_handler([this](Hdl) { return MakeTls(); });
-    client_.set_open_handler([this](Hdl h) { hdl_ = h; connected_ = true; });
+    client_.set_open_handler([this](Hdl h) {
+      hdl_ = h;
+      // Close 可能与 TLS 握手完成同时发生；关闭已经开始时绝不能把连接重新标为可用。
+      if (closing_.load(std::memory_order_acquire)) {
+        websocketpp::lib::error_code ec;
+        client_.close(h, websocketpp::close::status::normal, "", ec);
+        return;
+      }
+      connected_.store(true, std::memory_order_release);
+    });
     client_.set_fail_handler([this](Hdl h) { Fail(client_.get_con_from_hdl(h)->get_ec().message()); });
     client_.set_close_handler([this](Hdl h) {
       connected_ = false; auto c = client_.get_con_from_hdl(h);
@@ -115,6 +130,8 @@ class Transport::Impl final {
   }
 
   bool Send(const Control& c) {
+    // protocol_mutex 同时保护上下行序号、active turn 和 response 身份，使 callback 与 actor
+    // 不会各自接受一个彼此矛盾的状态。
     std::lock_guard<std::mutex> state_lock(protocol_mutex_);
     if (c.message_id.empty() || c.message_id.size() > 64) return false;
     const char* type = nullptr; std::string payload;
@@ -124,14 +141,21 @@ class Transport::Impl final {
         type = "hello"; payload = "{\"device_token\":" + Quote(c.device_token) + "}"; break;
       case ControlKind::kTurnStart:
         if (!ValidIds(c.ids) || c.sample_rate_hz != 16000 || active_ ||
-            c.ids.session != session_ || c.ids.epoch < session_epoch_) return false;
+            c.ids.session != session_ || c.ids.epoch < session_epoch_ ||
+            (turn_.epoch != 0U && c.ids.epoch <= turn_.epoch)) return false;
         type = "turn.start"; payload = "{\"sample_rate_hz\":16000}"; break;
       case ControlKind::kTurnCommit:
         if (!active_ || committed_ || !uplink_ended_ || c.ids.stream != turn_.stream || !SameTurn(c.ids, turn_)) return false;
         type = "turn.commit"; payload = "{}"; break;
+      case ControlKind::kTurnCancel:
+        if (!active_ || response_cancel_sent_ || !SameIds(c.ids, turn_)) return false;
+        type = "turn.cancel"; payload = "{}"; break;
       case ControlKind::kResponseCancel:
-        if (!active_ || !SameTurn(c.ids, turn_) ||
+        if (!SameTurn(c.ids, turn_) ||
             (c.ids.stream != turn_.stream && c.ids.stream != response_.stream)) return false;
+        // ASIO 可能已解析 response.done，但 application 还没消费该事件；此时取消已自然完成。
+        if (!active_) return response_done_ && ValidIds(response_) && SameIds(c.ids, response_);
+        if (response_cancel_sent_) return true;
         type = "response.cancel"; payload = "{}"; break;
     }
     std::string json = "{\"version\":1,\"type\":\"" + std::string(type) +
@@ -140,8 +164,14 @@ class Transport::Impl final {
       ",\"stream_id\":" + std::to_string(c.ids.stream) + ",\"epoch\":" + std::to_string(c.ids.epoch) +
       ",\"payload\":" + payload + "}";
     if (!SendText(json)) return false;
-    if (c.kind == ControlKind::kTurnStart) { turn_ = c.ids; active_ = true; committed_ = false; uplink_ended_ = false; uplink_sequence_ = 0; }
+    if (c.kind == ControlKind::kTurnStart) {
+      turn_ = c.ids; response_ = {}; response_id_.clear(); active_ = true; committed_ = false;
+      uplink_ended_ = audio_started_ = audio_ended_ = response_done_ = false;
+      response_cancel_sent_ = discard_downlink_ = false; uplink_sequence_ = downlink_sequence_ = 0;
+    }
     if (c.kind == ControlKind::kTurnCommit) committed_ = true;
+    if (c.kind == ControlKind::kTurnCancel || c.kind == ControlKind::kResponseCancel)
+      response_cancel_sent_ = true;
     return true;
   }
 
@@ -158,6 +188,7 @@ class Transport::Impl final {
         h.flags & ~kKnownFlags || h.sample_rate_hz != 16000 || !active_ || committed_ || uplink_ended_ ||
         !SameTurn(h.ids, turn_) || h.ids.stream != turn_.stream || h.sequence != uplink_sequence_ ||
         h.sequence == std::numeric_limits<std::uint32_t>::max() || ((h.sequence == 0) != ((h.flags & 1U) != 0))) return false;
+    // 字段逐个按网络字节序写入，不能直接发送 C++ struct（padding/endianness 不稳定）。
     std::array<std::uint8_t, kHeaderBytes + kMaxUplinkPcmBytes> frame; auto* p = frame.data();
     std::memcpy(p, "BPV1", 4); p[4] = 1; p[5] = 1; Put16(h.flags, p + 6); Put16(64, p + 8);
     p[10] = 1; p[11] = 1; Put32(h.sample_rate_hz, p + 12); Put32(static_cast<std::uint32_t>(bytes), p + 16);
@@ -172,10 +203,13 @@ class Transport::Impl final {
   }
 
   void Close() noexcept {
+    // closing_ 保证多条失败/信号路径只发一次 close；stop 还会取消尚未完成的 DNS/TCP/TLS，
+    // 避免 connected=false 时只停 perpetual work、却在 join 中永远等待 pending connect。
     if (!closing_.exchange(true)) {
       websocketpp::lib::error_code ec;
       if (connected_.exchange(false)) client_.close(hdl_, websocketpp::close::status::normal, "", ec);
       client_.stop_perpetual();
+      client_.stop();
     }
     if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id()) thread_.join();
   }
@@ -183,6 +217,15 @@ class Transport::Impl final {
 
  private:
   static bool ValidIds(const WireIds& i) { return i.session && i.turn && i.stream && i.epoch; }
+  bool IsStale(const WireIds& i) const {
+    if (i.session != session_ || i.epoch == 0U) return false;
+    if (turn_.epoch != 0U && i.epoch < turn_.epoch) return true;
+    return ValidIds(response_) && SameIds(i, response_) && !active_;
+  }
+  bool Discarding(const WireIds& i) const {
+    return ValidIds(response_) && SameIds(i, response_) &&
+        (response_cancel_sent_ || discard_downlink_);
+  }
   bool CanQueue(std::size_t bytes) {
     try {
       const std::size_t queued = client_.get_con_from_hdl(hdl_)->get_buffered_amount();
@@ -201,6 +244,7 @@ class Transport::Impl final {
     std::copy_n(decoded.begin(), pin_.size(), pin_.begin()); return true;
   }
   static int VerifyPin(X509_STORE_CTX* store, void* arg) {
+    // 固定的是证书公钥 SPKI SHA-256，不是整张证书；同一密钥续签不会导致设备失配。
     auto* self = static_cast<Impl*>(arg); X509* cert = X509_STORE_CTX_get0_cert(store);
     if (!self || !cert || X509_check_purpose(cert, X509_PURPOSE_SSL_SERVER, 0) <= 0) return 0;
     X509_PUBKEY* key = X509_get_X509_PUBKEY(cert); int n = i2d_X509_PUBKEY(key, nullptr);
@@ -228,6 +272,7 @@ class Transport::Impl final {
     } catch (...) { return false; }
   }
   void OnText(const std::string& json) {
+    // 解析、字段上限、identity 和状态校验全部在发出 Inbound 之前完成；半合法事件不外泄。
     if (json.empty() || json.size() > 64U * 1024U) return ProtocolError("invalid text message size");
     try {
       boost::property_tree::ptree p; std::istringstream input(json); boost::property_tree::read_json(input, p);
@@ -243,28 +288,55 @@ class Transport::Impl final {
           if (e.input_sample_rate_hz != 16000 || e.output_sample_rate_hz != 24000 || e.input_frame_ms != 20) throw std::runtime_error("unsupported hello audio contract");
           session_ = e.ids.session; session_epoch_ = e.ids.epoch;
         } else if (type == "response.start") {
-          if (!active_ || !SameTurn(e.ids, turn_) || e.ids.stream == 0) throw std::runtime_error("wrong response.start identity");
+          if (IsStale(e.ids)) return;
+          if (!active_ || !committed_ || ValidIds(response_) ||
+              !SameTurn(e.ids, turn_) || e.ids.stream == 0) throw std::runtime_error("wrong response.start identity or order");
           e.kind = InboundKind::kResponseStart; e.response_id = body.get<std::string>("response_id");
           if (e.response_id.empty() || e.response_id.size() > 128) throw std::runtime_error("invalid response_id");
-          response_ = e.ids; response_id_ = e.response_id; downlink_sequence_ = 0; audio_started_ = false; audio_ended_ = false;
+          response_ = e.ids; response_id_ = e.response_id; downlink_sequence_ = 0;
+          audio_started_ = audio_ended_ = response_done_ = false;
+          if (response_cancel_sent_) { discard_downlink_ = true; return; }
+          discard_downlink_ = false;
         } else if (type == "response.cancelled") {
-          const std::uint32_t stream = ValidIds(response_) ? response_.stream : turn_.stream;
-          if (!active_ || !SameTurn(e.ids, turn_) || e.ids.stream != stream) throw std::runtime_error("wrong cancellation identity");
+          if (IsStale(e.ids)) return;
+          const bool stream_matches = ValidIds(response_) ? e.ids.stream == response_.stream :
+                                                            e.ids.stream != 0U;
+          if (!active_ || !response_cancel_sent_ || !SameTurn(e.ids, turn_) || !stream_matches)
+            throw std::runtime_error("wrong cancellation identity");
           e.kind = InboundKind::kCancelled; e.reason = body.get<std::string>("reason");
           if (e.reason.empty() || e.reason.size() > 64) throw std::runtime_error("invalid cancellation reason");
-          active_ = false;
+          active_ = response_cancel_sent_ = discard_downlink_ = false;
         } else if (type == "error") {
+          if (IsStale(e.ids)) return;
           e.kind = InboundKind::kError; e.error_code = body.get<std::string>("code"); e.text = body.get<std::string>("message");
           if (e.error_code.empty() || e.error_code.size() > 64 || e.text.empty() || e.text.size() > 512) throw std::runtime_error("invalid error payload");
-          if (SameTurn(e.ids, turn_)) active_ = false;
+          const bool session_error = e.ids.session == session_ && e.ids.turn == 0U &&
+              e.ids.stream == 0U && e.ids.epoch == session_epoch_;
+          const bool turn_error = active_ && SameTurn(e.ids, turn_) && e.ids.stream != 0U;
+          if (!session_error && !turn_error) throw std::runtime_error("wrong error identity");
+          if (turn_error) active_ = false;
         } else {
+          if (IsStale(e.ids)) return;
           if (!active_ || !ValidIds(response_) || e.ids.session != response_.session || e.ids.turn != response_.turn ||
               e.ids.stream != response_.stream || e.ids.epoch != response_.epoch) throw std::runtime_error("wrong response identity");
           e.response_id = body.get<std::string>("response_id");
           if (e.response_id != response_id_) throw std::runtime_error("response_id changed");
-          if (type == "response.text_delta") { e.kind = InboundKind::kTextDelta; e.text = body.get<std::string>("text"); if (e.text.empty() || e.text.size() > 4096) throw std::runtime_error("invalid text delta"); }
-          else if (type == "response.audio_start") { e.kind = InboundKind::kAudioStart; e.output_sample_rate_hz = body.get<std::uint32_t>("sample_rate_hz"); if (audio_started_ || e.output_sample_rate_hz != 24000) throw std::runtime_error("invalid audio contract"); audio_started_ = true; }
-          else if (type == "response.done") { e.kind = InboundKind::kDone; if (audio_started_ && !audio_ended_) throw std::runtime_error("done before PCM END"); active_ = false; }
+          if (type == "response.text_delta") {
+            if (Discarding(e.ids)) return;
+            e.kind = InboundKind::kTextDelta; e.text = body.get<std::string>("text");
+            if (e.text.empty() || e.text.size() > 4096) throw std::runtime_error("invalid text delta");
+          } else if (type == "response.audio_start") {
+            if (Discarding(e.ids)) return;
+            e.kind = InboundKind::kAudioStart; e.output_sample_rate_hz = body.get<std::uint32_t>("sample_rate_hz");
+            if (audio_started_ || e.output_sample_rate_hz != 24000) {
+              throw std::runtime_error("invalid audio contract");
+            }
+            audio_started_ = true;
+          } else if (type == "response.done") {
+            e.kind = InboundKind::kDone;
+            if (audio_started_ && !audio_ended_ && !Discarding(e.ids)) throw std::runtime_error("done before PCM END");
+            active_ = response_cancel_sent_ = discard_downlink_ = false; response_done_ = true;
+          }
           else throw std::runtime_error("unsupported control type");
         }
       }
@@ -272,23 +344,34 @@ class Transport::Impl final {
     } catch (const std::exception& e) { ProtocolError(e.what()); }
   }
   void OnBinary(const std::string& bytes) {
+    // 下行 PCM 必须连续递增且匹配当前 response 四元组；不尝试补发或跳过中间音频。
     const auto* p = reinterpret_cast<const std::uint8_t*>(bytes.data());
     if (bytes.size() < kHeaderBytes || std::memcmp(p, "BPV1", 4) != 0 || p[4] != 1 || p[5] != 2 ||
         Get16(p + 8) != 64 || p[10] != 1 || p[11] != 1) return ProtocolError("invalid PCM header");
     const std::size_t payload = Get32(p + 16); const std::uint16_t flags = Get16(p + 6);
     Inbound e; e.kind = InboundKind::kPcm; e.pcm.kind = p[5]; e.pcm.flags = flags; e.pcm.sample_rate_hz = Get32(p + 12);
+    e.pcm.sequence = Get32(p + 20); e.pcm.timestamp_us = Get64(p + 24);
+    e.pcm.ids = {Get32(p + 52), Get32(p + 56), Get32(p + 60), Get32(p + 32)}; e.ids = e.pcm.ids;
+    if (payload == 0 || payload > kMaxDownlinkPcmBytes || payload % 2 ||
+        bytes.size() != kHeaderBytes + payload || flags & ~kKnownFlags ||
+        e.pcm.sample_rate_hz != 24000 || std::memcmp(p + 36, uuid_.data(), uuid_.size()) != 0)
+      return ProtocolError("invalid PCM framing");
     {
       std::unique_lock<std::mutex> state_lock(protocol_mutex_);
-      if (!audio_started_ || audio_ended_ || payload == 0 || payload > kMaxDownlinkPcmBytes || payload % 2 ||
-          bytes.size() != kHeaderBytes + payload || flags & ~kKnownFlags) { state_lock.unlock(); return ProtocolError("invalid PCM framing"); }
-      e.pcm.sequence = Get32(p + 20); e.pcm.timestamp_us = Get64(p + 24); e.pcm.ids = {Get32(p + 52), Get32(p + 56), Get32(p + 60), Get32(p + 32)};
-      if (e.pcm.sample_rate_hz != 24000 || std::memcmp(p + 36, uuid_.data(), uuid_.size()) != 0 ||
+      if (IsStale(e.ids) || Discarding(e.ids)) return;
+      if (!audio_started_ || audio_ended_ ||
           e.pcm.sequence != downlink_sequence_ || downlink_sequence_ == std::numeric_limits<std::uint32_t>::max() ||
           e.pcm.ids.session != response_.session || e.pcm.ids.turn != response_.turn ||
           e.pcm.ids.stream != response_.stream || e.pcm.ids.epoch != response_.epoch ||
           ((downlink_sequence_ == 0) != ((flags & 1U) != 0))) { state_lock.unlock(); return ProtocolError("PCM identity or sequence mismatch"); }
-      ++downlink_sequence_; audio_ended_ = (flags & 2U) != 0; e.ids = e.pcm.ids;
+      if ((flags & 4U) != 0U) {
+        discard_downlink_ = true; e.kind = InboundKind::kError;
+        e.error_code = "downlink_discontinuity"; e.text = "downlink PCM is discontinuous";
+      } else {
+        ++downlink_sequence_; audio_ended_ = (flags & 2U) != 0;
+      }
     }
+    if (e.kind == InboundKind::kError) { Emit(std::move(e)); return; }
     std::copy_n(p + kHeaderBytes, payload, e.audio.begin()); e.audio_size = payload; Emit(std::move(e));
   }
   void OnMessage(const Client::message_ptr& message) {
@@ -302,6 +385,7 @@ class Transport::Impl final {
     client_.close(hdl_, websocketpp::close::status::policy_violation, "protocol error", ec);
   }
 
+  // ASIO 线程拥有 client_/hdl_ 回调；protocol_mutex_ 是它与 application actor 的唯一协议共享边界。
   Client client_; Hdl hdl_; TransportConfig config_; InboundHandler inbound_; ErrorHandler error_; CloseHandler closed_;
   std::thread thread_; std::mutex send_mutex_, protocol_mutex_;
   std::atomic<bool> connected_{false}, closing_{false};
@@ -309,14 +393,15 @@ class Transport::Impl final {
   WireIds turn_{}, response_{}; std::string response_id_; std::uint32_t session_{0}, session_epoch_{0};
   std::uint32_t uplink_sequence_{0}, downlink_sequence_{0};
   bool active_{false}, committed_{false}, uplink_ended_{false}, audio_started_{false}, audio_ended_{false};
+  bool response_done_{false}, response_cancel_sent_{false}, discard_downlink_{false};
 };
 
-Transport::Transport() : impl_(std::make_unique<Impl>()) {}
-Transport::~Transport() = default;
-bool Transport::Connect(TransportConfig c, InboundHandler i, ErrorHandler e, CloseHandler x) { return impl_->Connect(std::move(c), std::move(i), std::move(e), std::move(x)); }
-bool Transport::SendControl(const Control& c) { return impl_->Send(c); }
-bool Transport::SendPcm64(const Pcm64Header& h, const std::uint8_t* p, std::size_t n) { return impl_->SendPcm(h, p, n); }
-void Transport::Close() noexcept { impl_->Close(); }
-bool Transport::connected() const noexcept { return impl_->connected(); }
+VoiceTransport::VoiceTransport() : impl_(std::make_unique<Impl>()) {}
+VoiceTransport::~VoiceTransport() = default;
+bool VoiceTransport::Connect(TransportConfig c, InboundHandler i, ErrorHandler e, CloseHandler x) { return impl_->Connect(std::move(c), std::move(i), std::move(e), std::move(x)); }
+bool VoiceTransport::SendControl(const Control& c) { return impl_->Send(c); }
+bool VoiceTransport::SendPcm64(const Pcm64Header& h, const std::uint8_t* p, std::size_t n) { return impl_->SendPcm(h, p, n); }
+void VoiceTransport::Close() noexcept { impl_->Close(); }
+bool VoiceTransport::connected() const noexcept { return impl_->connected(); }
 
-}  // namespace boompi::voice
+}  // namespace boompi::network

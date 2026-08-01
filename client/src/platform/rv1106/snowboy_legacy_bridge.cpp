@@ -1,3 +1,4 @@
+/// @file Snowboy 旧 libstdc++ ABI 隔离层；主程序只接触稳定的 C ABI。
 #include "snowboy_legacy_bridge.h"
 
 #include <climits>
@@ -83,7 +84,7 @@ void boompi_snowboy_legacy_destroy(
     delete handle->detector;
     delete handle;
   } catch (...) {
-    // Never allow a third-party destructor to unwind across the C boundary.
+    // 第三方析构绝不能让异常穿过 C ABI 边界，否则主程序会直接 terminate。
   }
 }
 

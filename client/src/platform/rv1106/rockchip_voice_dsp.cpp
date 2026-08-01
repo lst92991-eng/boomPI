@@ -1,5 +1,12 @@
+/// @file 对匹配 BSP 的 librkaudio 3A ABI 做固定参数、固定帧适配。
 #include "boompi/platform/rv1106/rockchip_voice_dsp.h"
 
+#ifndef BOOMPI_ROCKCHIP_ENABLE_STDT
+#define BOOMPI_ROCKCHIP_ENABLE_STDT 1
+#endif
+#ifndef BOOMPI_ROCKCHIP_DELAY_SAMPLES
+#define BOOMPI_ROCKCHIP_DELAY_SAMPLES 0
+#endif
 #include <algorithm>
 #include <cstdint>
 #include <new>
@@ -13,7 +20,7 @@ namespace {
 constexpr int kSampleRateHz = 16000;
 constexpr int kBitsPerSample = 16;
 constexpr int kMicrophoneChannels = 2;
-constexpr int kReferenceChannels = 1;
+constexpr int kReferenceChannels = BOOMPI_ROCKCHIP_REFERENCE_CHANNELS;
 constexpr int kVendorBlockSamples = 256;
 constexpr int kVendorInputShorts =
     kVendorBlockSamples * (kMicrophoneChannels + kReferenceChannels);
@@ -21,38 +28,35 @@ constexpr int kVendorOutputBytes =
     kVendorBlockSamples * static_cast<int>(sizeof(std::int16_t));
 constexpr int kMainFeatureMask = RKAUDIO_EN_AEC | RKAUDIO_EN_BF;
 constexpr int kBeamformingFeatureMask =
-    EN_Fastaec | EN_Dereverberation | EN_AES | EN_Agc | EN_Anr |
-    EN_HOWLING;
+    EN_Fastaec | EN_AES | EN_Anr | EN_Dereverberation |
+    (BOOMPI_ROCKCHIP_ENABLE_STDT != 0 ? EN_STDT : 0);
 
 using InitSignature = void* (*)(int, int, int, int, RKAUDIOParam*);
 using ProcessSignature = int (*)(void*, short*, short*, int, int*);
 using DestroySignature = void (*)(void*);
 
-static_assert(sizeof(short) == sizeof(std::int16_t),
-              "Rockchip 3A requires a 16-bit short");
-static_assert(
-    std::is_same<decltype(&rkaudio_preprocess_init), InitSignature>::value,
-    "unexpected rkaudio_preprocess_init signature");
-static_assert(
-    std::is_same<decltype(&rkaudio_preprocess_short), ProcessSignature>::value,
-    "unexpected rkaudio_preprocess_short signature");
-static_assert(std::is_same<decltype(&rkaudio_preprocess_destory),
-                           DestroySignature>::value,
+static_assert(sizeof(short) == sizeof(std::int16_t), "Rockchip 3A requires a 16-bit short");
+static_assert(std::is_same<decltype(&rkaudio_preprocess_init), InitSignature>::value,
+              "unexpected rkaudio_preprocess_init signature");
+static_assert(std::is_same<decltype(&rkaudio_preprocess_short), ProcessSignature>::value,
+              "unexpected rkaudio_preprocess_short signature");
+static_assert(std::is_same<decltype(&rkaudio_preprocess_destory), DestroySignature>::value,
               "unexpected rkaudio_preprocess_destory signature");
 static_assert(RKAUDIO_EN_AEC == (1 << 0), "unexpected AEC feature bit");
 static_assert(RKAUDIO_EN_BF == (1 << 1), "unexpected BF feature bit");
-static_assert(EN_DELAY == (1 << 0), "unexpected AEC delay-estimator bit");
-static_assert(EN_Agc == (1 << 5), "unexpected AGC feature bit");
 static_assert(EN_Anr == (1 << 6), "unexpected ANR feature bit");
+static_assert(EN_STDT == (1 << 10), "unexpected STDT feature bit");
 static_assert(EN_Fix == (1 << 9), "unexpected fixed-beam feature bit");
-static_assert(kBeamformingFeatureMask == 16501,
+static_assert(kBeamformingFeatureMask ==
+                  (BOOMPI_ROCKCHIP_ENABLE_STDT != 0 ? 1109 : 85),
               "validated Rockchip 3A profile changed");
+static_assert(BOOMPI_ROCKCHIP_DELAY_SAMPLES >= 0 &&
+                  BOOMPI_ROCKCHIP_DELAY_SAMPLES % 256 == 0,
+              "Rockchip fixed AEC delay must be a non-negative 256-sample multiple");
 
 void ReleaseParameters(RKAUDIOParam* const parameters) noexcept {
-  if (parameters != nullptr) {
-    rkaudio_param_deinit(parameters);
-    delete parameters;
-  }
+  if (parameters == nullptr) return;
+  rkaudio_param_deinit(parameters); delete parameters;
 }
 
 bool PrepareParameters(RKAUDIOParam* const parameters) noexcept {
@@ -61,19 +65,15 @@ bool PrepareParameters(RKAUDIOParam* const parameters) noexcept {
   parameters->aec_param = rkaudio_aec_param_init();
   parameters->bf_param = rkaudio_preprocess_param_init();
   parameters->rx_param = nullptr;
-  if (parameters->aec_param == nullptr || parameters->bf_param == nullptr) {
-    return false;
-  }
+  if (parameters->aec_param == nullptr || parameters->bf_param == nullptr) return false;
 
   auto* const aec = static_cast<SKVAECParameter*>(parameters->aec_param);
-  if (aec->delay_para == nullptr) {
-    return false;
-  }
-  // Software reference alignment is the only AEC setting that differs from
-  // the pinned SDK initializer.
+  if (aec->delay_para == nullptr) return false;
+  // Mode1 的 mic/reference 位于同一采集 period，硬回采不启用软件延迟估计。
   aec->pos = 1;
-  aec->model_aec_en = EN_DELAY;
+  aec->model_aec_en = 0;
   aec->drop_ref_channel = 0;
+  aec->delay_len = BOOMPI_ROCKCHIP_DELAY_SAMPLES;
 
   auto* const beamforming =
       static_cast<SKVPreprocessParam*>(parameters->bf_param);
@@ -83,10 +83,14 @@ bool PrepareParameters(RKAUDIOParam* const parameters) noexcept {
   beamforming->num_ref_channel = kReferenceChannels;
   beamforming->drop_ref_channel = 0;
   if (beamforming->dereverb_para == nullptr || beamforming->aes_para == nullptr ||
-      beamforming->anr_para == nullptr || beamforming->agc_para == nullptr ||
-      beamforming->howl_para == nullptr) {
+      beamforming->anr_para == nullptr || beamforming->dtd_para == nullptr) {
     return false;
   }
+
+  // STDT 只在 vendor 内部保护双讲；公开 ABI 没有可供 application 读取的 DTD 事件。
+  auto* const dtd = static_cast<RKDTDParam*>(beamforming->dtd_para);
+  dtd->ksiThd_high = 0.70F;
+  dtd->ksiThd_low = 0.50F;
 
   auto* const dereverb =
       static_cast<RKAudioDereverbParam*>(beamforming->dereverb_para);
@@ -97,22 +101,11 @@ bool PrepareParameters(RKAUDIOParam* const parameters) noexcept {
   aes->Beta_Up_Low = 0.005F;
   aes->THD_Flag = 0;
   aes->HARD_Flag = 0;
-
   auto* const anr = static_cast<SKVANRParam*>(beamforming->anr_para);
   anr->swU = 1;
   anr->fGmin = 0.01F;
   anr->InterV = 1;
 
-  auto* const agc = static_cast<RKAGCParam*>(beamforming->agc_para);
-  agc->attack_time = 200.0F;
-  agc->max_gain = 25.0F;
-  agc->max_peak = -1.0F;
-  agc->fRth0 = -55.0F;
-  agc->fRth1 = -45.0F;
-  agc->fRth2 = -30.0F;
-  agc->swSmL0 = 40;
-
-  static_cast<RKHOWLParam*>(beamforming->howl_para)->howlMode = 4;
   return true;
 }
 
@@ -123,14 +116,10 @@ RockchipVoiceDsp::~RockchipVoiceDsp() noexcept {
 }
 
 RockchipVoiceDspStatus RockchipVoiceDsp::Open() noexcept {
-  if (handle_ != nullptr || parameters_ != nullptr) {
-    return RockchipVoiceDspStatus::kAlreadyOpen;
-  }
+  if (handle_ != nullptr || parameters_ != nullptr) return RockchipVoiceDspStatus::kAlreadyOpen;
 
   auto* const parameters = new (std::nothrow) RKAUDIOParam{};
-  if (parameters == nullptr) {
-    return RockchipVoiceDspStatus::kParameterAllocationFailed;
-  }
+  if (parameters == nullptr) return RockchipVoiceDspStatus::kParameterAllocationFailed;
   if (!PrepareParameters(parameters)) {
     ReleaseParameters(parameters);
     return RockchipVoiceDspStatus::kParameterInitializationFailed;
@@ -146,6 +135,8 @@ RockchipVoiceDspStatus RockchipVoiceDsp::Open() noexcept {
 
   parameters_ = parameters;
   handle_ = handle;
+  // vendor 256-sample block 与产品 320-sample frame 不整除；prime 一帧输出让每次 API
+  // 调用仍保持严格 320 in / 320 out，代价是固定 20 ms 启动延迟。
   ResetFifos(true);
   return RockchipVoiceDspStatus::kOk;
 }
@@ -165,16 +156,13 @@ void RockchipVoiceDsp::Close() noexcept {
 RockchipVoiceDspStatus RockchipVoiceDsp::Process(
     const RockchipVoiceFrame16k& mic_left,
     const RockchipVoiceFrame16k& mic_right,
-    const RockchipVoiceFrame16k& playback_reference,
+    const RockchipVoiceFrame16k& reference_left,
+    const RockchipVoiceFrame16k& reference_right,
     RockchipVoiceFrame16k* const output) noexcept {
-  if (output == nullptr) {
-    return RockchipVoiceDspStatus::kInvalidArgument;
-  }
+  if (output == nullptr) return RockchipVoiceDspStatus::kInvalidArgument;
   output->fill(0);
-  if (!is_open()) {
-    return RockchipVoiceDspStatus::kNotOpen;
-  }
-  if (!PushInput(mic_left, mic_right, playback_reference)) {
+  if (!is_open()) return RockchipVoiceDspStatus::kNotOpen;
+  if (!PushInput(mic_left, mic_right, reference_left, reference_right)) {
     Close();
     return RockchipVoiceDspStatus::kFifoOverflow;
   }
@@ -196,19 +184,18 @@ void RockchipVoiceDsp::ResetFifos(const bool prime_output) noexcept {
   output_fifo_.fill(0);
   vendor_input_.fill(0);
   vendor_output_.fill(0);
-  input_head_ = 0U;
-  input_count_ = 0U;
-  output_head_ = 0U;
+  input_head_ = input_count_ = output_head_ = 0U;
   output_count_ = prime_output ? kRockchipVoiceFrameSamples16k : 0U;
 }
 
 bool RockchipVoiceDsp::PushInput(
     const RockchipVoiceFrame16k& mic_left,
     const RockchipVoiceFrame16k& mic_right,
-    const RockchipVoiceFrame16k& playback_reference) noexcept {
-  if (input_count_ > kInputFifoFrames - kRockchipVoiceFrameSamples16k) {
-    return false;
-  }
+    const RockchipVoiceFrame16k& reference_left,
+    const RockchipVoiceFrame16k& reference_right) noexcept {
+  if (input_count_ > kInputFifoFrames - kRockchipVoiceFrameSamples16k) return false;
+  // 单参考 HIL 只送物理扬声器所在的 REF-L；生产默认仍保持双参考，待 A/B 结果关闭。
+  static_cast<void>(reference_right);
   for (std::size_t sample = 0U; sample < kRockchipVoiceFrameSamples16k;
        ++sample) {
     const std::size_t frame =
@@ -216,16 +203,15 @@ bool RockchipVoiceDsp::PushInput(
     const std::size_t base = frame * kVendorInputChannels;
     input_fifo_[base] = mic_left[sample];
     input_fifo_[base + 1U] = mic_right[sample];
-    input_fifo_[base + 2U] = playback_reference[sample];
+    input_fifo_[base + 2U] = reference_left[sample];
+    if constexpr (kReferenceChannels == 2) input_fifo_[base + 3U] = reference_right[sample];
   }
   input_count_ += kRockchipVoiceFrameSamples16k;
   return true;
 }
 
 bool RockchipVoiceDsp::ProcessVendorBlock() noexcept {
-  if (output_count_ > kOutputFifoSamples - kVendorBlockSamples) {
-    return false;
-  }
+  if (output_count_ > kOutputFifoSamples - kVendorBlockSamples) return false;
   for (std::size_t sample = 0U; sample < kVendorBlockSamples; ++sample) {
     const std::size_t frame = (input_head_ + sample) % kInputFifoFrames;
     const std::size_t source = frame * kVendorInputChannels;
@@ -234,14 +220,13 @@ bool RockchipVoiceDsp::ProcessVendorBlock() noexcept {
                 vendor_input_.data() + target);
   }
 
+  // wakeup_status 是 vendor ABI 的必填输出；本产品唤醒固定由 Snowboy 处理，不消费它。
   int wakeup_status = 0;
   const int result = rkaudio_preprocess_short(
       handle_, reinterpret_cast<short*>(vendor_input_.data()),
       reinterpret_cast<short*>(vendor_output_.data()), kVendorInputShorts,
       &wakeup_status);
-  if (result != kVendorOutputBytes) {
-    return false;
-  }
+  if (result != kVendorOutputBytes) return false;
 
   input_head_ = (input_head_ + kVendorBlockSamples) % kInputFifoFrames;
   input_count_ -= kVendorBlockSamples;
@@ -254,11 +239,8 @@ bool RockchipVoiceDsp::ProcessVendorBlock() noexcept {
   return true;
 }
 
-bool RockchipVoiceDsp::PopOutput(
-    RockchipVoiceFrame16k* const output) noexcept {
-  if (output == nullptr || output_count_ < kRockchipVoiceFrameSamples16k) {
-    return false;
-  }
+bool RockchipVoiceDsp::PopOutput(RockchipVoiceFrame16k* const output) noexcept {
+  if (output == nullptr || output_count_ < kRockchipVoiceFrameSamples16k) return false;
   for (std::size_t sample = 0U; sample < kRockchipVoiceFrameSamples16k;
        ++sample) {
     (*output)[sample] =

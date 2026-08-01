@@ -25,6 +25,15 @@ LINK_CHECK_SOURCE = (
 HIL_SOURCE = (
     REPOSITORY_ROOT / "client" / "tests" / "hil" / "rockchip_3a_hil.cpp"
 )
+PRODUCTION_DSP_SOURCE = (
+    REPOSITORY_ROOT
+    / "client"
+    / "src"
+    / "platform"
+    / "rv1106"
+    / "rockchip_voice_dsp.cpp"
+)
+PRODUCTION_INCLUDE_DIR = REPOSITORY_ROOT / "client" / "include"
 
 HIL_TARGET = "boompi_rockchip_3a_hil"
 LINK_CHECK_TARGET = "boompi_rockchip_3a_link_check"
@@ -72,7 +81,12 @@ class Rockchip3aHilTests(unittest.TestCase):
         cls.host_cxx = shutil.which("c++") or shutil.which("g++")
         if cls.host_cxx is None:
             raise unittest.SkipTest("a host GNU C++ compiler was not found")
-        for required in (VENDOR_MODULE, LINK_CHECK_SOURCE, HIL_SOURCE):
+        for required in (
+            VENDOR_MODULE,
+            LINK_CHECK_SOURCE,
+            HIL_SOURCE,
+            PRODUCTION_DSP_SOURCE,
+        ):
             if not required.is_file():
                 raise AssertionError(f"required Rockchip 3A input is missing: {required}")
 
@@ -319,6 +333,8 @@ raise SystemExit(subprocess.run([real_compiler, *filtered], check=False).returnc
 #define EN_AES 16
 #define EN_Agc 32
 #define EN_Anr 64
+#define EN_Fix 512
+#define EN_STDT 1024
 #define EN_HOWLING 16384
 
 typedef struct SKVAECParameter {
@@ -389,26 +405,31 @@ typedef struct SKVANRParam {
 typedef struct RKAGCParam {
   float attack_time;
   float release_time;
-  float attenuate_time;
   float max_gain;
   float max_peak;
   float fRth0;
-  float fRth1;
-  float fRth2;
   float fRk0;
+  float fRth1;
+  int fs;
+  int frmlen;
+  float attenuate_time;
+  float fRth2;
   float fRk1;
   float fRk2;
   float fLineGainDb;
   int swSmL0;
   int swSmL1;
   int swSmL2;
-  int fs;
-  int frmlen;
 } RKAGCParam;
 
 typedef struct RKHOWLParam {
   short howlMode;
 } RKHOWLParam;
+
+typedef struct RKDTDParam {
+  float ksiThd_high;
+  float ksiThd_low;
+} RKDTDParam;
 
 typedef struct SKVPreprocessParam {
   int model_bf_en;
@@ -418,9 +439,14 @@ typedef struct SKVPreprocessParam {
   int drop_ref_channel;
   void* dereverb_para;
   void* aes_para;
+  void* nlp_para;
   void* anr_para;
   void* agc_para;
+  void* cng_para;
+  void* dtd_para;
+  void* eq_para;
   void* howl_para;
+  void* doa_para;
 } SKVPreprocessParam;
 
 typedef struct RKAUDIOParam {
@@ -448,6 +474,7 @@ static inline void* rkaudio_aec_param_init(void) {
   SKVAECParameter* parameters =
       (SKVAECParameter*)calloc(1, sizeof(SKVAECParameter));
   if (parameters != NULL) {
+    parameters->filter_len = 2;
     parameters->delay_para = calloc(1, 1);
     if (parameters->delay_para == NULL) {
       free(parameters);
@@ -468,14 +495,16 @@ static inline void* rkaudio_preprocess_param_init(void) {
   parameters->aes_para = calloc(1, sizeof(RKAudioAESParameter));
   parameters->anr_para = calloc(1, sizeof(SKVANRParam));
   parameters->agc_para = calloc(1, sizeof(RKAGCParam));
+  parameters->dtd_para = calloc(1, sizeof(RKDTDParam));
   parameters->howl_para = calloc(1, sizeof(RKHOWLParam));
   if (parameters->dereverb_para == NULL || parameters->aes_para == NULL ||
       parameters->anr_para == NULL || parameters->agc_para == NULL ||
-      parameters->howl_para == NULL) {
+      parameters->dtd_para == NULL || parameters->howl_para == NULL) {
     free(parameters->dereverb_para);
     free(parameters->aes_para);
     free(parameters->anr_para);
     free(parameters->agc_para);
+    free(parameters->dtd_para);
     free(parameters->howl_para);
     free(parameters);
     return NULL;
@@ -495,6 +524,7 @@ static inline void rkaudio_param_deinit(RKAUDIOParam* parameters) {
     free(beamforming->aes_para);
     free(beamforming->anr_para);
     free(beamforming->agc_para);
+    free(beamforming->dtd_para);
     free(beamforming->howl_para);
     free(beamforming);
   }
@@ -582,7 +612,7 @@ bool pinned_profile_matches(const RKAUDIOParam* parameters) {
       g_bf_parameters.aes_para == nullptr ||
       g_bf_parameters.anr_para == nullptr ||
       g_bf_parameters.agc_para == nullptr ||
-      g_bf_parameters.howl_para == nullptr) {
+      g_bf_parameters.dtd_para == nullptr) {
     return false;
   }
   const auto& g_dereverb_parameters = *static_cast<const RKAudioDereverbParam*>(
@@ -593,8 +623,8 @@ bool pinned_profile_matches(const RKAUDIOParam* parameters) {
       *static_cast<const SKVANRParam*>(g_bf_parameters.anr_para);
   const auto& g_agc_parameters =
       *static_cast<const RKAGCParam*>(g_bf_parameters.agc_para);
-  const auto& g_howl_parameters =
-      *static_cast<const RKHOWLParam*>(g_bf_parameters.howl_para);
+  const auto& g_dtd_parameters =
+      *static_cast<const RKDTDParam*>(g_bf_parameters.dtd_para);
   static const float expected_limit_ratio[2][3] = {
       {2.0F, 1.5F, 1.0F}, {1.5F, 1.2F, 1.0F}};
   static const short expected_thd_split_freq[4][2] = {
@@ -611,14 +641,16 @@ bool pinned_profile_matches(const RKAUDIOParam* parameters) {
 
   return g_aec_parameters.pos == 1 &&
       g_aec_parameters.drop_ref_channel == 0 &&
-      g_aec_parameters.model_aec_en == EN_DELAY &&
+      g_aec_parameters.model_aec_en == 0 &&
       g_aec_parameters.delay_len == 0 &&
       g_aec_parameters.look_ahead == 0 &&
       g_aec_parameters.filter_len == 2 &&
-      g_bf_parameters.model_bf_en == 16501 &&
+      g_bf_parameters.model_bf_en == 1141 &&
       g_bf_parameters.ref_pos == 1 && g_bf_parameters.Targ == 4 &&
-      g_bf_parameters.num_ref_channel == 1 &&
+      g_bf_parameters.num_ref_channel == 2 &&
       g_bf_parameters.drop_ref_channel == 0 &&
+      same_float(g_dtd_parameters.ksiThd_high, 0.70F) &&
+      same_float(g_dtd_parameters.ksiThd_low, 0.50F) &&
       g_dereverb_parameters.rlsLg == 4 &&
       g_dereverb_parameters.curveLg == 20 &&
       g_dereverb_parameters.delay == 2 &&
@@ -681,7 +713,7 @@ bool pinned_profile_matches(const RKAUDIOParam* parameters) {
       same_float(g_agc_parameters.fLineGainDb, -25.0F) &&
       g_agc_parameters.swSmL0 == 40 && g_agc_parameters.swSmL1 == 80 &&
       g_agc_parameters.swSmL2 == 80 && g_agc_parameters.fs == 16000 &&
-      g_agc_parameters.frmlen == 256 && g_howl_parameters.howlMode == 4;
+      g_agc_parameters.frmlen == 256;
 }
 
 __attribute__((constructor)) void record_library_load() {
@@ -792,8 +824,8 @@ target_include_directories(fake_aec PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include
 target_link_libraries(fake_aec PRIVATE fake_common)
 set_target_properties(fake_aec PROPERTIES
   OUTPUT_NAME aec_bf_process PREFIX "lib" SUFFIX ".so"
-  BUILD_RPATH "\$ORIGIN"
-  INSTALL_RPATH "\$ORIGIN")
+  BUILD_RPATH "\\$ORIGIN"
+  INSTALL_RPATH "\\$ORIGIN")
 
 add_library(fake_incomplete SHARED incomplete.cpp)
 set_target_properties(fake_incomplete PROPERTIES
@@ -867,6 +899,269 @@ set_target_properties(fake_incomplete PROPERTIES
         artifacts["runtime_aec"] = runtime_aec
         artifacts["runtime_incomplete"] = runtime_incomplete
         return artifacts
+
+    def _build_production_adapter_runner(
+        self, root: Path, artifacts: dict[str, Path]
+    ) -> Path:
+        source = root / "production-adapter-test"
+        source.mkdir()
+        fake_vendor = source / "production_fake_vendor.cpp"
+        fake_vendor.write_text(
+            """\
+#include <cmath>
+#include <cstddef>
+#include <cstdio>
+
+#include "rkaudio_preprocess.h"
+
+static_assert(offsetof(RKAGCParam, release_time) ==
+              offsetof(RKAGCParam, attack_time) + sizeof(float));
+static_assert(offsetof(RKAGCParam, max_gain) ==
+              offsetof(RKAGCParam, release_time) + sizeof(float));
+static_assert(offsetof(RKAGCParam, max_peak) ==
+              offsetof(RKAGCParam, max_gain) + sizeof(float));
+static_assert(offsetof(RKAGCParam, fRth0) ==
+              offsetof(RKAGCParam, max_peak) + sizeof(float));
+static_assert(offsetof(RKAGCParam, fRk0) ==
+              offsetof(RKAGCParam, fRth0) + sizeof(float));
+static_assert(offsetof(RKAGCParam, fRth1) ==
+              offsetof(RKAGCParam, fRk0) + sizeof(float));
+static_assert(offsetof(RKAGCParam, fs) ==
+              offsetof(RKAGCParam, fRth1) + sizeof(float));
+static_assert(offsetof(RKAGCParam, frmlen) ==
+              offsetof(RKAGCParam, fs) + sizeof(int));
+static_assert(offsetof(RKAGCParam, attenuate_time) ==
+              offsetof(RKAGCParam, frmlen) + sizeof(int));
+static_assert(offsetof(RKAGCParam, fRth2) ==
+              offsetof(RKAGCParam, attenuate_time) + sizeof(float));
+static_assert(offsetof(RKAGCParam, fRk1) ==
+              offsetof(RKAGCParam, fRth2) + sizeof(float));
+static_assert(offsetof(RKAGCParam, fRk2) ==
+              offsetof(RKAGCParam, fRk1) + sizeof(float));
+static_assert(offsetof(RKAGCParam, fLineGainDb) ==
+              offsetof(RKAGCParam, fRk2) + sizeof(float));
+static_assert(offsetof(RKAGCParam, swSmL0) ==
+              offsetof(RKAGCParam, fLineGainDb) + sizeof(float));
+static_assert(offsetof(RKAGCParam, swSmL1) ==
+              offsetof(RKAGCParam, swSmL0) + sizeof(int));
+static_assert(offsetof(RKAGCParam, swSmL2) ==
+              offsetof(RKAGCParam, swSmL1) + sizeof(int));
+
+static_assert(offsetof(SKVPreprocessParam, aes_para) ==
+              offsetof(SKVPreprocessParam, dereverb_para) + sizeof(void*));
+static_assert(offsetof(SKVPreprocessParam, nlp_para) ==
+              offsetof(SKVPreprocessParam, aes_para) + sizeof(void*));
+static_assert(offsetof(SKVPreprocessParam, anr_para) ==
+              offsetof(SKVPreprocessParam, nlp_para) + sizeof(void*));
+static_assert(offsetof(SKVPreprocessParam, agc_para) ==
+              offsetof(SKVPreprocessParam, anr_para) + sizeof(void*));
+static_assert(offsetof(SKVPreprocessParam, cng_para) ==
+              offsetof(SKVPreprocessParam, agc_para) + sizeof(void*));
+static_assert(offsetof(SKVPreprocessParam, dtd_para) ==
+              offsetof(SKVPreprocessParam, cng_para) + sizeof(void*));
+static_assert(offsetof(SKVPreprocessParam, eq_para) ==
+              offsetof(SKVPreprocessParam, dtd_para) + sizeof(void*));
+static_assert(offsetof(SKVPreprocessParam, howl_para) ==
+              offsetof(SKVPreprocessParam, eq_para) + sizeof(void*));
+static_assert(offsetof(SKVPreprocessParam, doa_para) ==
+              offsetof(SKVPreprocessParam, howl_para) + sizeof(void*));
+
+namespace {
+
+int g_handle = 41;
+int g_init_calls = 0;
+int g_process_calls = 0;
+int g_destroy_calls = 0;
+char g_error[192] = {};
+
+void Fail(const char* message) {
+  if (g_error[0] == '\\0') {
+    std::snprintf(g_error, sizeof(g_error), "%s", message);
+  }
+}
+
+bool SameFloat(float actual, float expected) {
+  return std::fabs(actual - expected) <= 0.000001F;
+}
+
+}  // namespace
+
+extern "C" void* rkaudio_preprocess_init(
+    int rate, int bits, int src_chan, int ref_chan,
+    RKAUDIOParam* parameters) {
+  ++g_init_calls;
+  if (rate != 16000 || bits != 16 || src_chan != 2 || ref_chan != 2) {
+    Fail("init must be 16k/S16/src2/ref2");
+    return nullptr;
+  }
+  if (parameters == nullptr || parameters->model_en != 3 ||
+      parameters->read_size != 256 || parameters->rx_param != nullptr ||
+      parameters->aec_param == nullptr || parameters->bf_param == nullptr) {
+    Fail("invalid main Rockchip parameter tree");
+    return nullptr;
+  }
+  const auto* aec =
+      static_cast<const SKVAECParameter*>(parameters->aec_param);
+  const auto* bf =
+      static_cast<const SKVPreprocessParam*>(parameters->bf_param);
+  if (aec->pos != 1 || aec->drop_ref_channel != 0 ||
+      aec->model_aec_en != 0) {
+    Fail("hardware reference must be ref-last without software delay");
+    return nullptr;
+  }
+  if (bf->model_bf_en != 1109 || bf->ref_pos != 1 || bf->Targ != 4 ||
+      bf->num_ref_channel != 2 || bf->drop_ref_channel != 0 ||
+      bf->dtd_para == nullptr) {
+    Fail("invalid 2+2 BF/STDT profile");
+    return nullptr;
+  }
+  const auto* dtd = static_cast<const RKDTDParam*>(bf->dtd_para);
+  if (!SameFloat(dtd->ksiThd_high, 0.70F) ||
+      !SameFloat(dtd->ksiThd_low, 0.50F)) {
+    Fail("invalid STDT thresholds");
+    return nullptr;
+  }
+  return &g_handle;
+}
+
+extern "C" int rkaudio_preprocess_short(
+    void* handle, short* input, short* output, int input_size,
+    int* wakeup_status) {
+  ++g_process_calls;
+  if (handle != &g_handle || input == nullptr || output == nullptr ||
+      wakeup_status == nullptr) {
+    Fail("invalid process pointers");
+    return 512;
+  }
+  if (input_size != 1024) {
+    Fail("input_size must be 1024 shorts");
+  }
+  for (int sample = 0; sample < 256; ++sample) {
+    for (int channel = 0; channel < 4; ++channel) {
+      const short expected = static_cast<short>(
+          (channel + 1) * 1000 + sample);
+      const short actual = input[4 * sample + channel];
+      if (actual != expected && g_error[0] == '\\0') {
+        std::snprintf(g_error, sizeof(g_error),
+                      "packing mismatch sample=%d channel=%d actual=%d expected=%d",
+                      sample, channel, static_cast<int>(actual),
+                      static_cast<int>(expected));
+      }
+    }
+    output[sample] = static_cast<short>(sample - 128);
+  }
+  *wakeup_status = 0;
+  return 512;
+}
+
+extern "C" void rkaudio_preprocess_destory(void* handle) {
+  ++g_destroy_calls;
+  if (handle != &g_handle) {
+    Fail("destroy received the wrong handle");
+  }
+}
+
+extern "C" int boompi_fake_contract_ok() {
+  if (g_init_calls != 1 || g_process_calls != 1 || g_destroy_calls != 1) {
+    Fail("unexpected production adapter call counts");
+  }
+  return g_error[0] == '\\0';
+}
+
+extern "C" const char* boompi_fake_contract_error() {
+  return g_error;
+}
+""",
+            encoding="utf-8",
+        )
+
+        runner = source / "production_adapter_runner.cpp"
+        runner.write_text(
+            """\
+#include <algorithm>
+#include <cstdio>
+
+#include "boompi/platform/rv1106/rockchip_voice_dsp.h"
+
+extern "C" int boompi_fake_contract_ok();
+extern "C" const char* boompi_fake_contract_error();
+
+int main() {
+  using boompi::platform::rv1106::RockchipVoiceDsp;
+  using boompi::platform::rv1106::RockchipVoiceDspStatus;
+  using boompi::platform::rv1106::RockchipVoiceFrame16k;
+
+  RockchipVoiceDsp dsp;
+  if (dsp.Open() != RockchipVoiceDspStatus::kOk) {
+    std::fprintf(stderr, "production adapter open failed: %s\\n",
+                 boompi_fake_contract_error());
+    return 1;
+  }
+
+  RockchipVoiceFrame16k mic_left{};
+  RockchipVoiceFrame16k mic_right{};
+  RockchipVoiceFrame16k reference_left{};
+  RockchipVoiceFrame16k reference_right{};
+  RockchipVoiceFrame16k output{};
+  for (std::size_t sample = 0; sample < mic_left.size(); ++sample) {
+    mic_left[sample] = static_cast<short>(1000 + sample);
+    mic_right[sample] = static_cast<short>(2000 + sample);
+    reference_left[sample] = static_cast<short>(3000 + sample);
+    reference_right[sample] = static_cast<short>(4000 + sample);
+  }
+
+  const auto status = dsp.Process(mic_left, mic_right, reference_left,
+                                  reference_right, &output);
+  if (status != RockchipVoiceDspStatus::kOk) {
+    std::fprintf(stderr, "production adapter process failed: %s\\n",
+                 boompi_fake_contract_error());
+    return 2;
+  }
+  if (!std::all_of(output.begin(), output.end(),
+                   [](short sample) { return sample == 0; })) {
+    std::fprintf(stderr, "production adapter prime frame was not silent\\n");
+    return 3;
+  }
+
+  dsp.Close();
+  if (!boompi_fake_contract_ok()) {
+    std::fprintf(stderr, "production adapter contract failed: %s\\n",
+                 boompi_fake_contract_error());
+    return 4;
+  }
+  std::puts("production RockchipVoiceDsp 2+2 contract passed");
+  return 0;
+}
+""",
+            encoding="utf-8",
+        )
+
+        executable = source / "production_adapter_runner"
+        compiled = subprocess.run(
+            [
+                str(self.host_cxx),
+                "-std=c++17",
+                "-Wall",
+                "-Wextra",
+                "-Wpedantic",
+                "-Werror",
+                "-I",
+                str(PRODUCTION_INCLUDE_DIR),
+                "-I",
+                str(artifacts["header"].parent),
+                str(PRODUCTION_DSP_SOURCE),
+                str(fake_vendor),
+                str(runner),
+                "-o",
+                str(executable),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+        return executable
 
     def _enabled_definitions(
         self,
@@ -1044,6 +1339,30 @@ set_target_properties(fake_incomplete PROPERTIES
             ("cross-compiled Linux/ARM",),
         )
 
+    def test_production_dsp_adapter_uses_mode1_two_plus_two_contract(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="boompi-rockchip-3a-production-adapter-"
+        ) as temporary:
+            root = Path(temporary)
+            artifacts = self._prepare_fake_vendor(root)
+            executable = self._build_production_adapter_runner(root, artifacts)
+            completed = subprocess.run(
+                [str(executable)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+        self.assertEqual(
+            completed.returncode, 0, completed.stdout + completed.stderr
+        )
+        self.assertEqual(
+            completed.stdout,
+            "production RockchipVoiceDsp 2+2 contract passed\n",
+        )
+        self.assertEqual(completed.stderr, "")
+
     def test_opt_in_target_lifecycle_and_fake_vendor_contracts(self) -> None:
         with tempfile.TemporaryDirectory(prefix="boompi-rockchip-3a-hil-") as temporary:
             root = Path(temporary)
@@ -1182,8 +1501,8 @@ set_target_properties(fake_incomplete PROPERTIES
             self.assertEqual(dry_document["contract"]["rate_hz"], 16000)
             self.assertEqual(dry_document["contract"]["sample_bits"], 16)
             self.assertEqual(dry_document["contract"]["source_channels"], 2)
-            self.assertEqual(dry_document["contract"]["reference_channels"], 1)
-            self.assertEqual(dry_document["contract"]["input_size_argument_shorts"], 768)
+            self.assertEqual(dry_document["contract"]["reference_channels"], 2)
+            self.assertEqual(dry_document["contract"]["input_size_argument_shorts"], 1024)
             self.assertEqual(dry_document["contract"]["expected_output_bytes"], 512)
             self.assertEqual(self._sentinel_lines(sentinel), [])
             self.assertNotIn(PRIVATE_PATH_MARKER, dry_run.stdout + dry_run.stderr)
@@ -1325,8 +1644,8 @@ set_target_properties(fake_incomplete PROPERTIES
                     "library_load",
                     "aec_param_init",
                     "bf_param_init",
-                    "init rate=16000 bits=16 src_chan=2 ref_chan=1",
-                    "process input_size=768 return=512",
+                    "init rate=16000 bits=16 src_chan=2 ref_chan=2",
+                    "process input_size=1024 return=512",
                     "destroy",
                     "param_deinit",
                     "library_unload",
@@ -1359,7 +1678,7 @@ set_target_properties(fake_incomplete PROPERTIES
                     "library_load",
                     "aec_param_init",
                     "bf_param_init",
-                    "init rate=16000 bits=16 src_chan=2 ref_chan=1",
+                    "init rate=16000 bits=16 src_chan=2 ref_chan=2",
                     "param_deinit",
                     "library_unload",
                 ],
@@ -1392,8 +1711,8 @@ set_target_properties(fake_incomplete PROPERTIES
                     "library_load",
                     "aec_param_init",
                     "bf_param_init",
-                    "init rate=16000 bits=16 src_chan=2 ref_chan=1",
-                    "process input_size=768 return=511",
+                    "init rate=16000 bits=16 src_chan=2 ref_chan=2",
+                    "process input_size=1024 return=511",
                     "destroy",
                     "param_deinit",
                     "library_unload",

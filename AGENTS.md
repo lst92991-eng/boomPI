@@ -10,7 +10,7 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
 
 第一版必须包含：
 
-- 双模拟麦克风采集、扬声器播放、播放参考、AEC、降噪、波束形成、AGC 和 VAD。
+- 双模拟麦克风采集、扬声器播放、播放参考、AEC、降噪、波束形成、增益管理和 VAD。
 - 本地 Snowboy 英文唤醒词；第一版固定使用 Snowboy 引擎，不得静默替换。
 - Qwen 实时 ASR、对话和 TTS；默认适配 `qwen3.5-omni-plus-realtime`，模型名必须可配置。
 - 普通话优先，允许中英文混说；回复默认使用简体中文。
@@ -33,10 +33,16 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
 
 - 英文唤醒词第一版使用 Snowboy 可用模型；唤醒后不播放提示音。
 - 唤醒词后可以紧接命令，不要求停顿。唤醒前音频预留 500 ms pre-roll。
-- 播放期间的打断也必须保留至少 500 ms AEC 后语音预卷；160 ms 确认打断后，把预卷作为新用户 utterance 的开头，不能吃掉句首。
+- 播放期间的打断必须保留并发送当前连续可用、最多 500 ms 的 AEC 后语音预卷；当前主动
+  硬参考探针确认打断后，把该预卷作为新用户 utterance 的开头，不能吃掉句首。
 - 唤醒后等待首次说话 6 秒；正常结束说话静音阈值 700 ms；单次用户语音最长 60 秒。
 - TTS 结束后进入 3 秒 `FOLLOW_UP`，期间无需再次唤醒。
-- 播放期间检测到用户语音后，约 80 ms 先 duck 扬声器，160 ms 确认后清空播放队列并取消云端回答。实测目标是从有效语音开始到扬声器静音不超过 250 ms。
+- 播放期间出现首个近端候选后立即硬静音扬声器，等待硬参考连续 3 帧降为低电平（最多
+  15 帧），再留出 10 帧（200 ms）清除声学尾音、重置 listener，并以连续 6 帧（120 ms）
+  重新确认近端语音；确认后才清空播放队列并取消云端回答。自然播放结束走另一条路径：
+  backend 先抑制 15 帧（300 ms）尾音，follow-up 随后必须连续 20 帧（400 ms）才开始新轮。
+  该主动探针是防自激的 containment 候选，不是 AEC 效果结论；取消
+  时延及真人双讲灵敏度必须在安静可控环境重新测量。
 - 打断后删除当前未播放/未完成的 AI 字幕，并截断服务端和 Qwen 中对应的未播放回答，防止上下文错误。
 - 当前会话最多保留 20 轮或约 24K tokens，先到者生效；超过后删除最旧的完整轮次，不自动总结为长期记忆。
 - 会话空闲 30 分钟、板端/服务端重启或连接重建后清空上下文。用户说“清空对话”也立即重置。
@@ -45,26 +51,37 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
 - 网络断开时丢弃当前轮次，不缓存并补发过期语音；本地唤醒、UI 和离线提示仍工作。
 - 默认女声方向是自然、年轻、不过度卖萌。具体 Qwen voice 必须在真实扬声器上试听至少三个候选后再固化。
 
-## 2.1 当前板端实现边界（2026-07-31，优先于后文路线图）
+## 2.1 当前板端实现边界（2026-08-01，优先于后文路线图）
 
-现役 `boompi-client` 自写生产 C++ 的硬上限是 2000 ELOC；当前基线为 15 个文件、1904
-ELOC，精确范围见 `docs/test/client-under-2000-refactor-20260731.md`。后文关于完整目录、
+现役 `boompi-client` 产品核心 C++ 的硬上限是 2000 ELOC；计数排除直接适配既有
+Rockchip/Snowboy vendor 的集成代码，但必须同时公开其中的纯 ABI 桥、硬件适配逻辑和含适配
+总量，且当前总量上限为 2300 ELOC。当前候选为 17 个文件、2285 ELOC，其中 vendor 集成
+439 ELOC、产品核心
+1846 ELOC；精确范围见 `docs/test/client-responsibility-layout-20260801.md`。后文关于完整目录、
 supervisor、UI、update、target 分层和发布架构的内容是后续路线图，不授权提前恢复占位层。
 
-- 生产目标只由 `voice/client` 状态机、`voice/audio_engine`、`voice/transport`、环境配置、
-  `Status`、Rockchip 3A 薄适配、Snowboy C ABI 桥和 `main` 组成。
+- 生产目标按仓库既定职责落位：`application/voice_client` 独占会话状态，
+  `audio/audio_engine` 管理播放线程和有界 TTS 环，`network/voice_transport` 管理
+  持久 WSS/TLS 与会话身份/序号校验，`platform/rv1106/audio_backend` 管理 ALSA、重采样、
+  Snowboy/VAD/近讲判定，并只调用一次 Rockchip 3A；其余只有环境配置、`Status`、
+  Snowboy C ABI 桥和 composition root。
+- `AudioBackend` 是 `AudioEngine` 的私有板级实现，不是 application 可见的第二套接口；
+  在出现第二种已验证硬件后端前，不建立工厂、虚基类或通用 backend 层。
+- 以上职责目录是当前实现，不是恢复旧的通用框架。不得另建 `App/Driver/Inf` 平行目录，
+  也不得用目录重排为理由增加 worker、虚接口、工厂或占位 target。
 - 禁止恢复已删除的 `manual_single_turn`、自写 WebSocket/TLS/JSON、重复 wire protocol、
   通用 capture/playback/control/committer/worker、host fake 音频和未接入产品的 UI/update
   占位实现。
 - WebSocketpp、Boost、OpenSSL、ALSA、libswresample、Rockchip 3A、Snowboy 和 WebRTC VAD
   作为外部实现使用；不得复制它们的功能到自写生产层，也不得把自写业务代码移进
   `third_party/` 规避计数。
-- 增加生产代码前必须先删减或用实测证明必要性，且保持总量低于 2000 ELOC。未来 UI、
+- 增加产品核心代码前必须先删减或用实测证明必要性，且保持产品核心低于 2000 ELOC、
+  含 vendor 集成总量不超过 2300 ELOC。未来 UI、
   配网和 supervisor 按实际硬件阶段单独核定预算，不能无声挤入当前语音客户端。
 
 ## 3. 硬件基线与事实来源
 
-目标板是 RV1106 Linux/Buildroot 自研板，已完成扬声器、双麦基本采集、以太网、Wi-Fi、ST7789P3、GT911 和 SC3336 的单项 bring-up。单项通过不代表四通道全双工 AEC、量产声学或长时间稳定性已经通过。
+目标板是 RV1106 Linux/Buildroot 自研板，已完成扬声器、两个动态 PCM slot、以太网、Wi-Fi、ST7789P3、GT911 和 SC3336 的单项 bring-up。第三块板已确认 Mode1 四通道顺序为 `[mic0,mic1,refL,refR]`，但两个 mic slot 尚未完成最终物理左右命名。单项和硬件参考通过不代表量产声学、真人 double-talk 或长时间稳定性已经通过。
 
 硬件相关修改必须遵守：
 
@@ -94,6 +111,29 @@ supervisor、UI、update、target 分层和发布架构的内容是后续路线�
   仍须实测。两条路径禁止同时叠加，也不得根据库名推断内部算法。
 - 允许独立的、显式 opt-in 的板端探针 target 直接调用 vendor API。探针只用于关闭事实
   问题，不需要先经过产品通用接口；测试产物和用户录音不提交仓库。
+
+2026-08-01 当前已验证并约束生产实现：
+
+- `I2STDM Digital Loopback Mode=Mode1` 提供 48 kHz/S16_LE 四通道 capture
+  `[mic0,mic1,refL,refR]`；capture period/buffer 为 `960/1920`，双通道 playback 为
+  `960/3840`，全双工窗口无 xrun。997 Hz→`refL`、1499 Hz→`refR` 的相关系数均为 `0.9983`。
+- 物理扬声器主要使用 DAC-L；数字参考到麦克风的声学到达约 `14–17 ms`，仅为阈值法近似。
+  raw mic DC/底噪较高，不得使用 raw RMS 判定近讲。
+- direct 3A 固定为 `init(16000,16,2,2)`，输入 1024 shorts/2048 bytes，输出 512 bytes；
+  当前生产 DSP profile mask 为 `1109`，启用 FastAEC、AES、ANR、Dereverberation 和 STDT，
+  禁用 vendor AGC；`model_aec_en=0`，不启用 software delay。`ALC31/ref2/delay0` 是当前候选，
+  不是最终声学参数。
+- 生产链路只使用 Mode1 硬件参考，不再维护软件 reference ring 或 60 ms lead。公开 ABI 没有
+  DTD 事件，`wakeup_status` 不是 DTD；`near_voice` 只使用 3A 后 VAD。首次有效硬参考后保留
+  600 ms warm-up。自然播放结束隔离 300 ms 尾音并在末端重置 VAD；主动打断必须保留已经
+  确认的近讲 VAD 生命周期，直到产生语音结束事件。
+- 同类无人声/嘈杂环境回归中，vendor AGC 开启时 `n=5`：`confirmed=4/5`、`follow=5/5`、
+  `attempts=119`；关闭 AGC 后累计 `n=10`：`confirmed=2/10`、`follow=3/10`、`attempts=43`。
+  AGC OFF 明显改善误触发，但仍不充分；环境噪声未受控且真人双讲尚未验证，不得据此宣布
+  AEC 或打断验收通过。主动硬参考探针期间因故意静音，相关采样也不得计入 AEC 效果评分。
+- 以上只关闭通道、ABI 和有限无人工冒烟；最终壳体 ERLE、残余回声、真人 double-talk、
+  最大音量和长期实时率仍须验收。证据见
+  `docs/test/p0-mode1-hard-reference-validation-20260801.md`。
 
 机械声学基线：
 
@@ -232,9 +272,16 @@ NetworkState:
 不得为了匹配这份清单继续增加空壳 worker。任何实际增加的线程和跨线程共享对象都要由
 测得的阻塞/实时需求支持，并在类型或模块文档中说明拥有者、生命周期和停止顺序。
 
+当前精简候选故意把 capture、DSP、Snowboy/VAD 和 application 状态机放在同一 actor；另有
+一个播放线程和一个 WSS/ASIO 线程。低频网络控制只经过固定 64 项 `EventQueue`，capture PCM
+不经过 EventBus 或中间队列，上行 PCM 直接交给 websocketpp 的有界发送缓冲。下列 EventBus、
+SPSC、独立上行队列和 credit/window 是实测证明需要进一步拆线程后的目标，不授权提前恢复。
+
 并发规则：
 
-- 控制事件走有界 EventBus；PCM 走预分配帧池和 SPSC 有界队列。不得用一个全局 mutex 队列承载全部数据。
+- 未来拆线程时，控制事件走有界 EventBus；跨线程 PCM 走预分配帧池和 SPSC 有界队列。
+  当前单 actor 内的 PCM 直接调用不需要为形式统一增加队列；固定 mutex `EventQueue` 只承载
+  WSS 控制/下行事件，不得扩成全局音频总线。
 - 实时录音、DSP 和播放热路径禁止每帧 `new`、`malloc`、`std::vector` 扩容、文件 I/O、网络 I/O 或无界锁等待。
 - 音频帧必须带单调时钟时间戳、`sequence`、`stream_id` 和 `epoch`。IDLE/唤醒前的常开 capture frame 可以使用 `turn_id=0`；进入 utterance 或网络传输后必须绑定有效 `turn_id`。重连/取消后旧 epoch 的帧和事件必须丢弃。
 - 队列满时不得阻塞录音线程。捕获到帧丢失或序号断裂时标记 discontinuity；会破坏 AEC/语义的情况应取消当前 turn，而不是继续发送伪连续音频。
@@ -249,17 +296,14 @@ NetworkState:
 目标链路：
 
 ```text
-rk_mpi_ai/rk_mpi_ao or direct ALSA 48 kHz full duplex
-  -> measured capture layout
-       candidate A: dual microphone only
-       candidate B: microphone + digital playback reference (vendor Mode2 sample)
-       candidate C: MIC-L, MIC-R, REF-L, REF-R
-  -> deinterleave + anti-alias resample 48 kHz -> 16 kHz
-  -> Rockchip 3A adapter once: configured AEC/NS/BF/AGC processing
+direct ALSA 48 kHz full duplex, Mode1
+  -> capture [mic0,mic1,refL,refR], S16_LE, period/buffer 960/1920
+  -> phase-aligned deinterleave + anti-alias resample 48 kHz -> 16 kHz
+  -> Rockchip 3A adapter once: 2 mic + 2 hard reference
   -> VAD + Snowboy + 16 kHz S16_LE mono uplink
 
 Qwen 24 kHz S16_LE mono downlink
-  -> adaptive jitter buffer
+  -> current fixed 180 ms initial jitter prebuffer (short EOS exception)
   -> resample 24 kHz -> 48 kHz
   -> volume + limiter + speaker mix
   -> ALSA playback
@@ -267,30 +311,37 @@ Qwen 24 kHz S16_LE mono downlink
 
 强约束：
 
-- Codec 48 kHz 全双工、可用 capture 通道数和 I2S/TDM loopback mode 均未验证。P0 必须
-  分别测试 rk_mpi 与直接 ALSA 的实际参数，并确认通道顺序、左右极性、数字参考采样点相对
-  mixer/volume/DAC 输入的位置和延迟，以及 capture/playback 时钟关系；不得把某个 vendor
-  样例、BCD channel mask 或数字 loopback 描述成功放/扬声器后的模拟参考。
+- direct ALSA 的 Mode1 四通道、双声道播放和 48 kHz 全双工已验证；不得把该结论外推为
+  raw rk_mpi 已通过，也不得把数字参考描述成扬声器之后的模拟回采。mic0/mic1 的最终物理左右、
+  极性和量产声学仍须在最终壳体中复核。
 - Rockchip 3A 当前按仅支持 8/16 kHz 处理。未经头文件、ABI 和板端测试证明，不得让 vendor AEC 直接吃 48 kHz，也不得在文档中宣称支持。
-- 只有硬件回采经实测不可用并完成方案评审后，才能从最终数字播放链路取软件参考、重采样
-  到 16 kHz 并通过延迟估计对齐。不得直接用收到的原始 TTS 包作为 AEC 参考，因为它尚未
-  经过 jitter、重采样、音量和混音。
+- 当前生产实现固定使用 Mode1 硬件参考。只有后续目标镜像证明硬件参考不可用并完成方案评审后，
+  才能重新设计软件参考；不得恢复旧 software reference ring/60 ms lead，也不得直接用收到的
+  原始 TTS 包作为 AEC 参考。
 - 硬件 Codec 回采和软件播放参考同一时刻只能启用一种，禁止把两种 reference 叠加后交给 AEC。
-- AEC、NS、BF、AGC 每一级只运行一次。若 Rockchip 3A 内部已经组合实现，外层不得再叠加同类处理。
+- AEC、NS、BF 和启用的增益处理每一级只运行一次。当前生产 profile 已禁用 vendor AGC，
+  外层不得再无依据叠加自动增益；若后续重新启用任一增益模块，必须先完成同条件 A/B 和声学验收。
 - `RockchipVoiceDsp` 只暴露板端实测所需的固定帧输入、输出和重置边界；vendor 实际算法顺序
   由匹配 BSP 的 adapter 负责，不得为统一接口重建未使用的通用 DSP engine 层，也不得把
   推测的内部顺序写成事实。
 - 第一版板端到服务端使用 16 kHz、16-bit、mono 原始 PCM，不使用 Opus。播放下行按 provider 实际格式标记，默认 Qwen 24 kHz PCM，板端统一转 48 kHz。
-- Snowboy 和上行网络消费同一份 AEC 后 16 kHz 音频，但必须各自使用独立有界队列，网络阻塞不得影响唤醒。
-- Snowboy 必须通过 `WakeWordEngine` adapter 隔离，并先检查 ARM ISA、hard/soft float、动态加载器、libc、libstdc++/`GLIBCXX`、模型加载和实时率。功能跑通后再做至少 30 分钟稳定性及 CPU/RSS/最坏帧耗时测试。失败时停止该里程碑、记录证据并请求用户选择更换引擎、进程隔离或调整系统 ABI；不得偷偷换引擎或自行改成多进程。
+- Snowboy 和上行网络消费同一份 AEC 后 16 kHz 音频。当前在同一 actor 中先完成本地检测，再把
+  PCM 交给 websocketpp 有界发送缓冲；只有实测 send 阻塞影响 capture 时才拆成独立有界队列。
+- Snowboy 只通过私有 C ABI bridge 隔离旧 libstdc++ ABI，不为单一实现增加 `WakeWordEngine`
+  虚接口。接入前检查 ARM ISA、hard/soft float、动态加载器、libc、libstdc++/`GLIBCXX`、模型
+  加载和实时率；第二种唤醒引擎真正进入产品后再按实测抽象。功能跑通后仍需至少 30 分钟
+  稳定性及 CPU/RSS/最坏帧耗时测试。
 - ALSA card/device、通道 map 和 mixer 控件必须来自配置及板端探测，禁止硬编码示例板编号。
 - 默认音量 60；所有增益和音量映射必须限幅。检测到播放削顶时优先降低链路增益，不通过提高 AEC 强度掩盖硬件失真。
 
 缓冲和背压：
 
-- 上行 PCM 队列最多保留 800 ms。超过上限取消当前 turn，不补发陈旧语音。
-- TTS 初始目标缓冲 180 ms，根据近期 jitter 在 120–400 ms 自适应，硬上限 1.5 秒。
-- 板端通过 credit/window 回报可接收的播放时长，服务端无 credit 时暂停下发。服务端 provider-to-board 队列也必须有界；两端均满时取消该 response 并报告拥塞，禁止丢弃中间 PCM 或无界缓存。
+- 当前没有独立上行 PCM 队列；websocketpp 待发送字节上限按约 800 ms 音频约束，超限取消当前
+  turn，不补发陈旧语音。若后续拆出上行队列，其容量仍不得超过 800 ms。
+- 当前 TTS 固定等待 9 × 20 ms，即 180 ms 后首播，短 EOS 例外，硬上限 1.5 秒；取得真实
+  jitter 分布后再评估 120–400 ms 自适应，不得把路线图写成现状。
+- credit/window 尚未实现；落地后服务端无 credit 时暂停下发，provider-to-board 队列也必须
+  有界。两端均满时取消 response 并报告拥塞，禁止丢弃中间 PCM 或无界缓存。
 - 打断、turn cancel、epoch 变化时立即清空对应 TTS 和字幕队列，不等待正常播放结束。
 - 长回答必须边生成边播放，不得把完整回答缓存后才开始播放。
 - 下行欠载时使用短淡出/静音并上报 underrun；不得重播旧 PCM 填洞。

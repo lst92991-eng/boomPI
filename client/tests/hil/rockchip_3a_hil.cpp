@@ -25,7 +25,7 @@ using Clock = std::chrono::steady_clock;
 constexpr int kRateHz = 16000;
 constexpr int kSampleBits = 16;
 constexpr int kSourceChannels = 2;
-constexpr int kReferenceChannels = 1;
+constexpr int kReferenceChannels = 2;
 constexpr int kTotalChannels = kSourceChannels + kReferenceChannels;
 constexpr int kSamplesPerChannel = 256;
 constexpr int kInputShorts = kSamplesPerChannel * kTotalChannels;
@@ -35,8 +35,7 @@ constexpr int kExpectedOutputBytes =
     kOutputShorts * static_cast<int>(sizeof(short));
 constexpr int kMainFeatureMask = RKAUDIO_EN_AEC | RKAUDIO_EN_BF;
 constexpr int kBeamformingFeatureMask =
-    EN_Fastaec | EN_Dereverberation | EN_AES | EN_Agc | EN_Anr |
-    EN_HOWLING;
+    EN_Fastaec | EN_STDT | EN_AES | EN_Anr | EN_Dereverberation | EN_Agc;
 #ifdef BOOMPI_ROCKCHIP_3A_HIL_TEST_VENDOR_LIBRARY_PATH
 constexpr const char* kVendorLibraryPath =
     BOOMPI_ROCKCHIP_3A_HIL_TEST_VENDOR_LIBRARY_PATH;
@@ -50,11 +49,12 @@ constexpr std::uint32_t kOutputGuardBefore = UINT32_C(0x4D28A17C);
 constexpr std::uint32_t kOutputGuardAfter = UINT32_C(0xE63B5092);
 
 static_assert(sizeof(short) == 2, "Rockchip 3A requires 16-bit short");
-static_assert(kInputShorts == 768, "fixed 2-mic plus reference input changed");
-static_assert(kInputBytes == 1536, "fixed input byte count changed");
+static_assert(kInputShorts == 1024,
+              "fixed 2-mic plus 2-reference input changed");
+static_assert(kInputBytes == 2048, "fixed input byte count changed");
 static_assert(kExpectedOutputBytes == 512,
               "fixed mono output byte count changed");
-static_assert(kBeamformingFeatureMask == 16501,
+static_assert(kBeamformingFeatureMask == 1141,
               "fixed feasibility feature profile changed");
 
 struct GuardedInput {
@@ -225,7 +225,7 @@ void PrintContract() {
       "    \"samples_per_channel\": %d,\n"
       "    \"source_channels\": %d,\n"
       "    \"reference_channels\": %d,\n"
-      "    \"channel_order\": \"mic0,mic1,reference\",\n"
+      "    \"channel_order\": \"mic0,mic1,refL,refR\",\n"
       "    \"input_shorts\": %d,\n"
       "    \"input_bytes\": %d,\n"
       "    \"input_size_argument_shorts\": %d,\n"
@@ -364,7 +364,7 @@ bool PrepareParameters(RKAUDIOParam* parameters) {
     return false;
   }
   aec->pos = 1;
-  aec->model_aec_en = EN_DELAY;
+  aec->model_aec_en = 0;
   aec->drop_ref_channel = 0;
   aec->delay_len = 0;
   aec->look_ahead = 0;
@@ -379,9 +379,13 @@ bool PrepareParameters(RKAUDIOParam* parameters) {
   beamforming->drop_ref_channel = 0;
   if (beamforming->dereverb_para == nullptr ||
       beamforming->aes_para == nullptr || beamforming->anr_para == nullptr ||
-      beamforming->agc_para == nullptr || beamforming->howl_para == nullptr) {
+      beamforming->agc_para == nullptr || beamforming->dtd_para == nullptr) {
     return false;
   }
+
+  auto* dtd = static_cast<RKDTDParam*>(beamforming->dtd_para);
+  dtd->ksiThd_high = 0.70F;
+  dtd->ksiThd_low = 0.50F;
 
   // The direct API does not parse config_aivqe.json. Keep this bounded probe's
   // enabled profile byte-for-byte reviewable in source and tie it to the
@@ -457,7 +461,6 @@ bool PrepareParameters(RKAUDIOParam* parameters) {
   agc->fs = kRateHz;
   agc->frmlen = kSamplesPerChannel;
 
-  static_cast<RKHOWLParam*>(beamforming->howl_para)->howlMode = 4;
   return true;
 }
 
@@ -471,6 +474,8 @@ void FillSyntheticInput(GuardedInput* input) {
         static_cast<short>((((phase + 5) % 32) - 16) * 3);
     input->samples[base + 2] =
         static_cast<short>((((phase + 11) % 16) - 8) * 2);
+    input->samples[base + 3] =
+        static_cast<short>((((phase + 3) % 16) - 8) * 2);
   }
 }
 

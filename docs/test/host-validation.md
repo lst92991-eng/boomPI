@@ -12,6 +12,11 @@ Host 侧仍负责三类与硬件无关的验证：
 2. Python 协议 fixture、探针/HIL 脚本的确定性测试。
 3. 文档、格式、敏感信息和源码体量检查。
 
+2026-08-01 当前生产 3A adapter 还由离线 fake 直接编译真实
+`client/src/platform/rv1106/rockchip_voice_dsp.cpp`，校验 `init(16000,16,2,2)`、
+`[mic0,mic1,refL,refR]` 交织、1024-short 输入、mask `1141`、STDT `0.70/0.50` 和硬参考
+profile；当前该组 Linux fake 为 7/7 通过。该测试只关闭适配器 ABI/packing，不能替代真板声学。
+
 ## Host 命令
 
 在仓库根目录执行协议和脚本测试：
@@ -62,7 +67,16 @@ sh -n scripts/hil/rv1106_alsa_full_duplex.sh
 - 真板语音验收必须覆盖首轮问答、3 s 追问、长回复、播放中打断、噪声误触发、断网恢复
   以及至少一个长时间稳定性窗口。
 
-## 当前验收状态
+## 2026-08-01 当前验收状态
+
+当前候选为 17 个生产 C++ 文件、2257 ELOC，其中 Rockchip/Snowboy vendor 集成 458 ELOC，
+产品核心 1799 ELOC。严格交叉构建、Mode1 四通道全双工、2 mic + 2 ref direct 3A 调用、
+`voice loop ready`/`secure session ready` 启动和 SIGTERM 自动恢复 mixer 已通过。有限低幅 997 Hz
+安静样本在适配后得到 processed RMS `0.000435`、wake count `0`，只能证明硬链路/收敛行为；
+真人 double-talk、最终壳体 ERLE/残余回声和长期稳定性仍未关闭。见
+[P0 Mode1 硬件播放参考验证记录](p0-mode1-hard-reference-validation-20260801.md)。
+
+## 2026-07-31 历史验收状态（原文保留）
 
 1904 ELOC 候选已完成严格交叉构建、板端加载、Rockchip 3A/Snowboy 初始化、持久 WSS 和
 空闲运行。真人语音回归尚未关闭，因此当前仍是测试候选，不是发布版。

@@ -1,13 +1,15 @@
+/** @file 进程组合根：只负责参数、环境配置、信号和 application 生命周期。 */
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
 #include <string_view>
 
 #include "boompi/config/voice_client_config.h"
-#include "boompi/voice/client.h"
+#include "boompi/application/voice_client.h"
 
 namespace {
 volatile std::sig_atomic_t g_stop = 0;
+// 信号处理函数只能写 sig_atomic_t；资源回收仍由正常控制流执行。
 void Stop(int) { g_stop = 1; }
 }
 
@@ -28,7 +30,7 @@ int main(int argc, char* argv[]) {
     return EXIT_SUCCESS;
   }
   std::signal(SIGINT, Stop); std::signal(SIGTERM, Stop);
-  const boompi::Status result = boompi::voice::RunVoiceClient(config, &g_stop);
+  const boompi::Status result = boompi::application::RunVoiceClient(config, &g_stop);
   if (!result.ok()) {
     std::cerr << "boompi-client: voice loop failed: " << result.message()
               << '\n';

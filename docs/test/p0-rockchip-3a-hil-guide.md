@@ -1,5 +1,14 @@
 # P0 Rockchip 3A 固定帧 HIL 指南
 
+> **2026-08-01 当前补充：** 下文原样保留 2026-07-29 探针的 `2 mic + 1 ref` 构建/执行契约，
+> 不把新结果倒灌进历史说明。现行生产 profile 和新版探针已经改为
+> `init(16000,16,2,2)`、`[mic0,mic1,refL,refR]`、1024 shorts/2048 bytes 输入和 512 bytes
+> 输出，并已在第三块板完成一次 direct vendor 调用；init/process 为 `11262 us`/`1561 us`，
+> mask `1141`、STDT `0.70/0.50`、`model_aec_en=0`。完整当前证据、Mode1 相关性和未验收边界见
+> [P0 Mode1 硬件播放参考验证记录](p0-mode1-hard-reference-validation-20260801.md)。
+
+## 2026-07-29 历史指南原文（保留）
+
 本指南对应 `boompi_rockchip_3a_hil`。它只验证构建期 pinned Rockchip direct 3A 契约能否用板端
 另行核验哈希的运行库完成一次固定帧调用，不是生产 DSP backend，也不打开 ALSA/MPI、读取录音
 或写出处理后 PCM。

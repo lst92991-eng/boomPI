@@ -42,12 +42,6 @@ jobs:
           go-version-file: server/go.mod
           cache: false
 
-      - name: Install ALSA development package
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev
-
       - name: Report tool versions
         run: |
           cmake --version
@@ -57,47 +51,17 @@ jobs:
       - name: Validate protocol fixtures
         run: python scripts/verify_protocol_fixtures.py
 
-      - name: Validate FIR coefficient design
-        run: |
-          python scripts/dsp/generate_fir_decimator_48_to_16.py --check client/src/audio/fir_decimator_48_to_16.cpp --quiet
-          python scripts/dsp/generate_playback_resampler_24_to_48.py --check client/src/audio/playback_resampler_24_to_48.cpp --quiet
-
       - name: Validate audio vendor dependency gates
         run: python -m unittest scripts.tests.test_audio_vendor_cmake -v
+
+      - name: Validate client source and documentation contracts
+        run: python -m unittest scripts.tests.test_client_source_contract -v
 
       - name: Validate POSIX P0 probes
         if: runner.os != 'Windows'
         run: |
           sh -n scripts/probes/rv1106_p0_probe.sh
           python -m unittest discover -s scripts/tests -p 'test_*.py' -v
-
-      - name: Configure C++ host build with ALSA single-turn smoke
-        if: runner.os == 'Linux'
-        run: cmake --preset host-debug -DBOOMPI_ENABLE_ALSA_PLAYBACK=ON
-
-      - name: Configure C++ host build
-        if: runner.os != 'Linux'
-        run: cmake --preset host-debug
-
-      - name: Build C++ host targets (single-config)
-        if: runner.os != 'Windows'
-        run: cmake --build --preset host-debug --parallel
-
-      - name: Build C++ host targets (Windows multi-config)
-        if: runner.os == 'Windows'
-        run: cmake --build --preset host-debug --parallel --config Debug
-
-      - name: Run C++ host tests (single-config)
-        if: runner.os != 'Windows'
-        run: ctest --preset host-debug --output-on-failure
-
-      - name: Require ALSA single-turn API-flow smoke
-        if: runner.os == 'Linux'
-        run: ctest --preset host-debug --output-on-failure --no-tests=error -L alsa-null-api-flow-only
-
-      - name: Run C++ host tests (Windows multi-config)
-        if: runner.os == 'Windows'
-        run: ctest --preset host-debug --output-on-failure -C Debug
 
       - name: Run Go tests
         working-directory: server

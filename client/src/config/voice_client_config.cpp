@@ -1,3 +1,4 @@
+/// @file 环境配置解析、边界校验和设备令牌生命周期。
 #include "boompi/config/voice_client_config.h"
 
 #include <algorithm>
@@ -57,6 +58,31 @@ int Hex(const char value) noexcept {
   return value >= 'a' && value <= 'f' ? value - 'a' + 10 : -1;
 }
 
+int Base64(const char value) noexcept {
+  if (value >= 'A' && value <= 'Z') return value - 'A';
+  if (value >= 'a' && value <= 'z') return value - 'a' + 26;
+  if (value >= '0' && value <= '9') return value - '0' + 52;
+  if (value == '+') return 62;
+  return value == '/' ? 63 : -1;
+}
+
+bool IsSpkiPin(const std::string& text) noexcept {
+  if (text.size() != 44U || text.back() != '=') return false;
+  for (std::size_t index = 0U; index + 1U < text.size(); ++index)
+    if (Base64(text[index]) < 0) return false;
+  // 32 字节摘要的最后一个 base64 字符只携带四个有效位，低两位必须为零。
+  return (Base64(text[42]) & 0x03) == 0;
+}
+
+bool IsSnowboySensitivity(const std::string& text) noexcept {
+  if (text == "0" || text == "1") return true;
+  if (text.size() < 3U || text[1] != '.' ||
+      (text[0] != '0' && text[0] != '1')) return false;
+  return std::all_of(text.begin() + 2, text.end(), [leading = text[0]](const char value) {
+    return value >= '0' && value <= '9' && (leading == '0' || value == '0');
+  });
+}
+
 bool IsUuid(const std::string& text) noexcept {
   if (text.size() != 36U) return false;
   std::array<std::uint8_t, 16U> decoded{};
@@ -92,6 +118,7 @@ bool IsToken(const std::string& value) noexcept {
 }  // namespace
 
 VoiceClientConfig::~VoiceClientConfig() noexcept {
+  // volatile 防止编译器把“随后不再读取”的清零优化掉；这里只覆盖本对象持有的副本。
   auto* bytes = reinterpret_cast<volatile char*>(device_token.data());
   for (std::size_t index = 0U; index < device_token.size(); ++index) bytes[index] = 0;
   device_token.clear();
@@ -119,12 +146,13 @@ Status LoadVoiceClientConfigFromEnvironment(VoiceClientConfig* const output) {
   output->speaker_gain_percent = static_cast<std::uint16_t>(parsed);
   if (!(status = ReadUint("BOOMPI_BARGE_IN_ENABLED", 1U, 0U, 1U, &parsed)).ok()) return status;
   output->barge_in_enabled = parsed != 0U;
-  if (!(status = ReadString("BOOMPI_SNOWBOY_RESOURCE_FILE", false, 1024U, &output->snowboy_resource_path)).ok()) return status;
-  if (!(status = ReadString("BOOMPI_SNOWBOY_MODEL_FILE", false, 1024U, &output->snowboy_model_path)).ok()) return status;
+  if (!(status = ReadString("BOOMPI_SNOWBOY_RESOURCE_FILE", true, 1024U, &output->snowboy_resource_path)).ok()) return status;
+  if (!(status = ReadString("BOOMPI_SNOWBOY_MODEL_FILE", true, 1024U, &output->snowboy_model_path)).ok()) return status;
   if (!(status = ReadString("BOOMPI_SNOWBOY_SENSITIVITY", false, 32U, &output->snowboy_sensitivity)).ok()) return status;
   if (output->snowboy_sensitivity.empty()) output->snowboy_sensitivity = "0.5";
-  return output->server_spki_sha256.size() == 44U ? Status::Ok()
-                                                  : Bad("BOOMPI_SERVER_SPKI_SHA256");
+  if (!IsSnowboySensitivity(output->snowboy_sensitivity)) return Bad("BOOMPI_SNOWBOY_SENSITIVITY");
+  return IsSpkiPin(output->server_spki_sha256) ? Status::Ok()
+                                               : Bad("BOOMPI_SERVER_SPKI_SHA256");
 }
 
 }  // namespace boompi::config

@@ -7,6 +7,16 @@ endif()
 option(BOOMPI_ENABLE_ALSA_PLAYBACK "Build the RV1106 ALSA voice path" ${_boompi_alsa_default})
 option(BOOMPI_ENABLE_WSS_CLIENT "Build the persistent WSS voice transport" OFF)
 option(BOOMPI_ENABLE_WEBRTC_VAD "Build the 16 kHz WebRTC VAD" OFF)
+option(BOOMPI_BUILD_AEC_LOOP_HIL
+  "Build the opt-in RV1106 local-playback AEC regression probe" OFF)
+option(BOOMPI_AEC_LOOP_ENABLE_STDT
+  "Enable vendor STDT in the opt-in AEC regression probe" ON)
+option(BOOMPI_AEC_LOOP_ACTIVE_PROBE
+  "Exercise the application mute-and-recheck barge-in guard in the AEC probe" OFF)
+set(BOOMPI_AEC_LOOP_REFERENCE_CHANNELS "2" CACHE STRING
+  "Reference channels passed to Rockchip 3A by the opt-in AEC probe (1 or 2)")
+set(BOOMPI_AEC_LOOP_DELAY_SAMPLES "0" CACHE STRING
+  "Fixed Rockchip AEC reference delay used by the opt-in probe (0 or 256)")
 set(BOOMPI_OPENSSL_ROOT "" CACHE PATH "Pinned OpenSSL 3.5.7 package root")
 set(BOOMPI_BOOST_INCLUDE_DIR "" CACHE PATH "External Boost header root")
 set(BOOMPI_WEBRTC_VAD_INCLUDE_DIR "" CACHE PATH "Directory containing webrtc_vad.h")
@@ -81,12 +91,13 @@ target_link_libraries(boompi_snowboy_bridge PRIVATE boompi_vendor::snowboy)
 
 add_executable(boompi_client
   apps/boompi_client/main.cpp
+  src/application/voice_client.cpp
+  src/audio/audio_engine.cpp
   src/config/voice_client_config.cpp
   src/event/status.cpp
-  src/platform/rv1106/rockchip_voice_dsp.cpp
-  src/voice/audio_engine.cpp
-  src/voice/client.cpp
-  src/voice/transport.cpp)
+  src/network/voice_transport.cpp
+  src/platform/rv1106/audio_backend.cpp
+  src/platform/rv1106/rockchip_voice_dsp.cpp)
 target_compile_features(boompi_client PRIVATE cxx_std_17)
 target_compile_definitions(boompi_client PRIVATE BOOMPI_TARGET_RV1106=1
   BOOST_ERROR_CODE_HEADER_ONLY=1 BOOST_SYSTEM_NO_DEPRECATED=1)
@@ -111,3 +122,46 @@ set_target_properties(boompi_client PROPERTIES OUTPUT_NAME boompi-client
   SKIP_BUILD_RPATH TRUE BUILD_RPATH "" INSTALL_RPATH ""
   BUILD_WITH_INSTALL_RPATH FALSE INSTALL_RPATH_USE_LINK_PATH FALSE)
 install(TARGETS boompi_client RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+if(BOOMPI_BUILD_AEC_LOOP_HIL)
+  if(NOT BOOMPI_AEC_LOOP_REFERENCE_CHANNELS MATCHES "^[12]$")
+    message(FATAL_ERROR "BOOMPI_AEC_LOOP_REFERENCE_CHANNELS must be 1 or 2")
+  endif()
+  if(NOT BOOMPI_AEC_LOOP_DELAY_SAMPLES MATCHES "^(0|256)$")
+    message(FATAL_ERROR "BOOMPI_AEC_LOOP_DELAY_SAMPLES must be 0 or 256")
+  endif()
+  add_executable(boompi_aec_loop_hil EXCLUDE_FROM_ALL
+    tests/hil/aec_loop_hil.cpp
+    src/audio/audio_engine.cpp
+    src/config/voice_client_config.cpp
+    src/event/status.cpp
+    src/platform/rv1106/audio_backend.cpp
+    src/platform/rv1106/rockchip_voice_dsp.cpp)
+  target_compile_features(boompi_aec_loop_hil PRIVATE cxx_std_17)
+  target_compile_definitions(boompi_aec_loop_hil PRIVATE
+    BOOMPI_TARGET_RV1106=1
+    BOOMPI_AEC_LOOP_DIAGNOSTICS=1
+    BOOMPI_AEC_LOOP_ACTIVE_PROBE=$<BOOL:${BOOMPI_AEC_LOOP_ACTIVE_PROBE}>
+    BOOMPI_ROCKCHIP_ENABLE_STDT=$<BOOL:${BOOMPI_AEC_LOOP_ENABLE_STDT}>
+    BOOMPI_ROCKCHIP_DELAY_SAMPLES=${BOOMPI_AEC_LOOP_DELAY_SAMPLES}
+    BOOMPI_ROCKCHIP_REFERENCE_CHANNELS=${BOOMPI_AEC_LOOP_REFERENCE_CHANNELS})
+  target_compile_options(boompi_aec_loop_hil PRIVATE -Wall -Wextra -Wpedantic
+    $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:-Werror>)
+  target_include_directories(boompi_aec_loop_hil PRIVATE
+    include src/platform/rv1106)
+  target_include_directories(boompi_aec_loop_hil SYSTEM PRIVATE
+    "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}"
+    "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}")
+  target_link_libraries(boompi_aec_loop_hil PRIVATE
+    boompi_snowboy_bridge
+    boompi_vendor::rockchip_3a_aec
+    boompi_webrtc_vad
+    ALSA::ALSA
+    "${BOOMPI_SWRESAMPLE_LIBRARY}"
+    "${BOOMPI_AVUTIL_LIBRARY}"
+    Threads::Threads ${CMAKE_DL_LIBS} atomic)
+  set_target_properties(boompi_aec_loop_hil PROPERTIES
+    OUTPUT_NAME boompi-aec-loop-hil-ref${BOOMPI_AEC_LOOP_REFERENCE_CHANNELS}
+    SKIP_BUILD_RPATH TRUE BUILD_RPATH "" INSTALL_RPATH ""
+    BUILD_WITH_INSTALL_RPATH FALSE INSTALL_RPATH_USE_LINK_PATH FALSE)
+endif()

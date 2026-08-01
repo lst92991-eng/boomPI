@@ -7,9 +7,10 @@
 ledger 和旧 ALSA playback adapter；历史 host 与交叉链接结果仍保存在测试记录中，但不再
 构成当前架构。
 
-当前板端运行链路只保留真实使用的边界：一个 `AudioEngine` 内聚直接 ALSA、
-`RockchipVoiceDsp`、Snowboy legacy bridge、WebRTC VAD、24→48 kHz 重采样、gain/limiter
-和播放 reference；`Client` 与 `Transport` 分别负责状态机和 WSS 协议。
+当前板端运行链路只保留真实使用的边界：`AudioEngine` 是 application 唯一音频接口，管理
+播放线程及有界队列；其私有 `AudioBackend` 内聚直接 ALSA、`RockchipVoiceDsp`、Snowboy legacy bridge、WebRTC VAD、
+24→48 kHz 重采样和 gain/limiter；`VoiceClient` 与 `VoiceTransport`
+分别负责状态机和 WSS/TLS 会话。
 raw `rk_mpi_ai`/`rk_mpi_ao` 仍是独立 HIL 候选，不接入产品进程。详细只读证据见
 [P0 vendor 音频证据基线](../test/p0-vendor-audio-inventory-20260727.md)；MPI 头文件、依赖和
 当时 21 个入口的交叉链接证据见
@@ -18,25 +19,28 @@ raw `rk_mpi_ai`/`rk_mpi_ao` 仍是独立 HIL 候选，不接入产品进程。�
 ## 数据流与帧布局
 
 ```text
-rk_mpi or ALSA: 48 kHz / S16_LE / measured channel count
-  -> measured layout: dual-mic | mic+reference | 2mic+reference(s)
-  -> explicit map and 48 -> 16 kHz conversion
-  -> one verified Rockchip 3A path
+direct ALSA Mode1: 48 kHz / S16_LE / 4 capture channels
+  -> [mic0,mic1,refL,refR]
+  -> phase-aligned 48 -> 16 kHz conversion
+  -> one Rockchip 3A path
   -> 16 kHz mono for VAD / wake / uplink
 ```
 
-当前 DTB 的 `TRCM clk-trcm=1` 只是共享 TX 时钟；vendor AI VQE 样例请求的 loopback
-Mode2 是独立 mixer 选择。物理 slot、极性、reference 数量和 packing 必须由板端相关性
-测试确定，不能从示例或类型名推断。
+当前 DTB 的 `TRCM clk-trcm=1` 只是共享 TX 时钟，不能独自证明布局。第三块板的相关性 HIL
+已经确认运行时 mixer `Mode1` 对应 `[mic0,mic1,refL,refR]`；997 Hz→`refL`、1499 Hz→`refR`
+的相关系数均为 `0.9983`。这个结论仅适用于当前板/镜像，不能从 vendor 示例外推到其他 BSP。
 
 ## 直接 ALSA 全双工边界
 
-`AudioEngine` 直接拥有 capture/playback 两个 blocking handle，并精确协商 48 kHz、S16_LE、
-2 ch、960-frame period 和 3840-frame buffer。控制/采集线程读取完整 20 ms 帧；独立播放
+私有 `AudioBackend` 先临时设置并回读 Mode1，再重新打开 capture/playback 两个 blocking handle，
+精确协商 48 kHz、S16_LE；capture 为 4 ch、960-frame period、1920-frame buffer，playback
+为 2 ch、960-frame period、3840-frame buffer。控制/采集线程读取完整 20 ms 帧；独立播放
 线程从固定 1.5 s 队列消费 TTS。不存在 capture pump 或中间采集队列。
 
 - capture xrun 恢复后显式报告 discontinuity，并重置 DSP、Snowboy 和 VAD 历史。
-- playback 在固定 scratch 中转换为双声道，处理 partial write；xrun 同步打断 reference 连续性。
+- playback 在固定 scratch 中转换为双声道并处理 partial write；可恢复 xrun 重新提交当前块，
+  Mode1 回采仍反映实际 DAC 数据；不可恢复错误结束本轮播放，不伪造 capture discontinuity。
+- 正常关闭和半初始化失败均恢复原 loopback mixer；测试结束状态为 `Disabled`。
 - `DropPlayback` 用于打断或失败；`EndPlayback` 用于正常 EOS，最终由播放线程有界收尾。
 - 这条生产路径只在匹配 RV1106 BSP 的交叉工具链和真板上构建运行，不提供虚假的 host
   ALSA null 等价实现。
@@ -48,8 +52,9 @@ Mode2 是独立 mixer 选择。物理 slot、极性、reference 数量和 packin
 
 `RockchipVoiceDsp` 是当前唯一产品 3A adapter。它使用匹配 BSP 的固定 16 kHz 帧配置和
 真实 vendor ABI；外层不再维护通用 `AudioDspEngine`、channel mapper 或 capture frontend。
-输入布局、reference 来源、延迟与功能位仍必须由目标板 HIL 确认。discontinuity、xrun 或
-turn 取消时，运行时必须重置 vendor 历史，不能继续发送伪连续音频。
+当前板已确认输入布局、reference 来源和固定功能 profile。discontinuity、xrun 或
+hard-reference broken 时重建 3A 前端；普通 turn cancel 只重置 listener 与播放状态，
+不销毁 vendor DSP。
 
 ## Rockchip MPI raw AI/AO 候选与链接边界
 
@@ -110,64 +115,69 @@ S16_LE、双麦 packing、reference slot 或可听播放。详细边界见
 没有 follow，`/dev/kmsg` stream 语义未验证；OEM stop 链又会 killall rkipc/udhcpc 并停止全部
 OEM service，所以当前只能保持 `safe_to_execute=false`，不得自动 stop/start 后强跑探针。
 
-## Rockchip 3A 候选与未决契约
+## Rockchip 3A 当前适配与未决契约
 
 匹配 BSP 已确认 `rkaudio_preprocess_init`、`rkaudio_preprocess_short` 和拼写如此的
 `rkaudio_preprocess_destory` 三个入口，精确实现库为 `libaec_bf_process.so`，目标 ABI 是
 ARMv7 hard-float/uClibc。匹配 header/PDF/wrapper 和 binary 已确定 16 kHz、16-bit、
-256 samples（16 ms）；`src_chan=2, ref_chan=1` 时输入为 768 shorts，默认 ref-last，BF
-mono 成功返回 512 bytes，非法尺寸返回 0，init 失败返回 null。直接 API 由调用方构造
-`RKAUDIOParam`，不读取 VQE JSON；Rockit/RockAA file mode 才解析 JSON。AEC、BF、ANR、
-AGC 等模块可能组合启用，因此外层不得叠加同类处理；`wakeup_status` 也不是产品 VAD。
+256 samples（16 ms）；当前生产 profile 使用 `src_chan=2, ref_chan=2`，输入为 1024 shorts，
+ref-last 顺序为 `[mic0,mic1,refL,refR]`，BF mono 成功返回 512 bytes。直接 API 由调用方构造
+`RKAUDIOParam`，不读取 VQE JSON；Rockit/RockAA file mode 才解析 JSON。当前生产组合只启用
+FastAEC、AES、ANR、Dereverberation 和 STDT，vendor AGC 已关闭；外层不得无依据叠加同类
+处理。公开 ABI 不提供 DTD 事件；`wakeup_status` 是唤醒状态，不是 DTD 或产品 VAD。
 
-这些仍是 SDK 契约候选而不是板端事实。进入生产 adapter 前必须关闭：
+当前 `RockchipVoiceDsp` 已进入 `boompi-client`：输入固定为 16 kHz/S16、
+`[mic0,mic1,refL,refR]`，用定长 FIFO 把产品 320-sample/20 ms 帧桥接到 vendor
+256-sample/16 ms block。当前生产 profile 固定 mask `1109`、STDT high/low `0.70/0.50`、
+`model_aec_en=0`，不启用 software delay；`ALC31/ref2/delay0` 是本轮候选参数，并非最终
+壳体声学结论。3A 初始化、固定帧调用和
+Snowboy/VAD 后续链路已经在第三块板运行；这只能证明实际代码路径被调用，不能替代以下 HIL：
 
-- direct API 的逻辑输入是 interleaved；板端物理 capture slot 如何映射到
-  `[mic0,mic1,ref]`，以及 reference tap、极性和延迟仍需 HIL。
-- 处理失败和设备 discontinuity 后是否必须 destroy/re-init。
-- `RKAUDIOParam` ownership、线程限制和释放顺序，以及 file mode 资源的目标安装路径。
+- 板端 mic0/mic1 的最终物理左右命名、极性及最终壳体声学表现。
+- 最终壳体的 ERLE、残余回声、最大音量和真人 double-talk。
+- discontinuity 后 destroy/re-init 的长期稳定性和恢复耗时。
 - 算法延迟、CPU/RSS、单帧最坏耗时和持续实时率。
 
 匹配工具链的真实符号 link-check 已通过；它只关闭编译、链接和三个动态入口的解析，详见
 [2026-07-27 Rockchip 3A 交叉链接验证记录](../test/p0-rockchip-3a-link-validation-20260727.md)。
-显式固定帧 HIL 又把 pinned profile、`init(16000,16,2,1)`、单帧 768-short 输入、
+2026-07-29 的历史固定帧 HIL 把当时的 `init(16000,16,2,1)`、单帧 768-short 输入、
 512-byte 成功返回和 handle→parameter tree 清理顺序固化为不安装、不自动执行的
-`EXCLUDE_FROM_ALL` target。HIL ELF 不直接 `NEEDED` vendor 库；按规定从外层清理 loader override
+`EXCLUDE_FROM_ALL` target。独立 HIL ELF 不直接 `NEEDED` vendor 库；按规定从外层清理 loader override
 后，无参数 dry-run 不主动加载 vendor 库，
 只有双 opt-in 与安全前置检查通过后才从固定 `/oem/usr/lib/libaec_bf_process.so` 路径 `dlopen`
 并解析固定入口；loader override 环境必须为空，运行前仍须单独核对目标文件哈希。Linux fake 6/6
 与匹配 RV1106 交叉构建已通过，详见
-[2026-07-29 构建验证](../test/p0-rockchip-3a-hil-build-validation-20260729.md)。该 ELF 尚未在板端
-执行，下一步仍须在正确镜像和物理 layout 关闭后逐项取得真实返回。没有证据时状态只能写
-“未验证”。
+[2026-07-29 构建验证](../test/p0-rockchip-3a-hil-build-validation-20260729.md)。独立 HIL ELF
+的执行边界仍按该记录控制；产品进程已经运行并不自动关闭物理 layout、声学效果或长期实时率。
 
-## WakeWordEngine 契约
+2026-08-01 的当前 direct 3A 板端 HIL 已验证 `init(16000,16,2,2)`、1024-short/2048-byte
+输入、512-byte 输出、guard 完整；init/process 分别为 `11262 us`/`1561 us`。详细证据和
+有限无人工收敛边界见
+[P0 Mode1 硬件播放参考验证记录](../test/p0-mode1-hard-reference-validation-20260801.md)。
 
-`WakeWordEngine` 固定消费完整的 16 kHz、20 ms、mono、S16_LE、320-sample
-`Mono16kFrame`。`Process` 返回无字符串的 POD 结果：decision、规范化 error、
-一基 keyword index，以及可选的 `score_milli`。
+同类无人声/嘈杂环境 A/B 中，AGC 开启 `n=5` 得到 `confirmed=4/5`、`follow=5/5`、
+`attempts=119`；关闭 AGC 后累计 `n=10` 得到 `confirmed=2/10`、`follow=3/10`、
+`attempts=43`。这说明 AGC OFF 对误触发有明显改善，但仍有残余确认和 follow-up，且环境噪声
+没有受控，不能替代 ERLE、残余回声或真人 double-talk 验收。播放期主动硬参考探针会先硬静音，
+等待 reference 连续 3 帧变低（最多 15 帧），清尾 10 帧（200 ms）并重置 listener，再连续
+6 帧（120 ms）确认近讲后才打断。自然播放结束另由 backend 抑制 15 帧（300 ms）尾音，
+follow-up 再连续 20 帧（400 ms）确认 VAD。它是应用层防自激
+containment 候选，探针期间的采样不得用于宣称 AEC 通过或计算有效 AEC 分数。
 
-- `score_milli` 只有在 `score_available=true` 时有效，范围为 0–1000。
-- Snowboy API 不提供置信度，因此未来 Snowboy adapter 必须返回
-  `score_available=false`、`score_milli=0`；sensitivity 不是检测分数。
-- Snowboy `RunDetection()` 的 `-2` 只映射为 diagnostic `kSilence`，不能作为产品 VAD。
-- `-1`、异常、未知负值或越界 keyword index 都必须转换为 backend error 并失败关闭。
-- `Reset(kVadSegmentEnded)` 只重置 detector 的 segment 状态；它不替代 generation gate。
-- reset 结果只有 `reset=true/error=None` 或 `reset=false/error!=None` 两种一致状态。
+## Snowboy 与 VAD 当前边界
 
-generation、sequence/timestamp 连续性、500 ms pre-roll 和产品 VAD 都属于单独的
-wake/VAD worker，而不是 engine：
+产品没有通用 `WakeWordEngine` 层。一个私有 C ABI bridge 是唯一 Snowboy 边界：只有该翻译单元
+包含 `snowboy-detect.h` 并设置 `_GLIBCXX_USE_CXX11_ABI=0`；边界外只传固定宽度状态、PCM 指针、
+sample 数和不透明 handle。bridge 捕获全部 C++ 异常，禁止旧 ABI、RTTI、Snowboy 对象或
+`std::string` 扩散到其余目标。
 
-- worker 独占 engine、自己的 `FrameContinuityGate` 和输入 SPSC consumer。
-- 旧 epoch/stream 帧不进入 detector、VAD 或 pre-roll。
-- discontinuity、丢帧或 backend error 清除 pre-roll、锁存 fault，并要求新 generation。
-- 500 ms pre-roll 是 AEC 后 mono 的 25 个 20 ms 固定帧；不能持久化原始录音。
-- 播放期间 80 ms duck、160 ms 打断确认和 700 ms 尾静音由独立产品 VAD 实现，
-  不能使用 Snowboy silence 或 wake detection 代替。
-
-`UnavailableWakeWordEngine` 对合法输入明确返回 backend unavailable，对非法格式返回
-invalid frame，永远不报告 silence、activity 或 detection。`FakeWakeWordEngine` 只在
-测试 target 中脚本化确定性结果和 reset 错误，不加载模型，也不是生产 fallback。
+采集 actor 对同一帧 AEC 后 16 kHz/mono/320-sample PCM 依次调用 Snowboy 和 WebRTC VAD，
+不增加 wake worker 或中间音频队列。Snowboy 只报告关键词命中，不提供可用置信度，也不充当
+产品 VAD；WebRTC VAD 在 3A 后产生瞬时判定，普通非 follow-up 语音默认 120 ms 起始和
+700 ms 尾静音迟滞；播放 containment 后的 follow-up 使用上述 400 ms 二次确认。
+首次有效硬参考后保留 600 ms warm-up，生产 `near_voice` 不读取 raw mic RMS。application
+独占 25 帧/500 ms pre-roll、turn generation 和打断状态，discontinuity 会清空旧时间轴。
+生产目标中没有 unavailable/fake 唤醒实现。
 
 ## 外部依赖闸门
 
@@ -195,8 +205,8 @@ CMake 对每个输入执行存在性、文件类型和固定 SHA-256 检查，�
 只是可行性候选，不是发布批准。必须显式设置
 `BOOMPI_ALLOW_FEASIBILITY_AUDIO_VENDOR_INPUTS=ON`，并把生成器限制为 Debug-only，
 才会创建 imported targets；Release/RelWithDebInfo/MinSizeRel
-和包含其他 configuration 的多配置生成器都会被拒绝。通过该闸门不等于 adapter 已经
-实现、模型可以加载或板端实时率已经通过。
+和包含其他 configuration 的多配置生成器都会被拒绝。通过该闸门只证明依赖输入匹配，
+不证明产品 adapter 已在该镜像正确加载、模型可用或板端实时率通过。
 
 显式启用 Rockchip feasibility 输入时，tests-off 默认 ALL 会构建不安装、不自动执行的
 `boompi_rockchip_3a_link_check` 或 `boompi_rockchip_mpi_audio_link_check`。额外显式开启
@@ -221,22 +231,21 @@ Snowboy、OpenBLAS、Rockchip 库、资源和模型继续保留在仓库外；�
 SHA-256 和再分发范围全部确认前禁止提交二进制。显式路径不得写入 preset、安装包日志
 或 target 的 PUBLIC 接口。
 
-Snowboy 候选静态库使用旧 libstdc++ 字符串 ABI。未来只能由一个私有 C bridge TU
+Snowboy 静态库使用旧 libstdc++ 字符串 ABI。当前实现只允许一个私有 C bridge TU
 包含 `snowboy-detect.h` 并私有设置 `_GLIBCXX_USE_CXX11_ABI=0`；bridge 外只传固定宽度
 整数、PCM 指针、长度和不透明 handle，不传 `std::string`、异常、RTTI 或 Snowboy
-对象。所有异常必须在 bridge 内转换为错误码，旧 ABI 定义不得扩散到 `boompi_audio_core`
+对象。所有异常在 bridge 内转换为错误码，旧 ABI 定义不得扩散到 `boompi-client`
 或应用。v1 不使用动态插件，也不因兼容失败擅自改成多进程或替换唤醒引擎。
 
 ## 后续验证顺序
 
-1. direct ALSA 48 kHz transport 全双工已通过；先对齐目标自定义 BSP，再完成通道相关性
-   HIL。rk_mpi 最小生命周期的真实交叉链接已通过，但真实执行仍被 `rkipc` owner 阻断。
-2. 直接 3A link-check、固定帧 HIL 的 Linux fake 和目标交叉构建已通过；下一步在正确镜像上
-   关闭物理 slot 映射、真实加载/返回、错误恢复、mono 输出、算法延迟、CPU/RSS 和实时率。
-3. 实现私有 Snowboy legacy bridge、启动期模型/格式校验和单线程 wake worker。
-4. 验证目标英文模型的加载、准确率、误唤醒、漏唤醒和最坏帧耗时，再进行至少
-   30 分钟稳定性测试。
-5. 最后接入 500 ms pre-roll、独立 VAD 和播放打断闭环；功能通过前不进行压力测试。
+1. direct ALSA Mode1 四通道相关性和 48 kHz 全双工已通过；raw rk_mpi 仍是独立候选，其真实
+   执行仍被 `rkipc` owner 阻断。
+2. 直接 3A link-check、2 mic + 2 ref 固定帧 fake/真板调用、目标交叉构建和产品进程初始化
+   已通过；继续关闭错误恢复、CPU/RSS、持续实时率和最终壳体 AEC 效果。
+3. 私有 Snowboy legacy bridge、启动期格式校验、500 ms pre-roll、WebRTC VAD 和播放打断
+   已进入产品路径；继续记录目标模型的误唤醒、漏唤醒、最坏帧耗时和至少 30 分钟稳定性。
+4. 以 Mode1 硬件参考进行真人 double-talk、最大音量和 3 秒追问验收；功能通过前不进行压力测试。
 
-真实 adapter 或 HIL 记录完成前，README、UI capability 和测试报告都不得写“DSP 已接通”
-“Snowboy 可用”或“AEC/唤醒已通过”。
+README 和测试报告可以写“3A/Snowboy 已初始化并进入产品路径”，但在相关 HIL 完成前不得写
+“AEC 声学效果、唤醒准确率或长期稳定性已通过”。

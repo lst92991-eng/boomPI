@@ -2,6 +2,8 @@
 /build*/
 /cmake-build-*/
 /client/out/
+/.tmp_*/
+/client.zip
 **/CMakeFiles/
 **/CMakeCache.txt
 **/cmake_install.cmake
@@ -57,10 +59,12 @@ CMakeUserPresets.json
 **/logs/
 **/recordings/
 **/debug-audio/
+/test/**/*.raw
 *.log
 *.core
 core
 core.*
+!third_party/websocketpp/config/core.hpp
 
 # Vendor/model payloads are installed externally until redistribution is cleared
 /third_party/snowboy/runtime/
