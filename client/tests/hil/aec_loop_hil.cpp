@@ -27,16 +27,16 @@ constexpr unsigned kPreadaptRepeats = 4U;
 constexpr unsigned kPlaybackRepeats = 6U;
 constexpr unsigned kPreadaptGuardFrames = 1U;  // 对齐 3A 固定的 20 ms 输出启动延迟。
 constexpr unsigned kMaximumCaptureFrames = 500U;
-constexpr unsigned kBargeConfirmFrames = 6U;
+constexpr unsigned kBargeCandidateFrames = 2U, kBargeSoftDuckFrames = 2U, kBargeConfirmFrames = 3U;
 constexpr unsigned kFollowUpConfirmFrames = 20U;
-constexpr unsigned kBargeReferenceLowFrames = 3U;
-constexpr unsigned kBargeReferenceWaitFrames = 15U;
-constexpr unsigned kBargeEchoClearFrames = 10U;
+constexpr unsigned kBargeReferenceLowFrames = 2U, kBargeReferenceWaitFrames = 8U;
+constexpr unsigned kBargeEchoClearFrames = 3U, kBargeRetryCooldownFrames = 15U;
+constexpr float kBargeSoftPlaybackScale = 0.30F;
 constexpr std::size_t kPrequeueFrames = 8U;
 constexpr int kCorrelationStrideSamples = 4;
 constexpr double kDbfsFloor = -120.0;
 using SignalSet = std::array<std::vector<std::int16_t>, 5U>;
-enum class ProbeState : std::uint8_t { kIdle, kWaitReferenceLow, kClear, kVerify };
+enum class ProbeState : std::uint8_t { kIdle, kSoftDuck, kWaitReferenceLow, kClear, kVerify };
 
 struct Metrics final {
   std::uint64_t squared_sum{0U};
@@ -311,9 +311,14 @@ int main(int argc, char* argv[]) {
 
   bool saw_playback = false, saw_reference = false, probe_confirmed = false;
   bool completed_score_window = false, completed_post_window = false;
-  unsigned post_frames = 0U, probe_frames = 0U, probe_near_frames = 0U;
+  unsigned post_frames = 0U, probe_frames = 0U, probe_near_frames = 0U, probe_cooldown_frames = 0U;
   unsigned probe_attempts = 0U;
   ProbeState probe_state = ProbeState::kIdle;
+  const auto reset_probe = [&](const bool cooldown) {
+    probe_frames = probe_near_frames = 0U; probe_state = ProbeState::kIdle;
+    probe_cooldown_frames = cooldown ? kBargeRetryCooldownFrames : 0U;
+    audio.SetPlaybackScale(1.0F);
+  };
   std::uint32_t reference_timeline_frames = 0U, score_frame = 0U;
   for (unsigned index = 0U; index < kMaximumCaptureFrames; ++index) {
     if (next_fixture_frame < playback_frames) {
@@ -349,13 +354,22 @@ int main(int argc, char* argv[]) {
     saw_playback = saw_playback || playing;
     if constexpr (BOOMPI_AEC_LOOP_ACTIVE_PROBE != 0) {
       if (!audio.playback_done()) {
-        if (probe_state == ProbeState::kIdle && frame.near_voice) {
-          ++probe_attempts; probe_frames = probe_near_frames = 0U;
-          probe_state = ProbeState::kWaitReferenceLow; audio.Duck(true);
+        if (probe_state == ProbeState::kIdle) {
+          if (probe_cooldown_frames != 0U) --probe_cooldown_frames;
+          else if (!frame.near_voice) probe_near_frames = 0U;
+          else if (++probe_near_frames >= kBargeCandidateFrames) {
+            ++probe_attempts; probe_frames = probe_near_frames = 0U;
+            probe_state = ProbeState::kSoftDuck; audio.SetPlaybackScale(kBargeSoftPlaybackScale);
+          }
+        } else if (probe_state == ProbeState::kSoftDuck) {
+          if (!frame.near_voice) reset_probe(true);
+          else if (++probe_frames >= kBargeSoftDuckFrames) {
+            probe_frames = probe_near_frames = 0U;
+            probe_state = ProbeState::kWaitReferenceLow; audio.SetPlaybackScale(0.0F);
+          }
         } else if (probe_state == ProbeState::kWaitReferenceLow) {
           if (++probe_frames > kBargeReferenceWaitFrames) {
-            probe_frames = probe_near_frames = 0U; probe_state = ProbeState::kIdle;
-            audio.Duck(false);
+            reset_probe(true);
           } else {
             probe_near_frames = frame.reference_active ? 0U : probe_near_frames + 1U;
             if (probe_near_frames >= kBargeReferenceLowFrames) {
@@ -364,8 +378,7 @@ int main(int argc, char* argv[]) {
           }
         } else if (probe_state == ProbeState::kClear) {
           if (frame.reference_active) {
-            probe_frames = probe_near_frames = 0U; probe_state = ProbeState::kIdle;
-            audio.Duck(false);
+            reset_probe(true);
           } else if (++probe_frames >= kBargeEchoClearFrames) {
             probe_frames = probe_near_frames = 0U; probe_state = ProbeState::kVerify;
             if (!audio.ResetListener()) {
@@ -374,15 +387,12 @@ int main(int argc, char* argv[]) {
             }
           }
         } else if (frame.reference_active || !frame.near_voice) {
-          probe_frames = probe_near_frames = 0U; probe_state = ProbeState::kIdle;
-          audio.Duck(false);
+          reset_probe(true);
         } else if (++probe_near_frames >= kBargeConfirmFrames) {
-          probe_confirmed = true; probe_frames = probe_near_frames = 0U;
-          probe_state = ProbeState::kIdle; audio.Duck(false);
+          probe_confirmed = true; reset_probe(false);
         }
-      } else if (probe_state != ProbeState::kIdle) {
-        probe_frames = probe_near_frames = 0U; probe_state = ProbeState::kIdle;
-        audio.Duck(false);
+      } else if (probe_state != ProbeState::kIdle || probe_cooldown_frames != 0U) {
+        reset_probe(false);
       }
     }
     if (playing) {

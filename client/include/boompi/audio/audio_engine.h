@@ -37,7 +37,7 @@ struct AudioEngineConfig final {
   std::string capture_pcm, playback_pcm;
   std::string snowboy_resource, snowboy_model, snowboy_sensitivity{"0.5"};
   float snowboy_gain{1.0F};
-  float playback_gain{1.8F}, duck_gain{0.0F};
+  float playback_gain{1.8F};
   std::int8_t left_polarity{1}, right_polarity{1};
   std::int32_t vad_mode{3}; std::uint16_t vad_start_ms{120U}, vad_end_ms{700U};
 };
@@ -77,8 +77,8 @@ class AudioEngine final {
   /// @brief 标记当前 TTS 已收完；播放线程会消费最后一个短帧、drain ALSA，再置完成状态。
   bool EndPlayback() noexcept;
 
-  /// `Duck` 只调整后续渲染增益；`DropPlayback` 异步唤醒播放线程并清空尚未渲染的 TTS。
-  void Duck(bool enabled) noexcept;
+  /// `SetPlaybackScale` 只调整后续渲染增益；`DropPlayback` 异步唤醒播放线程并清空尚未渲染的 TTS。
+  void SetPlaybackScale(float scale) noexcept;
   void DropPlayback() noexcept;
 
   /// 前两个查询是无锁快照；`playback_failed` 只表示最近一次已结束的流发生硬件/渲染失败，

@@ -31,7 +31,8 @@ struct AudioEngine::Impl final {
   std::uint64_t capture_sequence{0U}, next_tts_sequence{0U};
   bool open{false}, stop{false}, active{false}, ending{false}, playback_started{false};
   bool drop{false}, sequence_set{false};
-  std::atomic<bool> duck{false}, is_playing{false}, is_done{true}, playback_failed{false};
+  std::atomic<float> playback_scale{1.0F};
+  std::atomic<bool> is_playing{false}, is_done{true}, playback_failed{false};
 
   void SetError(const char* text) noexcept {
     std::lock_guard<std::mutex> lock(error_mutex); std::snprintf(error.data(), error.size(), "%s", text);
@@ -43,7 +44,7 @@ struct AudioEngine::Impl final {
 
   /// 播放线程只负责下行渲染；AEC reference 由 Codec Mode1 与双麦在同一 capture period 回采。
   bool Render(const TtsSlot& slot) noexcept {
-    const float gain = config.playback_gain * (duck.load(std::memory_order_relaxed) ? config.duck_gain : 1.0F);
+    const float gain = config.playback_gain * playback_scale.load(std::memory_order_relaxed);
     return backend.Render20ms(slot.pcm.data(), slot.used, gain);
   }
 
@@ -58,7 +59,7 @@ struct AudioEngine::Impl final {
     // DropPlayback 持有同一把锁先中断 PCM；因此这里可安全完成 prepare。
     if (drop && !discard) { discard = true; failed = false; backend.DropPlayback(); }
     active = ending = drop = playback_started = false; ClearQueue();
-    duck.store(false, std::memory_order_release);
+    playback_scale.store(1.0F, std::memory_order_release);
     playback_failed.store(failed, std::memory_order_release);
     is_playing.store(false, std::memory_order_release); is_done.store(true, std::memory_order_release);
     condition.notify_all();
@@ -98,7 +99,7 @@ bool AudioEngine::Open(const AudioEngineConfig& config) noexcept {
   if (impl_ == nullptr) impl_ = new (std::nothrow) Impl;
   if (impl_ == nullptr) return false;
   if (impl_->open) { impl_->SetError("audio is already open"); return false; }
-  if (config.playback_gain < 0.0F || config.duck_gain < 0.0F || config.duck_gain > 1.0F) {
+  if (config.playback_gain < 0.0F) {
     impl_->SetError("invalid playback gain configuration"); return false;
   }
   try {
@@ -159,7 +160,7 @@ bool AudioEngine::BeginPlayback() noexcept {
   // active=false 保证播放线程没有使用重采样器，主线程此刻可以安全复位其相位。
   if (!impl_->backend.PreparePlayback()) return false;
   impl_->sequence_set = impl_->ending = impl_->drop = impl_->playback_started = false; impl_->active = true;
-  impl_->duck.store(false, std::memory_order_release);
+  impl_->playback_scale.store(1.0F, std::memory_order_release);
   impl_->playback_failed.store(false, std::memory_order_release);
   impl_->is_playing.store(true, std::memory_order_release); impl_->is_done.store(false, std::memory_order_release);
   return true;
@@ -172,7 +173,9 @@ bool AudioEngine::EndPlayback() noexcept {
   impl_->ending = true; impl_->condition.notify_one(); return true;
 }
 
-void AudioEngine::Duck(bool enabled) noexcept { if (impl_ != nullptr) impl_->duck.store(enabled, std::memory_order_release); }
+void AudioEngine::SetPlaybackScale(const float scale) noexcept {
+  if (impl_ != nullptr) impl_->playback_scale.store(std::clamp(scale, 0.0F, 1.0F), std::memory_order_release);
+}
 void AudioEngine::DropPlayback() noexcept {
   if (impl_ == nullptr || !impl_->open) return;
   std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -205,7 +208,7 @@ void AudioEngine::Close() noexcept {
   impl_->sequence_set = false; impl_->capture_sequence = 0U;
   impl_->ClearQueue();
   impl_->playback_failed.store(false, std::memory_order_release);
-  impl_->duck.store(false, std::memory_order_release);
+  impl_->playback_scale.store(1.0F, std::memory_order_release);
   impl_->is_playing.store(false, std::memory_order_release); impl_->is_done.store(true, std::memory_order_release);
 }
 

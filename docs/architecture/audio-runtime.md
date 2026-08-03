@@ -11,8 +11,8 @@
 - 私有 `AudioBackend`（`platform/rv1106/`）：由 `AudioEngine` 独占，内聚 ALSA 全双工、
   重采样、Rockchip 3A、Snowboy、WebRTC VAD 和近讲判定，不向 application 暴露。
 
-整套生产 C++ 共 17 个文件、2285 ELOC，其中 439 ELOC 是 Rockchip/Snowboy vendor 集成，
-产品核心为 1846 ELOC。旧 `manual_single_turn`、独立 capture pump、
+整套生产 C++ 共 17 个文件、2300 ELOC，其中 439 ELOC 是 Rockchip/Snowboy vendor 集成，
+产品核心为 1861 ELOC。旧 `manual_single_turn`、独立 capture pump、
 通用 EventBus、自写 WSS/parser、renderer/resampler/gain 框架和 playback
 control/committer/worker 已删除；不得为了恢复历史测试结构重新引入。
 
@@ -75,9 +75,10 @@ actor 只在 `active=false` 且受 `AudioEngine` mutex 保护时复位播放重�
 - Snowboy 命中后重置 Snowboy/VAD 历史，最多等待 6 s 用户开口。
 - VAD 连续静音 700 ms 后提交；单轮语音硬上限 60 s。
 - 正常回复结束后进入 3 s 免唤醒追问。
-- 播放时首个近端候选立即把播放硬静音；状态机先等待硬参考连续 3 帧降为低电平（最多
-  15 帧），再等待 10 帧（200 ms）清除声学尾音、重置 listener，并以连续 6 帧（120 ms）
-  重新确认近端语音。只有二次确认成功才执行
+- 播放时先保持原音量连续确认 2 帧（40 ms）近端候选，再把播放降到 30% 并确认 2 帧
+  （40 ms）；候选持续才硬静音，等待硬参考连续 2 帧降为低电平（最多 8 帧），再等待 3 帧
+  （60 ms）清除声学尾音、重置 listener，并以连续 3 帧（60 ms）重新确认近端语音。
+  失败恢复播放并冷却 15 帧（300 ms）。只有二次确认成功才执行
   `DropPlayback`、清空本地 TTS、向服务端发送 cancel，并把已经采集的
   连续近端 pre-roll 作为新 utterance；参考未降低或二次确认失败时恢复播放。
 - 自然播放结束不走上述主动探针：backend 先抑制 15 帧（300 ms）尾音并重置 VAD，

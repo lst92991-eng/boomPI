@@ -22,12 +22,10 @@ using audio::AudioEngine; using audio::AudioEngineConfig; using audio::CaptureFr
 using network::Control; using network::ControlKind; using network::Inbound; using network::InboundKind;
 using network::Pcm64Header; using network::TransportConfig; using network::VoiceTransport; using network::WireIds;
 constexpr std::size_t kPreRollFrames = 25U;
-constexpr unsigned kBargeReferenceLowFrames = 3U;
-constexpr unsigned kBargeReferenceWaitFrames = 15U;
-// 200 ms covers the measured render queue, DSP frame, acoustic path and frame
-// phase after muting. This is a containment window, not an AEC delay estimate.
-constexpr unsigned kBargeEchoClearFrames = 10U;
-constexpr unsigned kBargeConfirmFrames = 6U;
+constexpr unsigned kBargeCandidateFrames = 2U, kBargeSoftDuckFrames = 2U, kBargeReferenceLowFrames = 2U;
+constexpr unsigned kBargeReferenceWaitFrames = 8U, kBargeEchoClearFrames = 3U, kBargeConfirmFrames = 3U;
+constexpr unsigned kBargeRetryCooldownFrames = 15U;
+constexpr float kBargeSoftPlaybackScale = 0.30F;
 // Follow-up has no wake word, so it must be stricter than an in-playback barge.
 // The 300 ms backend tail guard clears the known render tail first; these
 // additional 400 ms must then be continuously classified as near speech.
@@ -71,7 +69,7 @@ enum class State : std::uint8_t {
   kWake, kWaitSpeech, kCapture, kAwait,
   kSpeak, kBarge, kDrain, kFollowUp,
 };
-enum class BargeProbe : std::uint8_t { kIdle, kWaitReferenceLow, kClear, kVerify };
+enum class BargeProbe : std::uint8_t { kIdle, kSoftDuck, kWaitReferenceLow, kClear, kVerify };
 
 class VoiceClient final {
  public:
@@ -126,7 +124,11 @@ class VoiceClient final {
   }
   void ResetListener() { if (!audio_.ResetListener()) listener_failed_ = true; }
   void ResetBargeProbe() {
-    near_frames_ = probe_frames_ = 0U; barge_probe_ = BargeProbe::kIdle; audio_.Duck(false);
+    near_frames_ = probe_frames_ = cooldown_frames_ = 0U;
+    barge_probe_ = BargeProbe::kIdle; audio_.SetPlaybackScale(1.0F);
+  }
+  void RejectBargeProbe() {
+    ResetBargeProbe(); cooldown_frames_ = kBargeRetryCooldownFrames;
   }
 
   // Connect 只启动 WSS/ASIO 线程；hello 必须等 open callback 确认 connected 后由 actor 发送。
@@ -159,7 +161,7 @@ class VoiceClient final {
   // 连接错误会使当前 turn 失效。旧事件、旧音频和旧 epoch 必须一起清掉，不能重传。
   void LoseConnection(const char* reason) {
     if (transport_) transport_->Close();
-    transport_.reset(); events_.Clear(); audio_.DropPlayback(); audio_.Duck(false);
+    transport_.reset(); events_.Clear(); audio_.DropPlayback(); audio_.SetPlaybackScale(1.0F);
     state_ = State::kWake; ids_ = response_ = {};
     pre_head_ = pre_count_ = 0U; ResetBargeProbe();
     barge_ended_ = finish_after_start_ = finish_after_cancel_ = false;
@@ -259,7 +261,7 @@ class VoiceClient final {
   }
 
   void ResumeAfterBarge() {
-    audio_.DropPlayback(); audio_.Duck(false); finish_after_start_ = barge_ended_; finish_after_cancel_ = false;
+    audio_.DropPlayback(); audio_.SetPlaybackScale(1.0F); finish_after_start_ = barge_ended_; finish_after_cancel_ = false;
     if (AdvanceTurn()) StartTurn();
   }
 
@@ -324,19 +326,27 @@ class VoiceClient final {
     std::cout << "boompi-client: VAD speech ended; voice turn committed" << std::endl;
   }
 
-  // 首个候选立即静音；硬参考确认归零后清除200ms并重置VAD，再确认120ms。
+  // 先用连续近讲证据和短时轻降音过滤瞬态误判；只有候选持续时才硬静音并确认声学尾音已清除。
   void HandleBarge(const CaptureFrame& frame, bool response_active) {
     if (!config_.barge_in_enabled) {
       ResetBargeProbe(); return;
     }
     if (barge_probe_ == BargeProbe::kIdle) {
-      if (!frame.near_voice) return;
+      if (cooldown_frames_ != 0U) { --cooldown_frames_; return; }
+      if (!frame.near_voice) { near_frames_ = 0U; return; }
+      if (++near_frames_ < kBargeCandidateFrames) return;
+      near_frames_ = probe_frames_ = 0U; barge_probe_ = BargeProbe::kSoftDuck;
+      audio_.SetPlaybackScale(kBargeSoftPlaybackScale); return;
+    }
+    if (barge_probe_ == BargeProbe::kSoftDuck) {
+      if (!frame.near_voice) { RejectBargeProbe(); return; }
+      if (++probe_frames_ < kBargeSoftDuckFrames) return;
       near_frames_ = probe_frames_ = 0U; barge_probe_ = BargeProbe::kWaitReferenceLow;
-      audio_.Duck(true); return;
+      audio_.SetPlaybackScale(0.0F); return;
     }
     if (barge_probe_ == BargeProbe::kWaitReferenceLow) {
       if (++probe_frames_ > kBargeReferenceWaitFrames) {
-        ResetBargeProbe(); return;
+        RejectBargeProbe(); return;
       }
       near_frames_ = frame.reference_active ? 0U : near_frames_ + 1U;
       if (near_frames_ < kBargeReferenceLowFrames) return;
@@ -344,14 +354,14 @@ class VoiceClient final {
     }
     if (barge_probe_ == BargeProbe::kClear) {
       if (frame.reference_active) {
-        ResetBargeProbe(); return;
+        RejectBargeProbe(); return;
       }
       if (++probe_frames_ < kBargeEchoClearFrames) return;
       near_frames_ = probe_frames_ = 0U; barge_probe_ = BargeProbe::kVerify;
       ResetListener(); return;
     }
     if (frame.reference_active || !frame.near_voice) {
-      ResetBargeProbe(); return;
+      RejectBargeProbe(); return;
     }
     if (++near_frames_ != kBargeConfirmFrames) return;
     audio_.DropPlayback(); ResetBargeProbe();
@@ -447,7 +457,7 @@ class VoiceClient final {
   Clock::time_point deadline_{}, next_connect_{};
   std::uint64_t audio_origin_us_{0U};
   std::uint32_t message_{1U}, uplink_sequence_{0U}, turn_frames_{0U};
-  unsigned reconnect_attempt_{0U}, near_frames_{0U}, probe_frames_{0U};
+  unsigned reconnect_attempt_{0U}, near_frames_{0U}, probe_frames_{0U}, cooldown_frames_{0U};
   BargeProbe barge_probe_{BargeProbe::kIdle};
   bool hello_sent_{false}, barge_ended_{false}, finish_after_start_{false}, finish_after_cancel_{false};
   bool listener_failed_{false};

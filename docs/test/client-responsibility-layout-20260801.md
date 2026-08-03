@@ -30,8 +30,8 @@
 | 口径 | ELOC | 约束 |
 | --- | ---: | ---: |
 | Rockchip/Snowboy vendor 集成 | 439 | 单独公开，不计入产品核心预算 |
-| 产品核心 | 1846 | `< 2000` |
-| 含 vendor 集成总量 | 2285 | `<= 2300` |
+| 产品核心 | 1861 | `< 2000` |
+| 含 vendor 集成总量 | 2300 | `<= 2300` |
 
 这 439 行不是第三方库源码：其中 Snowboy C ABI bridge 为 148 ELOC；Rockchip adapter 为
 291 ELOC，包含固定 2 mic + 2 ref profile、320↔256 帧 FIFO、生命周期和错误恢复。将二者单列是为了回答
@@ -53,9 +53,10 @@
 - 保留持久 WSS；普通当前轮故障发送 `turn.cancel`/`response.cancel`，不重启健康会话。
 - 新 turn 清理旧 response 身份；迟到 epoch/response 帧丢弃，cancel/done 竞态幂等。
 - TTS 首播固定预缓冲 180 ms，短 EOS 例外；队列仍有 1.5 s 硬上限。
-- 首次有效硬参考后的 600 ms 只用于 3A 收敛；播放期首个近讲候选立即硬静音，等待硬参考
-  连续 3 帧降低（最多 15 帧），再清尾 10 帧（200 ms）、重置 listener，并以连续 6 帧
-  （120 ms）二次确认，再 drop/cancel。失败则恢复播放。
+- 首次有效硬参考后的 600 ms 只用于 3A 收敛；播放期先以原音量连续确认近讲 2 帧（40 ms），
+  再降到 30% 确认 2 帧（40 ms）。候选持续才硬静音，等待硬参考连续 2 帧降低（最多 8 帧），
+  再清尾 3 帧（60 ms）、重置 listener，并以连续 3 帧（60 ms）二次确认，再 drop/cancel。
+  失败则恢复播放并冷却 15 帧（300 ms）。
 - 自然播放结束由 backend 抑制 15 帧（300 ms）尾音；follow-up 随后以连续 20 帧
   （400 ms）确认新一轮近讲。
 - capture discontinuity 重建 3A/Snowboy/VAD 历史；播放故障与主动 drop 分开上报。
@@ -86,7 +87,7 @@
 | 生产 DSP profile | mask `1109`；FastAEC/AES/ANR/Dereverberation/STDT，vendor AGC 关闭 |
 | 无人声/嘈杂环境 AGC A/B | AGC OFF 显著改善但未通过：ON 4/5 confirmed、5/5 follow；OFF 2/10、3/10 |
 | 主动硬参考探针 | 业务防自激路径已启用；不计作 AEC 通过，真人双讲待验收 |
-| Snowboy、首轮问答、3 s 追问、长回复打断、无自激 | 待真人验收 |
+| Snowboy、首轮问答、3 s 追问、长回复打断、无自激 | 人工体验通过；量化与长期稳定性待验收 |
 
 候选 ELF 是 32-bit little-endian ARM EABI5 hard-float/uClibc，strip 后 5726412 bytes，
 SHA-256 为 `f8b7b3103599714cc5bb81ac2db2ecd1917aa3cd9b158841ae93246c324c7b63`。它只部署到

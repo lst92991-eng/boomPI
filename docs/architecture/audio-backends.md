@@ -159,9 +159,10 @@ Snowboy/VAD 后续链路已经在第三块板运行；这只能证明实际代�
 同类无人声/嘈杂环境 A/B 中，AGC 开启 `n=5` 得到 `confirmed=4/5`、`follow=5/5`、
 `attempts=119`；关闭 AGC 后累计 `n=10` 得到 `confirmed=2/10`、`follow=3/10`、
 `attempts=43`。这说明 AGC OFF 对误触发有明显改善，但仍有残余确认和 follow-up，且环境噪声
-没有受控，不能替代 ERLE、残余回声或真人 double-talk 验收。播放期主动硬参考探针会先硬静音，
-等待 reference 连续 3 帧变低（最多 15 帧），清尾 10 帧（200 ms）并重置 listener，再连续
-6 帧（120 ms）确认近讲后才打断。自然播放结束另由 backend 抑制 15 帧（300 ms）尾音，
+没有受控，不能替代 ERLE、残余回声或真人 double-talk 验收。播放期分阶段参考探针先以原音量
+连续确认近讲 2 帧（40 ms），再降到 30% 确认 2 帧（40 ms）；候选持续才硬静音，等待
+reference 连续 2 帧变低（最多 8 帧），清尾 3 帧（60 ms）并重置 listener，再连续 3 帧
+（60 ms）确认近讲后才打断。失败恢复播放并冷却 15 帧（300 ms）。自然播放结束另由 backend 抑制 15 帧（300 ms）尾音，
 follow-up 再连续 20 帧（400 ms）确认 VAD。它是应用层防自激
 containment 候选，探针期间的采样不得用于宣称 AEC 通过或计算有效 AEC 分数。
 

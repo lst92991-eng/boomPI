@@ -5,10 +5,13 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 > **语音链路的关键能力已经在第三块 RV1106 上完成组合验收，但当前候选仍不是发布版。**
 > 2026-08-03 的单参考候选已完成严格交叉构建、固定语音 A/B、板端启动、真实 Qwen 问答以及
 > 静默、完整播放、三秒追问和播放中打断四段真人验收；本次窗口未观察到自激或音频运行错误。
-> 当前候选为 17 个生产 C++ 文件、2285 ELOC；扣除
+> 当前候选为 17 个生产 C++ 文件、2300 ELOC；扣除
 > 439 ELOC 的 Rockchip/Snowboy vendor 集成后，
-> 产品核心为 1846 ELOC。旧版的丢帧、高延迟、`EPIPE` 和 jitter queue 记录仍作为回归风险
+> 产品核心为 1861 ELOC。旧版的丢帧、高延迟、`EPIPE` 和 jitter queue 记录仍作为回归风险
 > 保留；最终壳体 ERLE、受控 double-talk 和长期稳定性仍待量化验收。
+> 同日第一块板又完成分阶段打断 A/B：关闭打断后播放恢复流畅，快速候选完成真实 Qwen
+> 播放与多轮打断，用户确认体验可接受；主观结论、日志计数和未量化边界见
+> [P1 分阶段打断与播放连续性人工验证](docs/test/p1-staged-barge-playback-validation-20260803.md)。
 
 ## 系统形态
 
@@ -51,7 +54,8 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
   AGC 关闭），`ALC31/ref1/delay0` 仍是候选而非最终参数。同类无人声/嘈杂环境回归中，AGC
   开启 `n=5` 得到 `confirmed=4/5`、`follow=5/5`、`attempts=119`；关闭 AGC 累计 `n=10`
   得到 `confirmed=2/10`、`follow=3/10`、`attempts=43`。AGC OFF 明显改善但没有解决误触发。
-- 播放期的主动硬参考探针通过硬静音、等待 reference 降低和二次 VAD 确认来抑制自激；这是
+- 播放期的分阶段参考探针先连续确认近讲、短时降音，再用硬静音等待 reference 降低和二次
+  VAD 确认来抑制自激；失败后恢复播放并冷却，避免瞬态误判反复切断 TTS。这是
   产品侧 containment 候选，不是 AEC 效果证明。当前环境仍嘈杂，真人双讲和可控噪声条件下的
   打断验收待完成。
 - Snowboy 已在第三块板加载模型并多次检测到唤醒；误唤醒、漏唤醒、准确率和长期 CPU/RSS
@@ -63,8 +67,8 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 ### 软件阶段
 
-2026-08-01 板端生产目标按仓库既定职责整理为 17 个 C++ 文件、2285 ELOC；其中
-Rockchip/Snowboy vendor 集成为 439 ELOC，产品核心为 1846 ELOC：
+2026-08-01 板端生产目标按仓库既定职责整理；当前为 17 个 C++ 文件、2300 ELOC，其中
+Rockchip/Snowboy vendor 集成为 439 ELOC，产品核心为 1861 ELOC：
 `application` 是会话状态机，`audio` 是有界播放编排，`network` 是持久 WSS/TLS，
 `platform/rv1106` 是 ALSA/libswresample、Rockchip 3A、Snowboy 和 WebRTC VAD。它们直接组合
 外部库，不再保留自写 WSS、重复 wire protocol、
