@@ -990,8 +990,8 @@ extern "C" void* rkaudio_preprocess_init(
     int rate, int bits, int src_chan, int ref_chan,
     RKAUDIOParam* parameters) {
   ++g_init_calls;
-  if (rate != 16000 || bits != 16 || src_chan != 2 || ref_chan != 2) {
-    Fail("init must be 16k/S16/src2/ref2");
+  if (rate != 16000 || bits != 16 || src_chan != 2 || ref_chan != 1) {
+    Fail("init must be 16k/S16/src2/ref1");
     return nullptr;
   }
   if (parameters == nullptr || parameters->model_en != 3 ||
@@ -1010,9 +1010,9 @@ extern "C" void* rkaudio_preprocess_init(
     return nullptr;
   }
   if (bf->model_bf_en != 1109 || bf->ref_pos != 1 || bf->Targ != 4 ||
-      bf->num_ref_channel != 2 || bf->drop_ref_channel != 0 ||
+      bf->num_ref_channel != 1 || bf->drop_ref_channel != 0 ||
       bf->dtd_para == nullptr) {
-    Fail("invalid 2+2 BF/STDT profile");
+    Fail("invalid 2+1 BF/STDT profile");
     return nullptr;
   }
   const auto* dtd = static_cast<const RKDTDParam*>(bf->dtd_para);
@@ -1033,14 +1033,14 @@ extern "C" int rkaudio_preprocess_short(
     Fail("invalid process pointers");
     return 512;
   }
-  if (input_size != 1024) {
-    Fail("input_size must be 1024 shorts");
+  if (input_size != 768) {
+    Fail("input_size must be 768 shorts");
   }
   for (int sample = 0; sample < 256; ++sample) {
-    for (int channel = 0; channel < 4; ++channel) {
+    for (int channel = 0; channel < 3; ++channel) {
       const short expected = static_cast<short>(
           (channel + 1) * 1000 + sample);
-      const short actual = input[4 * sample + channel];
+      const short actual = input[3 * sample + channel];
       if (actual != expected && g_error[0] == '\\0') {
         std::snprintf(g_error, sizeof(g_error),
                       "packing mismatch sample=%d channel=%d actual=%d expected=%d",
@@ -1129,7 +1129,7 @@ int main() {
                  boompi_fake_contract_error());
     return 4;
   }
-  std::puts("production RockchipVoiceDsp 2+2 contract passed");
+  std::puts("production RockchipVoiceDsp 2+1 contract passed");
   return 0;
 }
 """,
@@ -1339,7 +1339,7 @@ int main() {
             ("cross-compiled Linux/ARM",),
         )
 
-    def test_production_dsp_adapter_uses_mode1_two_plus_two_contract(self) -> None:
+    def test_production_dsp_adapter_uses_mode1_two_plus_one_contract(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="boompi-rockchip-3a-production-adapter-"
         ) as temporary:
@@ -1359,7 +1359,7 @@ int main() {
         )
         self.assertEqual(
             completed.stdout,
-            "production RockchipVoiceDsp 2+2 contract passed\n",
+            "production RockchipVoiceDsp 2+1 contract passed\n",
         )
         self.assertEqual(completed.stderr, "")
 

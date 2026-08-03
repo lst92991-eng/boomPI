@@ -119,9 +119,9 @@ supervisor、UI、update、target 分层和发布架构的内容是后续路线�
   `960/3840`，全双工窗口无 xrun。997 Hz→`refL`、1499 Hz→`refR` 的相关系数均为 `0.9983`。
 - 物理扬声器主要使用 DAC-L；数字参考到麦克风的声学到达约 `14–17 ms`，仅为阈值法近似。
   raw mic DC/底噪较高，不得使用 raw RMS 判定近讲。
-- direct 3A 固定为 `init(16000,16,2,2)`，输入 1024 shorts/2048 bytes，输出 512 bytes；
+- direct 3A 固定为 `init(16000,16,2,1)`，输入 768 shorts/1536 bytes，输出 512 bytes；
   当前生产 DSP profile mask 为 `1109`，启用 FastAEC、AES、ANR、Dereverberation 和 STDT，
-  禁用 vendor AGC；`model_aec_en=0`，不启用 software delay。`ALC31/ref2/delay0` 是当前候选，
+  禁用 vendor AGC；`model_aec_en=0`，不启用 software delay。`ALC31/ref1/delay0` 是当前候选，
   不是最终声学参数。
 - 生产链路只使用 Mode1 硬件参考，不再维护软件 reference ring 或 60 ms lead。公开 ABI 没有
   DTD 事件，`wakeup_status` 不是 DTD；`near_voice` 只使用 3A 后 VAD。首次有效硬参考后保留
@@ -299,7 +299,7 @@ SPSC、独立上行队列和 credit/window 是实测证明需要进一步拆线�
 direct ALSA 48 kHz full duplex, Mode1
   -> capture [mic0,mic1,refL,refR], S16_LE, period/buffer 960/1920
   -> phase-aligned deinterleave + anti-alias resample 48 kHz -> 16 kHz
-  -> Rockchip 3A adapter once: 2 mic + 2 hard reference
+  -> Rockchip 3A adapter once: 2 mic + REF-L (REF-R remains captured but is discarded here)
   -> VAD + Snowboy + 16 kHz S16_LE mono uplink
 
 Qwen 24 kHz S16_LE mono downlink

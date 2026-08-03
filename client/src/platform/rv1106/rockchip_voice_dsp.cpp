@@ -194,7 +194,7 @@ bool RockchipVoiceDsp::PushInput(
     const RockchipVoiceFrame16k& reference_left,
     const RockchipVoiceFrame16k& reference_right) noexcept {
   if (input_count_ > kInputFifoFrames - kRockchipVoiceFrameSamples16k) return false;
-  // 单参考 HIL 只送物理扬声器所在的 REF-L；生产默认仍保持双参考，待 A/B 结果关闭。
+  // Mode1 仍保留四通道采集；生产只把 REF-L 送入 3A，丢弃重复的 REF-R。
   static_cast<void>(reference_right);
   for (std::size_t sample = 0U; sample < kRockchipVoiceFrameSamples16k;
        ++sample) {

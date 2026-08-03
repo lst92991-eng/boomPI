@@ -22,6 +22,7 @@ control/committer/worker 已删除；不得为了恢复历史测试结构重新�
 ALSA capture: 48 kHz / S16_LE / Mode1 4ch / 20 ms
   -> [mic0,mic1,refL,refR]
   -> phase-aligned 48 -> 16 kHz conversion
+  -> select [mic0,mic1,refL], discard duplicate refR
   -> Rockchip 3A
   -> Snowboy + WebRTC VAD
   -> WSS: 16 kHz / S16_LE / mono
@@ -42,7 +43,8 @@ ALSA 精确协商为 capture `960/1920`、playback `960/3840` frame period/buffe
 - 唤醒前卷：25 帧，即 500 ms。
 - 网络事件环：64 项；溢出视为连接失效，不覆盖旧事件。
 - TTS 队列：75 × 20 ms，即 1.5 s；满时取消当前响应，不无限堆积；只有取消发送本身失败时才重连。
-- 不存在软件播放参考环。硬件 Mode1 在同一个 capture frame 提供 `refL/refR`；首次有效硬参考后
+- 不存在软件播放参考环。硬件 Mode1 在同一个 capture frame 提供 `refL/refR`，生产 3A 只消费
+  `refL`；首次有效硬参考后
   保留 600 ms 3A 自适应 warm-up，期间不允许参考泄漏触发打断。
 - 单个上行 PCM：最多 640 bytes；单个下行 PCM：最多 960 bytes。
 - WebSocket 消息：最多 64 KiB 加协议头，发送端同时检查库内待发送字节数。
@@ -87,7 +89,7 @@ actor 只在 `active=false` 且受 `AudioEngine` mutex 保护时复位播放重�
 禁止触发并在末端重置 VAD；主动打断保留已经确认的近讲 VAD，避免短打断词丢失结束事件。
 主动硬参考探针是应用层防自激 containment 候选：由于它故意静音扬声器，探针区间不构成 AEC 效果证据，
 也不应纳入 ERLE 或 AEC 评分。当前生产 DSP mask 为 `1109`，启用 FastAEC、AES、ANR、
-Dereverberation 和 STDT，vendor AGC 关闭；`ALC31/ref2/delay0` 只是当前候选参数。
+Dereverberation 和 STDT，vendor AGC 关闭；`ALC31/ref1/delay0` 只是当前候选参数。
 
 ## 故障语义
 
@@ -107,6 +109,7 @@ Dereverberation 和 STDT，vendor AGC 关闭；`ALC31/ref2/delay0` 只是当前�
 最新同类无人声/嘈杂环境回归为：AGC ON `n=5`，`confirmed=4/5`、`follow=5/5`、
 `attempts=119`；AGC OFF 累计 `n=10`，`confirmed=2/10`、`follow=3/10`、`attempts=43`。
 关闭 AGC 明显改善但尚未充分解决误触发；环境噪声仍是混杂因素。
-Mode1 四通道、2 mic + 2 ref direct 3A 和启动/退出证据见
+Mode1 保留四通道 `[mic0,mic1,refL,refR]` 采集；生产 direct 3A 只接收
+`[mic0,mic1,refL]`，在 vendor 边界丢弃重复的 `refR`。启动/退出证据见
 [P0 Mode1 硬件播放参考验证记录](../test/p0-mode1-hard-reference-validation-20260801.md)。真人
 double-talk、最终壳体 ERLE/残余回声和最大音量仍待验收。

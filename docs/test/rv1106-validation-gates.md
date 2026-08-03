@@ -144,7 +144,7 @@ ALSA 的真实全双工、capture layout 和 3A 契约关闭。
   reference ring/60 ms lead。硬件与软件 reference 仍禁止叠加。
 - [x] 软件 reference 评审项当前不适用；若未来 BSP 失去硬件参考，必须重新开启方案评审，
   不得直接恢复旧实现或使用原始 TTS/补零前缀。
-- [ ] Rockchip 3A 的 16 kHz/2 mic + 2 ref 布局和一次调用已验证；错误恢复、单帧最坏耗时、
+- [ ] Rockchip 3A 的现行 16 kHz/2 mic + refL 布局和一次调用已验证；错误恢复、单帧最坏耗时、
   CPU/RSS 和持续实时率仍待关闭。
 - [ ] 最终壳体中记录距离、角度、音量、背景噪声、ERLE、残余回声和 double-talk 结果。
 

@@ -112,7 +112,7 @@ bool AudioEngine::Open(const AudioEngineConfig& config) noexcept {
 }
 
 bool AudioEngine::Capture(CaptureFrame* const frame) noexcept {
-  // 四通道 period 内已经同时包含双麦与双硬件 reference，不再跨线程估算播放时轴。
+  // 四通道 period 同时包含双麦和两个硬件 reference；3A 生产配置只消费 REF-L。
   if (impl_ == nullptr || !impl_->open || frame == nullptr) return false;
   bool discontinuity = false;
   if (!impl_->backend.ReadCapture20ms(&discontinuity)) return false;

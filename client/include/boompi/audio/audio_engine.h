@@ -45,7 +45,7 @@ struct AudioEngineConfig final {
 /// @brief 对话业务使用的音频门面。
 ///
 /// application 层只看到固定 20 ms 帧和播放控制。内部唯一播放线程消费有界 TTS 环形队列；
-/// AEC 使用 Codec Mode1 在采集侧同步提供的双硬件 reference。Close 会先唤醒并 join
+/// AEC 使用 Codec Mode1 同步采集的 REF-L；REF-R 仍保留在四通道采集数据中。Close 会先唤醒并 join
 /// 播放线程，随后才释放 platform 层的 ALSA、模型、DSP 和临时 mixer 配置。
 class AudioEngine final {
  public:

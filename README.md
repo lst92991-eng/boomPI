@@ -2,12 +2,13 @@
 
 boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端负责连接 Qwen 新加坡区，板端不保存云端 API Key。
 
-> **语音链路的关键能力已经分别在第三块 RV1106 上运行，但当前职责重排候选仍不是发布版。**
-> 历史证据覆盖 Snowboy、Rockchip 3A、VAD、持久 WSS 和真实 Qwen 流式播放；AEC 声学效果、
-> 打断与三秒追问仍以本轮组合验收为准。当前候选为 17 个生产 C++ 文件、2285 ELOC；扣除
+> **语音链路的关键能力已经在第三块 RV1106 上完成组合验收，但当前候选仍不是发布版。**
+> 2026-08-03 的单参考候选已完成严格交叉构建、固定语音 A/B、板端启动、真实 Qwen 问答以及
+> 静默、完整播放、三秒追问和播放中打断四段真人验收；本次窗口未观察到自激或音频运行错误。
+> 当前候选为 17 个生产 C++ 文件、2285 ELOC；扣除
 > 439 ELOC 的 Rockchip/Snowboy vendor 集成后，
 > 产品核心为 1846 ELOC。旧版的丢帧、高延迟、`EPIPE` 和 jitter queue 记录仍作为回归风险
-> 保留；当前候选须重新完成交叉构建、板端启动与真人语音验收。
+> 保留；最终壳体 ERLE、受控 double-talk 和长期稳定性仍待量化验收。
 
 ## 系统形态
 
@@ -42,11 +43,12 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
   `[mic0,mic1,refL,refR]` 四通道，period/buffer 为 `960/1920`；playback 为双通道，
   period/buffer 为 `960/3840`，测试窗口无 xrun。997 Hz→`refL`、1499 Hz→`refR` 的相关系数
   均为 `0.9983`；物理扬声器主要使用 DAC-L，声学到达约 `14–17 ms`（阈值法近似）。
-- direct Rockchip 3A 已在板端以 `init(16000,16,2,2)`、`[mic0,mic1,refL,refR]`、
-  1024-short 输入和 512-byte 输出通过固定帧调用。生产链路使用 Mode1 硬件参考，不再维护
-  软件 reference ring/60 ms lead；最终壳体 AEC、真人 double-talk 和长期实时率仍未验收。
+- 2026-08-01 历史 direct Rockchip 3A 已在板端以 `init(16000,16,2,2)`、
+  `[mic0,mic1,refL,refR]`、1024-short 输入和 512-byte 输出通过固定帧调用。现行生产链路保留
+  Mode1 四通道采集，但只把 `[mic0,mic1,refL]` 送入 3A：`init(16000,16,2,1)`、768-short
+  输入，进入 vendor 前丢弃重复的 `refR`；不再维护软件 reference ring/60 ms lead。
 - 当前生产 DSP profile 为 mask `1109`（FastAEC、AES、ANR、Dereverberation、STDT，vendor
-  AGC 关闭），`ALC31/ref2/delay0` 仍是候选而非最终参数。同类无人声/嘈杂环境回归中，AGC
+  AGC 关闭），`ALC31/ref1/delay0` 仍是候选而非最终参数。同类无人声/嘈杂环境回归中，AGC
   开启 `n=5` 得到 `confirmed=4/5`、`follow=5/5`、`attempts=119`；关闭 AGC 累计 `n=10`
   得到 `confirmed=2/10`、`follow=3/10`、`attempts=43`。AGC OFF 明显改善但没有解决误触发。
 - 播放期的主动硬参考探针通过硬静音、等待 reference 降低和二次 VAD 确认来抑制自激；这是
@@ -70,7 +72,7 @@ Rockchip/Snowboy vendor 集成为 439 ELOC，产品核心为 1846 ELOC：
 回滚位置和当前验证结果见
 [语音客户端职责重排记录](docs/test/client-responsibility-layout-20260801.md)。
 
-Mode1 四通道相关性、2 mic + 2 ref 的 direct 3A ABI、算法 profile、启动/退出和仍未关闭的
+Mode1 四通道相关性和历史 2 mic + 2 ref direct 3A ABI、算法 profile、启动/退出和仍未关闭的
 真人声学边界见
 [P0 Mode1 硬件播放参考验证记录](docs/test/p0-mode1-hard-reference-validation-20260801.md)。
 
@@ -278,9 +280,10 @@ vendor `.so`，真实调用只在双 opt-in 与安全前置检查后从固定 `/
 slot/reference、AEC 效果或实时率。详见
 [3A HIL 构建验证](docs/test/p0-rockchip-3a-hil-build-validation-20260729.md)。
 
-2026-08-01 当前生产 profile 和 HIL 已升级为 `2 mic + 2 ref`，并在第三块板以
+2026-08-01 当时的生产 profile 和 HIL 曾升级为 `2 mic + 2 ref`，并在第三块板以
 `init(16000,16,2,2)`、1024-short 输入和 512-byte 输出完成 direct vendor 调用。上段
-`2 mic + 1 ref` 只保留为 2026-07-29 历史构建证据，不再描述现行生产布局。
+`2 mic + 1 ref` 同时保留为 2026-07-29 历史构建证据。2026-08-03 现行生产布局已固定为
+`2 mic + refL`；Mode1 仍采集 `refR`，但在 vendor 输入边界丢弃它。
 
 同日还完成 Rockchip MPI 音频 Debug/tests-off 默认 ALL 交叉链接：ELF32 ARM
 hard-float/uClibc 产物保留 Rockit/MPP/RGA `NEEDED`、21 个 raw 生命周期 `UND`，且没有
@@ -331,7 +334,8 @@ raw MPI 对照使用独立的
 ## 路线图
 
 1. **P0 可行性闸门（进行中）**：direct ALSA Mode1 四通道全双工、capture/reference layout
-   和 2 mic + 2 ref direct Rockchip 3A 板端调用已通过；继续关闭 raw rk_mpi、真人 double-talk、
+   和历史 2 mic + 2 ref direct Rockchip 3A 板端调用已通过；现行生产改用 2 mic + refL，继续关闭
+   raw rk_mpi、真人 double-talk、
    最终壳体声学、长期实时率，以及 Wi-Fi AP/UI backend 探测。
 2. **P1 工程骨架（已完成）**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
 3. **P2 本地音频（进行中）**：只保留已进入真实客户端或直接支撑 HIL 的音频代码；以

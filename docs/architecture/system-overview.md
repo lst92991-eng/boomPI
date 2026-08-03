@@ -57,16 +57,17 @@ ALSA playback -> Mode1 hard ref -> AudioBackend             |
 
 `AudioEngine` 是 application 唯一可见的音频接口；其私有 `AudioBackend` 直接打开
 48 kHz/S16_LE Mode1 四通道 capture `[mic0,mic1,refL,refR]`
-和双通道 playback。20 ms capture 保持四通道相位完成 48→16 kHz 后送入
-`RockchipVoiceDsp`，其 mono 输出供 Snowboy、VAD 和 16 kHz 上行。
+和双通道 playback。20 ms capture 保持四通道相位完成 48→16 kHz；
+`RockchipVoiceDsp` 在 vendor 输入边界固定选择 `[mic0,mic1,refL]`，丢弃重复的 `refR`，
+其 mono 输出供 Snowboy、VAD 和 16 kHz 上行。
 24 kHz mono TTS 进入 75 帧/1.5 s 固定队列，经 24→48 kHz、gain/limiter 后播放；最终写入
 ALSA 的 PCM 由 Codec Mode1 数字回采到同帧 `refL/refR`，不再维护 software reference ring 或
 60 ms lead。采集不经过中间队列，在网络连接、云端等待和播放期间持续运行。xrun 或四通道
 重采样错位会建立 discontinuity 并重置前端历史。
 
-direct 3A 固定为 `init(16000,16,2,2)`、1024-short 输入和 512-byte mono 输出；项目 profile
+direct 3A 固定为 `init(16000,16,2,1)`、768-short 输入和 512-byte mono 输出；项目 profile
 使用 mask `1109`，启用 FastAEC、AES、ANR、Dereverberation 和 STDT，vendor AGC 关闭；
-STDT 为 `0.70/0.50`、`model_aec_en=0`。`ALC31/ref2/delay0` 是当前候选参数，不是最终声学
+STDT 为 `0.70/0.50`、`model_aec_en=0`。`ALC31/ref1/delay0` 是当前候选参数，不是最终声学
 定案。供应商公开 ABI 没有 DTD 事件，
 `wakeup_status` 不是 DTD；因此 `near_voice` 只使用 3A 后 VAD。首次有效硬参考后的
 600 ms warm-up 和自然结束后的 300 ms 尾音窗禁止触发；主动打断则保留近讲 VAD 历史。

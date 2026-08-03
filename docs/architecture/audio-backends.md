@@ -120,16 +120,17 @@ OEM service，所以当前只能保持 `safe_to_execute=false`，不得自动 st
 匹配 BSP 已确认 `rkaudio_preprocess_init`、`rkaudio_preprocess_short` 和拼写如此的
 `rkaudio_preprocess_destory` 三个入口，精确实现库为 `libaec_bf_process.so`，目标 ABI 是
 ARMv7 hard-float/uClibc。匹配 header/PDF/wrapper 和 binary 已确定 16 kHz、16-bit、
-256 samples（16 ms）；当前生产 profile 使用 `src_chan=2, ref_chan=2`，输入为 1024 shorts，
-ref-last 顺序为 `[mic0,mic1,refL,refR]`，BF mono 成功返回 512 bytes。直接 API 由调用方构造
+256 samples（16 ms）；当前生产 profile 使用 `src_chan=2, ref_chan=1`，输入为 768 shorts，
+ref-last 顺序为 `[mic0,mic1,refL]`，BF mono 成功返回 512 bytes。直接 API 由调用方构造
 `RKAUDIOParam`，不读取 VQE JSON；Rockit/RockAA file mode 才解析 JSON。当前生产组合只启用
 FastAEC、AES、ANR、Dereverberation 和 STDT，vendor AGC 已关闭；外层不得无依据叠加同类
 处理。公开 ABI 不提供 DTD 事件；`wakeup_status` 是唤醒状态，不是 DTD 或产品 VAD。
 
 当前 `RockchipVoiceDsp` 已进入 `boompi-client`：输入固定为 16 kHz/S16、
-`[mic0,mic1,refL,refR]`，用定长 FIFO 把产品 320-sample/20 ms 帧桥接到 vendor
+Mode1 仍提供 `[mic0,mic1,refL,refR]`；适配器在 vendor 边界固定丢弃 `refR`，以
+`[mic0,mic1,refL]` 用定长 FIFO 把产品 320-sample/20 ms 帧桥接到 vendor
 256-sample/16 ms block。当前生产 profile 固定 mask `1109`、STDT high/low `0.70/0.50`、
-`model_aec_en=0`，不启用 software delay；`ALC31/ref2/delay0` 是本轮候选参数，并非最终
+`model_aec_en=0`，不启用 software delay；`ALC31/ref1/delay0` 是本轮候选参数，并非最终
 壳体声学结论。3A 初始化、固定帧调用和
 Snowboy/VAD 后续链路已经在第三块板运行；这只能证明实际代码路径被调用，不能替代以下 HIL：
 
@@ -150,7 +151,7 @@ Snowboy/VAD 后续链路已经在第三块板运行；这只能证明实际代�
 [2026-07-29 构建验证](../test/p0-rockchip-3a-hil-build-validation-20260729.md)。独立 HIL ELF
 的执行边界仍按该记录控制；产品进程已经运行并不自动关闭物理 layout、声学效果或长期实时率。
 
-2026-08-01 的当前 direct 3A 板端 HIL 已验证 `init(16000,16,2,2)`、1024-short/2048-byte
+2026-08-01 的历史 direct 3A 板端 HIL 已验证 `init(16000,16,2,2)`、1024-short/2048-byte
 输入、512-byte 输出、guard 完整；init/process 分别为 `11262 us`/`1561 us`。详细证据和
 有限无人工收敛边界见
 [P0 Mode1 硬件播放参考验证记录](../test/p0-mode1-hard-reference-validation-20260801.md)。
@@ -241,8 +242,8 @@ Snowboy 静态库使用旧 libstdc++ 字符串 ABI。当前实现只允许一个
 
 1. direct ALSA Mode1 四通道相关性和 48 kHz 全双工已通过；raw rk_mpi 仍是独立候选，其真实
    执行仍被 `rkipc` owner 阻断。
-2. 直接 3A link-check、2 mic + 2 ref 固定帧 fake/真板调用、目标交叉构建和产品进程初始化
-   已通过；继续关闭错误恢复、CPU/RSS、持续实时率和最终壳体 AEC 效果。
+2. 直接 3A link-check、历史 2 mic + 2 ref 固定帧真板调用，以及现行 2 mic + refL fake、目标
+   交叉构建和产品进程初始化已通过；继续关闭错误恢复、CPU/RSS、持续实时率和最终壳体 AEC 效果。
 3. 私有 Snowboy legacy bridge、启动期格式校验、500 ms pre-roll、WebRTC VAD 和播放打断
    已进入产品路径；继续记录目标模型的误唤醒、漏唤醒、最坏帧耗时和至少 30 分钟稳定性。
 4. 以 Mode1 硬件参考进行真人 double-talk、最大音量和 3 秒追问验收；功能通过前不进行压力测试。

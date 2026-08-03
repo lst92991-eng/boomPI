@@ -10,7 +10,8 @@
 - 历史 AGC ON 基线的 Rockchip 日志为 `model_aec_en=0`、`delay_len=0`、`look_ahead=0`、
   `filter_len=2`，FastAEC/STDT/AES/ANR/DRVB/AGC 已启用，但公开 ABI 不提供可消费的 DTD 判定。
 - 当前生产 DSP profile 为 mask `1109`：FastAEC、AES、ANR、Dereverberation、STDT 启用，
-  vendor AGC 关闭；`ALC31/ref2/delay0` 是当前候选，并非最终声学参数。
+  vendor AGC 关闭；`ALC31/ref1/delay0` 是当前候选，并非最终声学参数。Mode1 仍采集
+  `[mic0,mic1,refL,refR]`，生产 3A 在输入边界丢弃与 `refL` 高度相关的 `refR`。
 - 当前应用把 Rockchip 3A 后的 WebRTC VAD 直接作为 `near_voice`；首次参考后仅做 `600 ms`
   预热，自然结束后做 `300 ms` 尾音隔离。
 - 最近一次无人值守日志在一次真实唤醒后又产生至少三次无人工新 turn，已确认存在自激现象。
@@ -33,6 +34,28 @@
   则由 backend 抑制 15 帧（300 ms）尾音，follow-up 再以连续 20 帧（400 ms）确认新一轮。
   它是业务 containment 候选，不是 AEC 结论；探针区间
   因扬声器被故意静音，不得用于 AEC 效果评分。
+
+## 2026-08-03 单参考生产候选
+
+- 唯一代码变量是 Rockchip 3A reference 数：Mode1 仍以 48 kHz 四通道采集
+  `[mic0,mic1,refL,refR]`，生产 adapter 在 vendor 边界丢弃 `refR`，调用
+  `init(16000,16,2,1)` 并按 `[mic0,mic1,refL]` 送入每块 768 shorts。AGC、VAD、
+  打断、网络、音量和 mixer 均未修改。
+- 板端以同一 1.4 s 固定测试语音、音量 60、speaker gain 100、ALC 31/31、delay 0，
+  交叉顺序各跑 3 次。双参考与单参考均为 `would_barge=0/3`、
+  `would_follow_up=0/3`，均无 capture discontinuity。
+- 双参考 processed RMS 为 `-58.42/-59.78/-47.84 dBFS`，均值 `-55.35 dBFS`；
+  单参考为 `-63.65/-58.67/-45.29 dBFS`，均值 `-55.87 dBFS`。单参考均值低约
+  `0.52 dB`，但轮间波动远大于差值，不能据此宣称声学效果显著优于双参考。
+- 真实 Qwen 闭环使用同样音量完成 1 次唤醒、连续问答和播放中真人打断；用户确认后续
+  “据说……”和“日语 1 到 10”均为主动发声，现场反馈“好很多、没有自激”。因此本次
+  有限窗口内没有确认到无人声新 turn 或误打断；仍不把单次主观结果写成最终壳体 AEC、
+  double-talk 或长期稳定性已通过。
+- 最终又按“静默 10 s、完整播放后静默、3 s 免唤醒追问、播放中真人打断”四段脚本验收，
+  用户确认全部通过；日志未出现 `voice loop failed`、xrun、broken pipe、jitter queue full
+  或 capture discontinuity。日志 SHA-256 为
+  `0678983d85250aa53335b65293809af2a801b85a1b92091a357c672a97ab5a45`；结束后客户端正常退出，
+  PCM 均为 `closed`，Mode1 mixer 已恢复 `Disabled`。
 
 ## 回归表
 
