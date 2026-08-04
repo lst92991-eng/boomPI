@@ -92,6 +92,10 @@ STRUCTURE_ANCHORS = (
     ("client/src/audio/audio_engine.cpp", (
         "impl_->condition.wait_for(lock, std::chrono::milliseconds(150),",
     )),
+    ("client/apps/boompi_client/main.cpp", (
+        # 忽略 SIGPIPE：对端 RST 后的 send 失败必须走传输层分类，不得直接杀进程。
+        "std::signal(SIGPIPE, SIG_IGN);",
+    )),
 )
 
 

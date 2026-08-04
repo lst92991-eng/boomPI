@@ -35,9 +35,9 @@ class RockchipVoiceDsp final {
 
   /// @brief 分配 vendor 参数树、创建句柄并 prime 固定输出 FIFO。
   ///
-  /// 初始化失败后实例保持关闭；重复打开返回 kAlreadyOpen 且不改变已有句柄。Close 幂等释放
+  /// 初始化失败后实例保持关闭；重复打开返回 false 且不改变已有句柄。Close 幂等释放
   /// 句柄、参数树和 FIFO 状态，可在初始化失败后调用。
-  /// @return 成功、重复打开或具体初始化阶段的状态码。
+  /// @return 成功返回 true；重复打开或任一初始化阶段失败返回 false。
   bool Open() noexcept;
   void Close() noexcept;  ///< 幂等关闭，允许在 Open 失败后调用。
 
