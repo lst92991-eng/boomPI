@@ -122,8 +122,9 @@ generation 删除。服务端若不能可靠把文本映射到实际播放位置
 命令投递给该设备唯一的 session actor，actor 串行消费命令并持有 turn/epoch 状态，
 避免读写 goroutine 直接共享会话状态。当前轮交给对话后端：默认 intelligence 管线
 （ASR→推理→TTS 三级级联），可选 realtime 直通；provider 会话由独立 goroutine 驱动。
-下行文本与音频经有界 sendQueue（容量 32）由 writePump 发出，控制帧走独立控制队列，
-不被音频积压阻塞。
+下行文本与音频经有界 sendQueue（容量 32）由 writePump 发出；应用层控制帧（含
+`response.cancelled` ACK）与音频共走 sendQueue，只有心跳 pong 走独立小队列，
+因此取消时必须先排空待发音频再回 ACK。
 
 取消时序与板端探针配套：actor 先在锁内把当前 turn 置为不活动（fence），随后
 `DiscardQueuedPCM` 排空 sendQueue 中尚未发出的音频（保留控制帧），再请求 provider
