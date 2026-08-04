@@ -12,6 +12,7 @@ extern "C" {
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -190,6 +191,12 @@ struct AudioBackend::Impl final {
   bool playback_session_active{false}, aec_warmup_armed{false};
   std::atomic<bool> playback_interrupted{false};
   std::atomic<bool> playback_ended{false};
+  /// alsa-lib 的 PCM 句柄不是线程安全的：采集线程的 prepare、播放线程的
+  /// writei、actor 的 drop 必须经 pcm_mutex 串行。WritePlayback 会持锁阻塞至多
+  /// 一个缓冲时长，因此中断侧先置 playback_interrupted 再取锁。
+  std::mutex pcm_mutex{};
+  std::atomic<std::uint32_t> xruns_capture{0U}, xruns_playback{0U};
+  std::atomic<long long> xrun_log_ms{0LL};
 
   void SetError(const char* text, int code = 0) noexcept {
     std::lock_guard<std::mutex> lock(error_mutex);
@@ -217,12 +224,21 @@ struct AudioBackend::Impl final {
                   kVoiceFrameSamples16k, capture16.data())) return false;
     dsp.Close(); return dsp.Open() && ResetListener();
   }
+  /// 成功恢复的 xrun 计数不丢；日志限速每秒一条，避免持续欠载时刷屏。
+  void NoteXrun(std::atomic<std::uint32_t>& counter, const char* name) noexcept {
+    const unsigned total = counter.fetch_add(1U, std::memory_order_relaxed) + 1U;
+    const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    long long last = xrun_log_ms.load(std::memory_order_relaxed);
+    if (now >= last + 1000 && xrun_log_ms.compare_exchange_strong(last, now))
+      std::fprintf(stderr, "boompi-client: ALSA %s xrun recovered (total %u)\n", name, total);
+  }
   bool WritePlayback(const std::int16_t* mono, std::size_t frames) noexcept {
     // TTS 是 mono；复制到 L/R，Mode1 同步回采两个数字参考。
     for (std::size_t i = 0U; i < frames; ++i) {
       playback_stereo[2U * i] = mono[i]; playback_stereo[2U * i + 1U] = mono[i];
     }
     std::size_t offset = 0U;
+    std::lock_guard<std::mutex> pcm_lock(pcm_mutex);
     while (offset < frames) {
       if (playback_interrupted.load(std::memory_order_acquire)) return false;
       const snd_pcm_sframes_t rc = snd_pcm_writei(playback_pcm,
@@ -231,9 +247,12 @@ struct AudioBackend::Impl final {
       if (playback_interrupted.load(std::memory_order_acquire)) return false;
       if (rc == -EINTR) continue;
       if (rc == -EPIPE || rc == -ESTRPIPE) {
+        NoteXrun(xruns_playback, "playback");
         const int recovered = snd_pcm_recover(playback_pcm, static_cast<int>(rc), 1);
         if (recovered < 0) { SetError("ALSA playback recovery", recovered); return false; }
-        offset = 0U; continue;
+        /// underrun 未提交本次数据，且已写部分已被放完：保持 offset 续写，
+        /// 重置为 0 会把最多 40 ms 已播音频重复一遍。
+        continue;
       }
       SetError("ALSA playback write", static_cast<int>(rc)); return false;
     }
@@ -354,6 +373,7 @@ bool AudioBackend::ReadCapture20ms(bool* const discontinuity) noexcept {
     if (rc > 0) { offset += static_cast<std::size_t>(rc); continue; }
     if (rc == -EINTR) continue;
     if (rc == -EPIPE || rc == -ESTRPIPE) {
+      impl_->NoteXrun(impl_->xruns_capture, "capture");
       const int recovered = snd_pcm_recover(impl_->capture_pcm, static_cast<int>(rc), 1);
       if (recovered < 0) { impl_->SetError("ALSA capture recovery", recovered); return false; }
       offset = 0U; *discontinuity = true; continue;
@@ -431,6 +451,7 @@ bool AudioBackend::ResetListener() noexcept {
 
 bool AudioBackend::PreparePlayback() noexcept {
   if (impl_ == nullptr || !impl_->open) return false;
+  std::lock_guard<std::mutex> pcm_lock(impl_->pcm_mutex);
   const int prepared = snd_pcm_prepare(impl_->playback_pcm);
   if (prepared < 0) { impl_->SetError("ALSA playback prepare", prepared); return false; }
   impl_->playback24.fill(0); impl_->playback48.fill(0);
@@ -468,6 +489,7 @@ bool AudioBackend::Render20ms(const std::int16_t* const pcm24, std::size_t sampl
 
 bool AudioBackend::DrainPlayback() noexcept {
   if (impl_ == nullptr || !impl_->open) return false;
+  std::lock_guard<std::mutex> pcm_lock(impl_->pcm_mutex);
   const int drained = snd_pcm_drain(impl_->playback_pcm);
   if (drained < 0 && !impl_->playback_interrupted.load(std::memory_order_acquire)) impl_->SetError("ALSA playback drain", drained);
   const int prepared = snd_pcm_prepare(impl_->playback_pcm);
@@ -477,6 +499,7 @@ bool AudioBackend::DrainPlayback() noexcept {
 }
 void AudioBackend::DropPlayback() noexcept {
   if (impl_ == nullptr || impl_->playback_pcm == nullptr) return;
+  std::lock_guard<std::mutex> pcm_lock(impl_->pcm_mutex);
   const int dropped = snd_pcm_drop(impl_->playback_pcm);
   const int prepared = snd_pcm_prepare(impl_->playback_pcm);
   if (dropped < 0 && dropped != -EBADFD) impl_->SetError("ALSA playback drop", dropped);
@@ -486,6 +509,8 @@ void AudioBackend::DropPlayback() noexcept {
 void AudioBackend::InterruptPlayback() noexcept {
   if (impl_ == nullptr || impl_->playback_pcm == nullptr) return;
   impl_->playback_interrupted.store(true, std::memory_order_release);
+  /// 先置标志再取句柄锁：正在阻塞的 writei 返回后立即退出，不再提交新帧。
+  std::lock_guard<std::mutex> pcm_lock(impl_->pcm_mutex);
   const int dropped = snd_pcm_drop(impl_->playback_pcm);
   if (dropped < 0 && dropped != -EBADFD) impl_->SetError("ALSA playback interrupt", dropped);
   impl_->playback_ended.store(true, std::memory_order_release);

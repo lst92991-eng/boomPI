@@ -82,6 +82,14 @@ STRUCTURE_ANCHORS = (
     (AUDIO_ENGINE_HEADER, (
         "bool stream_open() const noexcept { return !playback_done(); }",
     )),
+    ("client/src/platform/rv1106/audio_backend.cpp", (
+        # ALSA 句柄串行化与 xrun 可观测性是正确性修复，锚点防静默回退。
+        "std::mutex pcm_mutex{};",
+        "void NoteXrun(std::atomic<std::uint32_t>& counter, const char* name) noexcept",
+    )),
+    ("client/src/audio/audio_engine.cpp", (
+        "impl_->condition.wait_for(lock, std::chrono::milliseconds(150),",
+    )),
 )
 
 
@@ -110,9 +118,10 @@ class ClientSourceContractTest(unittest.TestCase):
         product_core = core_total - vendor_integration
         ui_layer = sum(counts[name] for name in UI_LAYER_FILES)
         # 预算按实测基线重定：2026-08-04 修正统计口径后为 2620，Phase 2 结构性重构
-        # （探针状态机提取、超时/断帧出口收敛）净开销 +23，换取教学可读性与可测性。
-        # 再新增代码必须先删减或证明必要性。UI 显示层单列公开，不计入该预算。
-        self.assertLessEqual(core_total, 2643)
+        # （探针状态机提取、超时/断帧出口收敛）净开销 +23；Phase 3 对标业界后的
+        # 正确性修复（ALSA 句柄串行化、underrun 续写、流切换有界等待、xrun 计数）
+        # 净开销 +23。再新增代码必须先删减或证明必要性。UI 显示层单列公开，不计入该预算。
+        self.assertLessEqual(core_total, 2666)
 
         for name in METRIC_DOCUMENTS:
             documented = (ROOT / name).read_text(encoding="utf-8")
@@ -121,7 +130,7 @@ class ClientSourceContractTest(unittest.TestCase):
             for metric in expected:
                 self.assertIn(metric, documented, f"{name}: missing current ELOC metric {metric}")
             for stale in ("2300", "439", "1861", "4517", "2498", "2228", "1921",
-                          "2620", "2340"):
+                          "2620", "2340", "2643", "2363"):
                 self.assertNotIn(stale, documented, f"{name}: stale ELOC metric {stale}")
 
     def test_architecture_anchors_present(self) -> None:

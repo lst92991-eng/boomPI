@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
@@ -293,7 +294,13 @@ bool AudioEngine::QueueTts24k(const std::uint8_t* const bytes, const std::size_t
 
 bool AudioEngine::BeginPlayback() noexcept {
   if (impl_ == nullptr || !impl_->open) return false;
-  std::lock_guard<std::mutex> lock(impl_->mutex);
+  std::unique_lock<std::mutex> lock(impl_->mutex);
+  /// 上一流刚被打断而播放线程尚未完成收尾时做有界等待，避免把
+  /// “新回复已到达”升级成整条会话重连；超时则维持原失败语义。
+  if (impl_->active && impl_->drop) {
+    impl_->condition.wait_for(lock, std::chrono::milliseconds(150),
+        [this] { return impl_->stop.load(std::memory_order_acquire) || !impl_->active; });
+  }
   if (impl_->active) return false;
   impl_->ClearQueue();
   // capture 线程在帧边界执行 prepare，后端控制字段不跨线程读写。
