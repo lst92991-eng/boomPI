@@ -270,7 +270,8 @@ class VoiceClient final {
     barge_quiet_frames_ = barge_silence_frames_ = 0U; barge_tail_frozen_ = false;
   }
   // 探针副作用（静音、复位监听器、拒绝日志）留在 actor；阶段计数全在 BargeProbeMachine。
-  // 逐帧语义与提取前完全一致：拒绝帧不累加 quiet，转换帧按原顺序执行副作用。
+  // 逐帧语义与提取前一致：拒绝帧不累加 quiet，转换帧按原顺序执行副作用。
+  // 唯一有意差异：拒绝时顺带清除可能残留的上一轮 admit/ended 证据，比旧实现更严格。
   void HandleBarge(const CaptureFrame& frame, bool response_active) {
     if (!config_.barge_in_enabled) { ResetBargeProbe(); return; }
     using ProbeEvent = BargeProbeMachine::Event;
@@ -364,7 +365,7 @@ class VoiceClient final {
 
   void DrainEvents() {
     Inbound event{};
-    // capture PCM 只有 40 ms 缓冲；限制单帧事件消费量，避免持续下行饿死采集 actor。
+    // capture 环只有 4×20 ms（80 ms）缓冲；限制单帧事件消费量，避免持续下行饿死采集 actor。
     for (unsigned handled = 0U;
          handled < kEventsPerCaptureFrame && transport_ && !listener_failed_ &&
          events_.Pop(&event);

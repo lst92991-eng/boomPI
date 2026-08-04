@@ -59,6 +59,30 @@ METRIC_DOCUMENTS = (
     "docs/architecture/system-overview.md",
     "docs/architecture/audio-runtime.md",
 )
+VOICE_CLIENT_SOURCE = "client/src/application/voice_client.cpp"
+AUDIO_ENGINE_HEADER = "client/include/boompi/audio/audio_engine.h"
+# 架构锚点：本机无交叉工具链时，C++ 行为测试只能在 CI/板端跑；
+# 这组结构性断言固定重构后的关键形状，防止后续提交静默回退。
+STRUCTURE_ANCHORS = (
+    (VOICE_CLIENT_SOURCE, (
+        "class BargeProbeMachine final",
+        "enum class Event : std::uint8_t { kNone, kMuted, kReferenceLow, kEchoCleared, kRejected, kConfirmed };",
+        "void HandleDiscontinuity(const CaptureFrame& frame)",
+        "bool ExpireDeadlines(const Clock::time_point& now)",
+        "void DispatchFrame(const CaptureFrame& frame)",
+        "void ResetBargeState()",
+        "kMaximumTurnFrames",
+        # barge 常量值与 docs/architecture/audio-runtime.md 的帧数描述一一对应。
+        "constexpr unsigned kBargeCandidateFrames = 6U, kBargeReferenceLowFrames = 3U;",
+        "constexpr unsigned kBargeReferenceWaitFrames = 15U, kBargeEchoClearFrames = 3U;",
+        "constexpr unsigned kBargeConfirmFrames = 3U;",
+        "constexpr unsigned kBargeAdmissionQuietFrames = 20U;",
+        "constexpr unsigned kBargeRetryCooldownFrames = 15U;",
+    )),
+    (AUDIO_ENGINE_HEADER, (
+        "bool stream_open() const noexcept { return !playback_done(); }",
+    )),
+)
 
 
 def eloc(path: Path) -> int:
@@ -99,6 +123,12 @@ class ClientSourceContractTest(unittest.TestCase):
             for stale in ("2300", "439", "1861", "4517", "2498", "2228", "1921",
                           "2620", "2340"):
                 self.assertNotIn(stale, documented, f"{name}: stale ELOC metric {stale}")
+
+    def test_architecture_anchors_present(self) -> None:
+        for name, anchors in STRUCTURE_ANCHORS:
+            source = (ROOT / name).read_text(encoding="utf-8")
+            for anchor in anchors:
+                self.assertIn(anchor, source, f"{name}: missing structure anchor {anchor!r}")
 
     def test_current_documents_have_no_broken_local_links(self) -> None:
         link_pattern = re.compile(r"\[[^]]*]\(([^)]+)\)")

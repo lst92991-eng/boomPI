@@ -388,7 +388,7 @@ Qwen 24 kHz S16_LE mono downlink
 - PCM 使用定义清楚的二进制 header，至少含 version、header/payload length、format、sequence、timestamp、device/session/turn/stream/epoch 标识。字段逐个序列化并声明字节序，不得直接发送 packed C++ struct。
 - 播放期间板端应周期上报 `response_id` 和实际 `played_samples`/`played_ms`，用于打断时对齐字幕和 provider 上下文。
 - 每类帧和字符串必须有显式最大长度；未知消息返回明确错误或忽略，不得越界或导致状态隐式变化。
-- 连接重建采用 1、2、4、8、16、30 秒指数退避并带小幅 jitter。当前 turn 直接失败，旧 turn/epoch 返回包全部丢弃。
+- 连接重建采用 1、2、4、8、16、30 秒指数退避；当前教学实现不带 jitter，保持重连时序确定可复现，多设备规模化前必须补上。当前 turn 直接失败，旧 turn/epoch 返回包全部丢弃。
 - WSS 在无业务流量时默认每 10 秒发送 ping/heartbeat，约 30 秒未收到 pong/有效消息即判定 half-open 并重连；数值可配置但必须有 deadline。
 - 音频不做应用层重传；可靠连接恢复后开始新 turn，避免把延迟语音当作实时语音。
 - 协议从 v1 就携带版本和 capabilities；支持多 device actor，但第一版验收只要求一台活跃设备。

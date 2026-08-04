@@ -17,6 +17,15 @@ boompi_configure_audio_vendor_dependencies()
 if(BOOMPI_BUILD_TESTS)
   include(CTest)
   enable_testing()
+  # 源码契约测试（ELOC 预算、文档数字、结构锚点）只需 Python，
+  # 挂进 ctest 避免 enable_testing 后零测试的假门；无 Python 时安静跳过。
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_FOUND)
+    add_test(NAME boompi_source_contract
+             COMMAND ${Python3_EXECUTABLE} -m unittest discover
+                     -s "${CMAKE_SOURCE_DIR}/scripts/tests"
+                     -t "${CMAKE_SOURCE_DIR}" -p "test_*.py")
+  endif()
 endif()
 
 add_subdirectory(client)
