@@ -75,7 +75,7 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
 - 网络断开时丢弃当前轮次，不缓存并补发过期语音；本地唤醒、UI 和离线提示仍工作。
 - 默认女声方向是自然、年轻、不过度卖萌。具体 Qwen voice 必须在真实扬声器上试听至少三个候选后再固化。
 
-## 2.1 当前板端实现边界（2026-08-03，优先于后文路线图）
+## 2.1 当前板端实现边界（2026-08-04，优先于后文路线图）
 
 现役 `boompi-client` 的语音核心包含 18 个生产 C/C++ 文件、2666 ELOC，其中 Rockchip/Snowboy vendor
 集成 280 ELOC，产品逻辑 2386 ELOC；UI 显示层（LVGL 渲染与 ST7789P3/GT911 驱动）另计 1926 ELOC，
@@ -86,6 +86,12 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
 重算并校验文档。2026-08-01 的
 `docs/test/client-responsibility-layout-20260801.md` 保留为纯语音阶段历史快照。后文关于完整
 supervisor、update、target 分层和发布架构的内容是未来路线图，不授权提前恢复占位层。
+
+- 2026-08-04 Phase 3 对标业界开源实现（xiaozhi-esp32、LiveKit Agents、Pipecat、speech-to-speech、
+  ESP-ADF、alsa-lib 官方示例）后落地四项正确性修复：`pcm_mutex` 串行化非线程安全的 ALSA 播放句柄；
+  播放 underrun 恢复后保持 offset 续写，避免重播已播音频；`BeginPlayback` 在上一流收尾期做
+  150 ms 有界等待，避免把新回复误升级为会话重连；xrun 原子计数与限速日志。需服务端配合的
+  机制（打断时长过滤、误打断恢复、played_samples 上报）未在本版实现，归入后文路线图。
 
 - 生产目标按仓库既定职责落位：`application/voice_client` 独占会话状态，
   `audio/audio_engine` 管理播放线程和有界 TTS 环，`network/voice_transport` 管理
@@ -388,6 +394,7 @@ Qwen 24 kHz S16_LE mono downlink
 - 控制帧必须使用正式 JSON 解析器，做类型、长度、必填字段、枚举、协议版本和 capability 校验；禁止通过字符串搜索解析 JSON。
 - PCM 使用定义清楚的二进制 header，至少含 version、header/payload length、format、sequence、timestamp、device/session/turn/stream/epoch 标识。字段逐个序列化并声明字节序，不得直接发送 packed C++ struct。
 - 播放期间板端应周期上报 `response_id` 和实际 `played_samples`/`played_ms`，用于打断时对齐字幕和 provider 上下文。
+- 路线图：对标 LiveKit Agents，后续可引入最小打断时长过滤（如 0.5 s）与误打断恢复（短噪声触发时恢复播放），均需服务端配合；在真人误打断率有实测数据前不提前实现。
 - 每类帧和字符串必须有显式最大长度；未知消息返回明确错误或忽略，不得越界或导致状态隐式变化。
 - 连接重建采用 1、2、4、8、16、30 秒指数退避；当前教学实现不带 jitter，保持重连时序确定可复现，多设备规模化前必须补上。当前 turn 直接失败，旧 turn/epoch 返回包全部丢弃。
 - WSS 在无业务流量时默认每 10 秒发送 ping/heartbeat，约 30 秒未收到 pong/有效消息即判定 half-open 并重连；数值可配置但必须有 deadline。

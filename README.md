@@ -70,7 +70,7 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 ### 软件阶段
 
-2026-08-03 教学候选按仓库既定职责整理；语音核心为 18 个生产 C/C++ 文件、2666 ELOC，其中
+2026-08-03 教学候选按仓库既定职责整理（2026-08-04 对标业界后重定基线）；语音核心为 18 个生产 C/C++ 文件、2666 ELOC，其中
 Rockchip/Snowboy vendor 集成为 280 ELOC，产品逻辑为 2386 ELOC；UI 显示层（LVGL 渲染与屏幕/触摸驱动）另计 1926 ELOC：
 `application` 是会话状态机，`audio` 是有界播放编排，`network` 是持久 WSS/TLS，
 `platform/rv1106` 是 ALSA/libswresample、Rockchip 3A、Snowboy 和 WebRTC VAD；同一
