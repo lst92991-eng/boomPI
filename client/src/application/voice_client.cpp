@@ -79,8 +79,61 @@ enum class State : std::uint8_t {
   kWake, kWaitSpeech, kCapture, kAwait,
   kSpeak, kBarge, kBargeAdmit, kDrain, kFollowUp,
 };
-enum class BargeProbe : std::uint8_t { kIdle, kWaitReferenceLow, kClear, kVerify };
 
+/// 播放中近讲探针：一次只产生一个明确切点（直接静音并取消），不走降音量阶梯。
+/// 四段状态全部由帧驱动：
+///   kIdle  连续 6 帧近讲 -> kMuted（一次性静音），进入 kWaitReferenceLow；
+///   kWaitReferenceLow  15 帧内等到连续 3 帧硬件参考安静 -> kReferenceLow，否则 kRejected；
+///   kClear  再等 3 帧回声消退（期间参考复活则 kRejected）-> kEchoCleared；
+///   kVerify  参考安静且连续 3 帧近讲 -> kConfirmed；任何参考复活/远讲 -> kRejected。
+/// kRejected 自带复位与 15 帧冷却；kConfirmed 由调用方复位。本类只持有探针自身
+/// 计数，轮次级证据（admit/freeze/tail）在 VoiceClient；两者经 Reset 同步复位。
+class BargeProbeMachine final {
+ public:
+  enum class Event : std::uint8_t { kNone, kMuted, kReferenceLow, kEchoCleared, kRejected, kConfirmed };
+  Event OnFrame(const CaptureFrame& frame) {
+    switch (stage_) {
+      case Stage::kIdle:
+        if (cooldown_ != 0U) { --cooldown_; return Event::kNone; }
+        if (!frame.near_voice) { near_ = 0U; return Event::kNone; }
+        if (++near_ < kBargeCandidateFrames) return Event::kNone;
+        near_ = stage_frames_ = 0U; stage_ = Stage::kWaitReferenceLow;
+        return Event::kMuted;
+      case Stage::kWaitReferenceLow:
+        if (++stage_frames_ > kBargeReferenceWaitFrames) return Reject();
+        near_ = frame.reference_active ? 0U : near_ + 1U;
+        if (near_ < kBargeReferenceLowFrames) return Event::kNone;
+        near_ = stage_frames_ = 0U; stage_ = Stage::kClear;
+        return Event::kReferenceLow;
+      case Stage::kClear:
+        if (frame.reference_active) return Reject();
+        if (++stage_frames_ < kBargeEchoClearFrames) return Event::kNone;
+        near_ = stage_frames_ = 0U; stage_ = Stage::kVerify;
+        return Event::kEchoCleared;
+      case Stage::kVerify:
+        if (frame.reference_active || !frame.near_voice) return Reject();
+        if (++near_ < kBargeConfirmFrames) return Event::kNone;
+        return Event::kConfirmed;
+    }
+    return Event::kNone;
+  }
+  void Reset() {
+    stage_ = Stage::kIdle; near_ = stage_frames_ = cooldown_ = 0U;
+  }
+  // kClear/kVerify 期间轮次级 quiet 证据逐帧累加（拒绝帧除外）。
+  bool counting_quiet() const { return stage_ == Stage::kClear || stage_ == Stage::kVerify; }
+ private:
+  enum class Stage : std::uint8_t { kIdle, kWaitReferenceLow, kClear, kVerify };
+  Event Reject() { Reset(); cooldown_ = kBargeRetryCooldownFrames; return Event::kRejected; }
+  Stage stage_{Stage::kIdle};
+  unsigned near_{0U}, stage_frames_{0U}, cooldown_{0U};
+};
+
+/// 会话 actor 导读：主线程即唯一 actor，帧驱动时序为
+///   Capture(20ms) -> FinishConnect -> DrainEvents -> PollUi -> OnFrame。
+/// WSS 回调线程只能写 EventQueue；audio 的 capture/playback 线程只碰自己的环。
+/// 因此以下会话字段无需加锁；状态转换只有三个入口：OnFrame（帧/超时）、
+/// HandleEvent（网络事件）和取消 helper（AbortCurrent/CompleteCancel/FinishTurn）。
 class VoiceClient final {
  public:
   VoiceClient(const config::VoiceClientConfig& config, std::string* error)
@@ -207,18 +260,42 @@ class VoiceClient final {
       brightness_ = false; ui_.SetBrightness(0U); SaveUiSettings();
     }
   }
+  // 探针自身复位：计数归零并恢复音量；near_frames_ 同时供 kFollowUp 复用，必须一起清。
   void ResetBargeProbe() {
-    near_frames_ = probe_frames_ = cooldown_frames_ = 0U;
-    barge_probe_ = BargeProbe::kIdle; audio_.SetPlaybackScale(1.0F);
+    probe_.Reset(); near_frames_ = 0U; audio_.SetPlaybackScale(1.0F);
   }
   // 轮次级 barge 证据的统一复位：探针拒绝、取消、断线、回合结束共用，避免多处漂移。
   void ResetBargeState() {
     barge_ended_ = barge_turn_admitted_ = barge_vad_started_seen_ = false;
     barge_quiet_frames_ = barge_silence_frames_ = 0U; barge_tail_frozen_ = false;
   }
-  void RejectBargeProbe() {
-    std::cout << "boompi-client: barge-in probe rejected" << std::endl;
-    ResetBargeProbe(); ResetBargeState(); cooldown_frames_ = kBargeRetryCooldownFrames;
+  // 探针副作用（静音、复位监听器、拒绝日志）留在 actor；阶段计数全在 BargeProbeMachine。
+  // 逐帧语义与提取前完全一致：拒绝帧不累加 quiet，转换帧按原顺序执行副作用。
+  void HandleBarge(const CaptureFrame& frame, bool response_active) {
+    if (!config_.barge_in_enabled) { ResetBargeProbe(); return; }
+    using ProbeEvent = BargeProbeMachine::Event;
+    const ProbeEvent event = probe_.OnFrame(frame);
+    if (event == ProbeEvent::kRejected) {
+      std::cout << "boompi-client: barge-in probe rejected" << std::endl;
+      audio_.SetPlaybackScale(1.0F); ResetBargeState(); return;
+    }
+    if (event == ProbeEvent::kMuted) {
+      barge_quiet_frames_ = 0U; barge_vad_started_seen_ = false;
+      barge_silence_frames_ = 0U; barge_tail_frozen_ = false;
+      std::cout << "boompi-client: barge-in probe muted; input_dbfs="
+                << frame.input_dbfs << std::endl;
+      audio_.SetPlaybackScale(0.0F); return;
+    }
+    if (event == ProbeEvent::kReferenceLow) {
+      // Drop playback-era history, but preserve the three newest frames whose
+      // hardware reference was already quiet so a real short phrase keeps its lead.
+      KeepNewestPreRoll(kBargeReferenceLowFrames);
+      barge_quiet_frames_ = kBargeReferenceLowFrames; return;
+    }
+    if (probe_.counting_quiet() && barge_quiet_frames_ < kBargeAdmissionQuietFrames)
+      ++barge_quiet_frames_;
+    if (event == ProbeEvent::kEchoCleared) { ResetListener(); return; }
+    if (event == ProbeEvent::kConfirmed) ConfirmBarge(response_active, frame);
   }
 
   void BeginListening(const char* reason) {
@@ -345,7 +422,7 @@ class VoiceClient final {
           AbortCurrent("TTS response cancel failed");
         break;
       case InboundKind::kDone:
-        if (audio_.playing() && !audio_.EndPlayback()) LoseConnection("playback finish failed");
+        if (audio_.stream_open() && !audio_.EndPlayback()) LoseConnection("playback finish failed");
         // 尾播仍出声，UI 用 kSpeakingTail 保留触屏打断入口；
         // kHappy 留给 FinishTurn 后的追问窗口（不可打断）。
         else { state_ = State::kDrain; ui_.SetState(DeviceUiState::kSpeakingTail); }
@@ -500,52 +577,6 @@ class VoiceClient final {
     std::cout << "boompi-client: VAD speech ended; voice turn committed" << std::endl;
   }
 
-  // 连续近讲一旦形成候选就一次性静音；随后等待硬件参考清零、声学尾音消退和一次完整
-  // VAD start。这样打断听感只有一个明确切点，不会经历“降音量 -> 静音”的阶梯卡顿。
-  void HandleBarge(const CaptureFrame& frame, bool response_active) {
-    if (!config_.barge_in_enabled) {
-      ResetBargeProbe(); return;
-    }
-    if (barge_probe_ == BargeProbe::kIdle) {
-      if (cooldown_frames_ != 0U) { --cooldown_frames_; return; }
-      if (!frame.near_voice) { near_frames_ = 0U; return; }
-      if (++near_frames_ < kBargeCandidateFrames) return;
-      barge_quiet_frames_ = 0U; barge_vad_started_seen_ = false;
-      barge_silence_frames_ = 0U; barge_tail_frozen_ = false;
-      near_frames_ = probe_frames_ = 0U; barge_probe_ = BargeProbe::kWaitReferenceLow;
-      std::cout << "boompi-client: barge-in probe muted; input_dbfs="
-                << frame.input_dbfs << std::endl;
-      audio_.SetPlaybackScale(0.0F); return;
-    }
-    if (barge_probe_ == BargeProbe::kWaitReferenceLow) {
-      if (++probe_frames_ > kBargeReferenceWaitFrames) {
-        RejectBargeProbe(); return;
-      }
-      near_frames_ = frame.reference_active ? 0U : near_frames_ + 1U;
-      if (near_frames_ < kBargeReferenceLowFrames) return;
-      // Drop playback-era history, but preserve the three newest frames whose
-      // hardware reference was already quiet so a real short phrase keeps its lead.
-      KeepNewestPreRoll(kBargeReferenceLowFrames);
-      barge_quiet_frames_ = kBargeReferenceLowFrames;
-      near_frames_ = probe_frames_ = 0U; barge_probe_ = BargeProbe::kClear; return;
-    }
-    if (barge_probe_ == BargeProbe::kClear) {
-      if (frame.reference_active) {
-        RejectBargeProbe(); return;
-      }
-      if (barge_quiet_frames_ < kBargeAdmissionQuietFrames) ++barge_quiet_frames_;
-      if (++probe_frames_ < kBargeEchoClearFrames) return;
-      near_frames_ = probe_frames_ = 0U; barge_probe_ = BargeProbe::kVerify;
-      ResetListener(); return;
-    }
-    if (frame.reference_active || !frame.near_voice) {
-      RejectBargeProbe(); return;
-    }
-    if (barge_quiet_frames_ < kBargeAdmissionQuietFrames) ++barge_quiet_frames_;
-    if (++near_frames_ < kBargeConfirmFrames) return;
-    ConfirmBarge(response_active, frame);
-  }
-
   void ConfirmBarge(bool response_active, const CaptureFrame& frame) {
     audio_.DropPlayback(); ResetBargeProbe();
     subtitle_.clear(); ui_.SetText({}, {});
@@ -561,23 +592,52 @@ class VoiceClient final {
     }
   }
 
+  // capture 断帧（ALSA xrun 或 actor 队列满）：pre-roll 不再可信；正在取消的轮次
+  // 无法保证云端收到 cancel，只能重建会话；其余状态降级为取消当前轮或回到唤醒。
+  void HandleDiscontinuity(const CaptureFrame& frame) {
+    std::cerr << "boompi-client: capture discontinuity; source="
+              << (frame.actor_overrun ? "actor_queue" : "alsa") << std::endl;
+    pre_count_ = 0U;
+    if (state_ == State::kBarge || state_ == State::kBargeAdmit)
+      LoseConnection("capture discontinuity while cancelling");
+    else if (state_ == State::kCapture || state_ == State::kAwait ||
+             state_ == State::kSpeak)
+      AbortCurrent("capture discontinuity cancel failed");
+    // kDrain 已消费 response.done，云端没有可取消对象，也不会再发送 cancelled。
+    else if (state_ == State::kDrain) FinishTurn(false);
+    else { audio_.DropPlayback(); state_ = State::kWake;
+           ui_.SetState(DeviceUiState::kIdle); ResetListener(); }
+  }
+
+  // 所有有界等待的超时出口集中在此：等话/追问回空闲，取消/排空/承认回回合收尾，
+  // 上行与首响等待走 AbortCurrent。返回 true 表示本帧已被超时消费。
+  bool ExpireDeadlines(const Clock::time_point& now) {
+    if (ids_.session == 0U) {
+      if (transport_ && now >= deadline_) LoseConnection("connect or hello timeout");
+      return false;  // 无会话时帧仍要处理唤醒词，不算超时消费。
+    }
+    if (now >= heartbeat_deadline_) { LoseConnection("server heartbeat timed out"); return true; }
+    const bool timed_state = state_ == State::kWaitSpeech ||
+        state_ == State::kAwait || state_ == State::kSpeak ||
+        state_ == State::kBarge || state_ == State::kBargeAdmit ||
+        state_ == State::kDrain ||
+        state_ == State::kFollowUp;
+    if (!timed_state || now < deadline_) return false;
+    if (state_ == State::kWaitSpeech || state_ == State::kFollowUp) {
+      state_ = State::kWake; pre_head_ = pre_count_ = 0U;
+      ui_.SetState(DeviceUiState::kIdle);
+      ResetListener(); return true;
+    }
+    if (state_ == State::kBarge) LoseConnection("voice cancel timed out");
+    else if (state_ == State::kBargeAdmit) FinishTurn(false);
+    else if (state_ == State::kDrain) FinishTurn(false);
+    else AbortCurrent("voice timeout cancel failed");
+    return true;
+  }
+
   // 唯一的帧驱动入口；网络事件和取消 helper 也可转换状态，且必须共享同一 actor。
   void OnFrame(const CaptureFrame& frame) {
-    if (frame.discontinuity) {
-      std::cerr << "boompi-client: capture discontinuity; source="
-                << (frame.actor_overrun ? "actor_queue" : "alsa") << std::endl;
-      pre_count_ = 0U;
-      if (state_ == State::kBarge || state_ == State::kBargeAdmit)
-        LoseConnection("capture discontinuity while cancelling");
-      else if (state_ == State::kCapture || state_ == State::kAwait ||
-               state_ == State::kSpeak)
-        AbortCurrent("capture discontinuity cancel failed");
-      // kDrain 已消费 response.done，云端没有可取消对象，也不会再发送 cancelled。
-      else if (state_ == State::kDrain) FinishTurn(false);
-      else { audio_.DropPlayback(); state_ = State::kWake;
-             ui_.SetState(DeviceUiState::kIdle); ResetListener(); }
-      return;
-    }
+    if (frame.discontinuity) { HandleDiscontinuity(frame); return; }
     if (state_ == State::kBarge || state_ == State::kBargeAdmit)
       PrepareBargePreRoll(frame);
     const bool freeze_barge_tail =
@@ -585,36 +645,23 @@ class VoiceClient final {
     if (state_ != State::kCapture && !freeze_barge_tail) SavePreRoll(frame);
     const auto now = Clock::now();
     if (ids_.session == 0U) {
-      if (transport_ && now >= deadline_)
-        LoseConnection("connect or hello timeout");
       if (frame.wake) {
         std::cout << "boompi-client: Snowboy wake detected; server offline" << std::endl; ResetListener();
       }
-      return;
+      ExpireDeadlines(now); return;
     }
-    if (now >= heartbeat_deadline_) { LoseConnection("server heartbeat timed out"); return; }
-    const bool timed_state = state_ == State::kWaitSpeech ||
-        state_ == State::kAwait || state_ == State::kSpeak ||
-        state_ == State::kBarge || state_ == State::kBargeAdmit ||
-        state_ == State::kDrain ||
-        state_ == State::kFollowUp;
-    if (timed_state && now >= deadline_) {
-      if (state_ == State::kWaitSpeech || state_ == State::kFollowUp) {
-        state_ = State::kWake; pre_head_ = pre_count_ = 0U;
-        ui_.SetState(DeviceUiState::kIdle);
-        ResetListener(); return;
-      }
-      if (state_ == State::kBarge) LoseConnection("voice cancel timed out");
-      else if (state_ == State::kBargeAdmit) FinishTurn(false);
-      else if (state_ == State::kDrain) FinishTurn(false);
-      else AbortCurrent("voice timeout cancel failed");
-      return;
-    }
+    if (ExpireDeadlines(now)) return;
     // 首响等待超过 15 秒时给一次本地状态提示（AGENTS.md）；不改变 30 秒取消线。
     if (state_ == State::kAwait && !await_hint_shown_ && now >= await_hint_at_) {
       await_hint_shown_ = true; ui_.SetText("还在思考", "云端正在组织回答，请稍候");
       std::cout << "boompi-client: first response pending 15s; showing local hint" << std::endl;
     }
+    DispatchFrame(frame);
+  }
+
+  // 每个状态只回答一个问题：唤醒后等首句、首句后上行、上行后等回复、回复后播放、
+  // 播放中只找打断切点、排空后给 3 秒免唤醒追问。
+  void DispatchFrame(const CaptureFrame& frame) {
     switch (state_) {
       case State::kWake:
         if (frame.wake || std::exchange(manual_wake_pending_, false)) {
@@ -685,11 +732,11 @@ class VoiceClient final {
   std::uint64_t audio_origin_us_{0U};
   std::uint32_t message_{1U}, uplink_sequence_{0U}, turn_frames_{0U};
   std::string subtitle_;
-  unsigned reconnect_attempt_{0U}, near_frames_{0U}, probe_frames_{0U}, cooldown_frames_{0U};
+  unsigned reconnect_attempt_{0U}, near_frames_{0U};
   unsigned barge_quiet_frames_{0U}, barge_silence_frames_{0U};
   std::uint8_t volume_{60U};
   bool brightness_{true};
-  BargeProbe barge_probe_{BargeProbe::kIdle};
+  BargeProbeMachine probe_;
   bool hello_sent_{false}, barge_ended_{false}, barge_turn_admitted_{false};
   bool barge_vad_started_seen_{false}, barge_tail_frozen_{false};
   bool finish_after_start_{false}, finish_after_cancel_{false};

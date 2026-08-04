@@ -2,8 +2,8 @@
 
 ## 文档状态
 
-当前教学候选的语音核心包含 18 个生产 C/C++ 文件、2620 ELOC，其中 Rockchip/Snowboy vendor 集成
-280 ELOC，产品逻辑 2340 ELOC；UI 显示层（LVGL 渲染与 ST7789P3/GT911 驱动）另计 1926 ELOC，不占语音核心预算。语音人工体验、严格交叉构建和板端启动已通过；屏幕/触摸、
+当前教学候选的语音核心包含 18 个生产 C/C++ 文件、2643 ELOC，其中 Rockchip/Snowboy vendor 集成
+280 ELOC，产品逻辑 2363 ELOC；UI 显示层（LVGL 渲染与 ST7789P3/GT911 驱动）另计 1926 ELOC，不占语音核心预算。语音人工体验、严格交叉构建和板端启动已通过；屏幕/触摸、
 网络启动、UDP 发现和二维码配网已进入同一候选。受控双讲、量化延迟、真实 Wi-Fi 配网和长期
 稳定性仍待完成。
 实现状态以测试和真实板端记录为准；根目录 `AGENTS.md` 是更高优先级的开发契约。
@@ -42,18 +42,19 @@ Ethernet/Wi-Fi -> NetworkBootstrap -> discovered WSS endpoint
 
 不存在另一套 `App/Driver/Inf` 平行目录，也没有恢复已删除的通用 worker 或 backend 工厂。
 
-当前源码创建四个工作线程，加上主线程，共五个客户端自有长期执行上下文。新的网络工作线程
-尚需在板端重新采集总线程数；依赖库内部线程不拥有业务状态：
+当前源码创建五个工作线程，加上主线程（唯一会话 actor），共六个客户端自有长期执行上下文。
+板端实测总线程数（含链接依赖内部线程）尚需重新采集；依赖库线程不拥有业务状态：
 
 | 执行上下文 | 独占资源与职责 |
 | --- | --- |
-| 控制/采集线程 | ALSA capture、DSP、Snowboy/VAD、500 ms pre-roll、状态机和重连调度 |
-| 播放线程 | 固定 TTS 队列、重采样、gain/limiter 和 ALSA playback |
+| 主线程（会话 actor） | 帧循环、状态机、turn/epoch、500 ms pre-roll、重连调度；业务状态唯一写者 |
+| 采集线程 | ALSA capture、DSP、Snowboy/VAD；成帧推入固定 4 槽 capture 环 |
+| 播放线程 | 固定 TTS 队列、重采样、gain/饱和钳位和 ALSA playback |
 | WebSocket service 线程 | TLS/WSS I/O；回调只向固定 64 项事件环提交结果 |
 | UI 线程 | 合并状态刷新、SPI 写屏和 GT911 触摸；只把用户动作交回主状态机 |
-| 网络线程 | DHCP/Wi-Fi 启动、UDP 发现与 endpoint 持久化；服务端晚启动时持续重试 |
+| 网络启动线程 | DHCP/Wi-Fi 启动、UDP 发现与 endpoint 持久化；服务端晚启动时持续重试 |
 
-业务状态只能由控制/采集线程修改。实时 PCM 使用对象内固定数组；播放 PCM 与网络事件通过
+业务状态只能由主线程（会话 actor）修改。实时 PCM 使用对象内固定数组；采集帧、播放 PCM 与网络事件通过
 预分配有界环传递，不允许逐帧动态分配或无界等待。
 
 有界队列、discontinuity barrier 和 consumer handoff 的具体 ownership 见
@@ -67,9 +68,10 @@ Ethernet/Wi-Fi -> NetworkBootstrap -> discovered WSS endpoint
 和双通道 playback。20 ms capture 保持四通道相位完成 48→16 kHz；
 `RockchipVoiceDsp` 在 vendor 输入边界固定选择 `[mic0,mic1,refL]`，丢弃重复的 `refR`，
 其 mono 输出供 Snowboy、VAD 和 16 kHz 上行。
-24 kHz mono TTS 进入 75 帧/1.5 s 固定队列，经 24→48 kHz、gain/limiter 后播放；最终写入
+24 kHz mono TTS 进入 75 帧/1.5 s 固定队列，经 24→48 kHz、gain/饱和钳位后播放；最终写入
 ALSA 的 PCM 由 Codec Mode1 数字回采到同帧 `refL/refR`，不再维护 software reference ring 或
-60 ms lead。采集不经过中间队列，在网络连接、云端等待和播放期间持续运行。xrun 或四通道
+60 ms lead。采集帧经固定 4 槽（80 ms）capture 环交给 actor，落后超限显式断帧；采集在网络连接、
+云端等待和播放期间持续运行。xrun 或四通道
 重采样错位会建立 discontinuity 并重置前端历史。
 
 direct 3A 固定为 `init(16000,16,2,1)`、768-short 输入和 512-byte mono 输出；项目 profile

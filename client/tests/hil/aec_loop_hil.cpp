@@ -339,7 +339,7 @@ int main(int argc, char* argv[]) {
         }
       }
     }
-    const bool playing_before_capture = audio.playing();
+    const bool playing_before_capture = audio.stream_open();
     if (!audio.Capture(&frame)) {
       std::cerr << "boompi-aec-loop-hil: capture failed: "
                 << audio.last_error() << '\n';
@@ -349,7 +349,7 @@ int main(int argc, char* argv[]) {
       std::cerr << "boompi-aec-loop-hil: capture discontinuity invalidated preadaptation\n";
       return EXIT_FAILURE;
     }
-    const bool playing = playing_before_capture || audio.playing();
+    const bool playing = playing_before_capture || audio.stream_open();
     saw_playback = saw_playback || playing;
     if constexpr (BOOMPI_AEC_LOOP_ACTIVE_PROBE != 0) {
       if (!audio.playback_done()) {

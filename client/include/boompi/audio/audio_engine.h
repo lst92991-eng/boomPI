@@ -78,14 +78,16 @@ class AudioEngine final {
   /// @brief 标记当前 TTS 已收完；播放线程会消费最后一个短帧、drain ALSA，再置完成状态。
   bool EndPlayback() noexcept;
 
+  /// 播放谓词三件套，全部是无锁快照：
+  /// - `stream_open`：当前 TTS 流尚未收到 EndPlayback（不代表扬声器正在出声）；
+  /// - `playback_done`：流已结束且尾帧已渲染完，kDrain 据此进入回合收尾；
+  /// - `playback_failed`：最近一次已结束的流发生硬件/渲染失败（主动 drop 不算）；
+  ///   BeginPlayback 会清除此状态。
   /// `SetPlaybackScale` 只调整后续渲染增益；`DropPlayback` 异步唤醒播放线程并清空尚未渲染的 TTS。
   void SetPlaybackGain(float gain) noexcept;
   void SetPlaybackScale(float scale) noexcept;
   void DropPlayback() noexcept;
-
-  /// 前两个查询是无锁快照；`playback_failed` 只表示最近一次已结束的流发生硬件/渲染失败，
-  /// 用户主动 drop 不计为失败。BeginPlayback 会清除此状态。
-  bool playing() const noexcept { return !playback_done(); } bool playback_done() const noexcept;
+  bool stream_open() const noexcept { return !playback_done(); } bool playback_done() const noexcept;
   bool playback_failed() const noexcept;
 
   /// 返回 AudioEngine 或板级后端最近一次错误；允许 application 与播放线程并发读取。
