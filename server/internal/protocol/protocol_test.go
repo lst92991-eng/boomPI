@@ -82,6 +82,22 @@ func TestControlEnvelopeRejectsDuplicateKeysAndNonObjectPayload(t *testing.T) {
 	}
 }
 
+func TestControlEnvelopeRejectsDeeplyNestedPayload(t *testing.T) {
+	// 深度构造的嵌套不应耗尽解析栈：显式深度上限必须早于任何内部限制拒绝。
+	nested := "0"
+	for index := 0; index < 64; index++ {
+		nested = "[" + nested + "]"
+	}
+	data := []byte(fmt.Sprintf(
+		`{"version":1,"type":"hello","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"deep":%s}}`,
+		nested,
+	))
+	// 断言错误来自深度上限，防止未来其他校验碰巧报错造成假绿。
+	if _, err := DecodeControl(data); err == nil || !strings.Contains(err.Error(), "depth limit") {
+		t.Fatalf("DecodeControl() error = %v, want depth limit rejection", err)
+	}
+}
+
 func controlJSONWithNumericField(field, value string) []byte {
 	values := map[string]string{
 		"version": "1", "session_id": "0", "turn_id": "0", "stream_id": "0", "epoch": "1",
