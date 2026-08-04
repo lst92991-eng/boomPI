@@ -6,9 +6,46 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
+const validTestDeviceToken = "0123456789abcdef0123456789abcdef"
+
+func TestDefaultsUseChinaBeijing(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Region != "china-beijing" {
+		t.Fatalf("Region = %q, want china-beijing", cfg.Region)
+	}
+	if cfg.ConversationMode != "intelligence" || cfg.TTSVoice != "Cherry" {
+		t.Fatalf("teaching defaults = mode %q, TTS voice %q", cfg.ConversationMode, cfg.TTSVoice)
+	}
+	if cfg.HeartbeatInterval != 10*time.Second || cfg.ConnectionTimeout != 30*time.Second ||
+		cfg.FirstResponseTimeout != 30*time.Second {
+		t.Fatalf("teaching timeouts = heartbeat %s, connection %s, first response %s",
+			cfg.HeartbeatInterval, cfg.ConnectionTimeout, cfg.FirstResponseTimeout)
+	}
+}
+
+func TestLoadNeedsOnlyYAMLAPIKey(t *testing.T) {
+	t.Setenv("DASHSCOPE_API_KEY", "")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "")
+	setValidDeviceToken(t)
+	path := writeConfig(t, "qwen_api_key: yaml-secret\n")
+
+	cfg, err := Load(path, nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Credentials.APIKey() != "yaml-secret" || cfg.Credentials.Source() != "config.yaml" {
+		t.Fatalf("YAML credential source = %q", cfg.Credentials.Source())
+	}
+	if cfg.Credentials.WorkspaceID() != "" {
+		t.Fatalf("workspace ID = %q, want optional empty value", cfg.Credentials.WorkspaceID())
+	}
+}
+
 func TestLoadExampleAndEnvironmentCredential(t *testing.T) {
+	t.Setenv("BOOMPI_DEVICE_TOKEN", "")
 	t.Setenv("DASHSCOPE_API_KEY", "dashscope-secret")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "workspace-1")
 
@@ -25,16 +62,31 @@ func TestLoadExampleAndEnvironmentCredential(t *testing.T) {
 	if cfg.Credentials.WorkspaceID() != "workspace-1" {
 		t.Fatalf("workspace ID = %q", cfg.Credentials.WorkspaceID())
 	}
+	if cfg.DeviceToken.Value() != "boompi-teaching-shared-token-v1-2026" {
+		t.Fatal("example device token does not match the teaching client default")
+	}
+	if cfg.ConversationMode != "intelligence" || cfg.ASRModel != "qwen3-asr-flash" ||
+		cfg.ReasoningModel != "qwen3.6-flash" || cfg.ReasoningEffort != "none" ||
+		cfg.SearchMode != "off" || cfg.TTSModel != "qwen3-tts-flash-realtime" {
+		t.Fatalf("intelligence pipeline config = mode %q, ASR %q, reasoning %q, TTS %q",
+			cfg.ConversationMode, cfg.ASRModel, cfg.ReasoningModel, cfg.TTSModel)
+	}
+	if cfg.FirstResponseTimeout != 30*time.Second {
+		t.Fatalf("example first response timeout = %s, want 30s", cfg.FirstResponseTimeout)
+	}
 	formatted := fmt.Sprintf("%+v", cfg)
-	if strings.Contains(formatted, "dashscope-secret") {
-		t.Fatal("formatted configuration leaked an API key")
+	if strings.Contains(formatted, "dashscope-secret") || strings.Contains(formatted, "boompi-teaching-shared-token-v1-2026") {
+		t.Fatal("formatted configuration leaked a credential")
 	}
 }
 
 func TestLoadRejectsSecretAndUnknownYAMLKeys(t *testing.T) {
+	setValidDeviceToken(t)
 	t.Setenv("DASHSCOPE_API_KEY", "environment-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	for _, content := range []string{
 		"api_key: do-not-store-this\n",
+		"dashscope_api_key: do-not-store-this\n",
 		"unexpected_option: true\n",
 	} {
 		path := writeConfig(t, content)
@@ -48,8 +100,35 @@ func TestLoadRejectsSecretAndUnknownYAMLKeys(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsInvalidAndOversizedConfiguration(t *testing.T) {
+func TestLoadRejectsServerSideFirstResponseWarning(t *testing.T) {
+	setValidDeviceToken(t)
+	t.Setenv("DASHSCOPE_API_KEY", "environment-secret")
+	path := writeConfig(t, "first_response_warning: 15s\n")
+
+	if _, err := Load(path, nil); err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("server-side first response warning error = %v", err)
+	}
+}
+
+func TestLoadRejectsDeviceTokenCLIOverride(t *testing.T) {
+	setValidDeviceToken(t)
 	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
+	cliToken := "abcdef0123456789abcdef0123456789"
+
+	_, err := Load("", Overrides{"device_token": cliToken})
+	if err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("device token CLI override error = %v", err)
+	}
+	if strings.Contains(err.Error(), cliToken) {
+		t.Fatalf("error leaked CLI device token: %v", err)
+	}
+}
+
+func TestLoadRejectsInvalidAndOversizedConfiguration(t *testing.T) {
+	setValidDeviceToken(t)
+	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	invalid := writeConfig(t, "wss_port: 70000\n")
 	if _, err := Load(invalid, nil); err == nil || !strings.Contains(err.Error(), "wss_port") {
 		t.Fatalf("invalid port error = %v", err)
@@ -62,7 +141,9 @@ func TestLoadRejectsInvalidAndOversizedConfiguration(t *testing.T) {
 }
 
 func TestLoadRejectsHostNameListenAddress(t *testing.T) {
+	setValidDeviceToken(t)
 	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	path := writeConfig(t, "listen_address: localhost\n")
 	if _, err := Load(path, nil); err == nil || !strings.Contains(err.Error(), "IPv4 or IPv6") {
 		t.Fatalf("hostname listen address error = %v", err)
@@ -70,18 +151,80 @@ func TestLoadRejectsHostNameListenAddress(t *testing.T) {
 }
 
 func TestLoadRequiresEnvironmentCredential(t *testing.T) {
+	setValidDeviceToken(t)
 	t.Setenv("DASHSCOPE_API_KEY", "")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	_, err := Load("", nil)
 	if err == nil || !strings.Contains(err.Error(), "DASHSCOPE_API_KEY") {
 		t.Fatalf("missing credential error = %v", err)
 	}
 }
 
-func TestLoadPrecedenceCLIEnvironmentYAMLDefaults(t *testing.T) {
+func TestLoadAllowsMissingWorkspaceID(t *testing.T) {
+	setValidDeviceToken(t)
 	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "")
+	cfg, err := Load("", nil)
+	if err != nil {
+		t.Fatalf("missing optional workspace ID error = %v", err)
+	}
+	if cfg.Credentials.WorkspaceID() != "" {
+		t.Fatalf("workspace ID = %q, want empty", cfg.Credentials.WorkspaceID())
+	}
+}
+
+func TestLoadRequiresDeviceToken(t *testing.T) {
+	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
+	t.Setenv("BOOMPI_DEVICE_TOKEN", "")
+
+	_, err := Load("", nil)
+	if err == nil || !strings.Contains(err.Error(), "BOOMPI_DEVICE_TOKEN") {
+		t.Fatalf("missing device token error = %v", err)
+	}
+}
+
+func TestLoadRejectsInvalidDeviceToken(t *testing.T) {
+	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
+
+	for name, token := range map[string]string{
+		"too-short":  "short-device-token",
+		"whitespace": validTestDeviceToken + " ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("BOOMPI_DEVICE_TOKEN", token)
+			_, err := Load("", nil)
+			if err == nil || !strings.Contains(err.Error(), "BOOMPI_DEVICE_TOKEN") {
+				t.Fatalf("invalid device token error = %v", err)
+			}
+			if strings.Contains(err.Error(), token) {
+				t.Fatalf("error leaked device token: %v", err)
+			}
+		})
+	}
+}
+
+func TestDeviceTokenFormattingIsRedacted(t *testing.T) {
+	token := DeviceToken{value: validTestDeviceToken}
+	if got := token.String(); got != "<redacted>" {
+		t.Fatalf("String() = %q, want <redacted>", got)
+	}
+	if got := token.GoString(); got != "<redacted>" {
+		t.Fatalf("GoString() = %q, want <redacted>", got)
+	}
+	if got := fmt.Sprintf("%v %#v", token, token); strings.Contains(got, validTestDeviceToken) {
+		t.Fatalf("formatted token leaked its value: %s", got)
+	}
+}
+
+func TestLoadPrecedenceCLIEnvironmentYAMLDefaults(t *testing.T) {
+	setValidDeviceToken(t)
+	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	t.Setenv("BOOMPI_WSS_PORT", "18002")
-	t.Setenv("BOOMPI_REGION", "singapore-env")
-	path := writeConfig(t, "wss_port: 18001\nregion: singapore-yaml\ndiscovery_port: 17807\n")
+	t.Setenv("BOOMPI_REGION", "singapore")
+	path := writeConfig(t, "wss_port: 18001\nregion: china-beijing\ndiscovery_port: 17807\n")
 
 	cfg, err := Load(path, Overrides{"wss_port": "18003"})
 	if err != nil {
@@ -90,7 +233,7 @@ func TestLoadPrecedenceCLIEnvironmentYAMLDefaults(t *testing.T) {
 	if cfg.WSSPort != 18003 {
 		t.Fatalf("WSSPort = %d, want CLI value 18003", cfg.WSSPort)
 	}
-	if cfg.Region != "singapore-env" {
+	if cfg.Region != "singapore" {
 		t.Fatalf("Region = %q, want environment value", cfg.Region)
 	}
 	if cfg.DiscoveryPort != 17807 {
@@ -102,7 +245,9 @@ func TestLoadPrecedenceCLIEnvironmentYAMLDefaults(t *testing.T) {
 }
 
 func TestLoadPreservesHashInsidePlainScalars(t *testing.T) {
+	setValidDeviceToken(t)
 	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	path := writeConfig(t, strings.Join([]string{
 		"model: Qwen-C#-model",
 		"system_prompt: https://example.test/docs/#voice",
@@ -136,12 +281,58 @@ func TestValidateRejectsControlCharactersInModel(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cfg := Defaults()
 			cfg.Model = model
-			cfg.Credentials = Credentials{apiKey: "test-secret"}
+			cfg.Credentials = Credentials{apiKey: "test-secret", workspaceID: "test-workspace"}
+			cfg.DeviceToken = DeviceToken{value: validTestDeviceToken}
 			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "control characters") {
 				t.Fatalf("Validate() error = %v", err)
 			}
 		})
 	}
+}
+
+func TestValidateRejectsUnsupportedRegion(t *testing.T) {
+	cfg := Defaults()
+	cfg.Region = "ap-southeast-1"
+	cfg.Credentials = Credentials{apiKey: "test-secret", workspaceID: "test-workspace"}
+	cfg.DeviceToken = DeviceToken{value: validTestDeviceToken}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "china-beijing or singapore") {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestValidateKeepsHeartbeatWithinClientTimeout(t *testing.T) {
+	valid := Defaults()
+	valid.Credentials = Credentials{apiKey: "test-secret"}
+	valid.DeviceToken = DeviceToken{value: validTestDeviceToken}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("default heartbeat validation error = %v", err)
+	}
+
+	for name, mutate := range map[string]func(*Config){
+		"heartbeat-over-ten-seconds": func(cfg *Config) {
+			cfg.HeartbeatInterval = maxHeartbeatInterval + time.Millisecond
+		},
+		"connection-over-client-timeout": func(cfg *Config) {
+			cfg.ConnectionTimeout = 30*time.Second + time.Millisecond
+		},
+		"connection-under-three-heartbeats": func(cfg *Config) {
+			cfg.HeartbeatInterval = 5 * time.Second
+			cfg.ConnectionTimeout = 15*time.Second - time.Millisecond
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := valid
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("Validate() unexpectedly accepted a server timeout that exceeds the client contract")
+			}
+		})
+	}
+}
+
+func setValidDeviceToken(t *testing.T) {
+	t.Helper()
+	t.Setenv("BOOMPI_DEVICE_TOKEN", validTestDeviceToken)
 }
 
 func writeConfig(t *testing.T, content string) string {

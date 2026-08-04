@@ -9,16 +9,19 @@ import (
 )
 
 const (
-	PCMHeaderSize      = 64
-	MaxPCMPayloadBytes = 64 * 1024
-	AudioFormatPCM16LE = 1
-	AudioKindUplink    = 1
-	AudioKindDownlink  = 2
+	PCMHeaderSize        = 64
+	MaxPCMPayloadBytes   = 64 * 1024
+	AudioFormatPCM16LE   = 1
+	AudioKindUplink      = 1
+	AudioKindDownlink    = 2
+	PCMFlagStart         = uint16(0x0001)
+	PCMFlagEnd           = uint16(0x0002)
+	PCMFlagDiscontinuity = uint16(0x0004)
 )
 
 var pcmMagic = [4]byte{'B', 'P', 'V', '1'}
 
-const allowedPCMFlags uint16 = 0x0007
+const allowedPCMFlags = PCMFlagStart | PCMFlagEnd | PCMFlagDiscontinuity
 
 type PCMHeader struct {
 	Version      uint8

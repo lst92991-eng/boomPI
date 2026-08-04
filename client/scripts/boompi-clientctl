@@ -1,0 +1,157 @@
+#!/bin/sh
+# BusyBox 教学版入口：一个进程、三次有限重启、一个手工回退版本。
+
+umask 077
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LD_LIBRARY_PATH=/oem/usr/lib:/usr/lib:/lib
+export PATH LD_LIBRARY_PATH
+BASE=/userdata/boompi
+APP=$BASE/bin/boompi-client
+CONF=$BASE/config/client.env
+LOG=$BASE/log/client.log
+PID=/run/boompi-client.pid
+CHILD_PID=/run/boompi-client-child.pid
+LOCK=/run/boompi-clientctl.lock
+
+fail() { echo "boompi-clientctl: $*" >&2; exit 1; }
+prepare() {
+  mkdir -p "$BASE/bin" "$BASE/config" "$BASE/log" /run || fail 'cannot create directories'
+  chmod 700 "$BASE" "$BASE/config" "$BASE/log"
+  if [ ! -e "$CONF" ]; then
+    device_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null) || fail 'cannot create device id'
+    resource=$BASE/models/common.res; model=$BASE/models/snowboy.umdl
+    [ ! -r "$BASE/qwen-test/common.res" ] || resource=$BASE/qwen-test/common.res
+    [ ! -r "$BASE/qwen-test/snowboy.umdl" ] || model=$BASE/qwen-test/snowboy.umdl
+    cat > "$CONF" <<EOF
+BOOMPI_DEVICE_ID=$device_id
+BOOMPI_CAPTURE_PCM=hw:0,0
+BOOMPI_PLAYBACK_PCM=hw:0,0
+BOOMPI_VOLUME_PERCENT=60
+BOOMPI_SPEAKER_GAIN_PERCENT=100
+BOOMPI_BARGE_IN_ENABLED=1
+BOOMPI_SNOWBOY_RESOURCE_FILE=$resource
+BOOMPI_SNOWBOY_MODEL_FILE=$model
+BOOMPI_SNOWBOY_SENSITIVITY=0.7
+BOOMPI_VAD_MIN_DBFS=-35
+BOOMPI_BARGE_MIN_DBFS=-25
+EOF
+    echo "boompi-clientctl: created $CONF"
+  fi
+  [ ! -f "$CONF" ] || chmod 600 "$CONF"
+}
+load_config() {
+  [ -r "$CONF" ] || fail "missing $CONF"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in ''|'#'*) continue ;; *=*) ;; *) fail 'invalid config line' ;; esac
+    name=${line%%=*}; value=${line#*=}
+    case $name in BOOMPI_*) export "$name=$value" ;; *) fail "invalid config key: $name" ;; esac
+  done < "$CONF"
+}
+running() {
+  [ -r "$PID" ] || return 1
+  RUN_PID=$(cat "$PID")
+  case $RUN_PID in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$RUN_PID" 2>/dev/null && grep -q 'boompi-clientctl' "/proc/$RUN_PID/cmdline" 2>/dev/null
+}
+stop_child() { [ -z "$CHILD" ] || { kill "$CHILD" 2>/dev/null; wait "$CHILD" 2>/dev/null; rm -f "$CHILD_PID"; }; }
+take_lock() {
+  mkdir "$LOCK" 2>/dev/null || fail 'another client control operation is running'
+  trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+}
+needs_provision() {
+  [ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" != 1 ] &&
+    ! grep -q '^# boomPI-managed$' /etc/wpa_supplicant.conf 2>/dev/null
+}
+
+run_provision() {
+  restore=${1:-0}
+  trap 'stop_child; rm -f "$PID"; exit 0' HUP INT TERM
+  prepare
+  /usr/sbin/boompi-provision &
+  CHILD=$!; echo "$CHILD" > "$CHILD_PID"; wait "$CHILD"; code=$?
+  rm -f "$CHILD_PID" "$PID"; CHILD=
+  if [ "$code" -eq 0 ] || [ "$restore" -eq 1 ]; then start 1; fi
+  exit "$code"
+}
+
+launch_provision() {
+  restore=${1:-0}; prepare
+  [ ! -f "$LOG" ] || [ "$(wc -c < "$LOG")" -le 1048576 ] || mv -f "$LOG" "$LOG.1"
+  nohup "$0" _provision "$restore" >> "$LOG" 2>&1 & echo $! > "$PID"
+  sleep 1; running || fail "provisioning failed; inspect $LOG"
+  echo "boompi provisioning started (pid $RUN_PID)"
+}
+
+run_loop() {
+  trap 'stop_child; rm -f "$PID"; exit 0' HUP INT TERM
+  load_config
+  tries=0
+  while [ "$tries" -lt 3 ]; do
+    "$APP" --voice-loop &
+    CHILD=$!; echo "$CHILD" > "$CHILD_PID"; wait "$CHILD"; code=$?; rm -f "$CHILD_PID"; CHILD=
+    [ "$code" -eq 0 ] && break
+    tries=$((tries + 1)); [ "$tries" -lt 3 ] && sleep "$tries"
+  done
+  rm -f "$PID"
+  exit "$code"
+}
+
+start() {
+  skip_provision=${1:-0}
+  prepare
+  running && { echo "boompi-client is running (pid $RUN_PID)"; return; }
+  rm -f "$PID"; [ -x "$APP" ] || fail 'client is not installed'
+  load_config; "$APP" --check-config >/dev/null || fail 'configuration check failed'
+  if [ "$skip_provision" -eq 0 ] && needs_provision; then launch_provision 0; return; fi
+  [ ! -f "$LOG" ] || [ "$(wc -c < "$LOG")" -le 1048576 ] || mv -f "$LOG" "$LOG.1"
+  nohup "$0" _run >> "$LOG" 2>&1 & echo $! > "$PID"
+  sleep 1; running || fail "start failed; inspect $LOG"
+  echo "boompi-client started (pid $RUN_PID)"
+}
+stop() {
+  if ! running; then rm -f "$PID"; echo 'boompi-client is stopped'; return; fi
+  kill "$RUN_PID" 2>/dev/null || true
+  waited=0; while running && [ "$waited" -lt 8 ]; do sleep 1; waited=$((waited + 1)); done
+  if running; then
+    child=$(cat "$CHILD_PID" 2>/dev/null || true)
+    case $child in ''|*[!0-9]*) ;; *) kill -KILL "$child" 2>/dev/null || true ;; esac
+    kill -KILL "$RUN_PID" 2>/dev/null || true
+  fi
+  rm -f "$PID" "$CHILD_PID"; echo 'boompi-client stopped'
+}
+provision() {
+  was_running=0; running && was_running=1
+  [ "$was_running" -eq 0 ] || stop
+  launch_provision "$was_running"
+}
+update() {
+  source=$1
+  case $source in /*) ;; *) fail 'update needs an absolute binary path' ;; esac
+  [ -f "$source" ] && [ -x "$source" ] || fail 'update binary is invalid'
+  prepare; load_config; "$source" --check-config >/dev/null || fail 'new binary check failed'
+  was_running=0; running && was_running=1
+  [ "$was_running" -eq 0 ] || stop
+  cp "$source" "$APP.new" && chmod 755 "$APP.new" || fail 'copy failed'
+  [ ! -f "$APP" ] || mv -f "$APP" "$APP.bak"
+  mv -f "$APP.new" "$APP" || fail 'install failed'
+  echo "boompi-client installed; backup=$APP.bak"
+  [ "$was_running" -eq 0 ] || start
+}
+
+case ${1:-} in
+  _run) run_loop ;;
+  _provision) run_provision "${2:-0}" ;;
+  *)
+    take_lock
+    case ${1:-} in
+      start) start ;;
+      stop) stop ;;
+      restart) stop; start ;;
+      provision) provision ;;
+      status) running && echo "boompi-client is running (pid $RUN_PID)" || echo 'boompi-client is stopped' ;;
+      log) tail -n 100 "$LOG" ;;
+      update) [ "$#" -eq 2 ] || fail 'usage: boompi-clientctl update /absolute/path'; update "$2" ;;
+      *) echo 'usage: boompi-clientctl start|stop|restart|status|log|update|provision' >&2; exit 2 ;;
+    esac
+    ;;
+esac

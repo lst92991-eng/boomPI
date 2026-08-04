@@ -2,6 +2,8 @@ include_guard(GLOBAL)
 
 option(BOOMPI_ENABLE_ROCKCHIP_3A
   "Enable the pinned Rockchip RV1106 3A feasibility dependency" OFF)
+option(BOOMPI_BUILD_ROCKCHIP_3A_HIL
+  "Build the explicit Rockchip RV1106 fixed-frame 3A HIL probe" OFF)
 option(BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO
   "Enable the pinned Rockchip RV1106 MPI audio feasibility dependency" OFF)
 option(BOOMPI_BUILD_ROCKCHIP_MPI_AUDIO_HIL
@@ -314,6 +316,97 @@ function(_boompi_configure_rockchip_3a_dependency)
     BOOMPI_AUDIO_VENDOR_ROCKCHIP_3A_CONFIGURED TRUE)
 endfunction()
 
+function(_boompi_configure_rockchip_3a_hil)
+  if(NOT BOOMPI_BUILD_ROCKCHIP_3A_HIL)
+    return()
+  endif()
+  if(NOT BOOMPI_ENABLE_ROCKCHIP_3A)
+    message(FATAL_ERROR
+      "BOOMPI_BUILD_ROCKCHIP_3A_HIL requires "
+      "BOOMPI_ENABLE_ROCKCHIP_3A=ON")
+  endif()
+
+  # Repeat both gates here because isolated test fixtures intentionally call
+  # this private constructor directly. No private input may be inspected until
+  # the target ABI and Debug-only feasibility opt-in are established.
+  _boompi_audio_vendor_require_rv1106_environment()
+  _boompi_audio_vendor_require_feasibility_mode()
+
+  get_property(_already_configured GLOBAL PROPERTY
+    BOOMPI_AUDIO_VENDOR_ROCKCHIP_3A_HIL_CONFIGURED)
+  if(_already_configured)
+    return()
+  endif()
+
+  if(NOT TARGET boompi_vendor::rockchip_3a_aec)
+    message(FATAL_ERROR
+      "Rockchip 3A dependency must be configured before its HIL probe")
+  endif()
+  if(TARGET boompi_rockchip_3a_hil)
+    message(FATAL_ERROR "Rockchip 3A HIL target name collision")
+  endif()
+
+  _boompi_audio_vendor_require_directory(
+    "BOOMPI_ROCKCHIP_3A_INCLUDE_DIR"
+    "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}"
+    _include_dir)
+
+  set(_hil_source
+    "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../tests/hil/rockchip_3a_hil.cpp")
+  if(NOT EXISTS "${_hil_source}" OR IS_DIRECTORY "${_hil_source}")
+    message(FATAL_ERROR "Rockchip 3A HIL source is missing")
+  endif()
+  file(SHA256 "${_hil_source}" _hil_source_sha256)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_hil_source}")
+
+  # Only stable logical names and pins enter the executable. The direct API
+  # does not read the VQE JSON, but its audited feasibility pin remains part of
+  # the provenance set; no workstation or SDK path is embedded.
+  string(CONCAT _pinset_manifest
+    "rkaudio_preprocess.h=${_BOOMPI_ROCKCHIP_3A_HEADER_SHA256}\n"
+    "libaec_bf_process.so=${_BOOMPI_ROCKCHIP_3A_AEC_SHA256}\n"
+    "librkaudio_common.so=${_BOOMPI_ROCKCHIP_3A_COMMON_SHA256}\n"
+    "librkaudio_detect.so=${_BOOMPI_ROCKCHIP_3A_DETECT_SHA256}\n"
+    "config_aivqe.json=${_BOOMPI_ROCKCHIP_3A_CONFIG_SHA256}\n")
+  string(SHA256 _pinset_sha256 "${_pinset_manifest}")
+
+  # The target must be named explicitly. It is neither installed nor added to
+  # CTest, and configure/build never runs it as a side effect.
+  add_executable(boompi_rockchip_3a_hil EXCLUDE_FROM_ALL
+    "${_hil_source}")
+  target_compile_features(boompi_rockchip_3a_hil PRIVATE cxx_std_17)
+  target_compile_options(boompi_rockchip_3a_hil PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    "-fdebug-prefix-map=${_include_dir}=boompi-rv1106-3a-include")
+  if(BOOMPI_STRICT_WARNINGS)
+    target_compile_options(boompi_rockchip_3a_hil PRIVATE -Werror)
+  endif()
+  target_compile_definitions(boompi_rockchip_3a_hil PRIVATE
+    "BOOMPI_ROCKCHIP_3A_HIL_PINSET_SHA256=\"${_pinset_sha256}\""
+    "BOOMPI_ROCKCHIP_3A_HIL_SOURCE_SHA256=\"${_hil_source_sha256}\"")
+  target_include_directories(boompi_rockchip_3a_hil PRIVATE
+    "${_include_dir}")
+  # Keep the default dry-run genuinely vendor-load-free. The existing
+  # boompi_rockchip_3a_link_check target owns direct link/ABI evidence; this
+  # probe resolves the pinned API only after both runtime opt-ins and safety
+  # preconditions have passed.
+  target_link_libraries(boompi_rockchip_3a_hil PRIVATE
+    ${CMAKE_DL_LIBS})
+  set_target_properties(boompi_rockchip_3a_hil PROPERTIES
+    SKIP_BUILD_RPATH TRUE
+    BUILD_RPATH ""
+    INSTALL_RPATH ""
+    BUILD_WITH_INSTALL_RPATH FALSE
+    INSTALL_RPATH_USE_LINK_PATH FALSE)
+
+  unset(_pinset_manifest)
+  set_property(GLOBAL PROPERTY
+    BOOMPI_AUDIO_VENDOR_ROCKCHIP_3A_HIL_CONFIGURED TRUE)
+endfunction()
+
 function(_boompi_configure_rockchip_mpi_audio_dependency)
   get_property(_already_configured GLOBAL PROPERTY
     BOOMPI_AUDIO_VENDOR_ROCKCHIP_MPI_AUDIO_CONFIGURED)
@@ -611,6 +704,12 @@ function(_boompi_configure_snowboy_dependency)
 endfunction()
 
 function(boompi_configure_audio_vendor_dependencies)
+  if(BOOMPI_BUILD_ROCKCHIP_3A_HIL AND
+      NOT BOOMPI_ENABLE_ROCKCHIP_3A)
+    message(FATAL_ERROR
+      "BOOMPI_BUILD_ROCKCHIP_3A_HIL requires "
+      "BOOMPI_ENABLE_ROCKCHIP_3A=ON")
+  endif()
   if(BOOMPI_BUILD_ROCKCHIP_MPI_AUDIO_HIL AND
       NOT BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO)
     message(FATAL_ERROR
@@ -629,6 +728,7 @@ function(boompi_configure_audio_vendor_dependencies)
 
   if(BOOMPI_ENABLE_ROCKCHIP_3A)
     _boompi_configure_rockchip_3a_dependency()
+    _boompi_configure_rockchip_3a_hil()
   endif()
   if(BOOMPI_ENABLE_ROCKCHIP_MPI_AUDIO)
     _boompi_configure_rockchip_mpi_audio_dependency()

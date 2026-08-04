@@ -1,62 +1,54 @@
+/** @file 进程组合根：只负责参数、环境配置、信号和 application 生命周期。 */
+#include <csignal>
 #include <cstdlib>
 #include <iostream>
 #include <string_view>
 
-#include "boompi/application/runtime.h"
-#include "boompi/config/client_config.h"
-#include "boompi/platform/monotonic_clock.h"
-#include "boompi/platform/rv1106_build_environment.h"
+#include "boompi/application/voice_client.h"
+#include "boompi/config/voice_client_config.h"
+#include "boompi/network/network_bootstrap.h"
 
 namespace {
-
-int ReportFailure(const char* const operation, const boompi::Status& status) {
-  std::cerr << "boompi-client: " << operation << " failed: "
-            << status.message() << '\n';
-  return EXIT_FAILURE;
+volatile std::sig_atomic_t g_stop = 0;
+// 信号处理函数只能写 sig_atomic_t；资源回收仍由正常控制流执行。
+void Stop(int) { g_stop = 1; }
 }
 
-}  // namespace
-
-int main(const int argc, char* argv[]) {
-  if (argc > 2) {
-    std::cerr << "usage: boompi-client [--check-config|--run-once]\n";
+int main(int argc, char* argv[]) {
+  const std::string_view mode = argc == 2 ? argv[1] : "--voice-loop";
+  if (argc > 2 || (mode != "--voice-loop" && mode != "--check-config" &&
+                   mode != "--save-wifi")) {
+    std::cerr << "usage: boompi-client [--voice-loop|--check-config|--save-wifi]\n";
     return EXIT_FAILURE;
   }
-
-  const std::string_view argument = argc == 2 ? argv[1] : "--run-once";
-  if (argument != "--check-config" && argument != "--run-once") {
-    std::cerr << "usage: boompi-client [--check-config|--run-once]\n";
-    return EXIT_FAILURE;
-  }
-
-#if defined(BOOMPI_TARGET_RV1106)
-  const auto target_status = boompi::platform::ValidateRv1106TargetBuild();
-  if (!target_status.ok()) {
-    return ReportFailure("RV1106 compiler target validation", target_status);
-  }
-#endif
-
-  const auto config = boompi::config::DefaultClientConfig();
-  const auto config_status = boompi::config::ValidateClientConfig(config);
-  if (!config_status.ok()) {
-    return ReportFailure("configuration validation", config_status);
-  }
-  if (argument == "--check-config") {
-    std::cout << "boompi-client: default configuration is valid\n";
+  if (mode == "--save-wifi") {
+    std::string ssid, password;
+    if (!std::getline(std::cin, ssid) || !std::getline(std::cin, password) ||
+        !boompi::network::NetworkBootstrap::SaveWifi(ssid, password)) return EXIT_FAILURE;
     return EXIT_SUCCESS;
   }
-
-  boompi::platform::PosixMonotonicClock clock;
-  boompi::application::Runtime runtime(config, clock);
-  const auto start_status = runtime.Start();
-  if (!start_status.ok()) {
-    return ReportFailure("runtime start", start_status);
+  boompi::config::VoiceClientConfig config;
+  std::string error;
+  if (!boompi::config::LoadVoiceClientConfigFromEnvironment(&config, &error)) {
+    std::cerr << "boompi-client: configuration failed: " << error << '\n';
+    return EXIT_FAILURE;
   }
-
-  std::cout << "boompi-client: P1 runtime initialized\n";
-  const auto stop_status = runtime.Stop();
-  if (!stop_status.ok()) {
-    return ReportFailure("runtime stop", stop_status);
+  if (mode == "--check-config") {
+    std::cout << "boompi-client: configuration is valid\n";
+    return EXIT_SUCCESS;
+  }
+  if (!config.server_ip.empty()) {
+    boompi::network::NetworkBootstrapResult network;
+    network.host = config.server_ip; network.port = config.server_port;
+    network.spki_sha256_base64 = config.server_spki_sha256;
+    if (!boompi::network::NetworkBootstrap::SaveServer(network)) {
+      std::cerr << "boompi-client: cannot save configured server\n"; return EXIT_FAILURE;
+    }
+  }
+  std::signal(SIGINT, Stop); std::signal(SIGTERM, Stop);
+  if (!boompi::application::RunVoiceClient(config, &g_stop, &error)) {
+    std::cerr << "boompi-client: voice loop failed: " << error << '\n';
+    return EXIT_FAILURE;
   }
   return EXIT_SUCCESS;
 }

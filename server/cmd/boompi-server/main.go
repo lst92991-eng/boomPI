@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/lst92991-eng/boomPI/server/internal/app"
@@ -36,7 +37,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	var opts options
 	opts.overrides = make(config.Overrides)
-	flags.StringVar(&opts.configPath, "config", "configs/config.yaml", "path to the non-secret YAML configuration")
+	flags.StringVar(&opts.configPath, "config", "config.yaml", "path to the YAML configuration")
 	flags.BoolVar(&opts.checkConfig, "check-config", false, "validate configuration and exit")
 	addOverrideFlag(flags, opts.overrides, "listen-address", "listen_address", "override the server listen address")
 	addOverrideFlag(flags, opts.overrides, "wss-port", "wss_port", "override the WSS port")
@@ -45,6 +46,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	addOverrideFlag(flags, opts.overrides, "provider", "provider", "override the provider name")
 	addOverrideFlag(flags, opts.overrides, "region", "region", "override the provider region")
 	addOverrideFlag(flags, opts.overrides, "model", "model", "override the provider model")
+	addOverrideFlag(flags, opts.overrides, "voice", "voice", "override the provider voice")
 	addOverrideFlag(flags, opts.overrides, "search-mode", "search_mode", "override search mode (auto or off)")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -55,6 +57,21 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if flags.NArg() != 0 {
 		fmt.Fprintln(stderr, "unexpected positional arguments")
 		return 2
+	}
+
+	created, err := config.CreateStarter(opts.configPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "configuration setup error: %v\n", err)
+		return 1
+	}
+	if created {
+		absolutePath, pathErr := filepath.Abs(opts.configPath)
+		if pathErr != nil {
+			absolutePath = opts.configPath
+		}
+		fmt.Fprintf(stdout, "Created starter configuration: %s\n", absolutePath)
+		fmt.Fprintln(stdout, "Edit qwen_api_key, save the file, then run boompi-server again.")
+		return 0
 	}
 
 	cfg, err := config.Load(opts.configPath, opts.overrides)
@@ -73,7 +90,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "logging configuration error: %v\n", err)
 		return 1
 	}
-	application, err := app.New(cfg, logger)
+	absoluteConfigPath, err := filepath.Abs(opts.configPath)
+	if err != nil {
+		logger.Error("resolve configuration path", "error", err)
+		return 1
+	}
+	identityDirectory := filepath.Join(filepath.Dir(absoluteConfigPath), "state")
+	application, err := app.New(cfg, logger, identityDirectory)
 	if err != nil {
 		logger.Error("application initialization failed", "error", err)
 		return 1

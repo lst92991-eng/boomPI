@@ -5,8 +5,6 @@ import (
 	"net"
 )
 
-const ProtocolVersion = 1
-
 type Config struct {
 	BindAddress string
 	UDPPort     int
@@ -24,11 +22,4 @@ func (c Config) Validate() error {
 		return errors.New("discovery UDP and WSS ports must differ")
 	}
 	return nil
-}
-
-type Advertisement struct {
-	Version      int      `json:"version"`
-	ServerID     string   `json:"server_id"`
-	WSSPort      int      `json:"wss_port"`
-	Capabilities []string `json:"capabilities"`
 }

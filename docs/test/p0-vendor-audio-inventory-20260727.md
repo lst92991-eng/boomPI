@@ -12,12 +12,17 @@
 > 同轮 schema v2 板端只读探针仅确认一个 capture PCM、一个 playback PCM、Rockit、AI/AO
 > test 与直接 3A 库存在，且 VQE JSON 缺失；没有打开 PCM 或执行 vendor。板端时钟错误地
 > 停留在 2021 年，故以 host 时间为准。随后物理链路断开，未进行 HIL。
+>
+> 2026-07-28 后续：direct ALSA 已在当前旧 `RV1106-Atguigu` 镜像完成 48 kHz/S16_LE/2ch
+> transport 真全双工；该结果没有关闭目标自定义 BSP、物理通道/reference、raw MPI 或 3A。
+> 见[真板验证记录](p0-alsa-full-duplex-validation-20260728.md)。
 
 ## 结论
 
 匹配 BSP 已提供完成最小音频闭环所需的三类候选入口：Rockit
-`rk_mpi_ai`/`rk_mpi_ao`、直接 ALSA PCM、Rockchip VQE/`libaec_bf_process.so`。当前证据足够
-开始制作板端探针，但不够宣称 48 kHz 全双工、四通道回采或 AEC 已经可用。
+`rk_mpi_ai`/`rk_mpi_ao`、直接 ALSA PCM、Rockchip VQE/`libaec_bf_process.so`。截至
+2026-07-27 的原始盘点，证据足够开始制作板端探针，但不够宣称 48 kHz 全双工、四通道
+回采或 AEC 已经可用；上方 2026-07-28 follow-up 只补充关闭 direct ALSA transport。
 
 20:27 的原始盘点只读取 SDK、已装配 rootfs/OEM、DTB、头文件、样例和 ELF，没有连接
 开发板。21:12 的后续只读探针连接了当前板/镜像，但仍没有打开 PCM、修改 mixer、录音、
@@ -27,7 +32,7 @@
 | 项目 | 当前结论 | 不能外推的事项 |
 | --- | --- | --- |
 | Rockit raw AI/AO | API、样例、目标库和预构建测试程序齐全 | 真实 card、参数协商、全双工、MB 总长度与 packing |
-| 直接 ALSA | 驱动和 codec 声明支持同率收发候选 | 当前板 48 kHz 无 xrun、period/buffer、真实通道布局 |
+| 直接 ALSA | 2026-07-28 当前旧镜像的 48 kHz/2ch transport 全双工通过 | 目标 BSP、物理通道、reference 和声学质量 |
 | DTB `TRCM clk-trcm=1` | TX/RX 共享 TX LRCK/BCLK | 不表示四通道，也不表示存在 DAC reference slot |
 | AI VQE 样例 loopback Mode2 | vendor test 启用 VQE 时会设置该 mixer 控件 | 不表示本板为双麦+reference，也不是 DTB 的 TRCM 设置 |
 | Rockchip 3A | ARM/uClibc ABI、固定帧、input/output 长度已核对 | 物理 packing/slot、错误恢复、声学参数和实时率仍需 HIL |
@@ -85,7 +90,9 @@ CMake link-check 使用 `media/out/lib/librockit.so` 的同哈希副本，并显
 
 当前 OEM 已装配 `librockit.so` 及依赖，并包含 `rk_mpi_ai_test`、`rk_mpi_ao_test` 和
 stress sample。raw AI/AO 不要求 VQE JSON，但需要驱动、设备节点和板级 mixer 初始化。
-当前 rootfs 的 `S60micinit` 会设置 `DiffadcLR`、MICBIAS、左右 MIC Work、gain/ALC；这些
+当时 BSP 工作区的目标 rootfs overlay `S60micinit` 会设置 `DiffadcLR`、MICBIAS、左右 MIC
+Work、gain/ALC；2026-07-28 真板复核发现当前实际烧录镜像仍是 `RV1106-Atguigu`，其
+`S60micinit` 设置 `SingadcL`。因此工作区 overlay 不能冒充板端启动事实。这些
 是本板前置条件，不是通用 Rockit API 默认行为。
 
 官方 test 构建还使用 pthread 和 test-only helper；产品 CMake 应以 imported
@@ -94,7 +101,7 @@ stress sample。raw AI/AO 不要求 VQE JSON，但需要驱动、设备节点和
 
 ## ALSA、Codec 与两个“Mode”
 
-当前定制 DTB 的 `acodec`、`i2s0_8ch` 和 simple-audio-card 均为 enabled，I2S
+BSP 工作区候选定制 DTB 的 `acodec`、`i2s0_8ch` 和 simple-audio-card 均为 enabled，I2S
 `mclk-fs=256`，`rockchip,clk-trcm=<1>`。Rockchip binding 将这个值定义为收发共用 TX
 LRCK/BCLK；驱动在 TRCM 下对 TX/RX 共启停，并要求 symmetric rates。Codec/DAI 的声明
 范围覆盖 48 kHz 和 capture 1..4ch，因此它们只是全双工候选。

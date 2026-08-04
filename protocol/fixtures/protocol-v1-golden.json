@@ -2,8 +2,8 @@
   "fixture_version": 1,
   "control_frames": [
     {
-      "name": "hello",
-      "wire_text": "{\"version\":1,\"type\":\"hello\",\"message_id\":\"msg-0001\",\"device_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"session_id\":0,\"turn_id\":0,\"stream_id\":0,\"epoch\":1,\"payload\":{\"client_version\":\"0.0.0-test\",\"capabilities\":[\"audio.pcm_s16le\",\"turn.manual\",\"playback.progress\"]}}",
+      "name": "hello_with_public_test_token",
+      "wire_text": "{\"version\":1,\"type\":\"hello\",\"message_id\":\"msg-0001\",\"device_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"session_id\":0,\"turn_id\":0,\"stream_id\":0,\"epoch\":0,\"payload\":{\"device_token\":\"0123456789abcdef0123456789abcdef\"}}",
       "expected": {
         "version": 1,
         "type": "hello",
@@ -12,14 +12,9 @@
         "session_id": 0,
         "turn_id": 0,
         "stream_id": 0,
-        "epoch": 1,
+        "epoch": 0,
         "payload": {
-          "client_version": "0.0.0-test",
-          "capabilities": [
-            "audio.pcm_s16le",
-            "turn.manual",
-            "playback.progress"
-          ]
+          "device_token": "0123456789abcdef0123456789abcdef"
         }
       }
     }

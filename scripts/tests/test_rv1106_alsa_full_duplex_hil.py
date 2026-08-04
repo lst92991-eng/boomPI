@@ -63,15 +63,21 @@ class FakeHilEnvironment:
     """A fake command environment that never opens a real ALSA device."""
 
     def __init__(self, base: Path):
-        self.base = base
-        self.bin_dir = base / "fake-bin"
-        self.state_dir = base / "fake-state"
+        # macOS exposes its temporary directory through /var, which is itself
+        # a symlink to /private/var.  The target script deliberately rejects
+        # artifact paths that traverse symlinks, so feed it the canonical test
+        # fixture path instead of weakening that production safety check.
+        self.base = base.resolve(strict=True)
+        self.bin_dir = self.base / "fake-bin"
+        self.state_dir = self.base / "fake-state"
+        self.proc_dir = self.base / "fake-proc"
         self.call_log = self.state_dir / "calls.log"
         self.mixer_state = self.state_dir / "mixer-state"
         self.uptime_file = self.state_dir / "uptime"
         self.uptime_ms = self.state_dir / "uptime-ms"
         self.bin_dir.mkdir(parents=True)
         self.state_dir.mkdir(parents=True)
+        self.proc_dir.mkdir(parents=True)
         self.call_log.write_text("", encoding="utf-8")
         self.mixer_state.write_text("2\n", encoding="utf-8")
         self.uptime_file.write_text("1000.00 0.00\n", encoding="utf-8")
@@ -82,6 +88,12 @@ class FakeHilEnvironment:
             raise AssertionError("expected exactly one production uptime read")
         script_text = script_text.replace(
             uptime_read, '<"$BOOMPI_HIL_TEST_UPTIME"'
+        )
+        proc_prefix = "/proc/"
+        if script_text.count(proc_prefix) != 3:
+            raise AssertionError("expected exactly three production proc paths")
+        script_text = script_text.replace(
+            proc_prefix, "${BOOMPI_HIL_TEST_PROC}/"
         )
         self.script_under_test = write_text(
             self.base, "rv1106_alsa_full_duplex-under-test.sh", script_text
@@ -95,6 +107,18 @@ class FakeHilEnvironment:
         log_call = (
             "printf '%s|%s\\n' \"$1\" \"$2\" "
             '>> \"$BOOMPI_HIL_TEST_CALL_LOG\"\n'
+        )
+
+        write_command(
+            self.bin_dir,
+            "wc",
+            "set -u\n"
+            + 'output=$(/usr/bin/wc "$@")\n'
+            + 'if [ "${WC_PAD_OUTPUT:-0}" = 1 ]; then\n'
+            + "  printf '   %s  \\n' \"$output\"\n"
+            + "else\n"
+            + "  printf '%s\\n' \"$output\"\n"
+            + "fi\n",
         )
 
         write_command(
@@ -165,6 +189,12 @@ class FakeHilEnvironment:
             + "esac\n"
             + 'printf \'%s\\n\' "$$" > '
             + '"$BOOMPI_HIL_TEST_STATE_DIR/arecord-pid"\n'
+            + 'proc_dir="$BOOMPI_HIL_TEST_PROC/$$"\n'
+            + 'mkdir -p "$proc_dir/fd"\n'
+            + ': > "$proc_dir/fd/3"\n'
+            + 'printf \'%s\\n\' "$$ (fake) S 0" > "$proc_dir/stat"\n'
+            + "mark_reapable() { printf '%s\\n' \"$$ (fake) Z 0\" > \"$proc_dir/stat\"; }\n"
+            + "trap mark_reapable EXIT\n"
             + "output=\n"
             + "consume_next=0\n"
             + "for argument do\n"
@@ -215,6 +245,12 @@ class FakeHilEnvironment:
             + "esac\n"
             + 'printf \'%s\\n\' "$$" > '
             + '"$BOOMPI_HIL_TEST_STATE_DIR/aplay-pid"\n'
+            + 'proc_dir="$BOOMPI_HIL_TEST_PROC/$$"\n'
+            + 'mkdir -p "$proc_dir/fd"\n'
+            + ': > "$proc_dir/fd/3"\n'
+            + 'printf \'%s\\n\' "$$ (fake) S 0" > "$proc_dir/stat"\n'
+            + "mark_reapable() { printf '%s\\n' \"$$ (fake) Z 0\" > \"$proc_dir/stat\"; }\n"
+            + "trap mark_reapable EXIT\n"
             + "input=\n"
             + "for argument do input=$argument; done\n"
             + 'if [ -f "$input" ]; then\n'
@@ -317,8 +353,8 @@ class FakeHilEnvironment:
             + "for argument do last=$argument; done\n"
             + 'case "$last" in\n'
             + '  /dev/snd/pcmC*|/dev/snd/controlC*) printf \'%s\\n\' "$last" ;;\n'
-            + "  /proc/[0-9]*/fd/*)\n"
-            + '    pid=${last#/proc/}\n'
+            + '  "$BOOMPI_HIL_TEST_PROC"/[0-9]*/fd/*)\n'
+            + '    pid=${last#"$BOOMPI_HIL_TEST_PROC"/}\n'
             + '    pid=${pid%%/*}\n'
             + '    capture_pid="$(sed -n \'1p\' '
             + '"$BOOMPI_HIL_TEST_STATE_DIR/arecord-pid" 2>/dev/null || true)"\n'
@@ -342,6 +378,7 @@ class FakeHilEnvironment:
             {
                 "BOOMPI_HIL_TEST_CALL_LOG": str(self.call_log),
                 "BOOMPI_HIL_TEST_STATE_DIR": str(self.state_dir),
+                "BOOMPI_HIL_TEST_PROC": str(self.proc_dir),
                 "BOOMPI_HIL_TEST_UPTIME": str(self.uptime_file),
                 "LC_ALL": "C",
                 "PATH": os.pathsep.join((str(self.bin_dir), environment["PATH"])),
@@ -690,6 +727,31 @@ class Rv1106AlsaFullDuplexHilTest(unittest.TestCase):
             self.assertEqual(capture_file.stat().st_mode & 0o077, 0)
 
             self.assertGreaterEqual(len(fixture.calls("dmesg")), 2)
+
+    def test_bsd_wc_padding_is_accepted(self):
+        with tempfile.TemporaryDirectory(prefix="boompi-hil-bsd-wc-") as temporary:
+            fixture = FakeHilEnvironment(Path(temporary))
+            artifact_dir = fixture.base / "new-artifacts"
+
+            completed = fixture.run(
+                *fixture.base_arguments(artifact_dir),
+                *EXECUTION_OPT_INS,
+                WC_PAD_OUTPUT="1",
+            )
+
+            result_text = (artifact_dir / "result.json").read_text(
+                encoding="utf-8"
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"{completed.stderr}\n{completed.stdout}\n{result_text}",
+            )
+            result = json.loads(result_text)
+            self.assertEqual(result["playback"]["silence_bytes"], PLAYBACK_BYTES)
+            self.assertEqual(result["capture"]["actual_bytes"], CAPTURE_BYTES)
+            self.assertEqual(result["overall"], "pass")
+            self.assertEqual(fixture.mixer_value(), "2")
 
     def test_playback_failure_still_restores_mixer(self):
         with tempfile.TemporaryDirectory(prefix="boompi-hil-play-fail-") as temporary:

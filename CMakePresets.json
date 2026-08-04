@@ -11,6 +11,7 @@
       "hidden": true,
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
+        "BOOMPI_BUILD_UI_SIMULATOR": "OFF",
         "BOOMPI_BUILD_TESTS": "ON",
         "BOOMPI_STRICT_WARNINGS": "ON",
         "BOOMPI_TARGET_RV1106": "OFF",
@@ -44,17 +45,36 @@
       }
     },
     {
-      "name": "rv1106-debug",
+      "name": "rv1106-candidate",
+      "displayName": "RV1106 teaching candidate (Debug + O2)",
+      "description": "Complete board voice client; private dependency paths come from BOOMPI_* environment variables or CMakeUserPresets.json.",
       "inherits": "rv1106-base",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug"
-      }
-    },
-    {
-      "name": "rv1106-release",
-      "inherits": "rv1106-base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "BOOMPI_ALLOW_FEASIBILITY_AUDIO_VENDOR_INPUTS": "ON",
+        "BOOMPI_BOOST_INCLUDE_DIR": "$env{BOOMPI_BOOST_INCLUDE_DIR}",
+        "BOOMPI_ENABLE_ALSA_PLAYBACK": "ON",
+        "BOOMPI_ENABLE_ROCKCHIP_3A": "ON",
+        "BOOMPI_ENABLE_SNOWBOY": "ON",
+        "BOOMPI_ENABLE_WEBRTC_VAD": "ON",
+        "BOOMPI_ENABLE_WSS_CLIENT": "ON",
+        "BOOMPI_LVGL_ROOT": "$env{BOOMPI_LVGL_ROOT}",
+        "BOOMPI_OPENBLAS_LIBRARY": "$env{BOOMPI_OPENBLAS_LIBRARY}",
+        "BOOMPI_OPENSSL_ROOT": "$env{BOOMPI_OPENSSL_ROOT}",
+        "BOOMPI_ROCKCHIP_3A_AEC_LIBRARY": "$env{BOOMPI_ROCKCHIP_3A_AEC_LIBRARY}",
+        "BOOMPI_ROCKCHIP_3A_COMMON_LIBRARY": "$env{BOOMPI_ROCKCHIP_3A_COMMON_LIBRARY}",
+        "BOOMPI_ROCKCHIP_3A_CONFIG_FILE": "$env{BOOMPI_ROCKCHIP_3A_CONFIG_FILE}",
+        "BOOMPI_ROCKCHIP_3A_DETECT_LIBRARY": "$env{BOOMPI_ROCKCHIP_3A_DETECT_LIBRARY}",
+        "BOOMPI_ROCKCHIP_3A_INCLUDE_DIR": "$env{BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}",
+        "BOOMPI_SNOWBOY_INCLUDE_DIR": "$env{BOOMPI_SNOWBOY_INCLUDE_DIR}",
+        "BOOMPI_SNOWBOY_LIBRARY": "$env{BOOMPI_SNOWBOY_LIBRARY}",
+        "BOOMPI_SNOWBOY_MODEL_FILE": "$env{BOOMPI_SNOWBOY_MODEL_FILE}",
+        "BOOMPI_SNOWBOY_RESOURCE_FILE": "$env{BOOMPI_SNOWBOY_RESOURCE_FILE}",
+        "BOOMPI_WEBRTC_VAD_INCLUDE_DIR": "$env{BOOMPI_WEBRTC_VAD_INCLUDE_DIR}",
+        "BOOMPI_WEBRTC_VAD_LIBRARY": "$env{BOOMPI_WEBRTC_VAD_LIBRARY}",
+        "BOOMPI_STRICT_WARNINGS": "ON",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS_DEBUG": "-O2 -g",
+        "CMAKE_CXX_FLAGS_DEBUG": "-O2 -g"
       }
     }
   ],
@@ -70,14 +90,9 @@
       "configuration": "Release"
     },
     {
-      "name": "rv1106-debug",
-      "configurePreset": "rv1106-debug",
+      "name": "rv1106-candidate",
+      "configurePreset": "rv1106-candidate",
       "configuration": "Debug"
-    },
-    {
-      "name": "rv1106-release",
-      "configurePreset": "rv1106-release",
-      "configuration": "Release"
     }
   ],
   "testPresets": [

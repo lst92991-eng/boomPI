@@ -1,0 +1,45 @@
+#!/bin/sh
+# 开启临时热点；手机提交 Wi-Fi 后立即退出热点并启动语音客户端。
+
+set -e
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+AP_CONF=/run/boompi-hostapd.conf
+HOSTAPD_PID=/run/boompi-hostapd.pid
+DNSMASQ_PID=/run/boompi-dnsmasq.pid
+PORTAL_PID=/run/boompi-portal.pid
+
+cleanup() {
+  [ ! -r "$PORTAL_PID" ] || kill "$(cat "$PORTAL_PID")" 2>/dev/null || true
+  [ ! -r "$DNSMASQ_PID" ] || kill "$(cat "$DNSMASQ_PID")" 2>/dev/null || true
+  [ ! -r "$HOSTAPD_PID" ] || kill "$(cat "$HOSTAPD_PID")" 2>/dev/null || true
+  rm -f "$AP_CONF" "$HOSTAPD_PID" "$DNSMASQ_PID" "$PORTAL_PID"
+  ifconfig wlan0 0.0.0.0 down 2>/dev/null || true
+  ifconfig wlan0 up 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM
+
+killall wpa_supplicant 2>/dev/null || true
+mkdir -p /run
+cat > "$AP_CONF" <<'EOF'
+interface=wlan0
+driver=nl80211
+ssid=boomPI-Setup
+hw_mode=g
+channel=6
+wpa=2
+wpa_passphrase=boompi-setup
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+EOF
+
+ifconfig wlan0 192.168.4.1 netmask 255.255.255.0 up
+hostapd -B -P "$HOSTAPD_PID" "$AP_CONF"
+dnsmasq --keep-in-foreground --interface=wlan0 --bind-interfaces \
+  --pid-file="$DNSMASQ_PID" --dhcp-range=192.168.4.20,192.168.4.80,255.255.255.0,10m \
+  --address=/#/192.168.4.1 >/dev/null 2>&1 &
+sleep 1
+kill -0 "$(cat "$DNSMASQ_PID")" 2>/dev/null
+python3 /usr/lib/boompi/boompi-provision.py &
+echo $! > "$PORTAL_PID"
+wait "$(cat "$PORTAL_PID")"

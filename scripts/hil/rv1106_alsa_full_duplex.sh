@@ -408,7 +408,8 @@ if ! dd if=/dev/zero of="$ARTIFACT_DIR/playback-silence.raw" \
     printf '%s\n' "rv1106_alsa_full_duplex: could not create bounded silence input" >&2
     exit 4
 fi
-silence_bytes=$(wc -c <"$ARTIFACT_DIR/playback-silence.raw")
+silence_bytes=$(wc -c <"$ARTIFACT_DIR/playback-silence.raw" |
+    sed 's/[[:space:]]//g')
 case "$silence_bytes" in *[!0-9]*|'') silence_bytes=0 ;; esac
 if [ "$silence_bytes" -ne "$PLAYBACK_BYTES" ]; then
     printf '%s\n' "rv1106_alsa_full_duplex: silence input has an unexpected size" >&2
@@ -582,8 +583,10 @@ fi
 if [ "$DMESG_DELTA_WRITABLE" = true ] &&
         [ "$DMESG_BEFORE_AVAILABLE" = true ] &&
         [ "$DMESG_AFTER_AVAILABLE" = true ] &&
-        before_lines=$(wc -l <"$ARTIFACT_DIR/dmesg-before.txt") &&
-        after_lines=$(wc -l <"$ARTIFACT_DIR/dmesg-after.txt"); then
+        before_lines=$(wc -l <"$ARTIFACT_DIR/dmesg-before.txt" |
+            sed 's/[[:space:]]//g') &&
+        after_lines=$(wc -l <"$ARTIFACT_DIR/dmesg-after.txt" |
+            sed 's/[[:space:]]//g'); then
     case "$before_lines:$after_lines" in
         *[!0-9:]*|:*) ;;
         *)
@@ -622,7 +625,8 @@ fi
 
 capture_actual_bytes=0
 if [ -f "$ARTIFACT_DIR/capture.raw" ]; then
-    capture_actual_bytes=$(wc -c <"$ARTIFACT_DIR/capture.raw")
+    capture_actual_bytes=$(wc -c <"$ARTIFACT_DIR/capture.raw" |
+        sed 's/[[:space:]]//g')
     case "$capture_actual_bytes" in *[!0-9]*|'') capture_actual_bytes=0 ;; esac
 fi
 
