@@ -146,6 +146,27 @@ class ClientSourceContractTest(unittest.TestCase):
             for anchor in anchors:
                 self.assertIn(anchor, source, f"{name}: missing structure anchor {anchor!r}")
 
+    def test_no_client_source_escapes_the_counted_roots(self) -> None:
+        # 把生产 C/C++ 挪到三个扫描根之外不得静默逃逸 ELOC 统计。
+        # 豁免三类 AGENTS.md 口径外的既有文件：桌面预览工具（不占预算）、
+        # 图像资产与 LVGL 构建配置（非逻辑代码）、板端 HIL/link 验证程序
+        # （不进 boompi-client，由 ctest/板端单独运行）。
+        suffixes = {".c", ".cc", ".cpp", ".h", ".hpp"}
+        exempt_prefixes = (
+            "client/apps/boompi_ui_simulator/",
+            "client/assets/",
+            "client/cmake/",
+            "client/tests/",
+        )
+        declared = PRODUCTION_FILES | UI_LAYER_FILES
+        for path in (ROOT / "client").rglob("*"):
+            if not path.is_file() or path.suffix not in suffixes:
+                continue
+            relative = path.relative_to(ROOT).as_posix()
+            if relative in declared or relative.startswith(exempt_prefixes):
+                continue
+            self.fail(f"uncounted client source escapes the contract: {relative}")
+
     def test_current_documents_have_no_broken_local_links(self) -> None:
         link_pattern = re.compile(r"\[[^]]*]\(([^)]+)\)")
         for name in CURRENT_DOCUMENTS:

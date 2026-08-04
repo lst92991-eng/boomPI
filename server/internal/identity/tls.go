@@ -49,7 +49,17 @@ func LoadOrCreate(directory string) (ServerIdentity, error) {
 		return ServerIdentity{}, fmt.Errorf("inspect server private key: %w", err)
 	}
 	if certificateExists != privateKeyExists {
-		return ServerIdentity{}, errors.New("server certificate and private key must exist together")
+		if certificateExists {
+			// A certificate without its key cannot sign anything; fail closed so
+			// the operator notices instead of silently minting a new identity.
+			return ServerIdentity{}, errors.New("server certificate exists without its private key")
+		}
+		// Orphaned private key from an interrupted first-start: without the
+		// certificate no device can hold a matching SPKI pin, so it is safe
+		// to remove it and regenerate instead of refusing to boot forever.
+		if err := os.Remove(privateKeyPath); err != nil {
+			return ServerIdentity{}, fmt.Errorf("remove orphaned server private key: %w", err)
+		}
 	}
 	if !certificateExists {
 		if err := createIdentity(certificatePath, privateKeyPath); err != nil {
