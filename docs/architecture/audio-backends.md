@@ -35,7 +35,9 @@ direct ALSA Mode1: 48 kHz / S16_LE / 4 capture channels
 私有 `AudioBackend` 先临时设置并回读 Mode1，再重新打开 capture/playback 两个 blocking handle，
 精确协商 48 kHz、S16_LE；capture 为 4 ch、960-frame period、1920-frame buffer，playback
 为 2 ch、960-frame period、3840-frame buffer。控制/采集线程读取完整 20 ms 帧；独立播放
-线程从固定 1.5 s 队列消费 TTS。不存在 capture pump 或中间采集队列。
+线程从固定 1.5 s 队列消费 TTS。独立 capture/DSP 线程持续排空 ALSA，并通过固定
+`4 × 20 ms` capture actor queue 提交处理完成的帧；队列溢出时丢弃陈旧帧并显式标记
+discontinuity，不静默拼接时间轴。
 
 - capture xrun 恢复后显式报告 discontinuity，并重置 DSP、Snowboy 和 VAD 历史。
 - playback 在固定 scratch 中转换为双声道并处理 partial write；可恢复 xrun 重新提交当前块，

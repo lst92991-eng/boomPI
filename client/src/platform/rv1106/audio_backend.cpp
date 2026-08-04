@@ -12,7 +12,6 @@ extern "C" {
 #include <array>
 #include <atomic>
 #include <cerrno>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -187,16 +186,15 @@ struct AudioBackend::Impl final {
   VoiceFrame16k mic_left{}, mic_right{}, reference_left{}, reference_right{}, processed{};
   std::uint32_t vad_speech_ms{0U}, vad_silence_ms{0U};
   unsigned aec_warmup_remaining{0U}, aec_tail_remaining{0U};
+  unsigned reference_wait_frames{0U};
+  float delayed_input_dbfs{-120.0F};
   bool open{false}, vad_in_speech{false};
   bool playback_session_active{false}, aec_warmup_armed{false};
+  bool delayed_reference_active{false};
+  std::atomic<bool> capture_interrupted{false};
+  std::atomic<bool> playback_render_started{false};
   std::atomic<bool> playback_interrupted{false};
   std::atomic<bool> playback_ended{false};
-  /// alsa-lib 的 PCM 句柄不是线程安全的：采集线程的 prepare、播放线程的
-  /// writei、actor 的 drop 必须经 pcm_mutex 串行。WritePlayback 会持锁阻塞至多
-  /// 一个缓冲时长，因此中断侧先置 playback_interrupted 再取锁。
-  std::mutex pcm_mutex{};
-  std::atomic<std::uint32_t> xruns_capture{0U}, xruns_playback{0U};
-  std::atomic<long long> xrun_log_ms{0LL};
 
   void SetError(const char* text, int code = 0) noexcept {
     std::lock_guard<std::mutex> lock(error_mutex);
@@ -222,15 +220,9 @@ struct AudioBackend::Impl final {
     capture48.fill(0);
     if (!ResetSwr(capture_swr, capture48.data(), kCapture48Frames,
                   kVoiceFrameSamples16k, capture16.data())) return false;
+    delayed_input_dbfs = -120.0F;
+    delayed_reference_active = false;
     dsp.Close(); return dsp.Open() && ResetListener();
-  }
-  /// 成功恢复的 xrun 计数不丢；日志限速每秒一条，避免持续欠载时刷屏。
-  void NoteXrun(std::atomic<std::uint32_t>& counter, const char* name) noexcept {
-    const unsigned total = counter.fetch_add(1U, std::memory_order_relaxed) + 1U;
-    const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    long long last = xrun_log_ms.load(std::memory_order_relaxed);
-    if (now >= last + 1000 && xrun_log_ms.compare_exchange_strong(last, now))
-      std::fprintf(stderr, "boompi-client: ALSA %s xrun recovered (total %u)\n", name, total);
   }
   bool WritePlayback(const std::int16_t* mono, std::size_t frames) noexcept {
     // TTS 是 mono；复制到 L/R，Mode1 同步回采两个数字参考。
@@ -238,7 +230,6 @@ struct AudioBackend::Impl final {
       playback_stereo[2U * i] = mono[i]; playback_stereo[2U * i + 1U] = mono[i];
     }
     std::size_t offset = 0U;
-    std::lock_guard<std::mutex> pcm_lock(pcm_mutex);
     while (offset < frames) {
       if (playback_interrupted.load(std::memory_order_acquire)) return false;
       const snd_pcm_sframes_t rc = snd_pcm_writei(playback_pcm,
@@ -247,24 +238,26 @@ struct AudioBackend::Impl final {
       if (playback_interrupted.load(std::memory_order_acquire)) return false;
       if (rc == -EINTR) continue;
       if (rc == -EPIPE || rc == -ESTRPIPE) {
-        NoteXrun(xruns_playback, "playback");
         const int recovered = snd_pcm_recover(playback_pcm, static_cast<int>(rc), 1);
         if (recovered < 0) { SetError("ALSA playback recovery", recovered); return false; }
-        /// underrun 未提交本次数据，且已写部分已被放完：保持 offset 续写，
-        /// 重置为 0 会把最多 40 ms 已播音频重复一遍。
+        // snd_pcm_writei 已接受的前缀已经进入同一条媒体时间线。恢复后只续写剩余
+        // 样本；从零重写会在一次 20 ms 帧内制造可听见的重复前缀。
+        std::fprintf(stderr,
+                     "boompi-client: ALSA playback xrun recovered; error=%s; "
+                     "accepted_frames=%zu\n",
+                     snd_strerror(static_cast<int>(rc)), offset);
         continue;
       }
       SetError("ALSA playback write", static_cast<int>(rc)); return false;
     }
     return true;
   }
-  bool UpdateVad(CaptureFrame* frame) noexcept {
+  bool UpdateVad(CaptureFrame* frame, float input_dbfs) noexcept {
     const int speech = WebRtcVad_Process(vad, 16000, processed.data(), processed.size());
     if (speech < 0) return false;
     // WebRTC determines whether the spectrum resembles speech.  The raw-mic
     // dBFS gate is evaluated before Rockchip AGC, so distant speech and room
     // noise cannot become a trigger merely because AGC amplified them.
-    const float input_dbfs = std::max(AcRmsDbfs(mic_left), AcRmsDbfs(mic_right));
     frame->input_dbfs = input_dbfs;
     const bool webrtc_voice = speech == 1;
     // The dBFS threshold is only an admission gate.  Once an utterance has
@@ -273,13 +266,22 @@ struct AudioBackend::Impl final {
     frame->vad_now = vad_in_speech
                          ? webrtc_voice
                          : webrtc_voice && input_dbfs >= config.vad_min_dbfs;
-    if (frame->vad_now) { vad_speech_ms = std::min(vad_speech_ms + kFrameMs, kVadStartMs); vad_silence_ms = 0U; }
-    else { vad_silence_ms = std::min(vad_silence_ms + kFrameMs, kVadEndMs); vad_speech_ms = 0U; }
+    if (frame->vad_now) {
+      vad_speech_ms = std::min(vad_speech_ms + kFrameMs, kVadStartMs);
+      vad_silence_ms = 0U;
+    }
+    else {
+      vad_silence_ms = std::min(vad_silence_ms + kFrameMs, kVadEndMs);
+      vad_speech_ms = 0U;
+    }
     if (!vad_in_speech && vad_speech_ms >= kVadStartMs) {
       vad_in_speech = true;
       frame->vad_started = true;
     }
-    else if (vad_in_speech && vad_silence_ms >= kVadEndMs) { vad_in_speech = false; frame->vad_ended = true; }
+    else if (vad_in_speech && vad_silence_ms >= kVadEndMs) {
+      vad_in_speech = false;
+      frame->vad_ended = true;
+    }
     return true;
   }
 
@@ -296,9 +298,15 @@ struct AudioBackend::Impl final {
       else { aec_tail_remaining = kAecTailFrames; suppress = true; }
     } else if (aec_warmup_armed) {
       suppress = true;
-      if (ReferenceActive(reference_left) || ReferenceActive(reference_right)) {
+      if (!playback_render_started.load(std::memory_order_acquire)) {
+        reference_wait_frames = 0U;
+      } else if (frame->reference_active) {
         aec_warmup_armed = false;
         aec_warmup_remaining = kAecWarmupFrames;
+        reference_wait_frames = 0U;
+      } else if (++reference_wait_frames == 50U) {
+        std::fprintf(stderr,
+                     "boompi-client: warning: AEC reference absent for 1000 ms of playback\n");
       }
     }
     if (aec_warmup_remaining != 0U) {
@@ -358,6 +366,7 @@ bool AudioBackend::Open(const AudioEngineConfig& config) noexcept {
     Close(); impl_->SetError("WebRTC VAD or voice front end initialization failed"); return false;
   }
   impl_->open = true;
+  impl_->capture_interrupted.store(false, std::memory_order_release);
   std::fprintf(stderr,
                "boompi-client: VAD configured; mode=%d; min_dbfs=%.1f; source=raw-mic-max\n",
                kVadMode, static_cast<double>(config.vad_min_dbfs));
@@ -371,12 +380,16 @@ bool AudioBackend::ReadCapture20ms(bool* const discontinuity) noexcept {
     const snd_pcm_sframes_t rc = snd_pcm_readi(impl_->capture_pcm,
         impl_->capture48.data() + kCaptureChannels * offset, kCapture48Frames - offset);
     if (rc > 0) { offset += static_cast<std::size_t>(rc); continue; }
+    if (impl_->capture_interrupted.load(std::memory_order_acquire)) return false;
     if (rc == -EINTR) continue;
     if (rc == -EPIPE || rc == -ESTRPIPE) {
-      impl_->NoteXrun(impl_->xruns_capture, "capture");
       const int recovered = snd_pcm_recover(impl_->capture_pcm, static_cast<int>(rc), 1);
       if (recovered < 0) { impl_->SetError("ALSA capture recovery", recovered); return false; }
-      offset = 0U; *discontinuity = true; continue;
+      std::fprintf(stderr, "boompi-client: ALSA capture discontinuity recovered; error=%s\n",
+                   snd_strerror(static_cast<int>(rc)));
+      offset = 0U;
+      *discontinuity = true;
+      continue;
     }
     impl_->SetError("ALSA capture read", static_cast<int>(rc)); return false;
   }
@@ -413,11 +426,16 @@ bool AudioBackend::ProcessCapture20ms(bool discontinuity, CaptureFrame* const fr
   if (converted != static_cast<int>(kVoiceFrameSamples16k)) { impl_->SetError("capture resampler lost frame alignment"); return false; }
   for (std::size_t i = 0U; i < kVoiceFrameSamples16k; ++i) {
     const std::size_t base = kCaptureChannels * i;
-    impl_->mic_left[i] = impl_->capture16[base]; impl_->mic_right[i] = impl_->capture16[base + 1U];
-    impl_->reference_left[i] = impl_->capture16[base + 2U]; impl_->reference_right[i] = impl_->capture16[base + 3U];
+    impl_->mic_left[i] = impl_->capture16[base];
+    impl_->mic_right[i] = impl_->capture16[base + 1U];
+    impl_->reference_left[i] = impl_->capture16[base + 2U];
+    impl_->reference_right[i] = impl_->capture16[base + 3U];
   }
-  frame->reference_active = ReferenceActive(impl_->reference_left) ||
-      ReferenceActive(impl_->reference_right);
+  // 生产 AEC 固定为双麦单参考。Mode1 仍保留 REF-R 原始/HIL 数据，
+  // 但打断门控必须和送入 Rockchip 3A 的 REF-L 使用同一证据。
+  const bool current_reference_active = ReferenceActive(impl_->reference_left);
+  const float current_input_dbfs = std::max(
+      AcRmsDbfs(impl_->mic_left), AcRmsDbfs(impl_->mic_right));
 #ifdef BOOMPI_AEC_LOOP_DIAGNOSTICS
   frame->aec_input[0] = impl_->mic_left;
   frame->aec_input[1] = impl_->mic_right;
@@ -427,18 +445,34 @@ bool AudioBackend::ProcessCapture20ms(bool discontinuity, CaptureFrame* const fr
   // 每个 sample 只进入这一条 Rockchip 3A 路径；STDT 在 vendor 内部保护双讲。
   if (!impl_->dsp.Process(impl_->mic_left, impl_->mic_right, impl_->reference_left,
                           impl_->reference_right, &impl_->processed)) {
-    impl_->SetError("Rockchip 3A rejected a frame"); return false;
+    impl_->SetError("Rockchip 3A rejected a frame");
+    return false;
   }
+  // 打断门限必须观察 AEC 后语音，不能使用必然包含扬声器声场的 raw mic dBFS。
+  frame->voice_dbfs = AcRmsDbfs(impl_->processed);
+  // vendor FIFO 的 mono 输出固定落后一帧；判定元数据必须取同一输入 period，
+  // 不能把上一帧的 VAD 结果和当前帧的 dBFS/reference 拼在一起。
+  frame->reference_active = impl_->delayed_reference_active;
+  impl_->delayed_reference_active = current_reference_active;
   std::int32_t detection = 0;
   if (!boompi_snowboy_legacy_process_s16(impl_->snowboy, impl_->processed.data(),
                                          impl_->processed.size(), &detection)) {
-    impl_->SetError("Snowboy processing failed"); return false;
+    impl_->SetError("Snowboy processing failed");
+    return false;
   }
   frame->wake = detection > 0;
-  if (!impl_->UpdateVad(frame)) { impl_->SetError("WebRTC VAD processing failed"); return false; }
+  if (!impl_->UpdateVad(frame, impl_->delayed_input_dbfs)) {
+    impl_->SetError("WebRTC VAD processing failed");
+    return false;
+  }
+  impl_->delayed_input_dbfs = current_input_dbfs;
   // librkaudio 不公开 DTD 结果；近讲事件只能来自 AEC/STDT 后的真实输出。
-  if (!impl_->UpdateNearVoice(frame)) { impl_->SetError("playback VAD reset failed"); return false; }
-  frame->pcm = impl_->processed; return true;
+  if (!impl_->UpdateNearVoice(frame)) {
+    impl_->SetError("playback VAD reset failed");
+    return false;
+  }
+  frame->pcm = impl_->processed;
+  return true;
 }
 
 bool AudioBackend::ResetListener() noexcept {
@@ -451,7 +485,8 @@ bool AudioBackend::ResetListener() noexcept {
 
 bool AudioBackend::PreparePlayback() noexcept {
   if (impl_ == nullptr || !impl_->open) return false;
-  std::lock_guard<std::mutex> pcm_lock(impl_->pcm_mutex);
+  // AudioEngine 只会让 capture 线程在帧边界调用本函数；返回后，
+  // playback 线程才开始 Render/Drain 热路径，避免两线程同时改播放状态。
   const int prepared = snd_pcm_prepare(impl_->playback_pcm);
   if (prepared < 0) { impl_->SetError("ALSA playback prepare", prepared); return false; }
   impl_->playback24.fill(0); impl_->playback48.fill(0);
@@ -462,9 +497,11 @@ bool AudioBackend::PreparePlayback() noexcept {
   impl_->playback_session_active = true;
   impl_->aec_warmup_armed = true;
   impl_->aec_warmup_remaining = 0U;
+  impl_->reference_wait_frames = 0U;
   impl_->aec_tail_remaining = 0U;
   impl_->playback_ended.store(false, std::memory_order_release);
   impl_->playback_interrupted.store(false, std::memory_order_release);
+  impl_->playback_render_started.store(false, std::memory_order_release);
   return true;
 }
 
@@ -477,6 +514,8 @@ bool AudioBackend::Render20ms(const std::int16_t* const pcm24, std::size_t sampl
   if (converted <= 0 || converted > static_cast<int>(impl_->playback48.size())) { impl_->SetError("TTS resampling failed"); return false; }
   long peak = 0;
   for (int i = 0; i < converted; ++i) peak = std::max(peak, std::abs(static_cast<long>(impl_->playback48[i])));
+  if (peak != 0 && gain > 0.0F)
+    impl_->playback_render_started.store(true, std::memory_order_release);
   // 95% 满幅为功放保留余量；扬声器非线性削顶无法由线性 AEC 消除。
   if (peak != 0 && gain * static_cast<float>(peak) > 31128.0F) gain = 31128.0F / static_cast<float>(peak);
   for (int i = 0; i < converted; ++i) {
@@ -489,31 +528,36 @@ bool AudioBackend::Render20ms(const std::int16_t* const pcm24, std::size_t sampl
 
 bool AudioBackend::DrainPlayback() noexcept {
   if (impl_ == nullptr || !impl_->open) return false;
-  std::lock_guard<std::mutex> pcm_lock(impl_->pcm_mutex);
   const int drained = snd_pcm_drain(impl_->playback_pcm);
   if (drained < 0 && !impl_->playback_interrupted.load(std::memory_order_acquire)) impl_->SetError("ALSA playback drain", drained);
   const int prepared = snd_pcm_prepare(impl_->playback_pcm);
   if (prepared < 0 && !impl_->playback_interrupted.load(std::memory_order_acquire)) impl_->SetError("ALSA playback prepare", prepared);
   impl_->playback_ended.store(true, std::memory_order_release);
+  impl_->playback_render_started.store(false, std::memory_order_release);
   return drained >= 0 && prepared >= 0;
 }
 void AudioBackend::DropPlayback() noexcept {
   if (impl_ == nullptr || impl_->playback_pcm == nullptr) return;
-  std::lock_guard<std::mutex> pcm_lock(impl_->pcm_mutex);
   const int dropped = snd_pcm_drop(impl_->playback_pcm);
   const int prepared = snd_pcm_prepare(impl_->playback_pcm);
   if (dropped < 0 && dropped != -EBADFD) impl_->SetError("ALSA playback drop", dropped);
   if (prepared < 0) impl_->SetError("ALSA playback prepare", prepared);
   impl_->playback_ended.store(true, std::memory_order_release);
+  impl_->playback_render_started.store(false, std::memory_order_release);
+}
+void AudioBackend::InterruptCapture() noexcept {
+  if (impl_ == nullptr || impl_->capture_pcm == nullptr) return;
+  impl_->capture_interrupted.store(true, std::memory_order_release);
+  const int aborted = snd_pcm_abort(impl_->capture_pcm);
+  if (aborted < 0) impl_->SetError("ALSA capture interrupt", aborted);
 }
 void AudioBackend::InterruptPlayback() noexcept {
   if (impl_ == nullptr || impl_->playback_pcm == nullptr) return;
   impl_->playback_interrupted.store(true, std::memory_order_release);
-  /// 先置标志再取句柄锁：正在阻塞的 writei 返回后立即退出，不再提交新帧。
-  std::lock_guard<std::mutex> pcm_lock(impl_->pcm_mutex);
   const int dropped = snd_pcm_drop(impl_->playback_pcm);
   if (dropped < 0 && dropped != -EBADFD) impl_->SetError("ALSA playback interrupt", dropped);
   impl_->playback_ended.store(true, std::memory_order_release);
+  impl_->playback_render_started.store(false, std::memory_order_release);
 }
 std::string AudioBackend::last_error() const {
   if (impl_ == nullptr) return "audio backend is not allocated";
@@ -524,13 +568,19 @@ void AudioBackend::Close() noexcept {
   // boomPI 独占这块板的音频链路，Mode1 是运行状态；退出时无需切回会破坏通道布局的默认值。
   if (impl_->capture_pcm != nullptr) snd_pcm_close(impl_->capture_pcm);
   if (impl_->playback_pcm != nullptr) snd_pcm_close(impl_->playback_pcm);
-  impl_->capture_pcm = impl_->playback_pcm = nullptr;
+  impl_->capture_pcm = nullptr;
+  impl_->playback_pcm = nullptr;
   swr_free(&impl_->capture_swr); swr_free(&impl_->playback_swr); impl_->dsp.Close();
   if (impl_->snowboy != nullptr) boompi_snowboy_legacy_destroy(impl_->snowboy);
   if (impl_->vad != nullptr) WebRtcVad_Free(impl_->vad);
   impl_->snowboy = nullptr; impl_->vad = nullptr; impl_->open = false;
   impl_->playback_session_active = impl_->aec_warmup_armed = false;
   impl_->aec_warmup_remaining = impl_->aec_tail_remaining = 0U;
+  impl_->reference_wait_frames = 0U;
+  impl_->delayed_input_dbfs = -120.0F;
+  impl_->delayed_reference_active = false;
+  impl_->capture_interrupted.store(false, std::memory_order_release);
+  impl_->playback_render_started.store(false, std::memory_order_release);
   impl_->playback_ended.store(false, std::memory_order_release);
   impl_->capture48.fill(0); impl_->capture16.fill(0); impl_->mic_left.fill(0); impl_->mic_right.fill(0);
   impl_->reference_left.fill(0); impl_->reference_right.fill(0); impl_->processed.fill(0);

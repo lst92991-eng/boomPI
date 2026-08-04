@@ -40,7 +40,7 @@ func TestLiveOpenSession(t *testing.T) {
 	pcm := liveTestPCM(t)
 
 	provider, err := New(Config{
-		APIKey: apiKey, WorkspaceID: workspaceID, Region: RegionSingapore,
+		APIKey: apiKey, WorkspaceID: workspaceID, Region: RegionChinaBeijing,
 		Model: model, Voice: voice,
 		Timeout: testTimeout, QueueSize: 64,
 	})

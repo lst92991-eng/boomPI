@@ -45,8 +45,7 @@ int main(int argc, char* argv[]) {
       std::cerr << "boompi-client: cannot save configured server\n"; return EXIT_FAILURE;
     }
   }
-  // 对端 RST 后再 send 不得直接杀进程：忽略 SIGPIPE，错误交给传输层分类。
-  std::signal(SIGINT, Stop); std::signal(SIGTERM, Stop); std::signal(SIGPIPE, SIG_IGN);
+  std::signal(SIGINT, Stop); std::signal(SIGTERM, Stop);
   if (!boompi::application::RunVoiceClient(config, &g_stop, &error)) {
     std::cerr << "boompi-client: voice loop failed: " << error << '\n';
     return EXIT_FAILURE;

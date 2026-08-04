@@ -16,30 +16,31 @@
 - 使用现有共享令牌和 SPKI 固定即可；六位码配对、多设备管理、复杂 flow-credit、工具系统、
   独立 C++ supervisor、签名 A/B 更新、掉电事务和 24 小时 soak 均后置。
 - 教学版仅保留缓冲区边界、超时、秘密不落日志和硬件安全等最低防线，不为未验证场景增加框架。
-- 板端语音核心生产 C/C++（含 Rockchip/Snowboy 适配与网络启动，不含 UI 显示层）硬上限为 **2665 ELOC**（按修正统计口径后的实测值重定基线，含 Phase 2 结构性重构与 Phase 3 对标业界的正确性修复净开销；不为数字压行）；
-  UI 显示层（LVGL 渲染与屏幕/触摸驱动）单独公开行数，不占该预算；
-  辅助 Shell/Python 也必须单独公开行数，禁止通过挪文件、压行或删除有价值注释规避统计。
+- 板端音频产品胶水（composition root、状态机、音频、WSS 和语音配置）设计目标为
+  **不超过 2500 ELOC**，CI 硬上限为 **2800 ELOC**；Rockchip/Snowboy vendor ABI
+  适配单列且不得超过 **300 ELOC**，合并后的音频主线硬上限为 **3100 ELOC**。LVGL UI
+  与网络启动继续独立统计；禁止通过挪文件、压行或删除有价值注释规避统计。
 - 新功能先复用 BSP 已验证的设备节点、命令和成熟库；在出现第二种真实后端前，不增加工厂、
   虚接口、插件、通用 worker 或占位模块。
 
-本节完成后，后文的六位码配对、`boompi-supervisor`、签名 A/B 更新和完整企业发布闸门仅作
-未来参考，不属于当前教学版交付阻断项。
+本文如提到六位码配对、独立 supervisor、签名 A/B 更新或完整企业发布闸门，必须明确标为
+未来路线；它们不属于当前教学版实现，也不是交付阻断项。
 
 ## 1. 项目目标与第一版边界
 
-boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运行 C++ 客户端，本地电脑运行跨平台 Go 服务端，服务端再访问 Qwen 新加坡区。第一版形态是“小智”式全双工语音聊天机器人。
+boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运行 C++ 客户端，本地电脑运行跨平台 Go 服务端，服务端默认访问 Qwen 中国内地（北京）区。第一版形态是“小智”式全双工语音聊天机器人。
 
 第一版必须包含：
 
 - 双模拟麦克风采集、扬声器播放、播放参考、AEC、降噪、波束形成、增益管理和 VAD。
 - 本地 Snowboy 英文唤醒词；第一版固定使用 Snowboy 引擎，不得静默替换。
-- Qwen 实时 ASR、对话和 TTS；默认适配 `qwen3.5-omni-plus-realtime`，模型名必须可配置。
+- Qwen 语音对话；默认使用实时 ASR、`qwen3.6-flash` 对话和流式 TTS 的组合链路，
+  `qwen3.5-omni-plus-realtime` 直连作为可选模式，模型名必须可配置。
 - 普通话优先，允许中英文混说；回复默认使用简体中文。
 - 任意语音打断 TTS、三秒连续对话、流式字幕和表情状态。
 - 以太网和 Wi-Fi；优先以太网，首次 Wi-Fi 使用二维码配网。
-- ST7789P3 横屏 UI、GT911 触摸、音量/亮度控制、配对和离线状态。
-- 本地自动发现、六位码首次配对、WSS、服务端公钥 SPKI 固定和设备长期令牌。
-- BusyBox init、`boompi-supervisor`、应用级 A/B 更新和失败回滚。
+- ST7789P3 横屏 UI、GT911 触摸、音量/亮度控制、配网和离线状态。
+- 本地自动发现、WSS、服务端公钥 SPKI 固定和教学局域网共享设备令牌。
 - Go 服务端单文件发布体验，学生配置环境变量和 `config.yaml` 后即可运行。
 
 第一版明确不包含：
@@ -48,6 +49,7 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
 - 在线音乐服务或版权音乐聚合。仅保留未来 `MediaPlayer` 能力边界和 TODO。
 - 长期记忆、用户画像或跨会话持久化对话。
 - 动态 DLL/so 后端插件、容器部署要求、Windows Service 强制安装。
+- 六位码配对、多设备管理、工具调用、独立 supervisor、签名 A/B 更新和自动回滚。
 - 通过语音直接执行 Shell、SSH、文件删除、刷机或软件升级。
 
 ## 2. 已确认的产品行为
@@ -75,32 +77,15 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
 - 网络断开时丢弃当前轮次，不缓存并补发过期语音；本地唤醒、UI 和离线提示仍工作。
 - 默认女声方向是自然、年轻、不过度卖萌。具体 Qwen voice 必须在真实扬声器上试听至少三个候选后再固化。
 
-## 2.1 当前板端实现边界（2026-08-04，优先于后文路线图）
+## 2.1 当前板端实现边界（2026-08-03，优先于后文路线图）
 
-现役 `boompi-client` 的语音核心包含 18 个生产 C/C++ 文件、2665 ELOC，其中 Rockchip/Snowboy vendor
-集成 280 ELOC，产品逻辑 2385 ELOC；UI 显示层（LVGL 渲染与 ST7789P3/GT911 驱动）另计 1926 ELOC，
-不占语音核心预算。宿主 SDL2 预览工具 `client/apps/boompi_ui_simulator` 不属于以上四个
-预算，仅用于桌面预览 UI，不得反向引入语音业务逻辑。同样不占预算的还有：`client/assets/`
-的图像资产、`client/cmake/` 的 LVGL 构建配置和 `client/tests/` 的板端 HIL/link 验证程序
-（不进 `boompi-client`，也不注册 CTest，仅在板端按需单独运行）。计数口径是非空行减去纯 `//` 注释，完整范围由
-`scripts/tests/test_client_source_contract.py` 固定；复现这四个数字只需运行
-`python3 -m unittest discover -s scripts/tests -p 'test_client_source_contract.py'`，它会用同一 `eloc()` 口径
-重算并校验文档。2026-08-01 的
+现役 `boompi-client` 的音频主线包含 15 个生产 C/C++ 文件、3066 ELOC，其中
+Rockchip/Snowboy vendor 集成 280 ELOC，音频产品逻辑 2786 ELOC。此次增长主要来自把状态转换、
+错误恢复和线程交接从压缩语句展开为可教学阅读的结构，不得为回到设计目标重新压行。LVGL UI 与网络启动不进入
+这项音频预算，也不得挪入音频目录规避独立审查。计数口径是非空行减去纯 `//` 注释，完整范围由
+`scripts/tests/test_client_source_contract.py` 固定；2026-08-01 的
 `docs/test/client-responsibility-layout-20260801.md` 保留为纯语音阶段历史快照。后文关于完整
 supervisor、update、target 分层和发布架构的内容是未来路线图，不授权提前恢复占位层。
-
-- 2026-08-04 Phase 3 对标业界开源实现（xiaozhi-esp32、LiveKit Agents、Pipecat、speech-to-speech、
-  ESP-ADF、alsa-lib 官方示例）后落地四项正确性修复：`pcm_mutex` 串行化非线程安全的 ALSA 播放句柄；
-  播放 underrun 恢复后保持 offset 续写，避免重播已播音频；`BeginPlayback` 在上一流收尾期做
-  150 ms 有界等待，避免把新回复误升级为会话重连；xrun 原子计数与限速日志。需服务端配合的
-  机制（打断时长过滤、误打断恢复、played_samples 上报）未在本版实现，归入后文路线图。
-
-- 2026-08-04 Phase 4 服务端与基建对抗审计轮：取消 fence 后 `DiscardQueuedPCM` 排空待发音频、
-  provider 异常时仍尽力回 `response.cancelled` ACK；identity 半写自愈（孤儿私钥重建、孤儿证书
-  fail-closed）；控制帧 JSON 嵌套深度上限 32；客户端源码契约增加扫描根外逃逸守卫与
-  `boompi_client` 源列表校验。再次对标 Azure/OpenAI Realtime 的 `conversation.item.truncate`
-  （audio_end_ms 与播放位置同步）与 LiveKit 的误打断自动恢复后确认：无 played_samples 上报时
-  “整轮删除被打断回答”是教学级合理简化，深度对齐归入路线图。
 
 - 生产目标按仓库既定职责落位：`application/voice_client` 独占会话状态，
   `audio/audio_engine` 管理播放线程和有界 TTS 环，`network/voice_transport` 管理
@@ -113,13 +98,16 @@ supervisor、update、target 分层和发布架构的内容是未来路线图，
 - 以上职责目录是当前实现，不是恢复旧的通用框架。不得另建 `App/Driver/Inf` 平行目录，
   也不得用目录重排为理由增加 worker、虚接口、工厂或占位 target。
 - 禁止恢复已删除的 `manual_single_turn`、自写 WebSocket/TLS/JSON、重复 wire protocol、
-  通用 capture/playback/control/committer/worker、host fake 音频和未接入产品的 update
-  占位实现；当前 UI 与配网是实际硬件功能，不是抽象框架。
+  通用 capture/playback/control/committer/worker、生产侧 host fake 音频和未接入产品的 update
+  占位实现。测试目录可保留只实现现有硬件边界的薄 fake，用于确定性驱动真实状态机和队列；
+  不得把它链接进 `boompi-client` 或计入板端能力。当前 UI 与配网是实际硬件功能，不是抽象框架。
 - WebSocketpp、Boost、OpenSSL、ALSA、libswresample、Rockchip 3A、Snowboy 和 WebRTC VAD
   作为外部实现使用；不得复制它们的功能到自写生产层，也不得把自写业务代码移进
   `third_party/` 规避计数。
-- 增加生产 C/C++ 前必须先删减或用实测证明必要性，语音核心（含 vendor 与网络启动）不得超过
-  2665 ELOC；UI 显示层单独公开行数、按需增长但需评审。辅助运维与配网脚本单独计数；未来 supervisor 不得挤入当前客户端预算。
+- 增加音频产品 C/C++ 前必须先删减或用实测证明必要性：产品胶水以 2500 ELOC 为设计目标、
+  CI 硬上限为 2800 ELOC；vendor ABI 单列且不得超过 300 ELOC，音频主线总量不得超过
+  3100 ELOC。LVGL、网络启动、辅助运维与
+  配网脚本分别计数；未来 supervisor 不得挤入音频预算。
 
 ## 3. 硬件基线与事实来源
 
@@ -189,7 +177,7 @@ supervisor、update、target 分层和发布架构的内容是未来路线图，
 
 ## 4. 仓库与目录边界
 
-目标仓库结构如下；新代码应向这个结构收敛，不建立单体巨型 `core`：
+当前仓库结构如下。新代码先进入现有职责目录；没有第二种真实实现前，不新增平行分层、工厂或占位目录：
 
 ```text
 boomPI/
@@ -198,49 +186,18 @@ boomPI/
   CMakeLists.txt
   CMakePresets.json
   client/
-    CMakeLists.txt
     apps/
       boompi_client/main.cpp
-      boompi_supervisor/main.cpp
-    include/boompi/
-      application/
-      audio/
-      config/
-      event/
-      network/
-      platform/
-      protocol/
-      ui/
-      update/
-    src/
-      application/
-      audio/
-      config/
-      event/
-      network/
-      platform/posix/
-      platform/rv1106/
-      protocol/
-      ui/
-      update/
+      boompi_ui_simulator/main.cpp
+    include/boompi/{application,audio,config,network,platform/rv1106,ui}/
+    src/{application,audio,config,network,platform/rv1106,ui}/
+    tests/{fixtures,hil,link,smoke,support,unit}/
+    assets/
     cmake/toolchains/rv1106.cmake
-    tests/
-      unit/
-      integration/
-      smoke/
-      support/
-      fixtures/
+    scripts/
   server/
     cmd/boompi-server/main.go
-    internal/
-      backend/
-      config/
-      discovery/
-      pairing/
-      protocol/
-      session/
-      tools/
-      update/
+    internal/{app,backend,config,discovery,identity,logging,protocol,session,transport}/
     configs/config.example.yaml
   protocol/
     protocol-v1.md
@@ -253,83 +210,81 @@ boomPI/
   third_party/
 ```
 
-主要 CMake target 应保持职责单一：
+当前 CMake target 与真实产物对应：
 
-- `boompi_event`
-- `boompi_audio_core`
-- `boompi_protocol`
-- `boompi_application`
-- `boompi_platform_posix`
-- `boompi_platform_rv1106`
-- `boompi_network`
-- `boompi_ui`
-- `boompi_update`
-- `boompi_client`
-- `boompi_supervisor`
-- `boompi_test_support`，仅在 `BOOMPI_BUILD_TESTS=ON` 时构建
+- `boompi_client`：唯一板端产品可执行文件，安装名为 `boompi-client`。
+- `boompi_lvgl_ui`、`boompi_snowboy_bridge`：产品目标直接使用的薄集成 target。
+- `boompi_ui_simulator`：显式打开桌面预览时构建，不进入板端安装包。
+- `boompi_voice_client_config_test`、`boompi_voice_client_harness` 和 Unix 下的
+  `boompi_audio_engine_harness`：只在 Host 测试配置中构建。
+- `boompi_protocol_json_test`、`boompi_aec_loop_hil` 以及 vendor link/HIL target：显式构建的
+  契约或真板探针，不进入默认安装，也不代表硬件效果已经通过。
 
-`main.cpp` 只能作为 composition root：加载配置、创建依赖、启动 Runtime、处理信号并按顺序停止。不得把音频循环、协议解析、业务状态机或测试 WAV 逻辑塞进 `main.cpp`。
+`main.cpp` 只能作为 composition root：解析三个现役命令、加载配置、保存显式 endpoint、安装信号
+处理并调用 `RunVoiceClient`。不得把音频循环、协议解析、业务状态机或测试 WAV 逻辑塞进 `main.cpp`。
 
-底层依赖方向必须是：
+当前产品依赖方向是：
 
 ```text
-application
-  -> interfaces / protocol / event
-  -> audio / network / ui services
-  -> platform abstractions
-  -> POSIX / ALSA / RV1106 vendor SDK
+main (composition root)
+  -> application/voice_client
+       -> audio/audio_engine -> platform/rv1106/audio_backend -> ALSA/vendor SDK
+       -> network/voice_transport -> WebSocketpp/OpenSSL/cJSON
+       -> network/network_bootstrap
+       -> ui/device_ui -> LVGL/ST7789P3/GT911
 ```
 
-底层模块不得反向引用 application。协议编码与 WebSocket 传输必须分离；UI 回调不得直接修改会话状态；板级适配不得包含产品对话逻辑。
+底层模块不得反向引用 application。当前严格 JSON/PCM 编解码作为 `VoiceTransport` 的私有实现，
+wire schema 由 `protocol/protocol-v1.md` 约束；在出现第二种 transport 前，不为形式分层新增 protocol
+目录或公共框架。UI 回调不得直接修改会话状态；板级适配不得包含产品对话逻辑。
 
 ## 5. 客户端状态与线程所有权
 
-会话状态和网络状态是两台正交状态机，均由 application actor 单线程独占：
+会话状态只由 application actor 修改；网络流程通过 endpoint/连接事件驱动，不另建可被多线程
+共同修改的业务状态机：
 
 ```text
 ConversationState:
-  STARTING -> IDLE -> LISTENING -> THINKING -> SPEAKING -> FOLLOW_UP
-                               \-> RECOVERING / ERROR
+  WAITING_FOR_WAKE -> WAITING_FOR_SPEECH -> CAPTURING_SPEECH
+  -> WAITING_FOR_RESPONSE -> PLAYING_RESPONSE -> DRAINING_PLAYBACK
+  -> WAITING_FOR_FOLLOW_UP
+  interrupt: CANCEL_PENDING -> BARGE_ADMISSION
 
-NetworkState:
-  NO_LINK -> DISCOVERING -> PAIRING -> CONNECTING -> ONLINE -> BACKOFF
+Network flow:
+  NO_LINK -> DISCOVERING -> CONNECTING -> ONLINE -> BACKOFF
 ```
 
-配置流程另有 `UNCONFIGURED / AP_STARTING / PORTAL_ACTIVE / APPLYING / CONFIGURED`。不要把所有组合展开为一个不可维护的巨大枚举。
+AP/STA 配网生命周期由 `boompi-clientctl provision` 独占，不塞进语音会话枚举。不要把网络、配网和
+对话状态的所有组合展开为一个巨大枚举。
 
 启动顺序必须让显示、音频、Snowboy 和本地状态机先进入可用状态，再由网络 worker 在后台发现/连接服务端。服务端离线或 DNS/路由异常不得阻塞本地启动。
 
-下面七类是产品完整链路的职责清单，不是要求预先实现七个线程或七层框架。vendor 最小
-闭环阶段只使用验证所需的最少执行上下文；全双工、阻塞行为和耗时实测后，再按单一所有权
-拆分生产线程：
+当前正常语音与显示共有六个客户端自有长期执行上下文；打开摄像头后再增加一个：
 
-1. 录音线程：只负责 ALSA 采集、时间戳和写入预分配队列。
-2. DSP 线程：解交织、重采样、AEC/NS/BF/AGC 和帧连续性检查。
-3. 播放线程：TTS jitter buffer、重采样、音量/限幅、ALSA 播放和参考路径。
-4. 唤醒/VAD 线程：Snowboy、用户语音起止、pre-roll 和打断候选。
-5. 网络线程：发现、WSS、收发、重连、流控；不得拥有业务状态。
-6. application actor：唯一可以转换会话状态、创建/取消 turn 和编排工具调用的线程。
-7. UI 线程：唯一拥有 LVGL/显示对象，只消费 UI model 和上报触摸事件。
+1. 主 application actor：唯一转换会话状态、创建/取消 turn，并从 `AudioEngine` 取 capture frame。
+2. capture/DSP 线程：独占 ALSA capture、解交织、重采样、Rockchip 3A、Snowboy/VAD 和帧连续性。
+3. playback 线程：独占 TTS 固定环、重采样、音量/限幅和 ALSA playback。
+4. WSS/ASIO 线程：负责 TLS/WebSocket I/O，只通过固定事件环向 actor 交付结果。
+5. network bootstrap 线程：负责链路准备、UDP discovery 和 endpoint 持久化，不拥有会话状态。
+6. UI 线程：唯一访问 LVGL、ST7789P3 和 GT911，只交换模型快照与触摸动作。
 
-不得为了匹配这份清单继续增加空壳 worker。任何实际增加的线程和跨线程共享对象都要由
-测得的阻塞/实时需求支持，并在类型或模块文档中说明拥有者、生命周期和停止顺序。
-
-当前精简候选故意把 capture、DSP、Snowboy/VAD 和 application 状态机放在同一 actor；另有
-一个播放线程和一个 WSS/ASIO 线程。低频网络控制只经过固定 64 项 `EventQueue`，capture PCM
-不经过 EventBus 或中间队列，上行 PCM 直接交给 websocketpp 的有界发送缓冲。下列 EventBus、
-SPSC、独立上行队列和 credit/window 是实测证明需要进一步拆线程后的目标，不授权提前恢复。
+capture/DSP 线程通过 `AudioEngine` 内部 `4 × 20 ms` 有界队列把 AEC 后帧交给 application actor；
+actor 取帧后再直接提交 websocketpp 有界发送缓冲，没有独立上行 PCM 网络队列。控制/下行事件走
+固定 64 项 `EventQueue`，TTS 下行走 `AudioEngine` 的 75 帧固定环。不得为了形式统一增加
+EventBus、通用 worker 或第二套音频队列。
 
 并发规则：
 
-- 未来拆线程时，控制事件走有界 EventBus；跨线程 PCM 走预分配帧池和 SPSC 有界队列。
-  当前单 actor 内的 PCM 直接调用不需要为形式统一增加队列；固定 mutex `EventQueue` 只承载
-  WSS 控制/下行事件，不得扩成全局音频总线。
+- capture 队列和 TTS 队列都使用对象内固定数组；固定 mutex `EventQueue` 只承载 WSS 控制/下行
+  事件，不得扩成全局音频总线。
 - 实时录音、DSP 和播放热路径禁止每帧 `new`、`malloc`、`std::vector` 扩容、文件 I/O、网络 I/O 或无界锁等待。
 - 音频帧必须带单调时钟时间戳、`sequence`、`stream_id` 和 `epoch`。IDLE/唤醒前的常开 capture frame 可以使用 `turn_id=0`；进入 utterance 或网络传输后必须绑定有效 `turn_id`。重连/取消后旧 epoch 的帧和事件必须丢弃。
 - 队列满时不得阻塞录音线程。捕获到帧丢失或序号断裂时标记 discontinuity；会破坏 AEC/语义的情况应取消当前 turn，而不是继续发送伪连续音频。
-- 线程停止顺序必须显式：先停止新 turn 和网络生产者，再停止采集/DSP，再排空或丢弃播放，最后销毁 UI、ALSA 和日志资源。
+- 当前停止顺序必须保持显式：actor 停止接受新 turn，关闭 WSS，`AudioEngine::Close` 唤醒并回收
+  capture/playback，停止并 join network bootstrap，最后由对象析构关闭 UI 和底层资源。
 - 不得用 `sleep` 猜测线程已经启动或退出。使用事件、条件变量、项目自定义 stop flag/cancellation token 等 C++17 可用的明确同步手段。
-- 实时调度优先级只能在板端测量后开启；不得未经验证就把多个线程设为高优先级 `SCHED_FIFO`，避免饿死系统。
+- 当前 capture/playback 分别申请 `SCHED_FIFO 40/30`，失败时记录一次警告并继续；UI 线程使用
+  `nice(5)`。修改这些值前必须在单核 RV1106 上复测 XRUN、队列水位和 UI 饥饿，不能继续抬高优先级掩盖阻塞。
 
 ## 6. 音频数据契约
 
@@ -395,30 +350,29 @@ Qwen 24 kHz S16_LE mono downlink
 - TCP/WSS `17806`
 - UDP discovery `17807`
 
-连接顺序是：缓存的已配对 endpoint -> UDP 自动发现 -> 手动 IP。以太网链路和有效路由存在时优先使用以太网；网络切换不得在一次有效 turn 中间无故撕毁连接。
+客户端先建立以太网或已保存 Wi-Fi 链路；配置了显式 server IP/SPKI 时直接使用该 endpoint，
+否则执行 UDP 自动发现并以已保存的 SPKI 约束回退。网络切换不得在一次有效 turn 中间无故撕毁连接。
 
 协议约束：
 
 - 一条持久 WSS 连接承载 JSON 控制事件和二进制 PCM 帧。
 - 控制帧必须使用正式 JSON 解析器，做类型、长度、必填字段、枚举、协议版本和 capability 校验；禁止通过字符串搜索解析 JSON。
 - PCM 使用定义清楚的二进制 header，至少含 version、header/payload length、format、sequence、timestamp、device/session/turn/stream/epoch 标识。字段逐个序列化并声明字节序，不得直接发送 packed C++ struct。
-- 播放期间板端应周期上报 `response_id` 和实际 `played_samples`/`played_ms`，用于打断时对齐字幕和 provider 上下文。
-- 路线图：对标 LiveKit Agents，后续可引入最小打断时长过滤（如 0.5 s）与误打断恢复（短噪声触发时恢复播放），均需服务端配合；在真人误打断率有实测数据前不提前实现。
+- 当前 v1 不上报播放位置；打断或尾播取消时发送精确 `{}`，服务端删除整个未听完的 assistant turn。
 - 每类帧和字符串必须有显式最大长度；未知消息返回明确错误或忽略，不得越界或导致状态隐式变化。
-- 连接重建采用 1、2、4、8、16、30 秒指数退避；当前教学实现不带 jitter，保持重连时序确定可复现，多设备规模化前必须补上。当前 turn 直接失败，旧 turn/epoch 返回包全部丢弃。
+- 连接重建采用 1、2、4、8、16、30 秒有界退避。当前 turn 直接失败，旧 turn/epoch 返回包全部丢弃。
 - WSS 在无业务流量时默认每 10 秒发送 ping/heartbeat，约 30 秒未收到 pong/有效消息即判定 half-open 并重连；数值可配置但必须有 deadline。
 - 音频不做应用层重传；可靠连接恢复后开始新 turn，避免把延迟语音当作实时语音。
-- 协议从 v1 就携带版本和 capabilities；支持多 device actor，但第一版验收只要求一台活跃设备。
+- 协议 v1 携带固定版本、严格 payload schema 和 turn/stream/epoch；当前服务端只允许一台活跃设备。
 
-安全握手：
+当前教学版安全边界：
 
-- Go 服务端首次启动自动生成本地 TLS 证书和密钥；私钥仅保存在服务端配置目录并限制权限。
-- 首次配对把六位短码与 TLS 公钥 SPKI SHA-256、设备 UUID、双方 nonce、server UUID 和本次 pairing transcript 绑定，不能使用一个与 TLS 会话无关的随机数字。
-- 六位码显示在板端屏幕上，由用户在本地 Go server 终端确认；确认成功后才持久保存 SPKI pin 和 device token。
-- 首配只允许在显式 `PAIRING` 状态对本次未知自签名公钥做定向验证；普通连接严禁全局关闭证书验证。任何 `SSL_VERIFY_NONE`、无条件信任自签证书或明文音频 WebSocket 都禁止进入生产构建。
-- 板端永久固定服务端公钥 SPKI SHA-256，UI 可以简称“证书指纹”。相同密钥续签证书不应破坏连接，服务端密钥变化必须重新配对。
-- 配对码默认约 2 分钟过期、限制尝试次数且一次只允许一个配对会话；成功后下发随机 256-bit device token。设备端提供“清除配对”，服务端提供“撤销设备”。
-- 每块板首次启动生成并持久保存随机 UUID。MAC 地址只用于网络链路和诊断，不得充当 device identity 或配对凭据。
+- Go 服务端首次启动自动生成本地 TLS 证书和密钥；私钥仅保存在服务端状态目录并限制权限。
+- 板端固定服务端公钥 SPKI SHA-256；相同密钥续签证书不破坏连接，密钥变化必须由用户重新配置。
+- 教学版使用两端一致的共享设备令牌，只适用于可信局域网；令牌和 SPKI 均不得写入普通日志。
+- 普通连接严禁全局关闭证书验证。任何 `SSL_VERIFY_NONE`、无条件信任自签证书或明文音频 WebSocket 都禁止进入生产构建。
+- 每块板首次启动生成并持久保存随机 UUID。MAC 地址只用于网络链路和诊断，不得充当 device identity。
+- 六位码配对、随机 per-device token 和撤销列表是未来产品路线，不得在当前教学版恢复占位字段或空模块。
 
 ## 8. Go 服务端
 
@@ -428,75 +382,67 @@ Qwen 24 kHz S16_LE mono downlink
 
 后端接口：
 
-- `ConversationBackend`：Qwen Omni Realtime 直通语音对话路径（`conversation_mode: realtime`）。
-- `ASRBackend`、`LLMBackend`、`TTSBackend`：intelligence 管线（`conversation_mode: intelligence`，
-  当前默认）的 ASR→推理→TTS 三级级联，默认模型 `qwen3-asr-flash`/`qwen3.6-flash`/`qwen3-tts-flash-realtime`。
-- 编译期 registry 根据配置选择实现；第一版不加载外部动态插件。
+- `ConversationBackend`/`ConversationSession` 是服务端唯一 provider 边界；Session Actor 只看统一事件。
+- `conversation_mode: intelligence` 是默认链路：实时 ASR 预连，未就绪或失败时有界回退 batch ASR，
+  随后流式对话模型与连续 `server_commit` TTS。
+- `conversation_mode: realtime` 选择 Omni Realtime 直连；两个实现由 composition root 的明确分支选择，
+  不建立 registry、动态插件或第二套 ASR/LLM/TTS 公共接口。
 - 生产二进制不得包含 `MockBackend`。测试替身只能位于测试包或 `boompi_test_support`。
 
-Qwen 默认配置（以下为 realtime 路径参数；默认模式 intelligence 使用上面列出的三级模型）：
+Qwen 默认配置：
 
-- region: Singapore
-- model: `qwen3.5-omni-plus-realtime`
+- region: China (Beijing)，配置值 `china-beijing`
+- conversation mode: `intelligence`
+- ASR: realtime 预连，batch 模型 `qwen3-asr-flash` 作为回退
+- reasoning model: `qwen3.6-flash`，reasoning effort `none`
+- TTS: `qwen3-tts-flash-realtime`，voice `Cherry`
+- optional direct model: `qwen3.5-omni-plus-realtime`
 - interaction: manual turn detection，由板端 VAD commit
 - input: 16 kHz S16_LE mono PCM
-- output: 24 kHz S16_LE mono PCM（以实时 API 实际事件元数据为准）
-- search: `auto`，允许配置关闭
+- output: 24 kHz S16_LE mono PCM
+- search: `off`，允许配置为 `auto`
 - language: 普通话优先并允许中英文混说
 
 Provider 名称、endpoint、模型、voice 和事件字段可能变化，必须封装在 Qwen adapter 内，并在实现时重新核对官方文档。不要把 Qwen event 直接泄漏为板端协议。
 
 系统提示词和 persona 放在服务端 `config.yaml`。配置变化只对下一次新会话生效，不得在当前会话中途无提示改变人设。
 
-工具调用采用明确 allowlist 的 `ToolRegistry`。第一版允许：
+当前教学版不提供工具调用。天气、闹钟、设备控制和其他工具只有在出现真实产品需求、明确 allowlist
+和板端执行边界后才能加入；任何工具都不得执行任意命令、SSH、任意文件路径、刷机或升级。
 
-- 当前日期和时间
-- 天气
-- 音量
-- 屏幕亮度
-- 网络和设备状态
-- 清空对话
-- 倒计时和闹钟
-
-倒计时由板端单调时钟执行；绝对时间闹钟只有在 NTP 校时成功后才可创建/触发。任何工具不得执行任意命令、SSH、任意文件路径、刷机或升级。高风险能力以后即使加入也必须有独立授权和二次确认，不得只依赖模型文本判断。
-
-用户打断时，server 必须取消当前 response、递增 response generation、阻止旧 delta 继续下发，并根据板端 `played_samples` 调用 provider 支持的 truncate/delete 语义修正上下文。若无法可靠对齐文字、音频和已播放位置，宁可删除整个被打断的 assistant turn，也不能把用户未听到的完整回答留进下一轮上下文。
+用户在播放或 ALSA 尾播阶段打断时，server 必须先 fence 旧 epoch、取消 provider、阻止旧 delta
+继续下发，并删除整个被打断的 assistant turn。当前 v1 没有可靠的文字/音频/已播放位置对齐，
+不得把用户未听到的完整回答留进下一轮上下文。
 
 ## 9. UI、触摸和配网
 
-显示基线是 ST7789P3 `320x240` 横屏：
+显示基线是 ST7789P3 `320x240` 横屏和 GT911 触摸：
 
-- 上方约 70% 显示圆润卡通表情。
-- 下方约 30% 显示两行流式字幕，长内容滚动。
-- 字幕同时覆盖用户实时/最终转写和 AI 流式回答，必须按 turn/response generation 处理替换与撤销。
-- 状态至少包括待机、聆听、思考、说话、开心、断网和错误。
+- LVGL 提供统一桌面、语音、摄像头、配网和占位应用页；天气、资源、闹钟和 YOLO 未接入时必须明确显示“待接入”，禁止伪造在线数据。
+- 语音页显示两行流式字幕以及待机、聆听、思考、说话、尾播、开心、断网和错误状态。
+- 点击桌面“小智”进入并唤醒；播放和尾播阶段点击语音主区域会打断。竖滑调音量、横滑控制当前二值背光。
 - UI 使用简体中文；协议字段、配置键和开发日志使用英文。
-- 点击表情/主区域打断当前 TTS，上下滑调音量，长按进入设置。
-- 5 分钟无操作后变暗，15 分钟后关闭背光；触摸或唤醒词立即点亮。
-
-UI 业务逻辑必须依赖抽象的 display/touch 接口。第一版优先使用 LVGL，但在 P0 先确认现有 framebuffer/DRM、像素格式、旋转和刷新路径；不得为了 UI 引入 Qt。所有 LVGL 对象只能由 UI 线程访问。
+- 所有 LVGL 对象只由 UI 线程访问；application 只提交状态/文本快照并消费有界动作队列。不得为了 UI 引入 Qt 或通用 display 工厂。
 
 Wi-Fi 首次配置流程：
 
-1. 无有效 Wi-Fi 配置且无以太网时启动临时 AP `BoomPI-XXXX`。
+1. 无有效 Wi-Fi 配置且无以太网时，`boompi-clientctl` 在语音客户端启动前进入临时 AP `boomPI-Setup`。
 2. 屏幕展示含 AP/配网页地址的二维码。
 3. 手机进入本地 captive portal，提交 SSID 和密码。
-4. 原子保存配置、关闭 AP、连接 Wi-Fi、发现服务端并进入配对。
+4. 原子保存配置、关闭 AP、重启语音客户端、连接 Wi-Fi并发现服务端。
 
-以太网可用时跳过 Wi-Fi 强制配网。SSID、密码、token 和证书私钥不得出现在二维码明文日志、崩溃包或普通诊断输出中。必须先验证目标 Wi-Fi 驱动是否支持所需 AP/STA 流程。
+运行中的 LVGL Wi-Fi 页只展示同一配网入口和操作说明，不伪造当前 SSID、IP、信号或频段；
+真正切换 AP/STA 生命周期仍由 `boompi-clientctl provision` 独占，避免与语音进程抢占 wlan0 和屏幕。
+以太网可用时跳过 Wi-Fi 强制配网。SSID、密码、token 和证书私钥不得出现在普通日志或崩溃包中。
 
 错误、断网和音量操作可以使用短本地提示声，但所有提示声都必须进入最终播放参考路径；唤醒本身保持无提示音。
 
 ## 10. 配置、日志与隐私
 
-服务端使用人类可编辑的 `config.yaml`。非敏感配置优先级为 CLI -> environment -> YAML -> defaults。Qwen 凭据优先从以下环境变量读取：
-
-- `DASHSCOPE_API_KEY`
-- `DASHSCOPE_WORKSPACE_ID`
-
-教学版例外（与第 0 节冻结范围一致）：允许 `config.yaml` 的 `qwen_api_key` 作为回退，保证三步启动；
-该文件必须 `0600` 权限、不得提交 Git，starter 模板只使用明显占位符；环境变量始终优先于 YAML。
-量产版必须移除 YAML 回退，只保留环境变量。
+服务端使用人类可编辑的 `config.yaml`。非敏感配置优先级为 CLI -> environment -> YAML -> defaults。
+教学部署可在本机私有 `config.yaml` 填写 `qwen_api_key`，也可用优先级更高的
+`DASHSCOPE_API_KEY`；专属 Workspace 只从 `DASHSCOPE_WORKSPACE_ID` 读取。配置检查和日志都不得
+打印 Key、Workspace ID 或设备令牌，真实 `config.yaml` 不得提交 Git。
 
 客户端的配网结果、音量、亮度、UUID、endpoint、SPKI pin 和 token 使用原子写入的持久配置；POSIX 配置目录权限至少 `0700`、敏感文件至少 `0600`，Windows 服务端使用当前用户最小 ACL。建议复用协议 JSON 解析能力，避免仅为板端配置引入第二套大型解析器。配置损坏时回退到上一个有效副本或安全默认值，不带着半写文件启动。
 
@@ -513,34 +459,16 @@ Wi-Fi 首次配置流程：
 
 任何曾暴露在聊天、日志或 Git 历史中的 API Key 都视为失效，必须吊销并重新生成。示例配置只能使用明显占位符。
 
-## 11. 守护、部署和升级
+## 11. 当前部署与未来产品路线
 
-板端进程关系：
+教学版安装为 `/userdata/boompi/bin/boompi-client`、`/usr/sbin/boompi-clientctl` 和
+BusyBox 启动脚本。`boompi-clientctl` 只提供有限三次重启、1 MiB 日志轮转、手工二进制替换及
+一个 `.bak` 回退；它不是独立 supervisor，也不宣称签名 A/B、掉电事务或 watchdog 健康闭环。
 
-```text
-BusyBox init (PID 1)
-  -> respawn boompi-supervisor
-       -> active slot/bin/boompi-client --foreground
-            -> worker threads
-```
-
-目标安装路径：
-
-- `/usr/sbin/boompi-supervisor`
-- `/userdata/boompi/app_A/bin/boompi-client`
-- `/userdata/boompi/app_B/bin/boompi-client`
-- `/userdata/boompi/update/active.json`
-- `/userdata/boompi/config/`
-- `/userdata/boompi/models/snowboy/`
-- `/userdata/boompi/app_A/` 和 `/userdata/boompi/app_B/`
-- `/run/boompi/` 用于 PID、socket 和临时状态
-- `/userdata/boompi/log/` 只保存限量轮转日志
-
-BusyBox `inittab` 的具体字段必须在目标 rootfs 上验证后再提交。`boompi-supervisor` 负责信号转发、有序停止和异常重启，退避为 1、2、4、8、16、30 秒；60 秒内崩溃五次进入故障状态，避免无限刷日志。application 内部另有线程 heartbeat，但 heartbeat 不能代替进程监管。
-
-板上目前只确认存在 watchdog 工具，尚未确认 `/dev/watchdog`。硬件 watchdog 只有在 DTS、驱动和设备节点验证完成后才启用，而且只能在音频、状态机和主循环健康时喂狗；禁止由一个与业务健康无关的盲目脚本持续喂狗。
-
-应用升级使用双目录和签名 manifest，只允许由已配对的本地 Go server 经 LAN 管理通道上传/分发，不做公网 OTA。新包写入非活动槽，校验版本、RV1106 ABI、最低 BSP 版本、协议兼容性、文件哈希和 Ed25519 签名后原子切换 pending slot。supervisor 读取原子 active-slot 元数据并直接启动对应槽内程序，不依赖含义不清的可变 symlink。候选版本的本地音频、DSP、Snowboy 模型加载/处理心跳、UI 和状态机连续健康约 60 秒后才 mark-good，不能要求外网在线才算健康；pending 候选连续启动失败三次自动回滚。配置、设备身份、日志和稳定的 supervisor 位于 slot 之外，supervisor 不随普通应用包更新。禁止低版本重放；管理员显式降级除外。签名私钥绝不进入设备或运行时 server，只能存在于离线 release 环境；server 仅分发已经签名的包。完整 BSP/系统镜像第一版仍由人工烧录，语音工具不能触发升级。
+独立 supervisor、签名双槽更新、硬件 watchdog、多设备管理和公网 OTA 都是未来产品路线，
+不属于当前教学版。没有真实需求、板端设备节点和故障注入证据前，不得为这些能力恢复占位 target、
+空 manifest、通用进程框架或服务端管理通道。完整 BSP/系统镜像仍只由人工烧录；语音模型和工具
+不得触发刷机或系统升级。
 
 ## 12. 编码规范
 
@@ -568,8 +496,10 @@ Go 规则：
 ## 13. CMake、依赖和构建卫生
 
 - 使用 target-based CMake 和 `target_compile_features(... cxx_std_17)`；禁止全局污染 include/link flags。
-- 脚手架应提供 `CMakePresets.json`，至少包含 `host-debug`、`host-release`、`rv1106-debug` 和 `rv1106-release` 的 configure preset，并提供与文档命令同名的 build/test presets；preset 不得包含个人绝对路径或 secret。
-- CMake 内部 target 使用下划线命名；可执行文件通过 `OUTPUT_NAME` 安装为 `boompi-client` 和 `boompi-supervisor`。
+- 脚手架应提供 `host-debug`、`host-release` 和唯一现役板端入口 `rv1106-candidate`；板端入口固定
+  为 Debug + `-O2` 并打开完整语音能力。个人绝对路径只通过环境变量或未跟踪的
+  `CMakeUserPresets.json` 注入，仓库 preset 不得包含绝对路径或 secret。
+- CMake 内部 target 使用下划线命名；当前唯一板端产品可执行文件通过 `OUTPUT_NAME` 安装为 `boompi-client`。
 - 源文件显式列出，不用 `file(GLOB ...)` 隐式收集生产源文件。
 - RV1106 vendor 库通过具有明确 include、library、ABI 和依赖的 `IMPORTED` targets 接入，不把 SDK 链接目录设为 `PUBLIC`。
 - 不回退查找相邻私人仓库或绝对路径。工具链和 SDK 位置通过 cache variable/environment 明确传入。
@@ -585,8 +515,8 @@ cmake --preset host-debug
 cmake --build --preset host-debug --parallel
 ctest --preset host-debug --output-on-failure
 
-cmake --preset rv1106-release
-cmake --build --preset rv1106-release --parallel
+cmake --preset rv1106-candidate
+cmake --build --preset rv1106-candidate --parallel
 
 cd server
 go test ./...
@@ -617,19 +547,15 @@ go build -trimpath -o <OUTPUT_DIR>/boompi-server[.exe] ./cmd/boompi-server
 
 生产代码不提供 Mock 后端，但 `client/tests/support` 和 Go `_test.go` 可以使用只为测试编译的 deterministic fake。测试替身不得进入发布 target。
 
-Host 自动测试至少覆盖：
+当前 Host 自动测试覆盖：
 
-- 状态机合法/非法转换、3 秒 follow-up、30 分钟会话清理。
-- turn cancel、epoch 变化、旧事件和旧 PCM 丢弃。
-- 队列满、帧断裂、长度越界和停止顺序。
-- 协议畸形 JSON、错误长度、未知版本、重复 sequence 和超大 payload。
-- C++ 与 Go 必须读取 `protocol/fixtures/` 中同一批 golden frames，验证跨语言编码一致性。
-- 网络抖动、断线重连、15/30 秒 timeout 和 discovery fallback。
-- TTS 打断同时清空 PCM、字幕和 provider 上下文。
-- 配置原子写、损坏回滚、secret 脱敏和配对限流。
-- 更新签名、非活动槽安装、三次失败回滚。
-- 离线 DSP fixture 的通道映射、重采样、延迟连续性和幅度边界。
-- 默认自动测试不访问真实 Qwen 或消耗付费额度；live provider 测试必须显式开启并从环境变量读取凭据。
+- C++ 客户端配置解析，以及显式 endpoint、捕获序号空洞、drain 打断、取消乱序、背压、重连、
+  最长输入和首响应计时等 application 状态机场景。
+- `AudioEngine` 的短尾包、启动缓冲、抖动、序号空洞、listener reset 和有界停止。
+- C++ 严格 JSON/PCM 契约；Go 侧协议、session actor、有界队列、provider 取消、连续 TTS、
+  transport、discovery、TLS 与配置测试；Go 协议测试读取共享 fixture。
+- Python 源码职责/ELOC 契约、共享协议 fixture 结构、vendor CMake、ELF 和只读探针脚本测试。
+- 默认测试不访问真实 Qwen 或消耗付费额度；live provider 测试必须显式开启并从环境变量读取凭据。
 
 板端 smoke/HIL 必须按顺序执行：
 
@@ -639,10 +565,10 @@ Host 自动测试至少覆盖：
    双麦极性；没有四通道或硬件 reference 时记录证据并进入软件参考方案评审。
 4. 验证 Rockchip 3A 头文件/ABI、双麦输入、16 kHz 实时率和错误路径。
 5. 独立验证 Snowboy 动态库、模型加载、唤醒率和 CPU 占用。
-6. 验证播放、录音、AEC 后录音，再验证说话打断；功能通过前不进行长时间压力测试。
-7. 验证以太网、Wi-Fi、AP 配网、UDP discovery、WSS 配对和断网恢复。
-8. 验证横屏刷新、触摸坐标、背光休眠和各状态表情。
-9. 最后进行稳定性、Flash 写入频率、日志轮转、supervisor 和 A/B 回滚测试。
+6. 验证播放、录音、AEC 后录音，再验证唤醒、VAD、三秒追问和播放中打断；功能通过前不进行长时间压力测试。
+7. 验证以太网、已保存 Wi-Fi、AP 配网、UDP discovery、WSS/SPKI/共享令牌和断网恢复。
+8. 验证横屏刷新、触摸坐标、二值背光、语音/配网/摄像头页面和各状态表情。
+9. 最后记录有界稳定性窗口、日志轮转、XRUN/overrun/core、CPU/RSS 和退出耗时。
 
 必须记录分段延迟：唤醒、VAD 结束、ASR 首字、LLM 首 token、TTS 首包、扬声器首声和打断静音。除已确定的打断目标外，云端首响先建立实测基线，不提前编造 SLA。
 
@@ -650,24 +576,17 @@ AEC/BF 验收必须在最终壳体、双麦 35 mm 和扬声器安装完成后进
 
 ## 15. 开发顺序
 
-当前快速交付顺序固定为：统一集成分支 -> 可用单麦单轮对话 -> VAD 与三秒连续监听 ->
-TTS 打断 -> Snowboy -> 双麦/AEC -> UI/配网 -> 守护与 OTA。单麦链路只作为开发里程碑，
-不改变最终双麦 AEC 需求，也不得写成双麦已经通过。完成纵向闭环前，暂停增加新的音频原语、
-通用框架和非阻塞功能。
+现阶段双麦、单硬件参考、Rockchip 3A、Snowboy、VAD、WSS、Qwen、流式 TTS、打断、
+三秒追问、LVGL/触摸、摄像头预览和首次配网均已有纵向实现。后续顺序固定为：
 
-最终产品的第一优先级仍是双麦输入、扬声器输出和可打断的 AEC 闭环。按以下里程碑推进：
+1. 先修复确定性状态机、取消、背压、停止和协议问题，并用 host harness 锁住回归。
+2. 执行唯一 `rv1106-candidate` 严格交叉构建，确认 ELF/ABI 和依赖 pin；部署后保持客户端关闭。
+3. 人工在同音量条件验收唤醒、VAD 句首、首响、连续播放、尾播打断、真人 double-talk 和三秒追问。
+4. 再采集分段延迟、XRUN/overrun/core、CPU/RSS 和最终壳体声学数据，按证据微调参数。
+5. 最后接入真实天气/资源数据和 YOLO；SC3336 预览通过不等于视觉 AI 已完成。
 
-1. **P0 可行性闸门**：工具链、ABI、真实 capture/reference 布局、Rockchip 3A、Snowboy、
-   WSS、Wi-Fi AP 和 UI backend 探测。
-2. **P1 工程骨架**：目录、CMake targets、Go module、配置、日志、事件和基础 CI。
-3. **P2 本地音频**：48/16 kHz 链路、AEC/BF/VAD、Snowboy、播放、打断和音频 smoke tools。
-4. **P3 服务端**：协议、discovery/pairing、Qwen adapter、Session Actor 和 ToolRegistry。
-5. **P4 端到端对话**：流式 ASR/文本/TTS、取消、上下文、断网和延迟指标。
-6. **P5 UI 与配网**：表情、字幕、触摸、二维码/captive portal、网络优先级。
-7. **P6 产品化**：supervisor、签名 A/B 更新、回滚、日志、隐私和完整 HIL。
-8. **P7 后续能力**：SC3336、多模态、音乐和其他 provider，不进入 v1 阻塞路径。
-
-每个里程碑都要先实现最小闭环和 smoke test，再扩展功能。不要同时改音频、协议、UI 和部署而无法定位回归。
+每步只修改最小负责层。声学参数必须等人工 HIL，不得用 host fake 宣称通过；未来 pairing、工具、
+supervisor 和 OTA 不进入当前阻断路径。
 
 ## 16. Agent 工作规则与完成标准
 

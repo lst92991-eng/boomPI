@@ -41,14 +41,14 @@ const std::array<AppInfo, 7>& Apps() {
        {"唤醒", "麦克风", "状态"}, {"Snowboy", "双麦 AEC", "待命"}, 0x3478F6},
       {"摄像头", kIconCamera, "BSP 已验证", "SC3336", "3MP · MIPI CSI", "轻触启动预览",
        {"曝光", "帧率", "预览"}, {"自动", "30 FPS", "待启动"}, 0xC64F69},
-      {"时间", kIconClock, "本地时间", "--:--", "Asia/Singapore\nUTC+8", "NTP 自动同步",
-       {"闹钟", "计时器", "同步"}, {"07:30", "00:00", "NTP"}, 0x5A687F},
-      {"WiFi", kIconWifi, "已连接", "boomPI Lab", "Wi-Fi · 192.168.1.82", "管理网络",
-       {"地址", "信号", "频段"}, {"DHCP", "-42 dBm", "2.4 GHz"}, 0x2878C9},
-      {"天气", kIconCloud, "新加坡", "26° 晴朗", "体感 29° · 今日少云", "在线天气",
-       {"湿度", "风力", "降雨"}, {"78%", "3 级", "10%"}, 0x2C8799},
-      {"资源", kIconFolder, "运行正常", "CPU 32%", "RV1106 · 系统状态", "实时监控",
-       {"内存", "NPU", "温度"}, {"48%", "空闲", "46°C"}, 0x397C60},
+      {"时间", kIconClock, "本地时间", "--:--", "使用系统本地时区", "时钟页面",
+       {"闹钟", "计时器", "同步"}, {"待接入", "待接入", "系统时间"}, 0x5A687F},
+      {"WiFi", kIconWifi, "配网入口", "boomPI-Setup", "首次联网 · 本地配置", "打开配网向导",
+       {"热点", "方式", "状态"}, {"boomPI-Setup", "二维码", "按需启动"}, 0x2878C9},
+      {"天气", kIconCloud, "数据待接入", "--°", "在线天气尚未接入", "后续接入",
+       {"湿度", "风力", "降雨"}, {"--", "--", "--"}, 0x2C8799},
+      {"资源", kIconFolder, "采集待接入", "RV1106", "系统监控尚未接入", "后续接入",
+       {"内存", "NPU", "温度"}, {"--", "--", "--"}, 0x397C60},
       {"YOLO", kIconScanEye, "即将开放", "NPU 视觉", "桌面完成后再接入推理", "最后阶段接入",
        {"模型", "输入", "状态"}, {"--", "--", "待接入"}, 0x7658D7},
   }};
@@ -63,7 +63,7 @@ struct VoiceView final {
 };
 
 const VoiceView& Voice(DeviceUiState state) {
-  // 条目顺序必须与 DeviceUiState 枚举一致（新状态追加在末尾）。
+  // 条目顺序必须与 DeviceUiState 一致；新状态追加在枚举末尾。
   static const std::array<VoiceView, 8> views{{
       {"随时可以说话", "说出唤醒词开始对话", 2, 2200},
       {"正在聆听", "我在听，请继续", 8, 760},
@@ -311,13 +311,13 @@ void LvglScreen::BuildHome(lv_obj_t* root) noexcept {
   lv_obj_set_pos(sun, 16, 39);
 
   lv_obj_t* temperature = lv_label_create(home_);
-  lv_label_set_text(temperature, "26°");
+  lv_label_set_text(temperature, "--°");
   StyleLabel(temperature, body_font_, 0xF3EEE6, LV_TEXT_ALIGN_LEFT);
   lv_obj_set_size(temperature, 72, 24);
   lv_obj_set_pos(temperature, 43, 42);
 
   lv_obj_t* weather = lv_label_create(home_);
-  lv_label_set_text(weather, "新加坡 · 晴");
+  lv_label_set_text(weather, "天气待接入");
   StyleLabel(weather, home_caption_font_, 0xA5B0C0, LV_TEXT_ALIGN_LEFT);
   lv_obj_set_size(weather, 120, 20);
   lv_obj_set_pos(weather, 42, 64);
@@ -1064,18 +1064,14 @@ void LvglScreen::MuteClicked(lv_event_t* event) {
 
 void LvglScreen::VoiceClicked(lv_event_t* event) {
   auto* screen = static_cast<LvglScreen*>(lv_event_get_user_data(event));
-  // 正在回答与尾播阶段都允许触屏打断；是否真正可打断由应用侧状态机裁决
-  // （voice_client.cpp PollUi 只在 kSpeak/kDrain 消费 kInterrupt）。
   const bool interruptible = screen->state_ == DeviceUiState::kSpeaking ||
                              screen->state_ == DeviceUiState::kSpeakingTail;
   if (!interruptible) return;
   if (screen->interrupt_handler_ != nullptr) {
     screen->interrupt_handler_(screen->interrupt_user_data_);
   }
-  // 仅完整播报时乐观切到聆听；尾播打断后由应用侧 FinishTurn 刷新 UI。
-  if (screen->state_ == DeviceUiState::kSpeaking) {
+  if (screen->state_ == DeviceUiState::kSpeaking)
     screen->SetState(DeviceUiState::kListening);
-  }
 }
 
 void LvglScreen::AppActionClicked(lv_event_t* event) {

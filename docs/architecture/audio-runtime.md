@@ -7,12 +7,15 @@
 - `VoiceClient`（`application/`）：语音状态机、重连、turn、pre-roll 和打断编排。
 - `AudioEngine`（`audio/`）：唯一播放线程、固定 TTS 环和播放控制。
 - `VoiceTransport`（`network/`）：持久 WSS、TLS SPKI 固定、协议身份/序号校验和收发；
-  当前 property_tree 解析器的 JSON 类型/重复键限制仍须替换或补齐。
+  cJSON 解析边界严格校验 UTF-8、字段集合与类型、重复键、无符号整数词法和范围。
 - 私有 `AudioBackend`（`platform/rv1106/`）：由 `AudioEngine` 独占，内聚 ALSA 全双工、
   重采样、Rockchip 3A、Snowboy、WebRTC VAD 和近讲判定，不向 application 暴露。
 
-语音核心生产 C/C++ 共 18 个文件、2665 ELOC，其中 280 ELOC 是
-Rockchip/Snowboy vendor 集成，产品逻辑为 2385 ELOC；UI 显示层另计 1926 ELOC，不占语音核心预算。UI 和网络启动不介入逐帧 PCM 路径。
+逐帧音频主线共 15 个生产 C/C++ 文件、3066 ELOC，其中 280 ELOC 是 Rockchip/Snowboy
+vendor 集成，音频产品逻辑为 2786 ELOC。产品胶水以 2500 ELOC 为设计目标，CI 硬线为
+产品 2800、vendor 300、主线总量 3100 ELOC；为教学阅读展开的状态转换不得重新压行。
+LVGL UI 和网络启动独立统计，不介入逐帧 PCM
+路径，也不占音频预算。
 旧 `manual_single_turn`、独立 capture pump、
 通用 EventBus、自写 WSS/parser、renderer/resampler/gain 框架和 playback
 control/committer/worker 已删除；不得为了恢复历史测试结构重新引入。
@@ -31,18 +34,17 @@ ALSA capture: 48 kHz / S16_LE / Mode1 4ch / 20 ms
 WSS TTS: 24 kHz / S16_LE / mono
   -> 180 ms initial prebuffer (short EOS exception) / fixed 1.5 s hard limit
   -> 24 -> 48 kHz
-  -> gain + int16 饱和钳位（barge 一次性静音用 SetPlaybackScale(0)，无渐变 duck）
+  -> gain + limiter + optional duck
   -> ALSA playback: 48 kHz / S16_LE / stereo
   -> Codec Mode1 digital loopback -> refL/refR capture slots
 ```
 
-ALSA 精确协商为 capture `960/1920`、playback `960/3840` frame period/buffer。采集线程阻塞读取完整 20 ms
-帧后推入固定 4 槽（80 ms）capture 环，主 actor 每轮消费一帧；actor 落后超限即显式断帧
-（`actor_overrun`）而不是静默丢帧。重连和云端等待期间采集持续运行，避免硬件 overrun。
+ALSA 精确协商为 capture `960/1920`、playback `960/3840` frame period/buffer。独立 capture
+线程阻塞读取完整 20 ms 帧，并通过 4 帧固定队列交给 application actor；重连和云端等待期间
+仍持续读取，避免硬件 overrun。队列满时清除陈旧帧，并在下一帧显式标记 discontinuity。
 
 ## 固定容量
 
-- capture 环：4 × 20 ms；actor 落后 80 ms 即显式断帧，不静默丢弃。
 - 唤醒前卷：25 帧，即 500 ms。
 - 网络事件环：64 项；溢出视为连接失效，不覆盖旧事件。
 - TTS 队列：75 × 20 ms，即 1.5 s；满时取消当前响应，不无限堆积；只有取消发送本身失败时才重连。
@@ -57,24 +59,19 @@ ALSA 精确协商为 capture `960/1920`、playback `960/3840` frame period/buffe
 
 ## 执行上下文与所有权
 
-当前源码创建五个工作线程，加上运行 `VoiceClient::Run` 的主线程（唯一会话 actor），共六个
-客户端自有长期执行上下文：
+正常语音与显示在线时，当前源码共有六个客户端自有长期执行上下文；打开摄像头后增加到七个：
 
 | 上下文 | 独占职责 |
 | --- | --- |
-| 主线程（会话 actor） | 帧循环、状态机、turn/epoch、pre-roll、重连调度；业务状态唯一写者 |
-| 采集线程 | 独占 ALSA capture 与 3A/Snowboy/VAD，把成帧推入 4 槽 capture 环 |
-| 播放线程 | 激活期间独占 TTS 渲染、gain/饱和钳位和 ALSA playback |
+| 主 application actor | 唯一修改状态机、turn 和重连状态；消费处理完成的 capture 帧 |
+| capture/DSP 线程 | `SCHED_FIFO 40`；独占 ALSA capture、DSP、Snowboy/VAD 和 4 帧采集队列生产端 |
+| playback 线程 | `SCHED_FIFO 30`；激活期间独占 TTS 渲染、gain/limiter 和 ALSA playback |
 | WebSocket service 线程 | TLS/WSS I/O；回调只向 64 项事件环提交结果 |
-| UI 线程 | 合并低频状态刷新、SPI 写屏和 GT911 触摸，不处理 PCM |
+| NetworkBootstrap 线程 | DHCP/Wi-Fi、UDP discovery 和 endpoint 持久化 |
+| UI 线程 | 普通调度、`nice +5`；合并低频状态刷新、SPI 写屏和 GT911 触摸，不处理 PCM |
+| camera 线程（可选） | 只在摄像头页面启用，退出页面后回收 |
 
-另有网络启动线程（DHCP/Wi-Fi、UDP 发现、endpoint 持久化）在 `VoiceClient` 内长期运行；
-配网二维码期间会临时增加一个 camera 工作线程。板端实测总线程数（含链接依赖内部线程）
-尚需重新采集；依赖库线程不拥有 boomPI 业务状态。若后续出现更多依赖线程，必须重新记录
-来源、优先级和退出行为。
-
-业务状态只由主线程（会话 actor）修改。采集/播放线程只碰自己的环，不切换 turn；网络回调
-不直接调用状态机。播放开始前，
+业务状态只由主 application actor 修改。capture/playback 线程不切换 turn，网络回调不直接调用状态机。播放开始前，
 actor 只在 `active=false` 且受 `AudioEngine` mutex 保护时复位播放重采样相位。
 `Close` 先通知工作线程退出并 join，再释放 ALSA、DSP、Snowboy、VAD 和 WSS 资源。
 

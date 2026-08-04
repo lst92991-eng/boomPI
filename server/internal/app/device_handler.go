@@ -41,6 +41,7 @@ const (
 var (
 	errDeviceAuthentication     = errors.New("device authentication failed")
 	errDeviceSessionIdleTimeout = errors.New("device session idle timeout")
+	errInvalidTurnStart         = errors.New("invalid turn.start")
 )
 
 type deviceHandler struct {
@@ -65,13 +66,17 @@ type activeTurn struct {
 	pendingPCM     []byte
 	outputStarted  bool
 	committedAt    time.Time
+	downlinkCtx    context.Context
+	stopDownlink   context.CancelFunc
 	active         bool
 }
 
 // pacedDownlink is deliberately local to the device handler. Provider audio
 // may arrive much faster than a speaker can consume it, but the wire must not
-// turn that burst into seconds of stale client-side audio. One complete frame
-// is retained as look-ahead so the terminal PCM packet can carry END.
+// turn that burst into seconds of stale client-side audio. No complete frame
+// should wait for a later provider delta merely to discover whether it is
+// terminal. When done arrives after an exact frame boundary, one silent
+// S16_LE sample carries the required non-empty END packet instead.
 type pacedDownlink struct {
 	epoch                uint32
 	turnID               uint32
@@ -118,12 +123,13 @@ func (p *pacedDownlink) matches(turn activeTurn, responseID string) bool {
 
 func (p *pacedDownlink) frameReady() bool {
 	buffered := p.pending.Len()
-	return buffered > outputFrameBytes || (p.providerDone && buffered != 0)
+	return buffered >= outputFrameBytes || (p.providerDone && buffered != 0)
 }
 
 type connectionState struct {
 	mu             sync.Mutex
 	turn           activeTurn
+	sessionEpoch   uint32
 	message        atomic.Uint64
 	monotonicStart time.Time
 }
@@ -167,10 +173,15 @@ func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connec
 	if err != nil {
 		return err
 	}
-	defer actor.Close()
+	defer func() {
+		if closeErr := actor.Close(); result == nil && closeErr != nil {
+			result = closeErr
+		}
+	}()
 
 	state := &connectionState{
 		turn:           activeTurn{deviceID: hello.DeviceID, deviceUUID: deviceUUID, sessionID: sessionID, epoch: 1},
+		sessionEpoch:   1,
 		monotonicStart: time.Now(),
 	}
 	if err := sendControl(ctx, connection, state, "hello.ack", state.turn, map[string]any{
@@ -207,21 +218,201 @@ func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connec
 	for {
 		message, receiveErr := connection.Receive(workerCtx)
 		if receiveErr != nil {
+			var congestion *transport.TurnCongestionError
+			if errors.As(receiveErr, &congestion) {
+				signalDeviceSessionActivity(activity)
+				if err := h.handleTurnCongestion(workerCtx, connection, actor, state, congestion); err != nil {
+					return err
+				}
+				continue
+			}
 			return receiveErr
 		}
 		signalDeviceSessionActivity(activity)
 		if message.Control != nil {
+			if staleRetiredTurnControl(state, *message.Control) {
+				continue
+			}
 			if err := h.handleControl(workerCtx, connection, actor, state, *message.Control); err != nil {
+				if errors.Is(err, errInvalidTurnStart) &&
+					controlBelongsToDeviceSession(state, *message.Control) {
+					if rejectErr := rejectTurnStart(workerCtx, connection, state, *message.Control); rejectErr != nil {
+						return rejectErr
+					}
+					continue
+				}
+				if controlBelongsToActiveTurn(state, *message.Control) {
+					if retireErr := h.retireActiveTurn(workerCtx, connection, actor, state, err); retireErr != nil {
+						return retireErr
+					}
+					continue
+				}
 				_ = sendProtocolError(workerCtx, connection, state, err)
 				return err
 			}
 			continue
 		}
+		if pcmBelongsToRetiredTurn(state, *message.PCMHeader) {
+			continue
+		}
 		if err := h.handlePCM(workerCtx, actor, state, *message.PCMHeader, message.PCM); err != nil {
+			if pcmBelongsToActiveTurn(state, *message.PCMHeader) {
+				if retireErr := h.retireActiveTurn(workerCtx, connection, actor, state, err); retireErr != nil {
+					return retireErr
+				}
+				continue
+			}
 			_ = sendProtocolError(workerCtx, connection, state, err)
 			return err
 		}
 	}
+}
+
+func (h *deviceHandler) handleTurnCongestion(
+	ctx context.Context,
+	connection *transport.Connection,
+	actor *session.Actor,
+	state *connectionState,
+	congestion *transport.TurnCongestionError,
+) error {
+	state.mu.Lock()
+	turn := state.turn
+	state.mu.Unlock()
+	if congestion.SessionID != turn.sessionID {
+		return errors.New("receive congestion does not belong to this device session")
+	}
+	if turn.active && congestion.TurnID == turn.turnID && congestion.Epoch == turn.epoch {
+		return h.retireActiveTurn(ctx, connection, actor, state, congestion)
+	}
+
+	// The queue can fill before turn.start reaches the handler. Reject that
+	// bounded turn explicitly and keep the authenticated provider session alive.
+	rejected := turn
+	rejected.turnID = congestion.TurnID
+	rejected.uplinkStream = congestion.StreamID
+	rejected.downlinkStream = congestion.StreamID
+	rejected.epoch = congestion.Epoch
+	rejected.active = false
+	return sendControl(ctx, connection, state, "error", rejected, map[string]any{
+		"code": "turn_error", "message": "The current voice turn was cancelled",
+	})
+}
+
+// A malformed message inside the current turn must not tear down the
+// authenticated WebSocket or the persistent provider session. Fence output,
+// tell the client that this turn failed, then return the actor to idle.
+func (h *deviceHandler) retireActiveTurn(
+	ctx context.Context,
+	connection *transport.Connection,
+	actor *session.Actor,
+	state *connectionState,
+	cause error,
+) error {
+	state.mu.Lock()
+	turn := state.turn
+	if !turn.active {
+		state.mu.Unlock()
+		return cause
+	}
+	state.turn.active = false
+	state.turn.pendingPCM = nil
+	stopDownlink := state.turn.stopDownlink
+	state.mu.Unlock()
+
+	if stopDownlink != nil {
+		stopDownlink()
+	}
+	if err := actor.Cancel(ctx, uint64(turn.epoch)); err != nil {
+		return err
+	}
+	if err := sendControl(ctx, connection, state, "error", turn, map[string]any{
+		"code": "turn_error", "message": "The current voice turn was cancelled",
+	}); err != nil {
+		return err
+	}
+	h.logger.Warn("voice turn retired after an invalid turn message",
+		"device_ref", redactedDeviceRef(turn.deviceID), "turn_id", turn.turnID,
+		"error_code", "invalid_turn_message")
+	return nil
+}
+
+func controlBelongsToActiveTurn(state *connectionState, envelope protocol.ControlEnvelope) bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	turn := state.turn
+	return turn.active && envelope.DeviceID == turn.deviceID &&
+		envelope.SessionID == turn.sessionID && envelope.TurnID == turn.turnID &&
+		envelope.Epoch == turn.epoch &&
+		(envelope.StreamID == turn.uplinkStream || envelope.StreamID == turn.downlinkStream)
+}
+
+func controlBelongsToDeviceSession(state *connectionState, envelope protocol.ControlEnvelope) bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return envelope.DeviceID == state.turn.deviceID && envelope.SessionID == state.turn.sessionID
+}
+
+func rejectTurnStart(
+	ctx context.Context,
+	connection *transport.Connection,
+	state *connectionState,
+	envelope protocol.ControlEnvelope,
+) error {
+	state.mu.Lock()
+	turn := state.turn
+	sessionEpoch := state.sessionEpoch
+	state.mu.Unlock()
+	if envelope.TurnID != 0 && envelope.StreamID != 0 && envelope.Epoch != 0 {
+		turn.turnID = envelope.TurnID
+		turn.uplinkStream = envelope.StreamID
+		turn.downlinkStream = envelope.StreamID
+		turn.epoch = envelope.Epoch
+	} else {
+		// A malformed start without a complete turn identity can only receive a
+		// session-scoped error that the strict client can authenticate.
+		turn.turnID = 0
+		turn.uplinkStream = 0
+		turn.downlinkStream = 0
+		turn.epoch = sessionEpoch
+	}
+	turn.active = false
+	return sendControl(ctx, connection, state, "error", turn, map[string]any{
+		"code": "turn_error", "message": "The requested voice turn was rejected",
+	})
+}
+
+func pcmBelongsToActiveTurn(state *connectionState, header protocol.PCMHeader) bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	turn := state.turn
+	return turn.active && header.DeviceUUID == turn.deviceUUID &&
+		header.SessionID == turn.sessionID && header.TurnID == turn.turnID &&
+		header.StreamID == turn.uplinkStream && header.Epoch == turn.epoch
+}
+
+// Once a turn is retired, frames already read from the socket may still be in
+// the bounded receive queue. They are expected in-flight data, not a new
+// session protocol violation. A later turn.start has a different identity and
+// therefore remains visible to the state machine.
+func pcmBelongsToRetiredTurn(state *connectionState, header protocol.PCMHeader) bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	turn := state.turn
+	return !turn.active && header.DeviceUUID == turn.deviceUUID &&
+		header.SessionID == turn.sessionID && header.TurnID == turn.turnID &&
+		header.StreamID == turn.uplinkStream && header.Epoch == turn.epoch
+}
+
+func staleRetiredTurnControl(state *connectionState, envelope protocol.ControlEnvelope) bool {
+	if envelope.Type != "turn.commit" {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	turn := state.turn
+	return !turn.active && envelope.DeviceID == turn.deviceID &&
+		envelope.SessionID == turn.sessionID && envelope.TurnID == turn.turnID &&
+		envelope.StreamID == turn.uplinkStream && envelope.Epoch == turn.epoch
 }
 
 func deviceSessionErrorCode(ctx context.Context, result error) (string, bool) {
@@ -341,22 +532,29 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 	switch envelope.Type {
 	case "turn.start":
 		if turn.active {
-			return errors.New("a turn is already active")
+			return fmt.Errorf("%w: a turn is already active", errInvalidTurnStart)
 		}
 		if envelope.TurnID == 0 || envelope.StreamID == 0 || envelope.Epoch == 0 {
-			return errors.New("turn.start identifiers must be nonzero")
+			return fmt.Errorf("%w: identifiers must be nonzero", errInvalidTurnStart)
 		}
-		var payload struct {
-			SampleRateHz uint32 `json:"sample_rate_hz"`
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(envelope.Payload, &fields); err != nil ||
+			len(fields) != 1 || fields["sample_rate_hz"] == nil {
+			return fmt.Errorf("%w: sample_rate_hz must be 16000", errInvalidTurnStart)
 		}
-		if err := json.Unmarshal(envelope.Payload, &payload); err != nil || payload.SampleRateHz != 16_000 {
-			return errors.New("turn.start requires sample_rate_hz 16000")
+		var sampleRateHz uint32
+		if err := json.Unmarshal(fields["sample_rate_hz"], &sampleRateHz); err != nil ||
+			sampleRateHz != 16_000 {
+			return fmt.Errorf("%w: sample_rate_hz must be 16000", errInvalidTurnStart)
 		}
 		downlinkStream, err := randomNonzeroID()
 		if err != nil {
 			return err
 		}
 		if err := actor.StartTurn(ctx, uint64(envelope.Epoch)); err != nil {
+			if errors.Is(err, session.ErrInvalidTransition) || errors.Is(err, session.ErrStaleEpoch) {
+				return fmt.Errorf("%w: provider session rejected the turn epoch", errInvalidTurnStart)
+			}
 			return err
 		}
 		turn.turnID = envelope.TurnID
@@ -371,6 +569,10 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 		turn.pendingPCM = nil
 		turn.outputStarted = false
 		turn.committedAt = time.Time{}
+		if turn.stopDownlink != nil {
+			turn.stopDownlink()
+		}
+		turn.downlinkCtx, turn.stopDownlink = context.WithCancel(ctx)
 		turn.active = true
 		state.mu.Lock()
 		state.turn = turn
@@ -380,6 +582,9 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 	case "turn.commit":
 		if err := validateActiveEnvelope(turn, envelope); err != nil {
 			return err
+		}
+		if !emptyObjectPayload(envelope.Payload) {
+			return errors.New("turn.commit payload must be empty")
 		}
 		if err := validateUplinkCommit(turn); err != nil {
 			return err
@@ -395,15 +600,27 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 		return actor.Commit(ctx, uint64(turn.epoch))
 
 	case "turn.cancel", "response.cancel":
+		if !emptyObjectPayload(envelope.Payload) {
+			return errors.New("cancel payload must be empty")
+		}
 		if !turn.active {
 			if envelope.TurnID != turn.turnID || envelope.Epoch != turn.epoch ||
 				(envelope.StreamID != turn.uplinkStream && envelope.StreamID != turn.downlinkStream) {
 				return nil
 			}
+			// The provider may finish before the client drains the last audio.
+			// A cancel for that retired epoch still means the user did not hear
+			// the complete answer, so let the actor discard it from history.
+			if err := actor.Cancel(ctx, uint64(turn.epoch)); err != nil {
+				_ = sendControl(ctx, connection, state, "response.cancelled", turn,
+					map[string]any{"reason": "client_request"})
+				return err
+			}
 			return sendControl(ctx, connection, state, "response.cancelled", turn, map[string]any{"reason": "client_request"})
 		}
-		if envelope.Epoch != turn.epoch {
-			return errors.New("cancel epoch does not match the active turn")
+		if envelope.TurnID != turn.turnID || envelope.Epoch != turn.epoch ||
+			(envelope.StreamID != turn.uplinkStream && envelope.StreamID != turn.downlinkStream) {
+			return errors.New("cancel identifiers do not match the active turn")
 		}
 		// Fence downlink immediately. Provider cancellation may wait for a remote
 		// acknowledgement, but no event from this epoch should be queued meanwhile.
@@ -411,15 +628,17 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 		if sameTurn(state.turn, turn) {
 			state.turn.active = false
 			state.turn.pendingPCM = nil
+			if state.turn.stopDownlink != nil {
+				state.turn.stopDownlink()
+			}
 		}
 		state.mu.Unlock()
-		// Drop already-queued PCM of the cancelled response so the ACK below is
-		// not delayed behind up to a queueful of audio the board must ignore.
-		connection.DiscardQueuedPCM()
 		if err := actor.Cancel(ctx, uint64(turn.epoch)); err != nil {
-			// The fence already stopped downlink; acknowledge best-effort so the
-			// board does not burn its bounded cancel timeout on a provider fault.
-			_ = sendControl(ctx, connection, state, "response.cancelled", turn, map[string]any{"reason": "client_request"})
+			// The local downlink fence is already established. Acknowledge it even
+			// when provider cleanup fails so the board does not wait for its full
+			// cancel deadline before observing the subsequent session close.
+			_ = sendControl(ctx, connection, state, "response.cancelled", turn,
+				map[string]any{"reason": "client_request"})
 			return err
 		}
 		turn.active = false
@@ -428,6 +647,11 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 	default:
 		return fmt.Errorf("unsupported control type %q", envelope.Type)
 	}
+}
+
+func emptyObjectPayload(payload json.RawMessage) bool {
+	var fields map[string]json.RawMessage
+	return json.Unmarshal(payload, &fields) == nil && len(fields) == 0
 }
 
 func (h *deviceHandler) handlePCM(ctx context.Context, actor *session.Actor, state *connectionState, header protocol.PCMHeader, pcm []byte) error {
@@ -530,6 +754,13 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 			pacer.reset()
 		}
 
+		if pacer.providerDone && pacer.pending.Len() == 0 && pacer.wireFrames != 0 {
+			// A complete frame was already released before the provider's done
+			// event. Protocol v1 requires END on a non-empty aligned PCM packet,
+			// so terminate with one inaudible zero sample instead of withholding
+			// 20 ms of real audio as framing look-ahead.
+			_, _ = pacer.pending.Write(make([]byte, pcmBytesPerSample))
+		}
 		if pacer.providerDone && pacer.pending.Len() == 0 {
 			finished, err := h.finishPacedResponse(ctx, connection, state, pacer)
 			if err != nil {
@@ -581,7 +812,10 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 			continue
 		case event, ok := <-providerEvents:
 			if !ok {
-				return nil
+				if ctx.Err() != nil {
+					return nil
+				}
+				return errors.New("conversation session event stream closed unexpectedly")
 			}
 			state.mu.Lock()
 			turn := state.turn
@@ -622,15 +856,19 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 					continue
 				}
 				turn = state.turn
+				startAudio := !turn.outputStarted
 				if !turn.outputStarted {
-					if err := sendControl(ctx, connection, state, "response.audio_start", turn, map[string]any{"response_id": event.ResponseID, "sample_rate_hz": event.SampleRateHz}); err != nil {
-						state.mu.Unlock()
-						return err
-					}
 					turn.outputStarted = true
 				}
 				state.turn = turn
 				state.mu.Unlock()
+				if startAudio {
+					if err := sendControlIfActive(ctx, connection, state, "response.audio_start", turn, map[string]any{
+						"response_id": event.ResponseID, "sample_rate_hz": event.SampleRateHz,
+					}); err != nil {
+						return err
+					}
+				}
 				if pacer.firstProviderAudioAt.IsZero() {
 					pacer.firstProviderAudioAt = time.Now()
 				}
@@ -650,14 +888,19 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 					state.mu.Unlock()
 					continue
 				}
+				turn = state.turn
+				state.turn.active = false
+				state.turn.pendingPCM = nil
+				stopDownlink := state.turn.stopDownlink
+				state.mu.Unlock()
+				if stopDownlink != nil {
+					stopDownlink()
+				}
 				if err := sendControl(ctx, connection, state, "error", turn, map[string]any{
 					"code": "provider_error", "message": "AI provider request failed",
 				}); err != nil {
-					state.mu.Unlock()
 					return err
 				}
-				state.turn.active = false
-				state.mu.Unlock()
 				pacer.reset()
 			}
 		}
@@ -665,6 +908,25 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 }
 
 func (h *deviceHandler) sendNextPacedFrame(ctx context.Context, connection *transport.Connection, state *connectionState, pacer *pacedDownlink) (bool, bool, error) {
+	return h.sendNextPacedFrameWith(ctx, state, pacer, func(
+		sendCtx context.Context,
+		turn activeTurn,
+		payload []byte,
+		final bool,
+	) error {
+		return sendDownlinkPCM(sendCtx, connection, state, turn, payload, final)
+	})
+}
+
+func (h *deviceHandler) sendNextPacedFrameWith(
+	ctx context.Context,
+	state *connectionState,
+	pacer *pacedDownlink,
+	writePCM func(context.Context, activeTurn, []byte, bool) error,
+) (bool, bool, error) {
+	// This narrow seam makes the lock/backpressure boundary deterministic in a
+	// host test. Production always supplies sendDownlinkPCM; it is not a second
+	// transport interface and must not acquire more call sites.
 	buffered := pacer.pending.Len()
 	if buffered == 0 {
 		return false, false, nil
@@ -682,13 +944,18 @@ func (h *deviceHandler) sendNextPacedFrame(ctx context.Context, connection *tran
 		return false, false, nil
 	}
 	turn := state.turn
-	if err := sendDownlinkPCM(ctx, connection, state, turn, payload, final); err != nil {
-		state.mu.Unlock()
+	// Reserve this sequence while holding the state lock, then release it before
+	// transport backpressure can block. Only forwardEvents reserves downlink
+	// sequences, so the wire order remains deterministic.
+	state.turn.outputSequence++
+	state.mu.Unlock()
+
+	if err := writePCM(turnContext(ctx, turn), turn, payload, final); err != nil {
+		if !activeTurnMatches(state, turn) {
+			return false, false, nil
+		}
 		return false, false, err
 	}
-	turn.outputSequence++
-	state.turn = turn
-	state.mu.Unlock()
 
 	pacer.pending.Next(payloadBytes)
 	pacer.wireFrames++
@@ -714,13 +981,28 @@ func (h *deviceHandler) finishPacedResponse(ctx context.Context, connection *tra
 		return false, nil
 	}
 	turn := state.turn
-	if err := sendControl(ctx, connection, state, "response.done", turn, map[string]any{"response_id": pacer.responseID}); err != nil {
-		state.mu.Unlock()
+	state.mu.Unlock()
+
+	if err := sendControl(turnContext(ctx, turn), connection, state, "response.done", turn, map[string]any{"response_id": pacer.responseID}); err != nil {
+		if !activeTurnMatches(state, turn) {
+			return false, nil
+		}
 		return false, err
 	}
+
+	state.mu.Lock()
+	if !sameActiveTurn(state.turn, turn) {
+		state.mu.Unlock()
+		return false, nil
+	}
+	turn = state.turn
 	turn.active = false
 	state.turn = turn
+	stopDownlink := turn.stopDownlink
 	state.mu.Unlock()
+	if stopDownlink != nil {
+		stopDownlink()
+	}
 
 	h.logger.Info("voice response timing",
 		"device_ref", redactedDeviceRef(turn.deviceID),
@@ -813,11 +1095,32 @@ func sameActiveTurn(current activeTurn, expected activeTurn) bool {
 
 func sendControlIfActive(ctx context.Context, connection *transport.Connection, state *connectionState, messageType string, turn activeTurn, payload any) error {
 	state.mu.Lock()
-	defer state.mu.Unlock()
 	if !sameActiveTurn(state.turn, turn) {
+		state.mu.Unlock()
 		return nil
 	}
-	return sendControl(ctx, connection, state, messageType, turn, payload)
+	turn = state.turn
+	state.mu.Unlock()
+	if err := sendControl(turnContext(ctx, turn), connection, state, messageType, turn, payload); err != nil {
+		if !activeTurnMatches(state, turn) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func activeTurnMatches(state *connectionState, turn activeTurn) bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return sameActiveTurn(state.turn, turn)
+}
+
+func turnContext(fallback context.Context, turn activeTurn) context.Context {
+	if turn.downlinkCtx != nil {
+		return turn.downlinkCtx
+	}
+	return fallback
 }
 
 func redactedDeviceRef(deviceID string) string {
@@ -825,11 +1128,17 @@ func redactedDeviceRef(deviceID string) string {
 	return fmt.Sprintf("%x", digest[:4])
 }
 
-func sendProtocolError(ctx context.Context, connection *transport.Connection, state *connectionState, err error) error {
+func sendProtocolError(ctx context.Context, connection *transport.Connection, state *connectionState, _ error) error {
 	state.mu.Lock()
 	turn := state.turn
+	turn.turnID = 0
+	turn.uplinkStream = 0
+	turn.downlinkStream = 0
+	turn.epoch = state.sessionEpoch
 	state.mu.Unlock()
-	return sendControl(ctx, connection, state, "error", turn, map[string]any{"code": "protocol_error", "message": err.Error()})
+	return sendControl(ctx, connection, state, "error", turn, map[string]any{
+		"code": "protocol_error", "message": "Protocol message rejected",
+	})
 }
 
 func sendControl(ctx context.Context, connection *transport.Connection, state *connectionState, messageType string, turn activeTurn, payload any) error {

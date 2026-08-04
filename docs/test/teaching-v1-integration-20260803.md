@@ -11,15 +11,12 @@
 - 板端交互：ST7789P3 七种简单状态、中文两行字幕、GT911 点击打断、音量和亮度手势。
 - 板端联网：以太网优先、已保存 Wi-Fi 备用、UDP 服务发现、endpoint/SPKI 持久化。
 - 首次配网：静态热点二维码、手机 HTTP 表单和凭据标准输入传递；不记录 SSID 或密码。
-- 服务端：Windows/Linux/macOS 单文件构建；首次运行生成私有配置并退出，填 Key 后的第二次运行生成 TLS 身份；Qwen 公共
+- 服务端：Windows/Linux/macOS 单文件构建；首次运行生成私有配置并退出，填 Key 后的第二次运行生成 TLS 身份；当时的 Qwen 公共
   新加坡端点、WSS 会话和 UDP 发现。
 - 最小运维：`boompi-clientctl` 提供启动、停止、重启、状态、日志、单备份更新和配网；异常退出后
   总计最多启动三次，不实现企业级 supervisor 或 A/B OTA。
 
 ## 代码体量
-
-> 本节的文件数与上限已被 2026-08-04 基线取代：当前为 18 个生产文件、2665 ELOC，
-> 以 AGENTS.md 第 2.1 节与 `scripts/tests/test_client_source_contract.py` 为准。
 
 统一口径为非空行减去纯 `//` 注释：
 

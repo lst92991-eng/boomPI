@@ -16,6 +16,8 @@ import (
 	"github.com/lst92991-eng/boomPI/server/internal/transport"
 )
 
+const providerEventQueueCapacity = 8
+
 // App is the deliberately small server MVP: one WSS listener, one device and
 // one pluggable conversation backend.
 type App struct {
@@ -53,7 +55,7 @@ func newQwenBackend(cfg config.Config, logger *slog.Logger) (backend.Conversatio
 			TTSVoice:         cfg.TTSVoice,
 			SearchMode:       cfg.SearchMode,
 			Timeout:          cfg.FirstResponseTimeout,
-			QueueSize:        64,
+			QueueSize:        providerEventQueueCapacity,
 			MaxTurns:         cfg.MaxTurns,
 			MaxContextTokens: cfg.MaxContextTokens,
 			Logger:           logger,
@@ -66,7 +68,7 @@ func newQwenBackend(cfg config.Config, logger *slog.Logger) (backend.Conversatio
 		Model:       cfg.Model,
 		Voice:       cfg.Voice,
 		Timeout:     cfg.ConnectionTimeout,
-		QueueSize:   32,
+		QueueSize:   providerEventQueueCapacity,
 	})
 }
 
@@ -123,16 +125,33 @@ func (a *App) Run(ctx context.Context) error {
 		"credential_source", a.cfg.Credentials.Source(),
 		"tls_spki_sha256", a.spkiPin,
 	)
+	err := runListeners(ctx, a.transport.Serve, a.discovery.Serve)
+	if err == nil && ctx.Err() != nil {
+		a.logger.Info("boomPI server stopped")
+	}
+	return err
+}
+
+func runListeners(
+	ctx context.Context,
+	serveWSS func(context.Context) error,
+	serveDiscovery func(context.Context) error,
+) error {
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	results := make(chan error, 2)
-	go func() { results <- a.transport.Serve(runCtx) }()
-	go func() { results <- a.discovery.Serve(runCtx) }()
+	go func() { results <- serveWSS(runCtx) }()
+	go func() { results <- serveDiscovery(runCtx) }()
 	first := <-results
+	// Both listeners are lifetime services: a nil result is valid only after
+	// the parent requested shutdown. Treat any earlier nil as a real failure so
+	// a silently stopped UDP or WSS listener cannot look like a clean restart.
+	if first == nil && ctx.Err() == nil {
+		first = errors.New("server listener stopped without a shutdown request")
+	}
 	stop()
 	second := <-results
 	if ctx.Err() != nil {
-		a.logger.Info("boomPI server stopped")
 		return nil
 	}
 	if first != nil {

@@ -1,13 +1,15 @@
 # boomPI
 
-boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端负责连接 Qwen 新加坡区，板端不保存云端 API Key。
+boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端默认连接 Qwen 中国内地（北京）区，板端不保存云端 API Key。
 
-> **语音链路的关键能力已经在 RV1106 上完成组合验收，教学版功能也已合入，但当前候选仍不是量产发布版。**
-> 2026-08-03 的单参考候选已完成严格交叉构建、固定语音 A/B、板端启动、真实 Qwen 问答以及
+> **当前工作树是教学版收尾候选：主机自动化、严格 RV1106 交叉构建和板端静态部署均已完成；客户端保持关闭，等待真人完成最终声学与交互复验。**
+> 2026-08-03 的单参考候选曾完成严格交叉构建、固定语音 A/B、板端启动、真实 Qwen 问答以及
 > 静默、完整播放、三秒追问和播放中打断四段真人验收；本次窗口未观察到自激或音频运行错误。
-> 当前候选的语音核心为 18 个生产 C/C++ 文件、2665 ELOC；其中
-> Rockchip/Snowboy vendor 集成 280 ELOC，产品逻辑 2385 ELOC；UI 显示层另计 1926 ELOC，不占语音核心预算。屏幕/触摸、网络启动、UDP
-> 发现和 Wi-Fi 二维码配网已进入同一教学候选。旧版的丢帧、高延迟、`EPIPE` 和 jitter queue 记录仍作为回归风险
+> 这些结果只属于当日源码与二进制，不自动覆盖后续工作树。当前冻结源码的音频主线为
+> 15 个生产文件、3066 ELOC：其中 vendor 集成 280 ELOC，产品胶水 2786 ELOC；
+> 2026-08-03 的 2929 ELOC 仅作历史快照。
+> 禁止用压行、挪文件或删除有效注释规避统计；LVGL UI 和网络启动独立统计，不计入音频 ELOC；
+> 屏幕/触摸、UDP 发现和 Wi-Fi 二维码配网仍属于同一教学候选。旧版的丢帧、高延迟、`EPIPE` 和 jitter queue 记录仍作为回归风险
 > 保留；最终壳体 ERLE、受控 double-talk 和长期稳定性仍待量化验收。
 > 同日第一块板又完成分阶段打断 A/B：关闭打断后播放恢复流畅，快速候选完成真实 Qwen
 > 播放与多轮打断，用户确认体验可接受；主观结论、日志计数和未量化边界见
@@ -24,24 +26,12 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
               |
        boompi-server（Go）
               |
-       Qwen Singapore API
+       Qwen China (Beijing) API
 ```
 
 第一版目标包括双麦 AEC、Snowboy 英文唤醒、可打断流式 TTS、三秒连续对话、横屏表情与字幕、以太网/Wi-Fi、首次二维码配网和本地服务端发现。SC3336 多模态、在线音乐和长期记忆不属于第一版运行链路。
 
 详细约束以 [AGENTS.md](AGENTS.md) 为准；架构摘要见 [docs/architecture/system-overview.md](docs/architecture/system-overview.md)，音频 vendor 边界见 [音频后端契约与依赖闸门](docs/architecture/audio-backends.md)，协议设计基线见 [protocol/protocol-v1.md](protocol/protocol-v1.md)。
-
-## 从零复现
-
-完整语音链路依赖 RV1106 真板与 vendor SDK；没有板卡无法复现语音对话，桌面
-`client/apps/boompi_ui_simulator` 只预览屏幕渲染，不含语音业务。具备板端条件时按顺序：
-
-1. 服务端：Go ≥ 1.26，按 [server/README.md](server/README.md) 三步启动（首次运行生成
-   `config.yaml` 后自动退出属正常行为，填入 Key 再运行）。
-2. Host 验证：Python 3 跑 [Host 构建与测试](#host-构建与测试) 的 fixture 与契约测试。
-3. 客户端：按 [RV1106 交叉编译](#rv1106-交叉编译) 准备工具链与 vendor 依赖并交叉构建。
-4. 上板：按 [client/README.md](client/README.md) 安装、启动与验收。
-5. 服务端启动后板端经 UDP 17807 自动发现；唤醒后对话，验证可打断的多轮流式回答。
 
 ## 当前真实状态
 
@@ -66,7 +56,7 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
   AGC 关闭），`ALC31/ref1/delay0` 仍是候选而非最终参数。同类无人声/嘈杂环境回归中，AGC
   开启 `n=5` 得到 `confirmed=4/5`、`follow=5/5`、`attempts=119`；关闭 AGC 累计 `n=10`
   得到 `confirmed=2/10`、`follow=3/10`、`attempts=43`。AGC OFF 明显改善但没有解决误触发。
-- 播放期的分阶段参考探针先连续确认近讲、短时降音，再用硬静音等待 reference 降低和二次
+- 播放期的参考探针先以原音量连续确认六帧近讲，然后直接静音，等待 reference 降低和二次
   VAD 确认来抑制自激；失败后恢复播放并冷却，避免瞬态误判反复切断 TTS。这是
   产品侧 containment 候选，不是 AEC 效果证明。当前环境仍嘈杂，真人双讲和可控噪声条件下的
   打断验收待完成。
@@ -77,18 +67,23 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
   `server_commit` TTS；教学版 UDP 发现、SPKI 首次保存、以太网优先和 AP 配网页已实现。
   新服务端与真实 Qwen 的付费联调、真实 Wi-Fi 凭据关联、断网恢复、量化首音延迟和长期运行
   仍需最终验收。
-- 当前教学候选已部署到板端并进入 `secure session ready`；UI 驱动打开时没有回退日志，进程
-  实测约 11.8 MiB RSS、5 个线程。屏幕内容、GT911 手势和手机扫描二维码仍需人工目视验收。
+- 2026-08-03 教学候选曾部署到板端并进入 `secure session ready`；UI 驱动打开时没有回退日志，该候选
+  实测约 11.8 MiB RSS。当前源码正常语音/显示拓扑为 6 个长期执行上下文，摄像头开启后为 7 个；
+  本轮源码冻结后仍需在板端重新采集线程数、RSS 和日志。屏幕内容、GT911 手势和手机扫描二维码仍需人工目视验收。
 
 ### 软件阶段
 
-2026-08-03 教学候选按仓库既定职责整理（2026-08-04 对标业界后重定基线）；语音核心为 18 个生产 C/C++ 文件、2665 ELOC，其中
-Rockchip/Snowboy vendor 集成为 280 ELOC，产品逻辑为 2385 ELOC；UI 显示层（LVGL 渲染与屏幕/触摸驱动）另计 1926 ELOC：
+当前工作树继续按仓库既定职责整理：
 `application` 是会话状态机，`audio` 是有界播放编排，`network` 是持久 WSS/TLS，
 `platform/rv1106` 是 ALSA/libswresample、Rockchip 3A、Snowboy 和 WebRTC VAD；同一
 `network` 目录中的启动模块负责以太网/Wi-Fi/发现，`ui` 直接驱动 ST7789P3 和 GT911。
 它们直接组合现有库，不再保留自写 WSS、重复 wire protocol、通用 playback/capture 框架或
-supervisor/update 占位实现。2026-08-01 的
+supervisor/update 占位实现。当前音频主线精确计数为 15 个生产文件、3066 ELOC，其中 vendor
+集成 280 ELOC、产品胶水 2786 ELOC。2026-08-04 严格交叉构建已经通过；stripped RV1106
+客户端 SHA-256 为 `8f07a622a4a23f02495261b668a7afd525550fc83a23a9d94529aa28cebd9ca3`，
+完整自动化证据和仍待人工关闭的板端边界见
+[教学版软件收口记录](docs/test/software-closeout-20260804.md)。
+2026-08-01 的
 [语音客户端职责重排记录](docs/test/client-responsibility-layout-20260801.md)是纯语音阶段历史快照；
 当前整体验证见 [教学版第一版集成验证](docs/test/teaching-v1-integration-20260803.md)。
 
@@ -147,9 +142,10 @@ third_party/            第三方接入说明；不提交未获许可的 vendor/
 
 ## Host 构建与测试
 
-`boompi-client` 当前是 RV1106/vendor-only 目标，host CMake 不再编译一套与真板不同的假音频
-框架。Host 侧继续运行 Go 服务端测试、共享协议 fixture 校验和不打开硬件的 BSP 探针测试；
-客户端验收使用匹配 GCC 8.3/uClibc 的交叉构建与真板 HIL。
+`boompi-client` 当前是 RV1106/vendor-only 目标，host CMake 不生成一套与真板不同的假客户端。
+Host 只把真实 `VoiceClient`/`AudioEngine` 与测试目录中的薄 fake 边界组合，确定性回归状态迁移、
+背压、抖动重蓄水和有界退出；它不会打开 ALSA、屏幕或网络。最终客户端验收仍使用匹配
+GCC 8.3/uClibc 的交叉构建与真板 HIL。
 
 ```text
 python scripts/verify_protocol_fixtures.py
@@ -186,14 +182,15 @@ go build -trimpath ./cmd/boompi-server
 
 1. 直接运行一次，程序在当前目录创建私有的 `config.yaml` 和 TLS 身份。
 2. 打开 `config.yaml`，只填写 `qwen_api_key: "sk-..."`。
-3. 再次运行；看到 `boomPI server started` 后即可让同一局域网内的板端自动发现。
+3. 再次运行；看到 `boomPI server starting` 且随后没有端口绑定错误后，即可让同一局域网内的板端自动发现。
 
 所有非密钥字段都有可运行默认值。也可以用 `DASHSCOPE_API_KEY` 覆盖 YAML；有专属
 Workspace 时再选填 `DASHSCOPE_WORKSPACE_ID`。教学版客户端和服务端内置相同的共享设备令牌，
 只适合可信局域网；需要隔离时在两端设置同一个随机 `BOOMPI_DEVICE_TOKEN`。
 
 当前实现提供 `wss://<host>:17806/ws`、稳定本地 TLS 身份、UDP `17807` 自动发现、16 kHz PCM
-上行、默认 intelligence 管线（ASR→推理→TTS 三级级联，可切 `realtime` 直通模式）、24 kHz PCM/文本下行与响应取消。完整操作见
+上行、默认 Qwen ASR → 对话模型 → 流式 TTS 组合链路、可选 Omni Realtime 直连、24 kHz
+PCM/文本下行与响应取消。完整操作见
 [服务端三步启动说明](server/README.md)。不要把真实 API Key、设备令牌、`config.yaml` 或
 `state/` 提交到 Git；任何曾出现在聊天或公开日志中的 Key 都应在控制台吊销并重新生成。
 
@@ -244,10 +241,18 @@ feasibility 环境中创建 `EXCLUDE_FROM_ALL` 的原始 AI/AO 探针，默认 b
 启动流程均不会构建或运行它。板端使用前必须阅读
 [Rockchip MPI 原始音频 HIL 指南](docs/test/p0-rockchip-mpi-audio-hil-guide.md)。
 
-准备完成后从全新 build 目录配置 Debug + `-O2` feasibility 候选，并显式传入上面列出的
-toolchain/sysroot、Boost、OpenSSL、Rockchip 3A、Snowboy 和 WebRTC VAD 路径。当前 vendor pin
-闸门刻意拒绝 Release；不得通过关闭 WSS/3A/Snowboy 生成一个冒充候选版的产物。已验证的
-完整参数与结果见
+准备完成后，把上述绝对路径设置为同名 `BOOMPI_*` 环境变量，然后只使用这一条板端构建入口：
+
+```text
+cmake --preset rv1106-candidate
+cmake --build --preset rv1106-candidate --parallel
+```
+
+也可以在 Git 已忽略的 `CMakeUserPresets.json` 中继承 `rv1106-candidate` 并覆盖同名 cache
+变量。仓库 preset 固定 Debug + `-O2`、ALSA、WSS、Rockchip 3A、Snowboy 和 WebRTC VAD；
+工具链/sysroot 继续由 `BOOMPI_RV1106_TOOLCHAIN_ROOT` 和 `BOOMPI_RV1106_SYSROOT` 注入。
+当前 vendor pin 闸门刻意拒绝 Release，所有 ABI 与 SHA-256 校验仍会执行；不得通过关闭
+WSS/3A/Snowboy 生成一个冒充候选版的产物。已验证的完整参数与结果见
 [语音客户端职责重排记录](docs/test/client-responsibility-layout-20260801.md)。
 
 2026-07-25 已使用与 BSP 匹配的 GCC 8.3.0 Buildroot wrapper 和 uClibc sysroot 成功构建 RV1106 Release 产物，并验证 ELF32 ARM EABI5 hard-float 与 loader；因当时板端管理通道不可用，产物尚未在板端执行。具体证据见 [P0 可行性报告](docs/test/p0-feasibility-report-20260725.md)，完整闸门见 [docs/test/rv1106-validation-gates.md](docs/test/rv1106-validation-gates.md)。刷镜像、改分区、设备树或启动项前必须单独取得用户授权。
@@ -312,23 +317,23 @@ raw MPI 对照使用独立的
 
 - 板端和本地服务端使用 WSS；教学版 UDP 发现包只给出端口和 SPKI，首次连接采用 TOFU 保存
   SPKI，只适用于可信局域网。
-- 音频采用二进制帧，控制事件采用 JSON；C++ 和 Go 必须读取同一份 [golden fixture](protocol/fixtures/protocol-v1-golden.json)。
+- 音频采用二进制帧，控制事件采用 JSON；[协议 fixture](protocol/fixtures/protocol-v1-golden.json)
+  由 Python 校验器和 Go 协议测试读取，C++ 严格 JSON/PCM 契约由独立 target 验证。
 - 断线或取消时丢弃当前 turn，不重传过期实时语音。
 - 默认不保存原始录音、播放参考或完整对话文本，不自动上传遥测或崩溃信息。
 - 生产代码不包含 Mock provider；deterministic fake 仅允许进入测试 target/package。
 
-## 路线图
+## 当前收尾与后置路线
 
-1. **P0 可行性闸门（主体完成）**：direct ALSA Mode1 四通道全双工、capture/reference layout
-   和历史 2 mic + 2 ref direct Rockchip 3A 板端调用已通过；现行生产改用 2 mic + refL。raw
-   rk_mpi、真人 double-talk、最终壳体声学和长期实时率仍是独立验收项。
-2. **P1 工程骨架（已完成）**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
-3. **P2 本地音频（进行中）**：只保留已进入真实客户端或直接支撑 HIL 的音频代码；以
-   vendor raw PCM 最小闭环和板端实测为边界，不预建通用 worker/control 层。
-4. **P3 服务端（教学版完成）**：首启配置、UDP discovery、Qwen adapter 和会话状态。
-5. **P4 端到端对话（主链完成）**：流式文字/音频、取消、上下文和自动重连；断网与延迟量化待验收。
-6. **P5 UI 与配网（实现完成）**：表情、字幕、触摸、二维码和网络优先级；真实 Wi-Fi/目视验收待完成。
-7. **P6 产品化（后置）**：supervisor、签名 A/B 应用更新和量产级配对不阻断教学版。
-8. **P7 后续能力**：SC3336、多模态、音乐和其他 provider。
+当前教学版只按以下顺序收尾：
+
+1. 修复确定性状态机、取消、背压、停止和协议问题，并用 Host harness 锁住回归。
+2. 冻结源码，重算 ELOC，执行唯一 `rv1106-candidate` 严格交叉构建并检查 ELF/ABI/依赖。
+3. 部署后由人工在同音量条件复验唤醒、VAD 句首、连续播放、尾播打断、double-talk、三秒追问、
+   屏幕/触摸和真实 Wi-Fi 配网。
+4. 记录分段延迟、XRUN/overrun/core、CPU/RSS 和有界稳定性结果；只有新记录能关闭本轮候选。
+
+后置能力包括真实天气/资源数据、YOLO 与多模态、在线音乐、长期记忆，以及企业级配对、独立
+supervisor、签名 A/B 更新、多设备管理和公网 OTA。它们不进入当前教学版阻断路径，也不提前建立占位模块。
 
 仓库许可证尚未确定。不要擅自添加许可证声明，也不要提交 Snowboy、Rockchip 或其他第三方二进制，除非来源、版本、校验和与再分发许可均已确认。

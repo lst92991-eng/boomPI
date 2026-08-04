@@ -1,6 +1,7 @@
 /** @file 有界播放样本回归：绕过唤醒和网络，复用生产音频链测量自激候选。 */
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -270,7 +271,8 @@ int main(int argc, char* argv[]) {
   Metrics metrics{};
   SignalSet quiet_signals{};
   for (unsigned index = 0U; index < kSettleFrames; ++index) {
-    if (!audio.Capture(&frame)) {
+    if (audio.Capture(&frame, std::chrono::milliseconds(200)) !=
+        boompi::audio::CaptureResult::kFrame) {
       std::cerr << "boompi-aec-loop-hil: settle capture failed: "
                 << audio.last_error() << '\n';
       return EXIT_FAILURE;
@@ -339,8 +341,9 @@ int main(int argc, char* argv[]) {
         }
       }
     }
-    const bool playing_before_capture = audio.stream_open();
-    if (!audio.Capture(&frame)) {
+    const bool playing_before_capture = audio.playback_active();
+    if (audio.Capture(&frame, std::chrono::milliseconds(200)) !=
+        boompi::audio::CaptureResult::kFrame) {
       std::cerr << "boompi-aec-loop-hil: capture failed: "
                 << audio.last_error() << '\n';
       return EXIT_FAILURE;
@@ -349,7 +352,7 @@ int main(int argc, char* argv[]) {
       std::cerr << "boompi-aec-loop-hil: capture discontinuity invalidated preadaptation\n";
       return EXIT_FAILURE;
     }
-    const bool playing = playing_before_capture || audio.stream_open();
+    const bool playing = playing_before_capture || audio.playback_active();
     saw_playback = saw_playback || playing;
     if constexpr (BOOMPI_AEC_LOOP_ACTIVE_PROBE != 0) {
       if (!audio.playback_done()) {

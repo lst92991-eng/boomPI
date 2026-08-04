@@ -7,8 +7,8 @@ tool calling.
 Protocol boundary verified against the Alibaba Cloud Model Studio documentation
 on 2026-07-28:
 
-- Singapore endpoint (boomPI default): `wss://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime`
-- China (Beijing) endpoint: `wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime`
+- China (Beijing) endpoint (boomPI default): `wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime`
+- Singapore endpoint (explicit option): `wss://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime`
 - Authentication: `Authorization: Bearer <API key>` during the WebSocket handshake
 - Model query: `?model=qwen3.5-omni-plus-realtime` (the configured model remains overridable)
 - Input: 16 kHz, mono, 16-bit PCM encoded as Base64 in `input_audio_buffer.append`

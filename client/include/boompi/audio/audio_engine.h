@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -25,10 +26,17 @@ struct CaptureFrame final {
   std::array<VoiceFrame16k, 4U> aec_input{};
 #endif
   std::uint64_t sequence{0U};
-  float input_dbfs{-120.0F};
+  float input_dbfs{-120.0F}, voice_dbfs{-120.0F};
   bool wake{false}, vad_now{false}, vad_started{false}, vad_ended{false};
   bool discontinuity{false}, actor_overrun{false};
   bool near_voice{false}, reference_active{false};
+};
+
+/// @brief application 等待下一帧的结果，区分正常轮询超时和音频故障。
+enum class CaptureResult : std::uint8_t {
+  kFrame,
+  kTimeout,
+  kFailed,
 };
 
 /// @brief 板端音频引擎的启动配置。
@@ -37,7 +45,7 @@ struct CaptureFrame final {
 struct AudioEngineConfig final {
   std::string capture_pcm, playback_pcm;
   std::string snowboy_resource, snowboy_model, snowboy_sensitivity{"0.7"};
-  float playback_gain{1.8F};
+  float playback_gain{1.0F};
   float vad_min_dbfs{-35.0F};
   std::int8_t left_polarity{1}, right_polarity{1};
 };
@@ -59,10 +67,12 @@ class AudioEngine final {
   /// @return 成功后才能调用其余方法；失败时对象仍可安全 `Close`，原因由 `last_error` 返回。
   bool Open(const AudioEngineConfig& config) noexcept;
 
-  /// @brief 阻塞取得一个由采集线程处理完成的 20 ms 帧。
+  /// @brief 在给定时间内取得一个由采集线程处理完成的 20 ms 帧。
   ///
-  /// 只能由 application actor 调用；不会直接访问 ALSA、3A 或模型资源。
-  bool Capture(CaptureFrame* frame) noexcept;
+  /// 只能由 application actor 调用；超时不代表 ALSA 故障，调用者应借此观察
+  /// stop flag。该边界保证 ALSA 阻塞时，进程仍能进入 Close 并调用 snd_pcm_abort。
+  CaptureResult Capture(CaptureFrame* frame,
+                        std::chrono::milliseconds timeout) noexcept;
 
   /// @brief 清空 Snowboy/VAD 的当前判定历史，不停止持续采集或 Rockchip 3A。
   bool ResetListener() noexcept;
@@ -72,22 +82,22 @@ class AudioEngine final {
   bool QueueTts24k(const std::uint8_t* pcm_bytes, std::size_t byte_count,
                    std::uint64_t sequence) noexcept;
 
-  /// @brief 开始一个新的 TTS 流并复位播放重采样相位；必须先于首个 PCM 包调用。
+  /// @brief 开始新 TTS 流；先等采集线程在帧边界准备后端，再交给播放线程消费。
+  /// 必须先于首个 PCM 包调用。
   bool BeginPlayback() noexcept;
 
   /// @brief 标记当前 TTS 已收完；播放线程会消费最后一个短帧、drain ALSA，再置完成状态。
   bool EndPlayback() noexcept;
 
-  /// 播放谓词三件套，全部是无锁快照：
-  /// - `stream_open`：当前 TTS 流尚未收到 EndPlayback（不代表扬声器正在出声）；
-  /// - `playback_done`：流已结束且尾帧已渲染完，kDrain 据此进入回合收尾；
-  /// - `playback_failed`：最近一次已结束的流发生硬件/渲染失败（主动 drop 不算）；
-  ///   BeginPlayback 会清除此状态。
   /// `SetPlaybackScale` 只调整后续渲染增益；`DropPlayback` 异步唤醒播放线程并清空尚未渲染的 TTS。
   void SetPlaybackGain(float gain) noexcept;
   void SetPlaybackScale(float scale) noexcept;
   void DropPlayback() noexcept;
-  bool stream_open() const noexcept { return !playback_done(); } bool playback_done() const noexcept;
+
+  /// 三个查询都是无锁快照。`playback_active` 表示 BeginPlayback 已开始且 drain/drop 尚未完成，
+  /// 不等同于扬声器此刻必然出声；用户主动 drop 不计为 `playback_failed`。
+  bool playback_active() const noexcept { return !playback_done(); }
+  bool playback_done() const noexcept;
   bool playback_failed() const noexcept;
 
   /// 返回 AudioEngine 或板级后端最近一次错误；允许 application 与播放线程并发读取。

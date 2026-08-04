@@ -1,19 +1,22 @@
 /// @file WSS/TLS 驱动及当前 v1 wire 校验；不包含对话状态转换。
 #include "boompi/network/voice_transport.h"
 
+#include "boompi/config/voice_client_config.h"
+
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
+#include <memory>
 #include <mutex>
-#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
 
-#include <boost/property_tree/json_parser.hpp>
-#include <boost/property_tree/ptree.hpp>
+#include <cjson/cJSON.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
@@ -21,6 +24,7 @@
 #include <openssl/x509v3.h>
 #include <websocketpp/client.hpp>
 #include <websocketpp/config/asio_client.hpp>
+#include <websocketpp/utf8_validator.hpp>
 
 namespace boompi::network {
 namespace {
@@ -69,8 +73,7 @@ std::string Quote(const std::string& value) {
   out.push_back('"'); return out;
 }
 bool ParseUuid(const std::string& value, std::array<std::uint8_t, 16>* out) {
-  if (!out || value.size() != 36 || value[8] != '-' || value[13] != '-' ||
-      value[18] != '-' || value[23] != '-') return false;
+  if (!out || !boompi::config::IsValidDeviceId(value)) return false;
   std::size_t n = 0; int high = -1;
   for (char c : value) {
     if (c == '-') continue;
@@ -79,6 +82,147 @@ bool ParseUuid(const std::string& value, std::array<std::uint8_t, 16>* out) {
     if (high < 0) high = d; else { (*out)[n++] = static_cast<std::uint8_t>((high << 4) | d); high = -1; }
   }
   return n == out->size();
+}
+
+struct CJsonDelete final {
+  void operator()(cJSON* value) const noexcept { cJSON_Delete(value); }
+};
+
+using JsonRoot = std::unique_ptr<cJSON, CJsonDelete>;
+
+struct ParsedEnvelope final {
+  JsonRoot root;
+  const cJSON* payload{nullptr};
+  std::string type;
+  std::string device_id;
+  WireIds ids{};
+};
+
+enum class QueueCapacity : std::uint8_t {
+  kAvailable,
+  kFull,
+  kUnavailable,
+};
+
+[[noreturn]] void InvalidJson(const char* why) {
+  throw std::runtime_error(why);
+}
+
+const cJSON* RequireItem(const cJSON* object, const char* name) {
+  const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, name);
+  if (!item) InvalidJson("missing JSON field");
+  return item;
+}
+
+void RequireExactObject(const cJSON* object, std::initializer_list<const char*> names) {
+  if (!cJSON_IsObject(object) || names.size() > 9U) InvalidJson("JSON value must be an object");
+  std::array<unsigned char, 9> seen{};
+  std::size_t members = 0;
+  for (const cJSON* item = object->child; item; item = item->next) {
+    const auto found = std::find_if(names.begin(), names.end(), [item](const char* name) {
+      return item->string && std::strcmp(item->string, name) == 0;
+    });
+    if (found == names.end()) InvalidJson("unknown JSON field");
+    const auto index = static_cast<std::size_t>(std::distance(names.begin(), found));
+    if (++seen[index] != 1U) InvalidJson("duplicate JSON object key");
+    ++members;
+  }
+  if (members != names.size()) InvalidJson("missing JSON field");
+}
+
+std::string RequireString(const cJSON* object, const char* name,
+                          std::size_t min_bytes, std::size_t max_bytes) {
+  const cJSON* item = RequireItem(object, name);
+  if (!cJSON_IsString(item) || !item->valuestring) InvalidJson("JSON field must be a string");
+  std::string value(item->valuestring);
+  if (value.size() < min_bytes || value.size() > max_bytes) {
+    InvalidJson("JSON string is outside its byte limit");
+  }
+  return value;
+}
+
+std::uint32_t RequireUint32(const cJSON* object, const char* name) {
+  const cJSON* item = RequireItem(object, name);
+  if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble) || item->valuedouble < 0.0 ||
+      item->valuedouble > static_cast<double>(std::numeric_limits<std::uint32_t>::max()) ||
+      std::trunc(item->valuedouble) != item->valuedouble) {
+    InvalidJson("JSON field must be an unsigned 32-bit integer");
+  }
+  return static_cast<std::uint32_t>(item->valuedouble);
+}
+
+bool VisibleAscii(const std::string& value) {
+  return std::all_of(value.begin(), value.end(), [](unsigned char byte) {
+    return byte >= 0x21U && byte <= 0x7eU;
+  });
+}
+
+void RejectNonIntegerNumberSyntax(const std::string& json) {
+  bool in_string = false, escaped = false, in_number = false;
+  for (const char byte : json) {
+    if (in_string) {
+      if (escaped) escaped = false;
+      else if (byte == '\\') escaped = true;
+      else if (byte == '"') in_string = false;
+      continue;
+    }
+    if (byte == '"') { in_string = true; in_number = false; continue; }
+    if (byte == '-') InvalidJson("JSON number must use unsigned integer syntax");
+    if (in_number && (byte == '.' || byte == 'e' || byte == 'E'))
+      InvalidJson("JSON number must use unsigned integer syntax");
+    if (byte >= '0' && byte <= '9') in_number = true;
+    else in_number = false;
+  }
+}
+
+void RejectEscapedNul(const std::string& json) {
+  bool in_string = false;
+  for (std::size_t index = 0; index < json.size(); ++index) {
+    const char byte = json[index];
+    if (!in_string) {
+      if (byte == '"') in_string = true;
+      continue;
+    }
+    if (byte == '"') {
+      in_string = false;
+      continue;
+    }
+    if (byte != '\\' || ++index >= json.size()) continue;
+    if (json[index] != 'u' || index + 4U >= json.size()) continue;
+    if (json[index + 1U] == '0' && json[index + 2U] == '0' &&
+        json[index + 3U] == '0' && json[index + 4U] == '0') {
+      // cJSON 的字符串 API 以 NUL 结尾；必须在解码前拒绝，避免 key/value 被截断。
+      InvalidJson("escaped NUL is not allowed in JSON strings");
+    }
+    index += 4U;
+  }
+}
+
+void RequireEnvelope(const cJSON* root) {
+  RequireExactObject(root, {"version", "type", "message_id", "device_id",
+                            "session_id", "turn_id", "stream_id", "epoch", "payload"});
+}
+
+ParsedEnvelope ParseEnvelope(const std::string& json) {
+  if (json.empty() || json.size() > 64U * 1024U || !websocketpp::utf8_validator::validate(json))
+    InvalidJson("invalid text message");
+  RejectEscapedNul(json);
+  const char* parse_end = nullptr;
+  ParsedEnvelope parsed;
+  parsed.root.reset(cJSON_ParseWithLengthOpts(json.c_str(), json.size() + 1U, &parse_end, true));
+  if (!parsed.root || parse_end != json.c_str() + json.size()) InvalidJson("invalid JSON text");
+  RejectNonIntegerNumberSyntax(json);
+  RequireEnvelope(parsed.root.get());
+  if (RequireUint32(parsed.root.get(), "version") != 1U) InvalidJson("unsupported protocol version");
+  parsed.type = RequireString(parsed.root.get(), "type", 1, 64);
+  if (!VisibleAscii(parsed.type)) InvalidJson("control type is not visible ASCII");
+  (void)RequireString(parsed.root.get(), "message_id", 1, 64);
+  parsed.device_id = RequireString(parsed.root.get(), "device_id", 1, 64);
+  parsed.ids = {RequireUint32(parsed.root.get(), "session_id"), RequireUint32(parsed.root.get(), "turn_id"),
+                RequireUint32(parsed.root.get(), "stream_id"), RequireUint32(parsed.root.get(), "epoch")};
+  parsed.payload = RequireItem(parsed.root.get(), "payload");
+  if (!cJSON_IsObject(parsed.payload)) InvalidJson("payload must be an object");
+  return parsed;
 }
 
 }  // namespace
@@ -137,7 +281,8 @@ class VoiceTransport::Impl final {
     const char* type = nullptr; std::string payload;
     switch (c.kind) {
       case ControlKind::kHello:
-        if (c.ids.session || c.ids.turn || c.ids.stream || c.ids.epoch || c.device_token.empty()) return false;
+        if (c.ids.session || c.ids.turn || c.ids.stream || c.ids.epoch ||
+            !boompi::config::IsValidDeviceToken(c.device_token)) return false;
         type = "hello"; payload = "{\"device_token\":" + Quote(c.device_token) + "}"; break;
       case ControlKind::kTurnStart:
         if (!ValidIds(c.ids) || active_ ||
@@ -153,9 +298,11 @@ class VoiceTransport::Impl final {
       case ControlKind::kResponseCancel:
         if (!SameTurn(c.ids, turn_) ||
             (c.ids.stream != turn_.stream && c.ids.stream != response_.stream)) return false;
-        // ASIO 可能已解析 response.done，但 application 还没消费该事件；此时取消已自然完成，
-        // 不会再有 cancelled ACK：返回 true 只表示无需重发，调用方不得据此等待 cancelled。
-        if (!active_) return response_done_ && ValidIds(response_) && SameIds(c.ids, response_);
+        // response.done 只表示下行已发送完。ALSA 尚未播完时仍需把 cancel
+        // 发到服务端，删除用户没有听到的 assistant turn。
+        if (!active_ &&
+            (!response_done_ || !ValidIds(response_) || !SameIds(c.ids, response_)))
+          return false;
         if (response_cancel_sent_) return true;
         type = "response.cancel"; payload = "{}"; break;
     }
@@ -164,11 +311,23 @@ class VoiceTransport::Impl final {
       ",\"session_id\":" + std::to_string(c.ids.session) + ",\"turn_id\":" + std::to_string(c.ids.turn) +
       ",\"stream_id\":" + std::to_string(c.ids.stream) + ",\"epoch\":" + std::to_string(c.ids.epoch) +
       ",\"payload\":" + payload + "}";
-    if (!SendText(json)) return false;
+    const bool cancellation = c.kind == ControlKind::kTurnCancel ||
+                              c.kind == ControlKind::kResponseCancel;
+    if (!SendText(json, cancellation)) return false;
     if (c.kind == ControlKind::kTurnStart) {
-      turn_ = c.ids; response_ = {}; active_ = true; committed_ = false;
-      uplink_ended_ = audio_started_ = audio_ended_ = response_done_ = false;
-      response_cancel_sent_ = discard_downlink_ = false; uplink_sequence_ = downlink_sequence_ = 0;
+      turn_ = c.ids;
+      response_ = {};
+      response_id_.clear();
+      active_ = true;
+      committed_ = false;
+      uplink_ended_ = false;
+      audio_started_ = false;
+      audio_ended_ = false;
+      response_done_ = false;
+      response_cancel_sent_ = false;
+      discard_downlink_ = false;
+      uplink_sequence_ = 0;
+      downlink_sequence_ = 0;
     }
     if (c.kind == ControlKind::kTurnCommit) committed_ = true;
     if (c.kind == ControlKind::kTurnCancel || c.kind == ControlKind::kResponseCancel)
@@ -176,11 +335,18 @@ class VoiceTransport::Impl final {
     return true;
   }
 
-  bool SendText(const std::string& json) {
+  bool SendText(const std::string& json,
+                const bool cancellation = false) {
     if (!connected_ || json.empty() || json.size() > 64U * 1024U) return false;
-    websocketpp::lib::error_code ec; std::lock_guard<std::mutex> lock(send_mutex_);
-    if (!CanQueue(json.size())) return false;
-    client_.send(hdl_, json, websocketpp::frame::opcode::text, ec); return !ec;
+    websocketpp::lib::error_code ec;
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    const QueueCapacity capacity = CheckQueueCapacity(json.size());
+    if (capacity == QueueCapacity::kUnavailable ||
+        (capacity == QueueCapacity::kFull && !cancellation)) return false;
+    // 每轮最多发一个取消控制帧。即使 PCM 已达到背压线，也允许这一个小帧排在
+    // 已接受的音频之后，避免把局部拥塞放大成 TLS/provider 会话重建。
+    client_.send(hdl_, json, websocketpp::frame::opcode::text, ec);
+    return !ec;
   }
 
   SendOutcome SendPcm(const Pcm64Header& h, const std::uint8_t* pcm, std::size_t bytes) {
@@ -197,12 +363,16 @@ class VoiceTransport::Impl final {
     Put32(h.sequence, p + 20); Put64(h.timestamp_us, p + 24); Put32(h.ids.epoch, p + 32);
     std::memcpy(p + 36, uuid_.data(), uuid_.size()); Put32(h.ids.session, p + 52);
     Put32(h.ids.turn, p + 56); Put32(h.ids.stream, p + 60); std::memcpy(p + 64, pcm, bytes);
-    websocketpp::lib::error_code ec; std::lock_guard<std::mutex> lock(send_mutex_);
-    // 缓冲满只是瞬时背压：本帧未发、sequence 不前移，由调用方取消本轮。
-    if (!CanQueue(kHeaderBytes + bytes)) return SendOutcome::kBackpressure;
+    websocketpp::lib::error_code ec;
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    // 缓冲满只是瞬时背压：本帧未发、sequence 不前移，由调用方取消当前 turn。
+    const QueueCapacity capacity = CheckQueueCapacity(kHeaderBytes + bytes);
+    if (capacity == QueueCapacity::kFull) return SendOutcome::kBackpressure;
+    if (capacity == QueueCapacity::kUnavailable) return SendOutcome::kRejected;
     client_.send(hdl_, frame.data(), kHeaderBytes + bytes, websocketpp::frame::opcode::binary, ec);
     if (ec) return SendOutcome::kRejected;
-    ++uplink_sequence_; uplink_ended_ = (h.flags & 2U) != 0;
+    ++uplink_sequence_;
+    uplink_ended_ = (h.flags & 2U) != 0;
     return SendOutcome::kOk;
   }
 
@@ -230,17 +400,35 @@ class VoiceTransport::Impl final {
     return ValidIds(response_) && SameIds(i, response_) &&
         (response_cancel_sent_ || discard_downlink_);
   }
-  bool CanQueue(std::size_t bytes) {
+  QueueCapacity CheckQueueCapacity(std::size_t bytes) noexcept {
     try {
       const std::size_t queued = client_.get_con_from_hdl(hdl_)->get_buffered_amount();
-      return queued <= kMaxBufferedBytes && bytes <= kMaxBufferedBytes - queued;
-    } catch (...) { return false; }
+      if (queued <= kMaxBufferedBytes &&
+          bytes <= kMaxBufferedBytes - queued) {
+        return QueueCapacity::kAvailable;
+      }
+      return QueueCapacity::kFull;
+    } catch (...) {
+      return QueueCapacity::kUnavailable;
+    }
   }
-  void Fail(std::string why) { connected_ = false; if (error_) try { error_(std::move(why)); } catch (...) {} }
-  void Emit(Inbound event) { if (inbound_) try { inbound_(std::move(event)); } catch (...) { Fail("inbound callback threw"); } }
+  void Fail(std::string why) {
+    connected_ = false;
+    if (error_) try {
+      error_(std::move(why));
+    } catch (...) {
+    }
+  }
+  void Emit(Inbound event) {
+    if (inbound_) try {
+      inbound_(std::move(event));
+    } catch (...) {
+      Fail("inbound callback threw");
+    }
+  }
 
   bool DecodePin(const std::string& text) {
-    if (text.size() != 44 || text.back() != '=') return false;
+    if (!boompi::config::IsValidSpkiSha256(text)) return false;
     std::array<unsigned char, 33> decoded{};
     const int n = EVP_DecodeBlock(decoded.data(), reinterpret_cast<const unsigned char*>(text.data()), 44);
     if (n != 33) return false;
@@ -266,54 +454,61 @@ class VoiceTransport::Impl final {
     SSL_CTX_set_cert_verify_callback(ctx->native_handle(), &VerifyPin, this); return ctx;
   }
 
-  bool Identity(const boost::property_tree::ptree& p, Inbound* event) {
-    try {
-      if (p.get<unsigned>("version") != 1 || p.get<std::string>("device_id") != config_.device_id) return false;
-      event->ids = {p.get<std::uint32_t>("session_id"), p.get<std::uint32_t>("turn_id"),
-                    p.get<std::uint32_t>("stream_id"), p.get<std::uint32_t>("epoch")};
-      const std::string id = p.get<std::string>("message_id"); return !id.empty() && id.size() <= 64;
-    } catch (...) { return false; }
-  }
   void OnText(const std::string& json) {
-    // 解析、字段上限、identity 和状态校验全部在发出 Inbound 之前完成；半合法事件不外泄。
-    if (json.empty() || json.size() > 64U * 1024U) return ProtocolError("invalid text message size");
+    // JSON 类型/字段和 payload schema 先完整验证，再进入状态锁；非法消息不会改变会话。
     try {
-      boost::property_tree::ptree p; std::istringstream input(json); boost::property_tree::read_json(input, p);
-      Inbound e;
+      const ParsedEnvelope parsed = ParseEnvelope(json);
+      const std::string& type = parsed.type; const cJSON* body = parsed.payload;
+      Inbound e; e.ids = parsed.ids;
       {
         std::lock_guard<std::mutex> state_lock(protocol_mutex_);
-        if (!Identity(p, &e)) throw std::runtime_error("invalid control envelope");
-        const auto& body = p.get_child("payload"); const std::string type = p.get<std::string>("type");
+        if (parsed.device_id != config_.device_id) throw std::runtime_error("wrong device identity");
         if (type == "hello.ack") {
+          RequireExactObject(body, {"input_sample_rate_hz", "output_sample_rate_hz", "input_frame_ms"});
           if (session_ || e.ids.session == 0 || e.ids.turn || e.ids.stream || e.ids.epoch == 0) throw std::runtime_error("invalid hello.ack identity");
           e.kind = InboundKind::kHelloAck;
-          if (body.get<std::uint32_t>("input_sample_rate_hz") != 16000 ||
-              body.get<std::uint32_t>("output_sample_rate_hz") != 24000 ||
-              body.get<std::uint32_t>("input_frame_ms") != 20) throw std::runtime_error("unsupported hello audio contract");
+          if (RequireUint32(body, "input_sample_rate_hz") != 16000 ||
+              RequireUint32(body, "output_sample_rate_hz") != 24000 ||
+              RequireUint32(body, "input_frame_ms") != 20)
+            throw std::runtime_error("unsupported hello audio contract");
           session_ = e.ids.session; session_epoch_ = e.ids.epoch;
         } else if (type == "response.start") {
+          RequireExactObject(body, {"response_id"});
           if (IsStale(e.ids)) return;
           if (!active_ || !committed_ || ValidIds(response_) ||
               !SameTurn(e.ids, turn_) || e.ids.stream == 0) throw std::runtime_error("wrong response.start identity or order");
           e.kind = InboundKind::kResponseStart;
-          if (body.get<std::string>("response_id").empty()) throw std::runtime_error("missing response_id");
-          response_ = e.ids; downlink_sequence_ = 0;
-          audio_started_ = audio_ended_ = response_done_ = false;
-          if (response_cancel_sent_) { discard_downlink_ = true; return; }
+          response_id_ = RequireString(body, "response_id", 1, 128);
+          response_ = e.ids;
+          downlink_sequence_ = 0;
+          audio_started_ = false;
+          audio_ended_ = false;
+          response_done_ = false;
+          if (response_cancel_sent_) {
+            discard_downlink_ = true;
+            return;
+          }
           discard_downlink_ = false;
         } else if (type == "response.cancelled") {
-          if (IsStale(e.ids)) return;
+          RequireExactObject(body, {"reason"});
+          (void)RequireString(body, "reason", 1, 64);
           const bool stream_matches = ValidIds(response_) ? e.ids.stream == response_.stream :
                                                             e.ids.stream != 0U;
-          if (!active_ || !response_cancel_sent_ || !SameTurn(e.ids, turn_) || !stream_matches)
+          // cancel 可能在 response.done 后确认；该确认仍负责清理 provider history。
+          if ((!active_ && !response_done_) || !response_cancel_sent_ ||
+              !SameTurn(e.ids, turn_) || !stream_matches)
             throw std::runtime_error("wrong cancellation identity");
-          e.kind = InboundKind::kCancelled; const std::string reason = body.get<std::string>("reason");
-          if (reason.empty() || reason.size() > 64) throw std::runtime_error("invalid cancellation reason");
-          active_ = response_cancel_sent_ = discard_downlink_ = false;
+          e.kind = InboundKind::kCancelled;
+          active_ = false;
+          response_done_ = false;
+          response_cancel_sent_ = false;
+          discard_downlink_ = false;
         } else if (type == "error") {
+          RequireExactObject(body, {"code", "message"});
           if (IsStale(e.ids)) return;
-          e.kind = InboundKind::kError; e.error_code = body.get<std::string>("code"); e.text = body.get<std::string>("message");
-          if (e.error_code.empty() || e.error_code.size() > 64 || e.text.empty() || e.text.size() > 512) throw std::runtime_error("invalid error payload");
+          e.kind = InboundKind::kError;
+          e.error_code = RequireString(body, "code", 1, 64);
+          e.text = RequireString(body, "message", 1, 512);
           const bool session_error = e.ids.session == session_ && e.ids.turn == 0U &&
               e.ids.stream == 0U && e.ids.epoch == session_epoch_;
           const bool turn_error = active_ && SameTurn(e.ids, turn_) && e.ids.stream != 0U;
@@ -324,20 +519,31 @@ class VoiceTransport::Impl final {
           if (!active_ || !ValidIds(response_) || e.ids.session != response_.session || e.ids.turn != response_.turn ||
               e.ids.stream != response_.stream || e.ids.epoch != response_.epoch) throw std::runtime_error("wrong response identity");
           if (type == "response.text_delta") {
+            RequireExactObject(body, {"response_id", "text"});
             if (Discarding(e.ids)) return;
-            e.kind = InboundKind::kTextDelta; e.text = body.get<std::string>("text");
-            if (e.text.empty() || e.text.size() > 4096) throw std::runtime_error("invalid text delta");
+            if (RequireString(body, "response_id", 1, 128) != response_id_) throw std::runtime_error("wrong response_id");
+            e.kind = InboundKind::kTextDelta; e.text = RequireString(body, "text", 1, 4096);
           } else if (type == "response.audio_start") {
+            RequireExactObject(body, {"response_id", "sample_rate_hz"});
             if (Discarding(e.ids)) return;
             e.kind = InboundKind::kAudioStart;
-            if (audio_started_ || body.get<std::uint32_t>("sample_rate_hz") != 24000) {
+            if (RequireString(body, "response_id", 1, 128) != response_id_ || audio_started_ ||
+                RequireUint32(body, "sample_rate_hz") != 24000) {
               throw std::runtime_error("invalid audio contract");
             }
             audio_started_ = true;
           } else if (type == "response.done") {
+            RequireExactObject(body, {"response_id"});
             e.kind = InboundKind::kDone;
-            if (audio_started_ && !audio_ended_ && !Discarding(e.ids)) throw std::runtime_error("done before PCM END");
-            active_ = response_cancel_sent_ = discard_downlink_ = false; response_done_ = true;
+            if (RequireString(body, "response_id", 1, 128) != response_id_ ||
+                (audio_started_ && !audio_ended_ && !Discarding(e.ids))) {
+              throw std::runtime_error("invalid response.done");
+            }
+            active_ = false;
+            response_done_ = true;
+            // 若 cancel 已在途中，继续丢弃旧下行并等待 response.cancelled；
+            // 清零会让迟到的合法确认被误判成协议错误。
+            if (!response_cancel_sent_) discard_downlink_ = false;
           }
           else throw std::runtime_error("unsupported control type");
         }
@@ -367,14 +573,22 @@ class VoiceTransport::Impl final {
           e.pcm.ids.stream != response_.stream || e.pcm.ids.epoch != response_.epoch ||
           ((downlink_sequence_ == 0) != ((flags & 1U) != 0))) { state_lock.unlock(); return ProtocolError("PCM identity or sequence mismatch"); }
       if ((flags & 4U) != 0U) {
-        discard_downlink_ = true; e.kind = InboundKind::kError;
-        e.error_code = "downlink_discontinuity"; e.text = "downlink PCM is discontinuous";
+        discard_downlink_ = true;
+        e.kind = InboundKind::kError;
+        e.error_code = "downlink_discontinuity";
+        e.text = "downlink PCM is discontinuous";
       } else {
-        ++downlink_sequence_; audio_ended_ = (flags & 2U) != 0;
+        ++downlink_sequence_;
+        audio_ended_ = (flags & 2U) != 0;
       }
     }
-    if (e.kind == InboundKind::kError) { Emit(std::move(e)); return; }
-    std::copy_n(p + kHeaderBytes, payload, e.audio.begin()); e.audio_size = payload; Emit(std::move(e));
+    if (e.kind == InboundKind::kError) {
+      Emit(std::move(e));
+      return;
+    }
+    std::copy_n(p + kHeaderBytes, payload, e.audio.begin());
+    e.audio_size = payload;
+    Emit(std::move(e));
   }
   void OnMessage(const Client::message_ptr& message) {
     if (message->get_payload().size() > kMaxMessageBytes) return ProtocolError("message too large");
@@ -393,6 +607,7 @@ class VoiceTransport::Impl final {
   std::atomic<bool> connected_{false}, closing_{false};
   std::array<std::uint8_t, 16> uuid_{}; std::array<unsigned char, 32> pin_{};
   WireIds turn_{}, response_{}; std::uint32_t session_{0}, session_epoch_{0};
+  std::string response_id_;
   std::uint32_t uplink_sequence_{0}, downlink_sequence_{0};
   bool active_{false}, committed_{false}, uplink_ended_{false}, audio_started_{false}, audio_ended_{false};
   bool response_done_{false}, response_cancel_sent_{false}, discard_downlink_{false};

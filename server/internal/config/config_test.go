@@ -11,10 +11,10 @@ import (
 
 const validTestDeviceToken = "0123456789abcdef0123456789abcdef"
 
-func TestDefaultsUseSingapore(t *testing.T) {
+func TestDefaultsUseChinaBeijing(t *testing.T) {
 	cfg := Defaults()
-	if cfg.Region != "singapore" {
-		t.Fatalf("Region = %q, want singapore", cfg.Region)
+	if cfg.Region != "china-beijing" {
+		t.Fatalf("Region = %q, want china-beijing", cfg.Region)
 	}
 	if cfg.ConversationMode != "intelligence" || cfg.TTSVoice != "Cherry" {
 		t.Fatalf("teaching defaults = mode %q, TTS voice %q", cfg.ConversationMode, cfg.TTSVoice)

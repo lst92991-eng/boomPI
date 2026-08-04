@@ -36,7 +36,10 @@ func TestLiveIntelligencePipeline(t *testing.T) {
 	tts := newTTSClient(config)
 	var questionPCM []byte
 	question := "请解释为什么柯西收敛准则不需要预先知道极限，并给出关键证明思路。"
-	if err := tts.synthesize(ctx, question, func(pcm []byte) error {
+	questionStream := make(chan string, 1)
+	questionStream <- question
+	close(questionStream)
+	if err := tts.synthesizeStream(ctx, questionStream, func(pcm []byte) error {
 		questionPCM = append(questionPCM, pcm...)
 		return nil
 	}); err != nil {

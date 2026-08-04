@@ -18,13 +18,10 @@
    ./boompi-server
    ```
 
-   生成 `config.yaml` 后程序会自动退出，等你填好 Key 再启动；这不是卡死，
-   属预期行为（TLS 身份在第三步真正启动时生成）。
-
 2. 打开第一步输出路径中的 `config.yaml`，只替换这一项并保存：
 
    ```yaml
-   qwen_api_key: "sk-你的新加坡区-Qwen-API-Key"
+   qwen_api_key: "sk-你的中国内地（北京）区-Qwen-API-Key"
    ```
 
 3. 再运行一次。看到 `boomPI server starting` 表示初始化完成、WSS 与 UDP 监听正在启动；若端口绑定失败，程序会紧接着报错退出；
@@ -44,9 +41,17 @@ export DASHSCOPE_API_KEY="sk-..."       # Linux / macOS
 ./boompi-server
 ```
 
-默认使用新加坡区公共 DashScope 端点，只需要 API Key。已有专属 Workspace 的用户可选设置
-`DASHSCOPE_WORKSPACE_ID`，服务端会继续使用 Workspace 专属域名。`--check-config` 只显示配置
-来源和非敏感摘要，不会输出 API Key 或设备令牌。
+默认使用中国内地（北京）区公共 DashScope 端点，只需要对应区域的 API Key。需要连接新加坡区时，
+把 `region` 显式设置为 `singapore`。已有专属 Workspace 的用户可选设置
+`DASHSCOPE_WORKSPACE_ID`；ASR 和对话请求会使用同区域的 Workspace 端点，TTS 则继续使用同区域
+公共端点并通过请求头携带 Workspace ID。`--check-config` 只显示配置来源和非敏感摘要，不会输出
+API Key、Workspace ID 或设备令牌。
+
+从旧的新加坡区部署迁移时，应同时完成三件事：把 `region` 改为 `china-beijing`，换用中国内地
+（北京）区的 API Key，并确认可选的 `DASHSCOPE_WORKSPACE_ID` 也属于该区域。环境变量
+`BOOMPI_REGION` 会覆盖 YAML；旧环境若设置过 `BOOMPI_REGION=singapore`，需要删除或同步改为
+`china-beijing`。暂不迁移的部署可继续显式使用 `singapore`，但 Key、Workspace 和 region 必须属于
+同一区域。
 
 ## UDP 发现
 

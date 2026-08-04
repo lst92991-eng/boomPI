@@ -18,14 +18,20 @@ struct VoiceClientConfig final {
   std::string snowboy_resource_path, snowboy_model_path;  ///< 最长 1024 字节；voice loop 打开时必须非空。
   std::string snowboy_sensitivity{"0.7"};     ///< 当前人工验收的单关键词敏感度，闭区间 0..1。
   float vad_min_dbfs{-35.0F};                 ///< 原始双麦较强一路的 VAD 能量门限，范围 -90..0 dBFS。
+  float barge_min_dbfs{-25.0F};               ///< AEC 后语音打断门限，范围 -90..0 dBFS。
   std::int8_t capture_left_polarity{1}, capture_right_polarity{1};  ///< 仅允许 +1/-1。
   bool barge_in_enabled{true};                ///< true 时允许播放期间用近讲证据触发打断。
 };
 
+/// WSS 连接和 --check-config 共用的设备身份格式边界。
+bool IsValidDeviceId(const std::string& value) noexcept;
+bool IsValidSpkiSha256(const std::string& value) noexcept;
+bool IsValidDeviceToken(const std::string& value) noexcept;
+
 /// @brief 从环境变量加载并完整校验不依赖外部 I/O 的启动配置。
 ///
-/// 本函数验证 Snowboy 路径非空、单关键词敏感度和 SPKI pin 编码；文件是否存在、ALSA PCM
-/// 是否可打开仍只能在 voice loop 启动阶段确认。
+/// 本函数验证设备 UUID/token、SPKI pin 编码、Snowboy 路径和灵敏度；文件是否存在、
+/// ALSA PCM 是否可打开仍只能在 voice loop 启动阶段确认。
 ///
 /// @param output 非空输出对象；错误文本只包含变量名而不包含秘密值。
 /// @return 前置校验通过时返回成功；指针为空、缺项或字段越界时返回参数错误。

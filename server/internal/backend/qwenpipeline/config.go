@@ -35,6 +35,9 @@ func (c Config) validate() error {
 	if strings.TrimSpace(c.APIKey) == "" {
 		return errors.New("Qwen API key is required")
 	}
+	if c.Region != RegionChinaBeijing && c.Region != RegionSingapore {
+		return errors.New("Qwen region must be china-beijing or singapore")
+	}
 	if strings.ContainsAny(c.WorkspaceID, "/?#@") {
 		return errors.New("Qwen workspace ID contains invalid characters")
 	}

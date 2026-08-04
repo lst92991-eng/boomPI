@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
     if (states[state] == boompi::ui::DeviceUiState::kSpeaking) {
       // Keep the three emoji that previously crashed LVGL on the board in the
       // simulator fixture.  The UI must omit unsupported glyphs and keep drawing.
-      screen.SetText("当然可以，正在为你查询。😅", "新加坡今天适合外出。😄😂");
+      screen.SetText("当然可以，正在为你查询。😅", "北京今天适合外出。😄😂");
     } else {
       screen.SetText({}, {});
     }

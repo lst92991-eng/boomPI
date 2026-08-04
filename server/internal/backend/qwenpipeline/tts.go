@@ -22,10 +22,7 @@ const (
 	maxTTSFragmentUnits         = 1600
 	maxTTSPCMDeltaBytes         = 64 * 1024
 	maxTTSWebSocketMessageBytes = 128 * 1024
-	ttsCommitMaxUnits           = 80
 )
-
-const ttsCommitIdle = 120 * time.Millisecond
 
 type ttsClient struct {
 	config Config
@@ -36,19 +33,6 @@ func newTTSClient(config Config) *ttsClient {
 	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = config.Timeout
 	return &ttsClient{config: config, dialer: dialer}
-}
-
-func (c *ttsClient) synthesize(ctx context.Context, text string, emit func([]byte) error) error {
-	fragments := splitTTSFragments(text, maxTTSFragmentUnits)
-	if len(fragments) == 0 {
-		return errors.New("Qwen TTS input text is empty")
-	}
-	stream := make(chan string, len(fragments))
-	for _, fragment := range fragments {
-		stream <- fragment
-	}
-	close(stream)
-	return c.synthesizeStream(ctx, stream, emit)
 }
 
 func (c *ttsClient) synthesizeStream(
@@ -95,7 +79,7 @@ func (c *ttsClient) synthesizeConnectedStream(
 		"event_id": eventID(),
 		"type":     "session.update",
 		"session": map[string]any{
-			"voice": c.config.TTSVoice, "mode": "commit",
+			"voice": c.config.TTSVoice, "mode": "server_commit",
 			"language_type": "Chinese", "response_format": "pcm",
 			"sample_rate": 24000,
 		},
@@ -111,7 +95,7 @@ func (c *ttsClient) synthesizeConnectedStream(
 	defer cancelStream()
 	writerDone := make(chan error, 1)
 	go func() {
-		err := c.writeContinuousText(streamCtx, connection, fragments)
+		err := c.writeServerCommitText(streamCtx, connection, fragments)
 		writerDone <- err
 		if err != nil {
 			_ = connection.Close()
@@ -179,46 +163,23 @@ func (c *ttsClient) synthesizeConnectedStream(
 	}
 }
 
-func (c *ttsClient) writeContinuousText(
+// writeServerCommitText streams each available text delta immediately. In
+// server_commit mode DashScope decides when enough context exists to begin
+// synthesis; sending client-side commit events would split one answer into
+// multiple audio responses and introduce audible gaps between them.
+func (c *ttsClient) writeServerCommitText(
 	ctx context.Context,
 	connection *websocket.Conn,
 	fragments <-chan string,
 ) error {
 	synthesized := false
 	filter := newTTSTextFilter()
-	var pending strings.Builder
-	pendingUnits := 0
-	timer := time.NewTimer(time.Hour)
-	if !timer.Stop() {
-		<-timer.C
-	}
-	defer timer.Stop()
-	var timerC <-chan time.Time
-	armTimer := func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer.Reset(ttsCommitIdle)
-		timerC = timer.C
-	}
-	flush := func() error {
-		text := pending.String()
-		pending.Reset()
-		pendingUnits = 0
-		timerC = nil
+	appendText := func(text string) error {
 		if strings.TrimSpace(text) == "" {
 			return nil
 		}
 		if err := c.writeJSON(connection, map[string]any{
 			"event_id": eventID(), "type": "input_text_buffer.append", "text": text,
-		}); err != nil {
-			return err
-		}
-		if err := c.writeJSON(connection, map[string]any{
-			"event_id": eventID(), "type": "input_text_buffer.commit",
 		}); err != nil {
 			return err
 		}
@@ -229,16 +190,9 @@ func (c *ttsClient) writeContinuousText(
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-timerC:
-			if err := flush(); err != nil {
-				return err
-			}
 		case fragment, ok := <-fragments:
 			if !ok {
-				tail := filter.Finish()
-				pending.WriteString(tail)
-				pendingUnits += ttsTextUnits(tail)
-				if err := flush(); err != nil {
+				if err := appendText(filter.Finish()); err != nil {
 					return err
 				}
 				if !synthesized {
@@ -255,100 +209,11 @@ func (c *ttsClient) writeContinuousText(
 			if text == "" {
 				continue
 			}
-			pending.WriteString(text)
-			pendingUnits += ttsTextUnits(text)
-			if containsTTSSentenceBoundary(text) ||
-				pendingUnits >= ttsCommitMaxUnits {
-				if err := flush(); err != nil {
-					return err
-				}
-			} else {
-				armTimer()
+			if err := appendText(text); err != nil {
+				return err
 			}
 		}
 	}
-}
-
-func containsTTSSentenceBoundary(text string) bool {
-	for _, value := range text {
-		if isTTSSentenceBoundary(value) {
-			return true
-		}
-	}
-	return false
-}
-
-func splitTTSFragments(text string, maxUnits int) []string {
-	text = strings.TrimSpace(text)
-	if text == "" || maxUnits <= 0 {
-		return nil
-	}
-
-	var fragments []string
-	var current strings.Builder
-	currentUnits := 0
-	appendSegment := func(segment string) {
-		for segment != "" {
-			segmentUnits := ttsTextUnits(segment)
-			if currentUnits > 0 && currentUnits+segmentUnits > maxUnits {
-				fragments = append(fragments, current.String())
-				current.Reset()
-				currentUnits = 0
-			}
-			if segmentUnits <= maxUnits {
-				current.WriteString(segment)
-				currentUnits += segmentUnits
-				return
-			}
-
-			prefix, remainder := splitTTSHard(segment, maxUnits)
-			fragments = append(fragments, prefix)
-			segment = remainder
-		}
-	}
-
-	start := 0
-	for index, r := range text {
-		if isTTSSentenceBoundary(r) {
-			end := index + len(string(r))
-			appendSegment(text[start:end])
-			start = end
-		}
-	}
-	if start < len(text) {
-		appendSegment(text[start:])
-	}
-	if current.Len() > 0 {
-		fragments = append(fragments, current.String())
-	}
-
-	result := fragments[:0]
-	for _, fragment := range fragments {
-		if strings.TrimSpace(fragment) != "" {
-			result = append(result, fragment)
-		}
-	}
-	return result
-}
-
-func splitTTSHard(text string, maxUnits int) (string, string) {
-	units := 0
-	for index, r := range text {
-		next := units + ttsRuneUnits(r)
-		if next > maxUnits {
-			return text[:index], text[index:]
-		}
-		units = next
-	}
-	return text, ""
-}
-
-func ttsTextUnits(text string) int {
-	units := 0
-	for _, r := range text {
-		units += ttsRuneUnits(r)
-	}
-	return units
 }
 
 func ttsRuneUnits(r rune) int {
@@ -356,15 +221,6 @@ func ttsRuneUnits(r rune) int {
 		return 2
 	}
 	return 1
-}
-
-func isTTSSentenceBoundary(r rune) bool {
-	switch r {
-	case '\n', '\r', '.', '!', '?', ';', '。', '！', '？', '；':
-		return true
-	default:
-		return false
-	}
 }
 
 func (c *ttsClient) waitFor(ctx context.Context, connection *websocket.Conn, wanted string, output any) error {

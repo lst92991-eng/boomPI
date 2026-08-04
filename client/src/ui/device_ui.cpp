@@ -59,11 +59,11 @@ constexpr char kIconFont[] = "/userdata/boompi/fonts/tabler-icons-200-subset.ttf
 constexpr char kCameraPipeline[] =
     "/usr/bin/v4l2-ctl -d /dev/video14 "
     "--set-fmt-video=width=576,height=324,pixelformat=NV12 "
-    "--stream-mmap=4 --stream-to=- 2>/tmp/boompi-camera-v4l2.log | "
+    "--stream-mmap=4 --stream-to=- 2>/run/boompi-camera-v4l2.log | "
     "/usr/bin/ffmpeg -hide_banner -loglevel error -f rawvideo "
     "-pixel_format nv12 -video_size 576x324 -framerate 25 -i pipe:0 "
     "-vf 'fps=4,scale=320:180' -pix_fmt rgb565le -f rawvideo pipe:1 "
-    "2>/tmp/boompi-camera-ffmpeg.log";
+    "2>/run/boompi-camera-ffmpeg.log";
 
 bool WriteAll(int fd, const void* source, std::size_t bytes) {
   auto* data = static_cast<const std::uint8_t*>(source);

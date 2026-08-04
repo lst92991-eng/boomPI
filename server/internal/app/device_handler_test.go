@@ -148,6 +148,9 @@ func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 		ack.TurnID != turn.TurnID || ack.Epoch != currentEpoch || ack.StreamID == 0 {
 		t.Fatalf("response.cancelled = %+v", ack)
 	}
+	if got := provider.session.discards.Load(); got != 1 {
+		t.Fatalf("completed response discards = %d, want 1", got)
+	}
 	if err := webSocket.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
 		t.Fatalf("SetReadDeadline() error = %v", err)
 	}
@@ -173,6 +176,261 @@ func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server did not stop")
+	}
+}
+
+func TestInvalidTurnSequencesDoNotClosePersistentSession(t *testing.T) {
+	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
+	t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
+	cfg, err := config.Load("", nil)
+	if err != nil {
+		t.Fatalf("config.Load() error = %v", err)
+	}
+	cfg.ListenAddress = "127.0.0.1"
+	cfg.WSSPort = freePort(t)
+	cfg.DiscoveryPort = freeUDPPort(t)
+	provider := newRoundTripBackend()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	application, err := newWithBackend(cfg, logger, t.TempDir(), provider)
+	if err != nil {
+		t.Fatalf("newWithBackend() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- application.Run(ctx) }()
+	webSocket := dialTestServer(t, cfg.WSSPort)
+
+	writeControl(t, webSocket, protocol.ControlEnvelope{
+		Version: protocol.Version, Type: "hello", MessageID: "client-1", DeviceID: testDeviceID,
+		Payload: json.RawMessage(`{"device_token":"` + testDeviceToken + `"}`),
+	})
+	helloAck := readControl(t, webSocket)
+	if helloAck.Type != "hello.ack" || helloAck.SessionID == 0 {
+		t.Fatalf("hello.ack = %+v", helloAck)
+	}
+	deviceUUID, err := protocol.ParseDeviceUUID(testDeviceID)
+	if err != nil {
+		t.Fatalf("ParseDeviceUUID() error = %v", err)
+	}
+
+	startTurn := func(messageID string, turnID, streamID, epoch uint32) protocol.ControlEnvelope {
+		envelope := protocol.ControlEnvelope{
+			Version: protocol.Version, Type: "turn.start", MessageID: messageID, DeviceID: testDeviceID,
+			SessionID: helloAck.SessionID, TurnID: turnID, StreamID: streamID, Epoch: epoch,
+			Payload: json.RawMessage(`{"sample_rate_hz":16000}`),
+		}
+		writeControl(t, webSocket, envelope)
+		return envelope
+	}
+
+	// Without a usable turn identity the only client-valid reply is a
+	// session-scoped error at the epoch negotiated by hello.ack.
+	zeroIdentity := protocol.ControlEnvelope{
+		Version: protocol.Version, Type: "turn.start", MessageID: "client-zero", DeviceID: testDeviceID,
+		SessionID: helloAck.SessionID, Payload: json.RawMessage(`{"sample_rate_hz":16000}`),
+	}
+	writeControl(t, webSocket, zeroIdentity)
+	assertSessionError(t, readControl(t, webSocket), helloAck)
+
+	// A parseable turn.start with invalid business payload is rejected without
+	// closing the authenticated socket or touching the provider actor.
+	rejected := protocol.ControlEnvelope{
+		Version: protocol.Version, Type: "turn.start", MessageID: "client-rejected", DeviceID: testDeviceID,
+		SessionID: helloAck.SessionID, TurnID: 7, StreamID: 8, Epoch: 2,
+		Payload: json.RawMessage(`{"sample_rate_hz":8000}`),
+	}
+	writeControl(t, webSocket, rejected)
+	assertTurnError(t, readControl(t, webSocket), rejected)
+
+	// Turn 1 is syntactically valid PCM, but violates the START framing rule.
+	first := startTurn("client-2", 11, 12, 2)
+	input := make([]byte, inputFrameBytes)
+	writePCM(t, webSocket, protocol.PCMHeader{
+		Version: protocol.Version, Kind: protocol.AudioKindUplink, AudioFormat: protocol.AudioFormatPCM16LE,
+		Flags: protocol.PCMFlagEnd, Channels: 1, SampleRateHz: 16_000,
+		PayloadLen: uint32(len(input)), DeviceUUID: deviceUUID,
+		SessionID: first.SessionID, TurnID: first.TurnID, StreamID: first.StreamID, Epoch: first.Epoch,
+	}, input)
+	assertTurnError(t, readControl(t, webSocket), first)
+
+	// The actor has retired epoch 2. Reusing that epoch is a turn error, not a
+	// reason to rebuild the authenticated WebSocket/provider session.
+	stale := startTurn("client-stale", 13, 14, 2)
+	assertTurnError(t, readControl(t, webSocket), stale)
+
+	// Turn 2 is also parseable, but commit is illegal before any complete input.
+	second := startTurn("client-3", 21, 22, 3)
+	second.Type = "turn.commit"
+	second.MessageID = "client-4"
+	second.Payload = json.RawMessage(`{}`)
+	writeControl(t, webSocket, second)
+	assertTurnError(t, readControl(t, webSocket), second)
+
+	// The same authenticated socket and provider session must accept turn 3.
+	third := startTurn("client-5", 31, 32, 4)
+	duplicate := startTurn("client-duplicate", 41, 42, 5)
+	assertTurnError(t, readControl(t, webSocket), duplicate)
+	// Rejecting the newer request must not consume its epoch or retire the
+	// already active turn. The original turn remains writable and committable.
+	writePCM(t, webSocket, protocol.PCMHeader{
+		Version: protocol.Version, Kind: protocol.AudioKindUplink, AudioFormat: protocol.AudioFormatPCM16LE,
+		Flags: protocol.PCMFlagStart | protocol.PCMFlagEnd, Channels: 1, SampleRateHz: 16_000,
+		PayloadLen: uint32(len(input)), DeviceUUID: deviceUUID,
+		SessionID: third.SessionID, TurnID: third.TurnID, StreamID: third.StreamID, Epoch: third.Epoch,
+	}, input)
+	third.Type = "turn.commit"
+	third.MessageID = "client-6"
+	third.Payload = json.RawMessage(`{}`)
+	writeControl(t, webSocket, third)
+	if got := readControl(t, webSocket); got.Type != "response.start" || got.TurnID != third.TurnID {
+		t.Fatalf("third turn response.start = %+v", got)
+	}
+	if got := provider.openCount.Load(); got != 1 {
+		t.Fatalf("provider Open calls = %d, want one persistent session", got)
+	}
+	if got := provider.session.commits.Load(); got != 1 {
+		t.Fatalf("provider commits = %d, want only the valid turn", got)
+	}
+
+	// A real peer close, unlike a turn error, ends the provider session.
+	if err := webSocket.Close(); err != nil {
+		t.Fatalf("WebSocket Close() error = %v", err)
+	}
+	select {
+	case <-provider.session.closed:
+	case <-time.After(time.Second):
+		t.Fatal("provider session remained open after WebSocket close")
+	}
+	cancel()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("App.Run() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop")
+	}
+}
+
+func TestBlockedDownlinkReleasesTurnStateAndDoesNotPoisonNextTurn(t *testing.T) {
+	turnCtx, stopTurn := context.WithCancel(context.Background())
+	turn := activeTurn{
+		sessionID: 1, turnID: 11, epoch: 2, active: true,
+		downlinkCtx: turnCtx, stopDownlink: stopTurn,
+	}
+	state := &connectionState{turn: turn, monotonicStart: time.Now()}
+	pacer := &pacedDownlink{epoch: turn.epoch, turnID: turn.turnID}
+	_, _ = pacer.pending.Write(make([]byte, outputFrameBytes*2))
+	handler := &deviceHandler{}
+
+	writeStarted := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := handler.sendNextPacedFrameWith(
+			context.Background(), state, pacer,
+			func(ctx context.Context, reserved activeTurn, _ []byte, _ bool) error {
+				if reserved.outputSequence != 0 {
+					return fmt.Errorf("reserved sequence = %d, want 0", reserved.outputSequence)
+				}
+				close(writeStarted)
+				<-ctx.Done()
+				return context.Cause(ctx)
+			},
+		)
+		result <- err
+	}()
+	select {
+	case <-writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("downlink write did not reach bounded transport wait")
+	}
+
+	// This is the lock ordering used by response.cancel: it must complete while
+	// the transport writer remains blocked, then its turn context releases that
+	// writer without ending the device session.
+	retired := make(chan struct{})
+	go func() {
+		state.mu.Lock()
+		state.turn.active = false
+		state.turn.stopDownlink()
+		state.mu.Unlock()
+		close(retired)
+	}()
+	select {
+	case <-retired:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("response.cancel could not acquire turn state during downlink backpressure")
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("retired downlink returned a session-fatal error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retired downlink did not observe its turn fence")
+	}
+
+	nextCtx, stopNext := context.WithCancel(context.Background())
+	defer stopNext()
+	next := activeTurn{
+		sessionID: 1, turnID: 21, epoch: 3, active: true,
+		downlinkCtx: nextCtx, stopDownlink: stopNext,
+	}
+	state.mu.Lock()
+	state.turn = next
+	state.mu.Unlock()
+	pacer.reset()
+	pacer.begin(next, "response-next", time.Now())
+	pacer.providerDone = true
+	_, _ = pacer.pending.Write(make([]byte, outputFrameBytes))
+	var nextSequence uint32
+	sent, final, err := handler.sendNextPacedFrameWith(
+		context.Background(), state, pacer,
+		func(_ context.Context, reserved activeTurn, _ []byte, _ bool) error {
+			nextSequence = reserved.outputSequence
+			return nil
+		},
+	)
+	if err != nil || !sent || !final || nextSequence != 0 {
+		t.Fatalf("next turn downlink = sent:%t final:%t sequence:%d error:%v",
+			sent, final, nextSequence, err)
+	}
+	state.mu.Lock()
+	gotSequence := state.turn.outputSequence
+	state.mu.Unlock()
+	if gotSequence != 1 {
+		t.Fatalf("next turn reserved sequence = %d, want 1", gotSequence)
+	}
+}
+
+func assertTurnError(t *testing.T, envelope protocol.ControlEnvelope, turn protocol.ControlEnvelope) {
+	t.Helper()
+	if envelope.Type != "error" || envelope.SessionID != turn.SessionID ||
+		envelope.TurnID != turn.TurnID || envelope.Epoch != turn.Epoch {
+		t.Fatalf("turn-scoped error = %+v, want turn=%d epoch=%d", envelope, turn.TurnID, turn.Epoch)
+	}
+	var payload struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil || payload.Code != "turn_error" {
+		t.Fatalf("turn error payload = %s, error=%v", envelope.Payload, err)
+	}
+}
+
+func assertSessionError(t *testing.T, envelope protocol.ControlEnvelope, helloAck protocol.ControlEnvelope) {
+	t.Helper()
+	if envelope.Type != "error" || envelope.SessionID != helloAck.SessionID ||
+		envelope.TurnID != 0 || envelope.StreamID != 0 || envelope.Epoch != helloAck.Epoch {
+		t.Fatalf("session-scoped error = %+v, want session=%d epoch=%d",
+			envelope, helloAck.SessionID, helloAck.Epoch)
+	}
+	var payload struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil || payload.Code != "turn_error" {
+		t.Fatalf("session error payload = %s, error=%v", envelope.Payload, err)
 	}
 }
 
@@ -459,11 +717,17 @@ type roundTripSession struct {
 	audio     []byte
 	events    chan backend.ConversationEvent
 	closed    chan struct{}
+	failAudio atomic.Bool
+	cancelErr error
 	commits   atomic.Int32
+	discards  atomic.Int32
 	closeOnce sync.Once
 }
 
 func (s *roundTripSession) SendAudio(_ context.Context, pcm []byte) error {
+	if s.failAudio.CompareAndSwap(true, false) {
+		return errors.New("test provider is not ready")
+	}
 	s.mu.Lock()
 	s.audio = append(s.audio, pcm...)
 	s.mu.Unlock()
@@ -493,7 +757,15 @@ func responsePCMFixture() []byte {
 	return pcm
 }
 
-func (s *roundTripSession) Cancel(context.Context) error             { return nil }
+func (s *roundTripSession) Cancel(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cancelErr
+}
+func (s *roundTripSession) DiscardLastResponse(context.Context) error {
+	s.discards.Add(1)
+	return nil
+}
 func (s *roundTripSession) Events() <-chan backend.ConversationEvent { return s.events }
 func (s *roundTripSession) Close() error {
 	s.closeOnce.Do(func() {

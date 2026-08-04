@@ -17,9 +17,10 @@ class NetworkBootstrap final {
  public:
   static bool SaveWifi(const std::string& ssid, const std::string& password);
   static bool SaveServer(const NetworkBootstrapResult& server);
-  /// stop 非空时，长阻塞步骤（DHCP 等待、重试间隙）会观察它并提前退出，
-  /// 保证进程退出路径不会被最长 12 秒的外部工具等待卡住。
-  static bool Start(bool enable_discovery, NetworkBootstrapResult* output,
+  /// 始终先完成有线/Wi-Fi 建链。explicit_server 非空时优先返回该地址；
+  /// 否则按“局域网发现 -> 已保存地址”回退。stop 可中断 DHCP 等长步骤。
+  static bool Start(const NetworkBootstrapResult* explicit_server,
+                    NetworkBootstrapResult* output,
                     const std::atomic<bool>* stop = nullptr);
 };
 

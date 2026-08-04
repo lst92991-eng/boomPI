@@ -14,8 +14,6 @@ import (
 const (
 	Version                = 1
 	MaxControlMessageBytes = 64 * 1024
-	// depth marker
-	maxJSONDepth = 32
 )
 
 type ControlEnvelope struct {
@@ -148,16 +146,13 @@ func validASCIIField(value string, maxBytes int) bool {
 func rejectDuplicateJSONKeys(data []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
-	if err := walkJSONValue(decoder, 0); err != nil {
+	if err := walkJSONValue(decoder); err != nil {
 		return fmt.Errorf("validate JSON object keys: %w", err)
 	}
 	return ensureJSONEOF(decoder)
 }
 
-func walkJSONValue(decoder *json.Decoder, depth int) error {
-	if depth >= maxJSONDepth {
-		return fmt.Errorf("JSON nesting exceeds the depth limit %d", maxJSONDepth)
-	}
+func walkJSONValue(decoder *json.Decoder) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return err
@@ -182,7 +177,7 @@ func walkJSONValue(decoder *json.Decoder, depth int) error {
 				return fmt.Errorf("duplicate object key %q", key)
 			}
 			seen[key] = struct{}{}
-			if err := walkJSONValue(decoder, depth+1); err != nil {
+			if err := walkJSONValue(decoder); err != nil {
 				return err
 			}
 		}
@@ -195,7 +190,7 @@ func walkJSONValue(decoder *json.Decoder, depth int) error {
 		}
 	case '[':
 		for decoder.More() {
-			if err := walkJSONValue(decoder, depth+1); err != nil {
+			if err := walkJSONValue(decoder); err != nil {
 				return err
 			}
 		}

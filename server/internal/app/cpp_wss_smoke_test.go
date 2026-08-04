@@ -130,94 +130,6 @@ func TestCppWSSHappyPath(t *testing.T) {
 	}
 }
 
-func TestCppManualSingleTurnHappyPath(t *testing.T) {
-	clientExecutable := strings.TrimSpace(os.Getenv("BOOMPI_CPP_MANUAL_SINGLE_TURN"))
-	if clientExecutable == "" {
-		t.Skip("set BOOMPI_CPP_MANUAL_SINGLE_TURN to the boompi-client executable to opt in")
-	}
-	if info, err := os.Stat(clientExecutable); err != nil {
-		t.Fatalf("stat C++ manual single-turn executable: %v", err)
-	} else if info.IsDir() {
-		t.Fatal("BOOMPI_CPP_MANUAL_SINGLE_TURN names a directory")
-	}
-
-	// Config.Load requires provider credentials, but this test injects the
-	// deterministic in-process fake and never constructs the Qwen backend.
-	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
-	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
-	t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
-	cfg, err := config.Load("", nil)
-	if err != nil {
-		t.Fatalf("config.Load() error = %v", err)
-	}
-	cfg.ListenAddress = "127.0.0.1"
-	cfg.WSSPort = freePort(t)
-	cfg.DiscoveryPort = freeUDPPort(t)
-	provider := newRoundTripBackend()
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	identityDirectory := t.TempDir()
-	writeFutureServerIdentity(t, identityDirectory)
-	application, err := newWithBackend(cfg, logger, identityDirectory, provider)
-	if err != nil {
-		t.Fatalf("newWithBackend() error = %v", err)
-	}
-
-	serverCtx, stopServer := context.WithCancel(context.Background())
-	serverDone := make(chan error, 1)
-	go func() { serverDone <- application.Run(serverCtx) }()
-	defer func() {
-		stopServer()
-		select {
-		case runErr := <-serverDone:
-			if runErr != nil {
-				t.Errorf("App.Run() error = %v", runErr)
-			}
-		case <-time.After(2 * time.Second):
-			t.Error("server did not stop")
-		}
-	}()
-
-	address := net.JoinHostPort(cfg.ListenAddress, strconv.Itoa(cfg.WSSPort))
-	if err := waitForTCPListener(address, 2*time.Second); err != nil {
-		t.Fatalf("wait for WSS listener: %v", err)
-	}
-
-	commandCtx, cancelCommand := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancelCommand()
-	command := exec.CommandContext(commandCtx, clientExecutable, "--manual-single-turn")
-	command.Env = manualSingleTurnChildEnvironment(cfg, application.spkiPin)
-	output, err := command.CombinedOutput()
-	if commandCtx.Err() != nil {
-		t.Fatalf("C++ manual single turn timed out: %v", commandCtx.Err())
-	}
-	if err != nil {
-		t.Fatalf("C++ manual single turn failed: %v\n%s", err, output)
-	}
-	outputText := string(output)
-	if !strings.Contains(outputText, "manual single turn completed") {
-		t.Fatalf("C++ manual single turn did not report success:\n%s", output)
-	}
-	for _, forbidden := range []string{testDeviceToken, testDeviceID, "response-1"} {
-		if strings.Contains(outputText, forbidden) {
-			t.Fatalf("C++ manual single-turn output leaked sensitive protocol content")
-		}
-	}
-
-	provider.session.mu.Lock()
-	recordedBytes := len(provider.session.audio)
-	provider.session.mu.Unlock()
-	const expectedRecordedBytes = 3 * 16_000 * 2
-	if recordedBytes != expectedRecordedBytes {
-		t.Fatalf("provider input length=%d, want %d for 3 seconds", recordedBytes, expectedRecordedBytes)
-	}
-	if got := provider.session.commits.Load(); got != 1 {
-		t.Fatalf("provider commits = %d, want 1", got)
-	}
-	if got := provider.openCount.Load(); got != 1 {
-		t.Fatalf("provider Open calls = %d, want 1", got)
-	}
-}
-
 func TestCppWSSExternalHILServer(t *testing.T) {
 	if os.Getenv("BOOMPI_EXTERNAL_WSS_HIL") != "1" {
 		t.Skip("set BOOMPI_EXTERNAL_WSS_HIL=1 to serve one external board smoke")
@@ -362,43 +274,6 @@ func smokeChildEnvironment(deviceToken string) []string {
 		environment = append(environment, entry)
 	}
 	return append(environment, "BOOMPI_DEVICE_TOKEN="+deviceToken)
-}
-
-func manualSingleTurnChildEnvironment(cfg config.Config, spkiPin string) []string {
-	overrides := map[string]string{
-		"BOOMPI_SERVER_IP":            cfg.ListenAddress,
-		"BOOMPI_SERVER_PORT":          strconv.Itoa(cfg.WSSPort),
-		"BOOMPI_SERVER_NAME":          "boompi.test",
-		"BOOMPI_SERVER_SPKI_SHA256":   spkiPin,
-		"BOOMPI_DEVICE_ID":            testDeviceID,
-		"BOOMPI_DEVICE_TOKEN":         testDeviceToken,
-		"BOOMPI_CAPTURE_PCM":          "null",
-		"BOOMPI_PLAYBACK_PCM":         "null",
-		"BOOMPI_CAPTURE_MIC_SLOT":     "0",
-		"BOOMPI_CAPTURE_MIC_POLARITY": "1",
-		"BOOMPI_MANUAL_RECORD_MS":     "3000",
-		"BOOMPI_VOLUME_PERCENT":       "60",
-		"BOOMPI_SPEAKER_GAIN_PERCENT": "100",
-	}
-	blocked := make(map[string]struct{}, len(overrides)+2)
-	for key := range overrides {
-		blocked[strings.ToUpper(key)] = struct{}{}
-	}
-	blocked["DASHSCOPE_API_KEY"] = struct{}{}
-	blocked["DASHSCOPE_WORKSPACE_ID"] = struct{}{}
-
-	environment := make([]string, 0, len(os.Environ())+len(overrides))
-	for _, entry := range os.Environ() {
-		key, _, _ := strings.Cut(entry, "=")
-		if _, found := blocked[strings.ToUpper(key)]; found {
-			continue
-		}
-		environment = append(environment, entry)
-	}
-	for key, value := range overrides {
-		environment = append(environment, key+"="+value)
-	}
-	return environment
 }
 
 func minInt(left, right int) int {

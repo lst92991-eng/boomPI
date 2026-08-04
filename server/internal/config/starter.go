@@ -11,7 +11,7 @@ import (
 
 const starterTemplate = `# boomPI 教学版服务端配置
 #
-# 只需把下一行替换成新加坡区 Model Studio 的 Qwen API Key，然后重新运行。
+# 只需把下一行替换成中国内地（北京）区 Model Studio 的 Qwen API Key，然后重新运行。
 # 也可以不修改本行，改用 DASHSCOPE_API_KEY 环境变量覆盖。
 qwen_api_key: %q
 
@@ -22,7 +22,7 @@ device_token: "boompi-teaching-shared-token-v1-2026"
 # 以下均有可用默认值；需要时取消注释再调整。
 # listen_address: "0.0.0.0"
 # wss_port: 17806
-# region: "singapore"
+# region: "china-beijing"
 # conversation_mode: "intelligence"
 # log_level: "info"
 `

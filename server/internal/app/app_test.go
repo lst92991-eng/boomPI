@@ -3,6 +3,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"io"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -10,10 +12,43 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lst92991-eng/boomPI/server/internal/backend/qwen"
+	"github.com/lst92991-eng/boomPI/server/internal/backend/qwenpipeline"
 	"github.com/lst92991-eng/boomPI/server/internal/config"
 	"github.com/lst92991-eng/boomPI/server/internal/discovery"
 	"github.com/lst92991-eng/boomPI/server/internal/logging"
 )
+
+func TestQwenBackendSelectionKeepsDefaultAndDirectModesDistinct(t *testing.T) {
+	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
+	t.Setenv("BOOMPI_DEVICE_TOKEN", "0123456789abcdef0123456789abcdef")
+	cfg, err := config.Load("", nil)
+	if err != nil {
+		t.Fatalf("config.Load() error = %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	if cfg.ConversationMode != "intelligence" {
+		t.Fatalf("default conversation mode = %q, want intelligence", cfg.ConversationMode)
+	}
+	provider, err := newQwenBackend(cfg, logger)
+	if err != nil {
+		t.Fatalf("newQwenBackend(default) error = %v", err)
+	}
+	if _, ok := provider.(*qwenpipeline.Backend); !ok {
+		t.Fatalf("default backend type = %T, want intelligence pipeline", provider)
+	}
+
+	cfg.ConversationMode = "realtime"
+	provider, err = newQwenBackend(cfg, logger)
+	if err != nil {
+		t.Fatalf("newQwenBackend(realtime) error = %v", err)
+	}
+	if _, ok := provider.(*qwen.Backend); !ok {
+		t.Fatalf("realtime backend type = %T, want direct Qwen", provider)
+	}
+}
 
 func TestRunStopsWhenContextIsCanceled(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "never-log-this-secret")
@@ -64,6 +99,27 @@ func TestRunStopsWhenContextIsCanceled(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "tls_spki_sha256") {
 		t.Fatalf("TLS identity was not logged: %s", output.String())
+	}
+}
+
+func TestRunListenersRejectsUnexpectedCleanExit(t *testing.T) {
+	peerStopped := make(chan struct{})
+	err := runListeners(
+		context.Background(),
+		func(context.Context) error { return nil },
+		func(ctx context.Context) error {
+			<-ctx.Done()
+			close(peerStopped)
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "without a shutdown request") {
+		t.Fatalf("runListeners() error = %v, want unexpected listener exit", err)
+	}
+	select {
+	case <-peerStopped:
+	default:
+		t.Fatal("runListeners() did not cancel and join the peer listener")
 	}
 }
 

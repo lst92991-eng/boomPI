@@ -18,10 +18,11 @@ import (
 )
 
 const (
-	maxAudioChunkBytes = 256 * 1024
-	maxMessageBytes    = 8 * 1024 * 1024
-	RegionChinaBeijing = "china-beijing"
-	RegionSingapore    = "singapore"
+	maxAudioChunkBytes    = 256 * 1024
+	maxMessageBytes       = 8 * 1024 * 1024
+	outputAudioEventBytes = 24_000 * 2 * 20 / 1000
+	RegionChinaBeijing    = "china-beijing"
+	RegionSingapore       = "singapore"
 )
 
 var workspaceIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
@@ -125,6 +126,15 @@ func (b *Backend) Open(ctx context.Context, cfg backend.SessionConfig) (backend.
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	return newPendingSession(ctx, func(openCtx context.Context) (backend.ConversationSession, error) {
+		return b.openReady(openCtx, cfg)
+	}), nil
+}
+
+// openReady owns the provider handshake. Backend.Open deliberately runs this
+// behind pendingSession so the device hello path is never coupled to Qwen's
+// Dial/session.updated latency.
+func (b *Backend) openReady(ctx context.Context, cfg backend.SessionConfig) (backend.ConversationSession, error) {
 	endpoint, err := b.config.endpointURL()
 	if err != nil {
 		return nil, fmt.Errorf("build qwen endpoint: %w", err)

@@ -3,6 +3,7 @@ package qwenpipeline
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -44,6 +45,49 @@ func TestRealtimeASRStreamsAudioBeforeCommit(t *testing.T) {
 	}
 	if err := <-serverResult; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRealtimeASRHandshakeObservesContextCancellation(t *testing.T) {
+	updateReceived := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		connection, err := (&websocket.Upgrader{}).Upgrade(response, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		if connection.WriteJSON(map[string]any{"type": "session.created"}) != nil {
+			return
+		}
+		var update any
+		if connection.ReadJSON(&update) != nil {
+			return
+		}
+		close(updateReceived)
+		_, _, _ = connection.ReadMessage()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := openRealtimeASRAt(ctx, Config{APIKey: "test-key", Timeout: 2 * time.Second},
+			strings.Replace(server.URL, "http://", "ws://", 1))
+		result <- err
+	}()
+	select {
+	case <-updateReceived:
+	case <-time.After(time.Second):
+		t.Fatal("realtime ASR handshake did not reach session.update")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled realtime ASR handshake error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("realtime ASR handshake ignored context cancellation")
 	}
 }
 

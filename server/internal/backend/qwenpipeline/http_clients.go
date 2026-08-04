@@ -93,55 +93,6 @@ func (c *httpClients) transcribe(ctx context.Context, pcm []byte) (string, error
 	return strings.TrimSpace(response.Choices[0].Message.Content), nil
 }
 
-func (c *httpClients) complete(ctx context.Context, instructions string, history []chatMessage) (string, error) {
-	requestCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
-	defer cancel()
-	payload := struct {
-		Model        string        `json:"model"`
-		Instructions string        `json:"instructions"`
-		Input        []chatMessage `json:"input"`
-		Reasoning    any           `json:"reasoning"`
-		Tools        []any         `json:"tools,omitempty"`
-		Store        bool          `json:"store"`
-	}{
-		Model:        c.config.ReasoningModel,
-		Instructions: instructions,
-		Input:        history,
-		Reasoning:    map[string]any{"effort": c.config.ReasoningEffort},
-		Store:        false,
-	}
-	if c.config.SearchMode == "auto" {
-		payload.Tools = []any{map[string]any{"type": "web_search"}}
-	}
-	var response struct {
-		Output []struct {
-			Type    string `json:"type"`
-			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"output"`
-	}
-	if err := c.postJSON(requestCtx, c.config.compatibleBaseURL()+"/responses", payload, &response); err != nil {
-		return "", fmt.Errorf("Qwen reasoning: %w", err)
-	}
-	var answer strings.Builder
-	for _, output := range response.Output {
-		if output.Type != "message" {
-			continue
-		}
-		for _, content := range output.Content {
-			if content.Type == "output_text" {
-				answer.WriteString(content.Text)
-			}
-		}
-	}
-	if strings.TrimSpace(answer.String()) == "" {
-		return "", errors.New("Qwen reasoning returned no answer text")
-	}
-	return strings.TrimSpace(answer.String()), nil
-}
-
 func (c *httpClients) completeStream(
 	ctx context.Context,
 	instructions string,
@@ -191,11 +142,114 @@ func (c *httpClients) completeStream(
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return "", fmt.Errorf("Qwen reasoning: %w", providerHTTPError(response))
 	}
-	answer, err := readResponsesStream(response.Body, onDelta)
+	answer, err := readResponsesStreamWithTimeout(
+		ctx, response.Body, c.config.Timeout, onDelta,
+	)
 	if err != nil {
 		return "", fmt.Errorf("Qwen reasoning: %w", err)
 	}
 	return answer, nil
+}
+
+type streamDeltaRequest struct {
+	text   string
+	result chan error
+}
+
+type streamReadResult struct {
+	answer string
+	err    error
+}
+
+type progressReader struct {
+	reader   io.Reader
+	progress chan<- struct{}
+}
+
+func (reader progressReader) Read(buffer []byte) (int, error) {
+	count, err := reader.reader.Read(buffer)
+	if count != 0 {
+		select {
+		case reader.progress <- struct{}{}:
+		default:
+		}
+	}
+	return count, err
+}
+
+// readResponsesStreamWithTimeout distinguishes a healthy long answer from a
+// provider connection that delivered headers and then stopped making progress.
+// onDelta stays on this goroutine so downstream backpressure pauses, rather
+// than falsely triggering, the provider no-progress timer.
+func readResponsesStreamWithTimeout(
+	ctx context.Context,
+	body io.ReadCloser,
+	timeout time.Duration,
+	onDelta func(string) error,
+) (string, error) {
+	readCtx, cancelRead := context.WithCancel(ctx)
+	defer cancelRead()
+	progress := make(chan struct{}, 1)
+	deltas := make(chan streamDeltaRequest)
+	result := make(chan streamReadResult, 1)
+	go func() {
+		answer, err := readResponsesStream(progressReader{reader: body, progress: progress}, func(delta string) error {
+			request := streamDeltaRequest{text: delta, result: make(chan error, 1)}
+			select {
+			case deltas <- request:
+			case <-readCtx.Done():
+				return readCtx.Err()
+			}
+			select {
+			case err := <-request.result:
+				return err
+			case <-readCtx.Done():
+				return readCtx.Err()
+			}
+		})
+		result <- streamReadResult{answer: answer, err: err}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	resetProgress := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(timeout)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			cancelRead()
+			_ = body.Close()
+			return "", ctx.Err()
+		case <-progress:
+			resetProgress()
+		case request := <-deltas:
+			var err error
+			if onDelta != nil {
+				err = onDelta(request.text)
+			}
+			request.result <- err
+			if err != nil {
+				cancelRead()
+				_ = body.Close()
+				return "", err
+			}
+			resetProgress()
+		case read := <-result:
+			return read.answer, read.err
+		case <-timer.C:
+			cancelRead()
+			_ = body.Close()
+			return "", fmt.Errorf("provider stream made no progress for %s: %w",
+				timeout, context.DeadlineExceeded)
+		}
+	}
 }
 
 func readResponsesStream(reader io.Reader, onDelta func(string) error) (string, error) {

@@ -1,6 +1,7 @@
 /// @file 环境配置解析、边界校验和设备令牌生命周期。
 #include "boompi/config/voice_client_config.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstddef>
@@ -74,7 +75,49 @@ bool IsSnowboySensitivity(const std::string& text) noexcept {
          value >= 0.0F && value <= 1.0F;
 }
 
+int Base64Value(const char digit) noexcept {
+  if (digit >= 'A' && digit <= 'Z') return digit - 'A';
+  if (digit >= 'a' && digit <= 'z') return digit - 'a' + 26;
+  if (digit >= '0' && digit <= '9') return digit - '0' + 52;
+  if (digit == '+') return 62;
+  if (digit == '/') return 63;
+  return -1;
+}
+
 }  // namespace
+
+bool IsValidDeviceId(const std::string& value) noexcept {
+  if (value.size() != 36U || value[8] != '-' || value[13] != '-' ||
+      value[18] != '-' || value[23] != '-') {
+    return false;
+  }
+  bool nonzero = false;
+  for (std::size_t index = 0; index < value.size(); ++index) {
+    if (index == 8U || index == 13U || index == 18U || index == 23U) continue;
+    const char digit = value[index];
+    if (!((digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f'))) {
+      return false;
+    }
+    nonzero = nonzero || digit != '0';
+  }
+  return nonzero;
+}
+
+bool IsValidSpkiSha256(const std::string& value) noexcept {
+  if (value.size() != 44U || value.back() != '=') return false;
+  for (std::size_t index = 0; index < 43U; ++index) {
+    if (Base64Value(value[index]) < 0) return false;
+  }
+  // SHA-256 是 32 字节；末个 base64 数据字符的两个 padding bit 必须为零。
+  return (static_cast<unsigned>(Base64Value(value[42])) & 0x03U) == 0U;
+}
+
+bool IsValidDeviceToken(const std::string& value) noexcept {
+  return value.size() >= 32U && value.size() <= 256U &&
+         std::all_of(value.begin(), value.end(), [](const unsigned char byte) {
+           return byte >= 0x21U && byte <= 0x7eU;
+         });
+}
 
 bool LoadVoiceClientConfigFromEnvironment(VoiceClientConfig* const output,
                                           std::string* const error) {
@@ -88,12 +131,14 @@ bool LoadVoiceClientConfigFromEnvironment(VoiceClientConfig* const output,
       !ReadString("BOOMPI_DEVICE_TOKEN", false, 256U, &output->device_token, error) ||
       !ReadString("BOOMPI_CAPTURE_PCM", true, 31U, &output->capture_pcm, error) ||
       !ReadString("BOOMPI_PLAYBACK_PCM", true, 31U, &output->playback_pcm, error)) return false;
-  // UUID/SPKI 的完整格式由唯一的 WSS 边界解析；配置层只做长度与秘密最小长度检查。
-  if (output->device_id.size() != 36U) return Bad("BOOMPI_DEVICE_ID", error);
-  if ((output->server_ip.empty() != output->server_spki_sha256.empty()) || (!output->server_spki_sha256.empty() && output->server_spki_sha256.size() != 44U))
+  if (!IsValidDeviceId(output->device_id)) return Bad("BOOMPI_DEVICE_ID", error);
+  if ((output->server_ip.empty() != output->server_spki_sha256.empty()) ||
+      (!output->server_spki_sha256.empty() &&
+       !IsValidSpkiSha256(output->server_spki_sha256))) {
     return Bad("BOOMPI_SERVER_SPKI_SHA256", error);
+  }
   if (output->device_token.empty()) output->device_token = "boompi-teaching-shared-token-v1-2026";
-  if (output->device_token.size() < 32U) return Bad("BOOMPI_DEVICE_TOKEN", error);
+  if (!IsValidDeviceToken(output->device_token)) return Bad("BOOMPI_DEVICE_TOKEN", error);
   std::uint32_t parsed = 0U;
   if (!ReadUint("BOOMPI_SERVER_PORT", 17806U, 1U, 65535U, &parsed, error)) return false;
   output->server_port = static_cast<std::uint16_t>(parsed);
@@ -111,7 +156,9 @@ bool LoadVoiceClientConfigFromEnvironment(VoiceClientConfig* const output,
   if (output->snowboy_sensitivity.empty()) output->snowboy_sensitivity = "0.7";
   if (!IsSnowboySensitivity(output->snowboy_sensitivity)) return Bad("BOOMPI_SNOWBOY_SENSITIVITY", error);
   if (!ReadFloat("BOOMPI_VAD_MIN_DBFS", -35.0F, -90.0F, 0.0F,
-                 &output->vad_min_dbfs, error))
+                 &output->vad_min_dbfs, error) ||
+      !ReadFloat("BOOMPI_BARGE_MIN_DBFS", -25.0F, -90.0F, 0.0F,
+                 &output->barge_min_dbfs, error))
     return false;
   if (error != nullptr) error->clear();
   return true;

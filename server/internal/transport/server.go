@@ -22,7 +22,7 @@ const (
 	maxPingInterval      = 10 * time.Second
 	maxPongTimeout       = 30 * time.Second
 	writeTimeout         = 5 * time.Second
-	sendQueueCapacity    = 32
+	sendQueueCapacity    = 16
 	receiveQueueCapacity = 32
 )
 

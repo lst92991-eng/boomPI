@@ -43,8 +43,6 @@ var configKeys = []string{
 	"session_idle_timeout",
 	"max_turns",
 	"max_context_tokens",
-	"pairing_code_ttl",
-	"pairing_max_attempts",
 	"qwen_api_key",
 	"device_token",
 }
@@ -101,8 +99,6 @@ type Config struct {
 	SessionIdleTimeout   time.Duration
 	MaxTurns             int
 	MaxContextTokens     int
-	PairingCodeTTL       time.Duration
-	PairingMaxAttempts   int
 	Credentials          Credentials
 	DeviceToken          DeviceToken
 }
@@ -114,7 +110,7 @@ func Defaults() Config {
 		DiscoveryPort:        17807,
 		LogLevel:             "info",
 		Provider:             "qwen",
-		Region:               "singapore",
+		Region:               "china-beijing",
 		ConversationMode:     "intelligence",
 		Model:                "qwen3.5-omni-plus-realtime",
 		ASRModel:             "qwen3-asr-flash",
@@ -132,8 +128,6 @@ func Defaults() Config {
 		SessionIdleTimeout:   30 * time.Minute,
 		MaxTurns:             20,
 		MaxContextTokens:     24_000,
-		PairingCodeTTL:       2 * time.Minute,
-		PairingMaxAttempts:   5,
 	}
 }
 
@@ -292,12 +286,6 @@ func (c Config) Validate() error {
 	}
 	if c.MaxContextTokens < 1024 || c.MaxContextTokens > 1_000_000 {
 		return errors.New("max_context_tokens must be between 1024 and 1000000")
-	}
-	if c.PairingCodeTTL < 30*time.Second || c.PairingCodeTTL > 10*time.Minute {
-		return errors.New("pairing_code_ttl must be between 30s and 10m")
-	}
-	if c.PairingMaxAttempts < 1 || c.PairingMaxAttempts > 10 {
-		return errors.New("pairing_max_attempts must be between 1 and 10")
 	}
 	apiKey := strings.TrimSpace(c.Credentials.apiKey)
 	if apiKey == "" || apiKey == APIKeyPlaceholder {
@@ -539,18 +527,6 @@ func applyValue(cfg *Config, key, value string) error {
 			return err
 		}
 		cfg.MaxContextTokens = parsed
-	case "pairing_code_ttl":
-		parsed, err := parseDuration()
-		if err != nil {
-			return err
-		}
-		cfg.PairingCodeTTL = parsed
-	case "pairing_max_attempts":
-		parsed, err := parseInt()
-		if err != nil {
-			return err
-		}
-		cfg.PairingMaxAttempts = parsed
 	case "qwen_api_key":
 		cfg.Credentials.apiKey = value
 		cfg.Credentials.source = "config.yaml"

@@ -44,7 +44,7 @@ tts_voice:              Cherry
 first_response_timeout: 2m
 ```
 
-仓库的 `configs/config.example.yaml` 仍以目标市场的 `singapore` 区域作为可复制模板；因此它与
+仓库当时的 `configs/config.example.yaml` 仍以目标市场的 `singapore` 区域作为可复制模板；因此它与
 本轮 HIL 的区域并不相同。复现实机现象时必须显式改成上面的区域和模型配置，不能把示例文件
 直接称为本轮运行配置。API Key、workspace ID 和设备 token 仍只能由环境注入。
 

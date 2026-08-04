@@ -37,7 +37,7 @@ class RockchipVoiceDsp final {
   ///
   /// 初始化失败后实例保持关闭；重复打开返回 false 且不改变已有句柄。Close 幂等释放
   /// 句柄、参数树和 FIFO 状态，可在初始化失败后调用。
-  /// @return 成功返回 true；重复打开或任一初始化阶段失败返回 false。
+  /// @return 完整初始化成功返回 true，已打开或任一步失败返回 false。
   bool Open() noexcept;
   void Close() noexcept;  ///< 幂等关闭，允许在 Open 失败后调用。
 

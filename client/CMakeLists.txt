@@ -76,6 +76,85 @@ if(BOOMPI_BUILD_UI_SIMULATOR)
   set_target_properties(boompi_ui_simulator PROPERTIES OUTPUT_NAME boompi-ui-simulator)
 endif()
 
+if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
+  if(NOT TARGET Threads::Threads)
+    find_package(Threads REQUIRED)
+  endif()
+  add_executable(boompi_voice_client_config_test
+    tests/voice_client_config_test.cpp
+    src/config/voice_client_config.cpp)
+  target_compile_features(boompi_voice_client_config_test PRIVATE cxx_std_17)
+  target_include_directories(boompi_voice_client_config_test PRIVATE include)
+  if(MSVC)
+    target_compile_definitions(boompi_voice_client_config_test PRIVATE
+      _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(boompi_voice_client_config_test PRIVATE /W4 /utf-8
+      $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:/WX>)
+  else()
+    target_compile_options(boompi_voice_client_config_test PRIVATE
+      -Wall -Wextra -Wpedantic
+      $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:-Werror>)
+  endif()
+  add_test(NAME voice-client-config-contract
+    COMMAND boompi_voice_client_config_test)
+
+  add_executable(boompi_voice_client_harness
+    tests/voice_client_harness_test.cpp
+    tests/support/voice_client_harness.cpp
+    src/application/voice_client.cpp)
+  target_compile_features(boompi_voice_client_harness PRIVATE cxx_std_17)
+  target_compile_definitions(boompi_voice_client_harness PRIVATE
+    BOOMPI_VOICE_CLIENT_HARNESS=1)
+  if(MSVC)
+    target_compile_options(boompi_voice_client_harness PRIVATE /W4 /utf-8
+      $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:/WX>)
+  else()
+    target_compile_options(boompi_voice_client_harness PRIVATE
+      -Wall -Wextra -Wpedantic
+      $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:-Werror>)
+  endif()
+  target_include_directories(boompi_voice_client_harness PRIVATE
+    include tests)
+  target_link_libraries(boompi_voice_client_harness PRIVATE Threads::Threads)
+  foreach(_scenario IN ITEMS explicit-endpoint capture-hole touch-wake-stale-vad
+      hello-timeout hello-frame-timeout
+      heartbeat-timeout heartbeat-frame-timeout
+      capture-wall-timeout cancel-timeout cancel-frame-timeout
+      follow-up-timeout follow-up-frame-timeout
+      drain-touch drain-barge drain-timeout drain-complete-timeout
+      drain-complete-frame
+      drain-discontinuity cancel-discontinuity
+      barge-turn-discontinuity first-response-hint first-response-content
+      stop-stalled-capture
+      backpressure reconnect connection-subtitle abnormal-subtitle barge
+      barge-short-before-ack barge-long-across-ack
+      cancel-done max-input)
+    add_test(NAME voice-client-${_scenario}
+      COMMAND boompi_voice_client_harness ${_scenario})
+  endforeach()
+
+  if(UNIX)
+    add_executable(boompi_audio_engine_harness
+      tests/audio_engine_harness_test.cpp
+      tests/support/audio_backend.cpp
+      src/audio/audio_engine.cpp)
+    target_compile_features(boompi_audio_engine_harness PRIVATE cxx_std_17)
+    target_compile_options(boompi_audio_engine_harness PRIVATE
+      -Wall -Wextra -Wpedantic
+      $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:-Werror>)
+    # support must precede the board backend directory so audio_engine.cpp
+    # binds to the deterministic fake while the production target stays intact.
+    target_include_directories(boompi_audio_engine_harness PRIVATE
+      tests/support include)
+    target_link_libraries(boompi_audio_engine_harness PRIVATE Threads::Threads)
+    foreach(_scenario IN ITEMS sub-grace-jitter confirmed-gap short-tail
+        bounded-close bounded-capture bounded-command reset-preserves-pcm)
+      add_test(NAME audio-engine-${_scenario}
+        COMMAND boompi_audio_engine_harness ${_scenario})
+    endforeach()
+  endif()
+endif()
+
 if(NOT BOOMPI_TARGET_RV1106)
   message(STATUS "boompi-client is a board-only target; configure with BOOMPI_TARGET_RV1106=ON")
   return()
@@ -96,6 +175,14 @@ endforeach()
 find_package(ALSA REQUIRED)
 find_library(BOOMPI_SWRESAMPLE_LIBRARY NAMES swresample REQUIRED)
 find_library(BOOMPI_AVUTIL_LIBRARY NAMES avutil REQUIRED)
+find_path(BOOMPI_CJSON_INCLUDE_DIR NAMES cjson/cJSON.h REQUIRED)
+find_library(BOOMPI_CJSON_LIBRARY NAMES cjson REQUIRED)
+if(NOT IS_ABSOLUTE "${BOOMPI_CJSON_INCLUDE_DIR}" OR
+   NOT EXISTS "${BOOMPI_CJSON_INCLUDE_DIR}/cjson/cJSON.h" OR
+   NOT IS_ABSOLUTE "${BOOMPI_CJSON_LIBRARY}" OR
+   NOT EXISTS "${BOOMPI_CJSON_LIBRARY}")
+  message(FATAL_ERROR "RV1106 BSP cJSON headers/library are missing")
+endif()
 
 if(NOT IS_ABSOLUTE "${BOOMPI_BOOST_INCLUDE_DIR}" OR
    NOT EXISTS "${BOOMPI_BOOST_INCLUDE_DIR}/boost/asio.hpp")
@@ -161,6 +248,7 @@ target_include_directories(boompi_client PRIVATE include src/platform/rv1106)
 target_include_directories(boompi_client SYSTEM PRIVATE
   "${PROJECT_SOURCE_DIR}/third_party"
   "${BOOMPI_BOOST_INCLUDE_DIR}"
+  "${BOOMPI_CJSON_INCLUDE_DIR}"
   "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}"
   "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}")
 target_link_libraries(boompi_client PRIVATE
@@ -171,12 +259,29 @@ target_link_libraries(boompi_client PRIVATE
   ALSA::ALSA
   "${BOOMPI_SWRESAMPLE_LIBRARY}"
   "${BOOMPI_AVUTIL_LIBRARY}"
+  "${BOOMPI_CJSON_LIBRARY}"
   Freetype::Freetype
   OpenSSL::SSL OpenSSL::Crypto
   Threads::Threads ${CMAKE_DL_LIBS} atomic)
 set_target_properties(boompi_client PROPERTIES OUTPUT_NAME boompi-client
   SKIP_BUILD_RPATH TRUE BUILD_RPATH "" INSTALL_RPATH ""
   BUILD_WITH_INSTALL_RPATH FALSE INSTALL_RPATH_USE_LINK_PATH FALSE)
+
+add_executable(boompi_protocol_json_test EXCLUDE_FROM_ALL
+  tests/protocol_json_contract.cpp
+  src/config/voice_client_config.cpp)
+target_compile_features(boompi_protocol_json_test PRIVATE cxx_std_17)
+target_compile_definitions(boompi_protocol_json_test PRIVATE
+  BOOST_ERROR_CODE_HEADER_ONLY=1 BOOST_SYSTEM_NO_DEPRECATED=1)
+target_compile_options(boompi_protocol_json_test PRIVATE -Wall -Wextra -Wpedantic
+  $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:-Werror>)
+target_include_directories(boompi_protocol_json_test PRIVATE include)
+target_include_directories(boompi_protocol_json_test SYSTEM PRIVATE
+  "${PROJECT_SOURCE_DIR}/third_party" "${BOOMPI_BOOST_INCLUDE_DIR}"
+  "${BOOMPI_CJSON_INCLUDE_DIR}")
+target_link_libraries(boompi_protocol_json_test PRIVATE
+  "${BOOMPI_CJSON_LIBRARY}" OpenSSL::SSL OpenSSL::Crypto
+  Threads::Threads ${CMAKE_DL_LIBS} atomic)
 install(TARGETS boompi_client RUNTIME DESTINATION /userdata/boompi/bin)
 install(FILES assets/icons/tabler-icons-200-subset.ttf
   DESTINATION /userdata/boompi/fonts)

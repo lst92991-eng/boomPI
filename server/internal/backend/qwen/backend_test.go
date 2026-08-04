@@ -16,6 +16,60 @@ import (
 	"github.com/lst92991-eng/boomPI/server/internal/backend"
 )
 
+func TestOpenReturnsBeforeProviderSessionIsReady(t *testing.T) {
+	updateReceived := make(chan struct{})
+	releaseHandshake := make(chan struct{})
+	endpoint := startProvider(t, func(conn *websocket.Conn) {
+		writeServerJSON(t, conn, map[string]any{"type": "session.created"})
+		var update clientEvent
+		readClientJSON(t, conn, &update)
+		close(updateReceived)
+		<-releaseHandshake
+		writeServerJSON(t, conn, map[string]any{"type": "session.updated"})
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	b, err := New(validConfig(endpoint))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	started := time.Now()
+	session, err := b.Open(context.Background(), backend.SessionConfig{})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer session.Close()
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("Open() waited %s for provider readiness", elapsed)
+	}
+	select {
+	case <-updateReceived:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not receive session.update")
+	}
+
+	sendResult := make(chan error, 1)
+	go func() { sendResult <- session.SendAudio(context.Background(), []byte{1, 2}) }()
+	select {
+	case err := <-sendResult:
+		t.Fatalf("SendAudio() returned before session.updated: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseHandshake)
+	select {
+	case err := <-sendResult:
+		if err != nil {
+			t.Fatalf("SendAudio() after session.updated error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SendAudio() remained blocked after session.updated")
+	}
+}
+
 func TestSessionHandshakeCommandsAndEventMapping(t *testing.T) {
 	commands := make(chan clientEvent, 5)
 	endpoint := startProvider(t, func(conn *websocket.Conn) {
@@ -25,7 +79,7 @@ func TestSessionHandshakeCommandsAndEventMapping(t *testing.T) {
 		commands <- update
 		writeServerJSON(t, conn, map[string]any{"type": "session.updated"})
 
-		for range 4 {
+		for range 3 {
 			var command clientEvent
 			readClientJSON(t, conn, &command)
 			commands <- command
@@ -40,9 +94,12 @@ func TestSessionHandshakeCommandsAndEventMapping(t *testing.T) {
 		writeServerJSON(t, conn, map[string]any{
 			"type": "response.audio.delta", "response_id": "resp-1", "delta": base64.StdEncoding.EncodeToString([]byte{1, 2, 3, 4}),
 		})
+		var cancelCommand clientEvent
+		readClientJSON(t, conn, &cancelCommand)
+		commands <- cancelCommand
 		writeServerJSON(t, conn, map[string]any{
 			"type":     "response.done",
-			"response": map[string]any{"id": "resp-1", "status": "completed"},
+			"response": map[string]any{"id": "resp-1", "status": "cancelled"},
 		})
 	})
 
@@ -57,7 +114,7 @@ func TestSessionHandshakeCommandsAndEventMapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
-	session := opened.(*Session)
+	session := opened
 	defer func() {
 		if err := session.Close(); err != nil {
 			t.Errorf("Close() error = %v", err)
@@ -65,14 +122,11 @@ func TestSessionHandshakeCommandsAndEventMapping(t *testing.T) {
 	}()
 
 	pcm := []byte{0x01, 0x02, 0x03, 0x04}
-	if err := session.SendAudio(context.Background(), pcm); err != nil {
+	if err := sendAudioWhenReady(t, session, pcm); err != nil {
 		t.Fatalf("SendAudio() error = %v", err)
 	}
 	if err := session.Commit(context.Background()); err != nil {
 		t.Fatalf("Commit() error = %v", err)
-	}
-	if err := session.Cancel(context.Background()); err != nil {
-		t.Fatalf("Cancel() error = %v", err)
 	}
 
 	update := receive(t, commands)
@@ -90,7 +144,6 @@ func TestSessionHandshakeCommandsAndEventMapping(t *testing.T) {
 		"input_audio_buffer.append",
 		"input_audio_buffer.commit",
 		"response.create",
-		"response.cancel",
 	}
 	for _, want := range wantTypes {
 		command := receive(t, commands)
@@ -109,13 +162,25 @@ func TestSessionHandshakeCommandsAndEventMapping(t *testing.T) {
 		{Type: backend.EventStarted, ResponseID: "resp-1"},
 		{Type: backend.EventTextDelta, ResponseID: "resp-1", Text: "你好"},
 		{Type: backend.EventAudio, ResponseID: "resp-1", PCM: []byte{1, 2, 3, 4}, SampleRateHz: 24_000},
-		{Type: backend.EventDone, ResponseID: "resp-1"},
 	}
 	for _, want := range wantEvents {
 		got := receive(t, session.Events())
 		if got.Type != want.Type || got.ResponseID != want.ResponseID || got.Text != want.Text || got.SampleRateHz != want.SampleRateHz || string(got.PCM) != string(want.PCM) {
 			t.Fatalf("event = %#v, want %#v", got, want)
 		}
+	}
+	if err := session.Cancel(context.Background()); err != nil {
+		t.Fatalf("Cancel() error = %v", err)
+	}
+	if command := receive(t, commands); command.Type != "response.cancel" {
+		t.Fatalf("command type = %q, want response.cancel", command.Type)
+	}
+	select {
+	case stale, ok := <-session.Events():
+		if ok {
+			t.Fatalf("cancelled response leaked a stale event: %#v", stale)
+		}
+	case <-time.After(25 * time.Millisecond):
 	}
 }
 
@@ -136,7 +201,7 @@ func TestProviderErrorAfterHandshakeIsAnEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
-	session := opened.(*Session)
+	session := opened
 	defer session.Close()
 	event := receive(t, session.Events())
 	if event.Type != backend.EventError || !errors.Is(event.Err, ErrProvider) {
@@ -177,7 +242,7 @@ func TestResponseDoneStatusMapping(t *testing.T) {
 	}
 }
 
-func TestProviderErrorDuringHandshakeFailsOpen(t *testing.T) {
+func TestProviderErrorDuringHandshakeFailsFirstOperation(t *testing.T) {
 	endpoint := startProvider(t, func(conn *websocket.Conn) {
 		writeServerJSON(t, conn, map[string]any{"type": "session.created"})
 		var update clientEvent
@@ -191,9 +256,14 @@ func TestProviderErrorDuringHandshakeFailsOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	_, err = b.Open(context.Background(), backend.SessionConfig{})
+	opened, err := b.Open(context.Background(), backend.SessionConfig{})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer opened.Close()
+	err = awaitSessionOperationError(t, opened)
 	if !errors.Is(err, ErrProvider) {
-		t.Fatalf("Open() error = %v, want provider error", err)
+		t.Fatalf("SendAudio() error = %v, want provider error", err)
 	}
 }
 
@@ -206,12 +276,17 @@ func TestAuthenticationFailureIsClassified(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	_, err = b.Open(context.Background(), backend.SessionConfig{})
+	opened, err := b.Open(context.Background(), backend.SessionConfig{})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer opened.Close()
+	err = awaitSessionOperationError(t, opened)
 	if !errors.Is(err, ErrTransport) {
-		t.Fatalf("Open() error = %v, want transport error", err)
+		t.Fatalf("SendAudio() error = %v, want transport error", err)
 	}
 	if !strings.Contains(err.Error(), "401 Unauthorized") {
-		t.Fatalf("Open() error = %v, want HTTP response status", err)
+		t.Fatalf("SendAudio() error = %v, want HTTP response status", err)
 	}
 }
 
@@ -242,9 +317,14 @@ func TestHandshakeDiagnosticRedactsAPIKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	_, err = b.Open(context.Background(), backend.SessionConfig{})
+	opened, err := b.Open(context.Background(), backend.SessionConfig{})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer opened.Close()
+	err = awaitSessionOperationError(t, opened)
 	if !errors.Is(err, ErrTransport) {
-		t.Fatalf("Open() error = %v, want transport error", err)
+		t.Fatalf("SendAudio() error = %v, want transport error", err)
 	}
 	message := err.Error()
 	if !strings.Contains(message, "InvalidApiKey") || !strings.Contains(message, "<redacted>") {
@@ -272,7 +352,7 @@ func TestBoundedSendQueueHonorsCancellation(t *testing.T) {
 	}
 }
 
-func TestBoundedSendQueueClassifiesDeadline(t *testing.T) {
+func TestBoundedAudioQueueReturnsBackpressureWithoutBlockingActor(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	session := &Session{
@@ -282,11 +362,52 @@ func TestBoundedSendQueueClassifiesDeadline(t *testing.T) {
 		writes: make(chan outboundBatch, 1),
 	}
 	session.writes <- outboundBatch{}
-	callCtx, stop := context.WithTimeout(context.Background(), time.Millisecond)
-	defer stop()
-	err := session.SendAudio(callCtx, []byte{1, 2})
-	if !errors.Is(err, ErrTransport) || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("SendAudio() error = %v, want transport deadline", err)
+	started := time.Now()
+	err := session.SendAudio(context.Background(), []byte{1, 2})
+	if !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("SendAudio() error = %v, want backpressure", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("SendAudio() waited %s on a full provider queue", elapsed)
+	}
+}
+
+func TestListeningCancelBypassesFullAudioQueue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	session := &Session{
+		config: Config{}, ctx: ctx, cancel: cancel,
+		writes: make(chan outboundBatch, 1), urgentWrites: make(chan outboundBatch, 1),
+	}
+	session.writes <- outboundBatch{
+		events: []clientEvent{{Type: "input_audio_buffer.append"}}, inputAudio: true,
+	}
+	if err := session.Cancel(context.Background()); err != nil {
+		t.Fatalf("Cancel() with full audio queue error = %v", err)
+	}
+	select {
+	case batch := <-session.urgentWrites:
+		if len(batch.events) != 1 || batch.events[0].Type != "input_audio_buffer.clear" {
+			t.Fatalf("urgent cancel batch = %+v", batch)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("listening cancel did not bypass the full audio queue")
+	}
+	if got := session.inputGeneration.Load(); got != 1 {
+		t.Fatalf("input generation after cancel = %d, want 1", got)
+	}
+}
+
+func TestCommitReturnsBackpressureAndRollsBackResponseState(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	session := &Session{ctx: ctx, cancel: cancel, writes: make(chan outboundBatch, 1)}
+	session.writes <- outboundBatch{}
+	if err := session.Commit(context.Background()); !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("Commit() error = %v, want backpressure", err)
+	}
+	if session.responseRequested {
+		t.Fatal("Commit() left response active after queue backpressure")
 	}
 }
 
@@ -342,7 +463,7 @@ func TestCloseStopsWorkersAndRejectsNewCommands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
-	session := opened.(*Session)
+	session := opened
 	if err := session.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
@@ -422,6 +543,36 @@ func receive[T any](t *testing.T, channel <-chan T) T {
 	}
 }
 
+func awaitSessionOperationError(t *testing.T, session backend.ConversationSession) error {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		err := session.SendAudio(context.Background(), []byte{1, 2})
+		if !errors.Is(err, ErrSessionNotReady) {
+			return err
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for provider initialization error")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func sendAudioWhenReady(t *testing.T, session backend.ConversationSession, pcm []byte) error {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		err := session.SendAudio(context.Background(), pcm)
+		if !errors.Is(err, ErrSessionNotReady) {
+			return err
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for provider session readiness")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestInvalidAudioIsRejectedBeforeQueueing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -431,6 +582,161 @@ func TestInvalidAudioIsRejectedBeforeQueueing(t *testing.T) {
 		if err == nil {
 			t.Fatalf("SendAudio(%d bytes) unexpectedly succeeded", len(pcm))
 		}
+	}
+}
+
+func TestProviderAudioIsPublishedAsBounded20msEvents(t *testing.T) {
+	pcm := make([]byte, outputAudioEventBytes*2+200)
+	for index := range pcm {
+		pcm[index] = byte(index)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	session := &Session{ctx: ctx, events: make(chan backend.ConversationEvent, 3)}
+	event := serverEvent{Type: "response.audio.delta", ResponseID: "response-bounded"}
+	event.Delta = base64.StdEncoding.EncodeToString(pcm)
+	if err := session.handleServerEvent(event); err != nil {
+		t.Fatalf("handleServerEvent() error = %v", err)
+	}
+
+	var rebuilt []byte
+	for index, wantBytes := range []int{outputAudioEventBytes, outputAudioEventBytes, 200} {
+		event := receive(t, session.Events())
+		if event.Type != backend.EventAudio || event.ResponseID != "response-bounded" ||
+			event.SampleRateHz != 24_000 || len(event.PCM) != wantBytes {
+			t.Fatalf("audio event %d = %+v, want %d bytes", index, event, wantBytes)
+		}
+		rebuilt = append(rebuilt, event.PCM...)
+	}
+	if string(rebuilt) != string(pcm) {
+		t.Fatal("bounded audio events changed PCM")
+	}
+}
+
+func TestProviderAudioBackpressurePreservesDeltaLargerThanQueue(t *testing.T) {
+	const queueSize = 2
+	pcm := make([]byte, outputAudioEventBytes*5+200)
+	for index := range pcm {
+		pcm[index] = byte(index)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	session := &Session{ctx: ctx, events: make(chan backend.ConversationEvent, queueSize)}
+	event := serverEvent{Type: "response.audio.delta", ResponseID: "response-backpressure"}
+	event.Delta = base64.StdEncoding.EncodeToString(pcm)
+	result := make(chan error, 1)
+	go func() { result <- session.handleServerEvent(event) }()
+
+	select {
+	case err := <-result:
+		t.Fatalf("large provider delta bypassed bounded backpressure: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	var rebuilt []byte
+	for index := 0; index < 6; index++ {
+		published := receive(t, session.Events())
+		if published.Type != backend.EventAudio || published.ResponseID != event.ResponseID {
+			t.Fatalf("audio event %d = %+v", index, published)
+		}
+		rebuilt = append(rebuilt, published.PCM...)
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("large provider delta failed after the consumer caught up: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("large provider delta remained blocked after queue space became available")
+	}
+	if string(rebuilt) != string(pcm) {
+		t.Fatal("backpressured provider audio changed PCM")
+	}
+}
+
+func TestProviderAudioBackpressureUnblocksOnSessionCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	session := &Session{ctx: ctx, events: make(chan backend.ConversationEvent, 1)}
+	pcm := make([]byte, outputAudioEventBytes*2)
+	event := serverEvent{Type: "response.audio.delta", ResponseID: "response-cancel"}
+	event.Delta = base64.StdEncoding.EncodeToString(pcm)
+	result := make(chan error, 1)
+	go func() { result <- session.handleServerEvent(event) }()
+
+	select {
+	case err := <-result:
+		t.Fatalf("provider publish returned before its full queue was canceled: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled provider publish error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("provider publish remained blocked after session cancellation")
+	}
+}
+
+func TestProviderAudioBackpressureUnblocksOnTurnCancellation(t *testing.T) {
+	ctx, stopSession := context.WithCancel(context.Background())
+	defer stopSession()
+	session := &Session{
+		config: Config{Timeout: time.Second}, ctx: ctx, cancel: stopSession,
+		writes: make(chan outboundBatch, 2), events: make(chan backend.ConversationEvent, 1),
+	}
+	if err := session.Commit(context.Background()); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	sentinel := backend.ConversationEvent{Type: backend.EventStarted, ResponseID: "already-queued"}
+	session.events <- sentinel
+
+	pcm := make([]byte, outputAudioEventBytes*2)
+	audio := serverEvent{Type: "response.audio.delta", ResponseID: "response-cancel"}
+	audio.Delta = base64.StdEncoding.EncodeToString(pcm)
+	publishResult := make(chan error, 1)
+	go func() { publishResult <- session.handleServerEvent(audio) }()
+	select {
+	case err := <-publishResult:
+		t.Fatalf("provider publish returned before turn cancellation: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	cancelResult := make(chan error, 1)
+	go func() { cancelResult <- session.Cancel(context.Background()) }()
+	select {
+	case err := <-publishResult:
+		if err != nil {
+			t.Fatalf("turn-cancelled provider publish error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("provider publish remained blocked after turn cancellation")
+	}
+	var done serverEvent
+	done.Type = "response.done"
+	done.Response.ID = audio.ResponseID
+	done.Response.Status = "cancelled"
+	if err := session.handleServerEvent(done); err != nil {
+		t.Fatalf("cancel response.done error = %v", err)
+	}
+	select {
+	case err := <-cancelResult:
+		if err != nil {
+			t.Fatalf("Cancel() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Cancel() did not observe response.done")
+	}
+
+	if queued := <-session.events; queued.ResponseID != sentinel.ResponseID {
+		t.Fatalf("queued event = %+v, want sentinel", queued)
+	}
+	select {
+	case stale := <-session.events:
+		t.Fatalf("cancelled response leaked a stale event: %+v", stale)
+	default:
 	}
 }
 

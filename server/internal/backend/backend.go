@@ -2,14 +2,7 @@ package backend
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"sort"
-	"strings"
-	"sync"
 )
-
-var ErrNotRegistered = errors.New("backend is not registered")
 
 type SessionConfig struct {
 	DeviceID     string
@@ -61,62 +54,4 @@ type CompletedResponseDiscarder interface {
 
 type ConversationBackend interface {
 	Open(ctx context.Context, cfg SessionConfig) (ConversationSession, error)
-}
-
-type ASRBackend interface {
-	Transcribe(ctx context.Context, pcm []byte) (string, error)
-}
-
-type LLMBackend interface {
-	Complete(ctx context.Context, messages []string) (string, error)
-}
-
-type TTSBackend interface {
-	Synthesize(ctx context.Context, text string) ([]byte, error)
-}
-
-type ConversationFactory func() (ConversationBackend, error)
-
-type Registry struct {
-	mu           sync.RWMutex
-	conversation map[string]ConversationFactory
-}
-
-func NewRegistry() *Registry {
-	return &Registry{conversation: make(map[string]ConversationFactory)}
-}
-
-func (r *Registry) RegisterConversation(name string, factory ConversationFactory) error {
-	name = strings.TrimSpace(strings.ToLower(name))
-	if name == "" || factory == nil {
-		return errors.New("backend name and factory are required")
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, exists := r.conversation[name]; exists {
-		return fmt.Errorf("conversation backend %q is already registered", name)
-	}
-	r.conversation[name] = factory
-	return nil
-}
-
-func (r *Registry) Conversation(name string) (ConversationBackend, error) {
-	r.mu.RLock()
-	factory, exists := r.conversation[strings.ToLower(strings.TrimSpace(name))]
-	r.mu.RUnlock()
-	if !exists {
-		return nil, ErrNotRegistered
-	}
-	return factory()
-}
-
-func (r *Registry) ConversationNames() []string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	names := make([]string, 0, len(r.conversation))
-	for name := range r.conversation {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
 }

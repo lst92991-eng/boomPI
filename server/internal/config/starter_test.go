@@ -26,7 +26,8 @@ func TestCreateStarterCreatesPrivateStableConfiguration(t *testing.T) {
 		t.Fatalf("ReadFile() error = %v", err)
 	}
 	if !strings.Contains(string(before), "qwen_api_key: \""+APIKeyPlaceholder+"\"") ||
-		!strings.Contains(string(before), "device_token:") {
+		!strings.Contains(string(before), "device_token:") ||
+		!strings.Contains(string(before), "# region: \"china-beijing\"") {
 		t.Fatalf("starter configuration is incomplete: %s", before)
 	}
 

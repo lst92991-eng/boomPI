@@ -68,6 +68,10 @@ func (r *Responder) serveConnection(ctx context.Context, connection *net.UDPConn
 			if ctx.Err() != nil {
 				return nil
 			}
+			// UDP 读超时或临时网络错误不代表 WSS 服务失效；继续监听即可。
+			if networkError, ok := err.(net.Error); ok && (networkError.Timeout() || networkError.Temporary()) {
+				continue
+			}
 			return fmt.Errorf("read UDP discovery request: %w", err)
 		}
 		if !bytes.Equal(request[:count], []byte(Request)) {
@@ -77,7 +81,8 @@ func (r *Responder) serveConnection(ctx context.Context, connection *net.UDPConn
 			if ctx.Err() != nil {
 				return nil
 			}
-			return fmt.Errorf("write UDP discovery response: %w", err)
+			// UDP 没有会话，某个请求方在响应前离线不应拖垮持久 WSS 服务。
+			continue
 		}
 	}
 }

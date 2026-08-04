@@ -19,7 +19,7 @@ var (
 const (
 	commandCapacity      = 32
 	urgentCapacity       = 4
-	eventCapacity        = 32
+	eventCapacity        = 8
 	pcmFrameBytes16kMono = 320 * 2
 )
 

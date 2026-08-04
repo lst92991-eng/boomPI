@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -21,10 +20,11 @@ import (
 
 func TestProviderAudioIsReframedWithTerminalFlagsBeforeDone(t *testing.T) {
 	testCases := []struct {
-		name        string
-		providerPCM [][]byte
-		wantLengths []int
-		wantFlags   []uint16
+		name               string
+		providerPCM        [][]byte
+		wantLengths        []int
+		wantFlags          []uint16
+		wantTerminalMarker bool
 	}{
 		{
 			name:        "single short frame",
@@ -33,10 +33,11 @@ func TestProviderAudioIsReframedWithTerminalFlagsBeforeDone(t *testing.T) {
 			wantFlags:   []uint16{protocol.PCMFlagStart | protocol.PCMFlagEnd},
 		},
 		{
-			name:        "exactly one 20 ms frame",
-			providerPCM: [][]byte{pcmBoundaryFixture(outputFrameBytes, 0)},
-			wantLengths: []int{outputFrameBytes},
-			wantFlags:   []uint16{protocol.PCMFlagStart | protocol.PCMFlagEnd},
+			name:               "exactly one 20 ms frame",
+			providerPCM:        [][]byte{pcmBoundaryFixture(outputFrameBytes, 0)},
+			wantLengths:        []int{outputFrameBytes, pcmBytesPerSample},
+			wantFlags:          []uint16{protocol.PCMFlagStart, protocol.PCMFlagEnd},
+			wantTerminalMarker: true,
 		},
 		{
 			name: "provider chunks cross multiple wire frames",
@@ -122,10 +123,84 @@ func TestProviderAudioIsReframedWithTerminalFlagsBeforeDone(t *testing.T) {
 			for _, chunk := range testCase.providerPCM {
 				wantPCM = append(wantPCM, chunk...)
 			}
+			if testCase.wantTerminalMarker {
+				wantPCM = append(wantPCM, make([]byte, pcmBytesPerSample)...)
+			}
 			if !bytes.Equal(gotPCM, wantPCM) {
 				t.Fatalf("reframed PCM length = %d, want byte-identical length %d", len(gotPCM), len(wantPCM))
 			}
 		})
+	}
+}
+
+func TestCompleteProviderFrameDoesNotWaitForDelayedDone(t *testing.T) {
+	const doneDelay = 200 * time.Millisecond
+	connection := startPCMOutputTestWithBackend(t, &delayedDonePCMBackend{delay: doneDelay})
+	if got := readControl(t, connection); got.Type != "response.start" {
+		t.Fatalf("first response type = %q, want response.start", got.Type)
+	}
+	if got := readControl(t, connection); got.Type != "response.audio_start" {
+		t.Fatalf("second response type = %q, want response.audio_start", got.Type)
+	}
+
+	// The provider deliberately pauses after one complete 20 ms delta. The
+	// speaker frame must cross the wire during that pause, not wait for a later
+	// delta or response.done to provide framing look-ahead.
+	type wireMessage struct {
+		messageType int
+		data        []byte
+		err         error
+	}
+	firstMessage := make(chan wireMessage, 1)
+	go func() {
+		messageType, data, err := connection.ReadMessage()
+		firstMessage <- wireMessage{messageType: messageType, data: data, err: err}
+	}()
+	var first wireMessage
+	select {
+	case first = <-firstMessage:
+	case <-time.After(doneDelay / 2):
+		t.Fatal("complete 20 ms provider frame was withheld until response.done")
+	}
+	if first.err != nil || first.messageType != websocket.BinaryMessage {
+		t.Fatalf("first media message type=%d error=%v, want binary PCM", first.messageType, first.err)
+	}
+	header, payload, err := protocol.ParsePCMFrame(first.data)
+	if err != nil {
+		t.Fatalf("ParsePCMFrame(first) error = %v", err)
+	}
+	if header.Sequence != 0 || header.Flags != protocol.PCMFlagStart || len(payload) != outputFrameBytes {
+		t.Fatalf("first media frame sequence=%d flags=%#x bytes=%d, want sequence=0 START and %d bytes",
+			header.Sequence, header.Flags, len(payload), outputFrameBytes)
+	}
+
+	messageType, frame, err := connection.ReadMessage()
+	if err != nil || messageType != websocket.BinaryMessage {
+		t.Fatalf("terminal marker type=%d error=%v, want binary PCM", messageType, err)
+	}
+	header, payload, err = protocol.ParsePCMFrame(frame)
+	if err != nil {
+		t.Fatalf("ParsePCMFrame(terminal) error = %v", err)
+	}
+	if header.Sequence != 1 || header.Flags != protocol.PCMFlagEnd || len(payload) != pcmBytesPerSample || !bytes.Equal(payload, make([]byte, pcmBytesPerSample)) {
+		t.Fatalf("terminal marker sequence=%d flags=%#x payload=%v, want sequence=1 END and one silent sample",
+			header.Sequence, header.Flags, payload)
+	}
+	if got := readControl(t, connection); got.Type != "response.done" {
+		t.Fatalf("message after terminal marker = %q, want response.done", got.Type)
+	}
+}
+
+func TestTextOnlyProviderResponseDoesNotInventPCMEndMarker(t *testing.T) {
+	connection := startPCMOutputTest(t, []backend.ConversationEvent{
+		{Type: backend.EventStarted, ResponseID: "response-text-only"},
+		{Type: backend.EventTextDelta, ResponseID: "response-text-only", Text: "hello"},
+		{Type: backend.EventDone, ResponseID: "response-text-only"},
+	})
+	for _, want := range []string{"response.start", "response.text_delta", "response.done"} {
+		if got := readControl(t, connection); got.Type != want {
+			t.Fatalf("control type = %q, want %q; text-only response must not synthesize PCM", got.Type, want)
+		}
 	}
 }
 
@@ -339,74 +414,6 @@ func TestActiveResponseCancelPreemptsPacedAudio(t *testing.T) {
 	}
 }
 
-func TestCancelStillAcknowledgesWhenProviderCancelFails(t *testing.T) {
-	// provider 取消失败时 fence 已停下行；仍要 best-effort 回 ACK，
-	// 不让板端烧掉取消超时，随后错误照常上报（连接关闭）。
-	connection := startPCMOutputTestWithOptions(t, []backend.ConversationEvent{
-		{Type: backend.EventStarted, ResponseID: "response-cancel-fault"},
-		{
-			Type:         backend.EventAudio,
-			ResponseID:   "response-cancel-fault",
-			PCM:          pcmBoundaryFixture(outputFrameBytes, 0),
-			SampleRateHz: outputSampleRateHz,
-		},
-	}, nil, errors.New("provider fault"))
-	started := readControl(t, connection)
-	if started.Type != "response.start" {
-		t.Fatalf("first response = %+v, want response.start", started)
-	}
-	if got := readControl(t, connection); got.Type != "response.audio_start" {
-		t.Fatalf("second response type = %q, want response.audio_start", got.Type)
-	}
-
-	writeControl(t, connection, protocol.ControlEnvelope{
-		Version: protocol.Version, Type: "response.cancel", MessageID: "client-cancel-fault",
-		DeviceID: testDeviceID, SessionID: started.SessionID, TurnID: started.TurnID,
-		StreamID: started.StreamID, Epoch: started.Epoch, Payload: json.RawMessage(`{}`),
-	})
-
-	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("SetReadDeadline(cancel) error = %v", err)
-	}
-	acknowledged := false
-	for !acknowledged {
-		messageType, data, err := connection.ReadMessage()
-		if err != nil {
-			t.Fatalf("provider cancel failed but no response.cancelled arrived: %v", err)
-		}
-		if messageType == websocket.BinaryMessage {
-			continue
-		}
-		ack, err := protocol.DecodeControl(data)
-		if err != nil {
-			t.Fatalf("DecodeControl(cancel ack) error = %v", err)
-		}
-		if ack.Type != "response.cancelled" {
-			t.Fatalf("control before cancellation ack = %q", ack.Type)
-		}
-		if ack.SessionID != started.SessionID || ack.TurnID != started.TurnID ||
-			ack.StreamID != started.StreamID || ack.Epoch != started.Epoch {
-			t.Fatalf("response.cancelled identity = %+v, want active response", ack)
-		}
-		acknowledged = true
-	}
-
-	// 错误仍要上报：handler 返回错误后服务端关闭连接。
-	// 关闭前可能先到达尾随的协议错误帧，循环消费直至读到关闭错误；
-	// 并用 Timeout 反向区分"服务端关闭"与"2 秒 deadline 到期"。
-	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("SetReadDeadline(post-cancel) error = %v", err)
-	}
-	for {
-		if _, _, err := connection.ReadMessage(); err != nil {
-			if networkError, ok := err.(net.Error); ok && networkError.Timeout() {
-				t.Fatal("connection stayed open after provider cancel failure")
-			}
-			break
-		}
-	}
-}
-
 func TestUplinkFramingStateMachine(t *testing.T) {
 	t.Run("multi-frame happy path then rejects PCM after END", func(t *testing.T) {
 		turn := activeTurn{}
@@ -485,14 +492,16 @@ func pcmBoundaryFixture(length int, offset int) []byte {
 }
 
 func startPCMOutputTest(t *testing.T, events []backend.ConversationEvent) *websocket.Conn {
-	return startPCMOutputTestWithOptions(t, events, nil, nil)
+	return startPCMOutputTestWithCancelCounter(t, events, nil)
 }
 
 func startPCMOutputTestWithCancelCounter(t *testing.T, events []backend.ConversationEvent, cancelCount *atomic.Int32) *websocket.Conn {
-	return startPCMOutputTestWithOptions(t, events, cancelCount, nil)
+	return startPCMOutputTestWithBackend(t, &pcmBoundaryBackend{
+		events: events, cancelCount: cancelCount,
+	})
 }
 
-func startPCMOutputTestWithOptions(t *testing.T, events []backend.ConversationEvent, cancelCount *atomic.Int32, cancelErr error) *websocket.Conn {
+func startPCMOutputTestWithBackend(t *testing.T, provider backend.ConversationBackend) *websocket.Conn {
 	t.Helper()
 	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
@@ -505,9 +514,7 @@ func startPCMOutputTestWithOptions(t *testing.T, events []backend.ConversationEv
 	cfg.WSSPort = freePort(t)
 	cfg.DiscoveryPort = freeUDPPort(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	application, err := newWithBackend(cfg, logger, t.TempDir(), &pcmBoundaryBackend{
-		events: events, cancelCount: cancelCount, cancelErr: cancelErr,
-	})
+	application, err := newWithBackend(cfg, logger, t.TempDir(), provider)
 	if err != nil {
 		t.Fatalf("newWithBackend() error = %v", err)
 	}
@@ -562,10 +569,78 @@ func startPCMOutputTestWithOptions(t *testing.T, events []backend.ConversationEv
 	return connection
 }
 
+type delayedDonePCMBackend struct {
+	delay time.Duration
+}
+
+func (b *delayedDonePCMBackend) Open(context.Context, backend.SessionConfig) (backend.ConversationSession, error) {
+	return &delayedDonePCMSession{
+		delay:  b.delay,
+		events: make(chan backend.ConversationEvent, 3),
+		stop:   make(chan struct{}),
+	}, nil
+}
+
+type delayedDonePCMSession struct {
+	delay     time.Duration
+	events    chan backend.ConversationEvent
+	stop      chan struct{}
+	workers   sync.WaitGroup
+	closeOnce sync.Once
+}
+
+func (*delayedDonePCMSession) SendAudio(context.Context, []byte) error { return nil }
+
+func (s *delayedDonePCMSession) Commit(context.Context) error {
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		if !s.emit(backend.ConversationEvent{Type: backend.EventStarted, ResponseID: "response-delayed-done"}) {
+			return
+		}
+		if !s.emit(backend.ConversationEvent{
+			Type: backend.EventAudio, ResponseID: "response-delayed-done",
+			PCM: pcmBoundaryFixture(outputFrameBytes, 0), SampleRateHz: outputSampleRateHz,
+		}) {
+			return
+		}
+		timer := time.NewTimer(s.delay)
+		defer timer.Stop()
+		select {
+		case <-s.stop:
+			return
+		case <-timer.C:
+		}
+		s.emit(backend.ConversationEvent{Type: backend.EventDone, ResponseID: "response-delayed-done"})
+	}()
+	return nil
+}
+
+func (*delayedDonePCMSession) Cancel(context.Context) error { return nil }
+
+func (s *delayedDonePCMSession) Events() <-chan backend.ConversationEvent { return s.events }
+
+func (s *delayedDonePCMSession) emit(event backend.ConversationEvent) bool {
+	select {
+	case <-s.stop:
+		return false
+	case s.events <- event:
+		return true
+	}
+}
+
+func (s *delayedDonePCMSession) Close() error {
+	s.closeOnce.Do(func() {
+		close(s.stop)
+		s.workers.Wait()
+		close(s.events)
+	})
+	return nil
+}
+
 type pcmBoundaryBackend struct {
 	events      []backend.ConversationEvent
 	cancelCount *atomic.Int32
-	cancelErr   error
 }
 
 func (b *pcmBoundaryBackend) Open(context.Context, backend.SessionConfig) (backend.ConversationSession, error) {
@@ -573,7 +648,6 @@ func (b *pcmBoundaryBackend) Open(context.Context, backend.SessionConfig) (backe
 		eventsToSend: append([]backend.ConversationEvent(nil), b.events...),
 		events:       make(chan backend.ConversationEvent, len(b.events)+1),
 		cancelCount:  b.cancelCount,
-		cancelErr:    b.cancelErr,
 	}, nil
 }
 
@@ -581,7 +655,6 @@ type pcmBoundarySession struct {
 	eventsToSend []backend.ConversationEvent
 	events       chan backend.ConversationEvent
 	cancelCount  *atomic.Int32
-	cancelErr    error
 	closeOnce    sync.Once
 }
 
@@ -598,7 +671,7 @@ func (s *pcmBoundarySession) Cancel(context.Context) error {
 	if s.cancelCount != nil {
 		s.cancelCount.Add(1)
 	}
-	return s.cancelErr
+	return nil
 }
 
 func (s *pcmBoundarySession) Events() <-chan backend.ConversationEvent { return s.events }

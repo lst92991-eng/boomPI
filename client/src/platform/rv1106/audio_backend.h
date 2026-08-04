@@ -36,6 +36,8 @@ class AudioBackend final {
                   float gain) noexcept;
   bool DrainPlayback() noexcept;
   void DropPlayback() noexcept;
+  /// 唤醒可能阻塞在 snd_pcm_readi 的采集线程，仅用于 AudioEngine::Close。
+  void InterruptCapture() noexcept;
   void InterruptPlayback() noexcept;
 
   /// last_error 由独立锁保护；Close 必须在播放线程 join 后调用。

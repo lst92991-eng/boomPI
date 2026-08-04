@@ -86,6 +86,20 @@ func openRealtimeASRAt(ctx context.Context, config Config, endpoint string) (*as
 	if err != nil {
 		return nil, fmt.Errorf("connect Qwen realtime ASR: %w", err)
 	}
+	handshakeDone := make(chan struct{})
+	handshakeWatcherDone := make(chan struct{})
+	go func() {
+		defer close(handshakeWatcherDone)
+		select {
+		case <-connectCtx.Done():
+			_ = connection.Close()
+		case <-handshakeDone:
+		}
+	}()
+	defer func() {
+		close(handshakeDone)
+		<-handshakeWatcherDone
+	}()
 	setupConfig := config
 	setupConfig.Timeout = connectTimeout
 	stream := &asrRealtimeStream{
@@ -296,6 +310,9 @@ func (s *asrRealtimeStream) readEvent(ctx context.Context) (realtimeASREvent, er
 	}
 	messageType, encoded, err := s.connection.ReadMessage()
 	if err != nil {
+		if ctx.Err() != nil {
+			return realtimeASREvent{}, ctx.Err()
+		}
 		return realtimeASREvent{}, err
 	}
 	if messageType != websocket.TextMessage || len(encoded) > realtimeASRMaxMessageBytes {

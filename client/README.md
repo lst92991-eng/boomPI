@@ -1,8 +1,12 @@
 # boomPI 板端客户端
 
 板端程序负责双麦采集、Rockchip 3A、Snowboy、VAD、WSS 流式对话、AEC 打断，
-以及 ST7789P3/GT911 的表情、两行字幕和触摸控制。语音核心生产 C/C++ 总量受根目录
-`AGENTS.md` 的 2665 ELOC 上限约束（按修正统计口径后的实测值重定基线，含结构性重构与正确性修复净开销）；UI 显示层（LVGL 渲染与屏幕驱动）单独公开行数，不占该预算。
+以及 ST7789P3/GT911 的表情、字幕和触摸控制。唯一板端产品可执行文件是 `boompi-client`；
+LVGL 桌面模拟器和 HIL 探针都不进入板端安装包。
+
+音频 ELOC 由 `scripts/tests/test_client_source_contract.py` 按固定文件集合计算；LVGL UI、网络启动和
+测试代码单独统计。2026-08-03 的 2929 ELOC 是当日候选快照，不代表后续工作树。源码冻结后必须
+重新运行契约脚本、严格交叉构建和板端 HIL，不能沿用旧哈希或旧验收结论。
 
 ## 配置
 
@@ -18,7 +22,11 @@ BOOMPI_SNOWBOY_RESOURCE_FILE=/userdata/boompi/models/common.res
 BOOMPI_SNOWBOY_MODEL_FILE=/userdata/boompi/models/snowboy.umdl
 BOOMPI_SNOWBOY_SENSITIVITY=0.7
 BOOMPI_VAD_MIN_DBFS=-35
+BOOMPI_BARGE_MIN_DBFS=-25
 ```
+
+`BOOMPI_VAD_MIN_DBFS` 约束原始麦克风启动门限；`BOOMPI_BARGE_MIN_DBFS` 只约束播放期
+Rockchip AEC 后的近讲语音。两者分开，避免扬声器声场仅凭 raw mic 电平反复触发静音探针。
 
 服务端地址和 SPKI 可以留空，由 UDP 发现并首次保存；端口默认 `17806`。教学版客户端与
 服务端具有相同的默认共享令牌，只适用于可信局域网。正式部署时，在两端设置相同的随机
@@ -33,7 +41,7 @@ Snowboy 的 `common.res`/`snowboy.umdl` 和 CJK 字体是授权外部资产，�
 CMake 安装规则使用板端绝对目录；生成 rootfs staging 时使用 `DESTDIR`：
 
 ```sh
-DESTDIR=/tmp/boompi-rootfs cmake --install build/rv1106-debug
+DESTDIR=/tmp/boompi-rootfs cmake --install build/rv1106-candidate
 ```
 
 它会安装程序、配网工具和 `/etc/init.d/S99boompi-client`。对已运行的板子做手工更新时：

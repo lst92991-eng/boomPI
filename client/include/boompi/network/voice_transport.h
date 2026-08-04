@@ -39,8 +39,7 @@ struct Pcm64Header final {
   WireIds ids;
 };
 
-/// 上行 PCM 发送结果：区分三种语义，避免把瞬时背压误判为断线。
-/// kBackpressure = 协议状态合法但发送缓冲已满，调用方应取消当前 turn（而非重建连接）。
+/// 上行 PCM 发送结果：瞬时背压不等于连接断开。
 enum class SendOutcome : std::uint8_t { kOk, kBackpressure, kRejected };
 
 enum class InboundKind : std::uint8_t {
@@ -96,9 +95,8 @@ class VoiceTransport final {
   bool SendControl(const Control& control);
 
   /// @brief 校验四元组/sequence 后排队一帧 16 kHz mono PCM；payload 在返回前完成复制。
-  /// kOk 已排队；kBackpressure 仅缓冲满，本帧未发；kRejected 为连接/协议错误。
-  SendOutcome SendPcm64(const Pcm64Header& header, const std::uint8_t* payload,
-                        std::size_t bytes);
+  SendOutcome SendPcm64(const Pcm64Header& header,
+                        const std::uint8_t* payload, std::size_t bytes);
 
   /// Close 幂等停止 ASIO；connected 是跨线程原子快照。心跳由服务端驱动。
   void Close() noexcept; bool connected() const noexcept;

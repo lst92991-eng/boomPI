@@ -2,9 +2,11 @@ package app
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -17,7 +19,11 @@ import (
 	"github.com/lst92991-eng/boomPI/server/internal/config"
 )
 
-const voiceLoopHILPrefix = "BOOMPI_EXTERNAL_VOICE_LOOP_HIL"
+const (
+	voiceLoopHILPrefix     = "BOOMPI_EXTERNAL_VOICE_LOOP_HIL"
+	voiceLoopHILSampleRate = 24_000
+	voiceLoopHILTonePeak   = 1_500
+)
 
 func TestExternalVoiceLoopHILServer(t *testing.T) {
 	if os.Getenv(voiceLoopHILPrefix) != "1" {
@@ -45,7 +51,7 @@ func TestExternalVoiceLoopHILServer(t *testing.T) {
 
 	provider := &voiceLoopHILBackend{session: &voiceLoopHILSession{
 		events: make(chan backend.ConversationEvent, 64),
-		tone:   safeManualSingleTurnHILTonePCM(),
+		tone:   voiceLoopHILTonePCM(),
 	}}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	identityDirectory := t.TempDir()
@@ -185,7 +191,7 @@ func (s *voiceLoopHILSession) streamResponse(ctx context.Context, done chan stru
 			end = len(s.tone)
 		}
 		if !s.emit(ctx, backend.ConversationEvent{Type: backend.EventAudio, ResponseID: responseID,
-			PCM: s.tone[offset:end], SampleRateHz: manualSingleTurnHILSampleRate}) {
+			PCM: s.tone[offset:end], SampleRateHz: voiceLoopHILSampleRate}) {
 			return
 		}
 		select {
@@ -235,3 +241,21 @@ func (s *voiceLoopHILSession) Close() error {
 }
 
 func (s *voiceLoopHILSession) terminals() int32 { return s.completed.Load() + s.cancelled.Load() }
+
+func voiceLoopHILTonePCM() []byte {
+	const sampleCount = voiceLoopHILSampleRate / 2
+	const fadeSamples = voiceLoopHILSampleRate * 20 / 1_000
+	pcm := make([]byte, sampleCount*2)
+	for index := 0; index < sampleCount; index++ {
+		phase := 2 * math.Pi * 440 * float64(index) / voiceLoopHILSampleRate
+		envelope := 1.0
+		if index < fadeSamples {
+			envelope = float64(index) / fadeSamples
+		} else if remaining := sampleCount - 1 - index; remaining < fadeSamples {
+			envelope = float64(remaining) / fadeSamples
+		}
+		sample := int16(math.Round(voiceLoopHILTonePeak * envelope * math.Sin(phase)))
+		binary.LittleEndian.PutUint16(pcm[index*2:], uint16(sample))
+	}
+	return pcm
+}

@@ -13,11 +13,78 @@ import (
 	"github.com/lst92991-eng/boomPI/server/internal/backend"
 )
 
+func TestOpenReturnsBeforeRealtimeASRPreparation(t *testing.T) {
+	provider, err := New(Config{
+		APIKey: "test-key", Region: RegionChinaBeijing,
+		ASRModel: "asr", ReasoningModel: "reasoning", ReasoningEffort: "none",
+		TTSModel: "tts", TTSVoice: "voice", SearchMode: "off",
+		Timeout: time.Second, QueueSize: 8, MaxTurns: 20, MaxContextTokens: 24_000,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	preparationStarted := make(chan struct{})
+	preparationStopped := make(chan struct{})
+	provider.openASR = func(ctx context.Context, _ Config) (*asrRealtimeStream, error) {
+		close(preparationStarted)
+		<-ctx.Done()
+		close(preparationStopped)
+		return nil, ctx.Err()
+	}
+	type openResult struct {
+		session backend.ConversationSession
+		err     error
+	}
+	opened := make(chan openResult, 1)
+	go func() {
+		session, openErr := provider.Open(context.Background(), backend.SessionConfig{})
+		opened <- openResult{session: session, err: openErr}
+	}()
+
+	var result openResult
+	select {
+	case result = <-opened:
+		if result.err != nil {
+			t.Fatalf("Open() error = %v", result.err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Open() waited for realtime ASR and would delay hello.ack")
+	}
+	select {
+	case <-preparationStarted:
+	case <-time.After(time.Second):
+		t.Fatal("realtime ASR preparation did not start in the background")
+	}
+
+	session := result.session.(*Session)
+	if err := session.SendAudio(context.Background(), []byte{0, 0}); err != nil {
+		t.Fatalf("SendAudio() error = %v", err)
+	}
+	session.mu.Lock()
+	batchOnly := session.turnBatchOnly
+	session.mu.Unlock()
+	if !batchOnly {
+		t.Fatal("first turn did not select batch fallback while realtime ASR was preparing")
+	}
+	if err := session.Cancel(context.Background()); err != nil {
+		t.Fatalf("Cancel() error = %v", err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	select {
+	case <-preparationStopped:
+	case <-time.After(time.Second):
+		t.Fatal("background realtime ASR preparation survived Session.Close()")
+	}
+}
+
 func TestTurnTimingWritesOneSanitizedAggregateRecord(t *testing.T) {
 	var output bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&output, nil))
 	committedAt := time.Date(2026, time.July, 29, 12, 0, 0, 0, time.UTC)
 	timing := newTurnTiming(logger, "response-test", committedAt, 32000)
+	timing.markASRMode("realtime")
 	timing.markASRDone(committedAt.Add(100 * time.Millisecond))
 	timing.markLLMFirstDelta(committedAt.Add(250 * time.Millisecond))
 	timing.markLLMDone(committedAt.Add(350 * time.Millisecond))
@@ -46,6 +113,9 @@ func TestTurnTimingWritesOneSanitizedAggregateRecord(t *testing.T) {
 	}
 	if got := record["status"]; got != "completed" {
 		t.Errorf("status = %#v, want completed", got)
+	}
+	if got := record["asr_mode"]; got != "realtime" {
+		t.Errorf("asr_mode = %#v, want realtime", got)
 	}
 	encoded := output.String()
 	for _, forbidden := range []string{"transcript", "answer", "api_key", "workspace_id", `"pcm"`} {
@@ -300,6 +370,36 @@ func TestClearConversationCommandKeepsHistoryClearedWhenConfirmationFails(t *tes
 	}
 	if len(session.history) != 0 {
 		t.Fatalf("history survived failed confirmation = %#v", session.history)
+	}
+}
+
+func TestTTSAudioIsPublishedAsBounded20msEvents(t *testing.T) {
+	pcm := make([]byte, ttsEventPCMBytes*2+200)
+	for index := range pcm {
+		pcm[index] = byte(index)
+	}
+	session := &Session{
+		ctx:    context.Background(),
+		events: make(chan backend.ConversationEvent, 3),
+	}
+	if err := session.emitTTSAudio(
+		context.Background(), "response-bounded",
+		newTurnTiming(nil, "response-bounded", time.Now(), 640), pcm,
+	); err != nil {
+		t.Fatalf("emitTTSAudio() error = %v", err)
+	}
+
+	var rebuilt []byte
+	for index, wantBytes := range []int{ttsEventPCMBytes, ttsEventPCMBytes, 200} {
+		event := <-session.events
+		if event.Type != backend.EventAudio || event.ResponseID != "response-bounded" ||
+			event.SampleRateHz != ttsSampleRateHz || len(event.PCM) != wantBytes {
+			t.Fatalf("audio event %d = %+v, want %d bytes", index, event, wantBytes)
+		}
+		rebuilt = append(rebuilt, event.PCM...)
+	}
+	if !bytes.Equal(rebuilt, pcm) {
+		t.Fatal("bounded audio events changed PCM")
 	}
 }
 

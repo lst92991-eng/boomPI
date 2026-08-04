@@ -2,11 +2,15 @@
 
 ## 文档状态
 
-当前教学候选的语音核心包含 18 个生产 C/C++ 文件、2665 ELOC，其中 Rockchip/Snowboy vendor 集成
-280 ELOC，产品逻辑 2385 ELOC；UI 显示层（LVGL 渲染与 ST7789P3/GT911 驱动）另计 1926 ELOC，不占语音核心预算。语音人工体验、严格交叉构建和板端启动已通过；屏幕/触摸、
-网络启动、UDP 发现和二维码配网已进入同一候选。受控双讲、量化延迟、真实 Wi-Fi 配网和长期
-稳定性仍待完成。
-实现状态以测试和真实板端记录为准；根目录 `AGENTS.md` 是更高优先级的开发契约。
+本页描述当前教学版的职责和数据流，不给未冻结工作树继承旧候选的验收结论。音频 ELOC 由
+`scripts/tests/test_client_source_contract.py` 按固定集合计算；LVGL UI、网络启动和测试代码单独
+统计。当前冻结源码为 15 个生产文件、3066 ELOC，其中 vendor 集成 280 ELOC、产品胶水
+2786 ELOC。2026-08-03 的 2929 ELOC 以及当日严格交叉构建、板端启动和真人语音结果，只属于
+对应历史候选。后续修改必须重新完成 Host、严格交叉构建和板端 HIL 后才能声明通过。
+
+当前仍待关闭的硬件项包括受控 double-talk、量化延迟、真实 Wi-Fi 配网、屏幕/触摸目视验收和
+有界稳定性窗口。实现状态以当前测试输出和带日期的板端记录为准；根目录 `AGENTS.md` 是更高
+优先级的开发契约。
 
 ## 部署边界
 
@@ -17,7 +21,7 @@ ALSA capture -> [private AudioBackend] -> AudioEngine -> VoiceClient
         ^                  |                 |             |
         |              3A/VAD/AEC       fixed queues   VoiceTransport
 ALSA playback -> Mode1 hard ref -> AudioBackend             |
-                                                      boompi-server -> Qwen Singapore
+                                                      boompi-server -> Qwen China (Beijing)
 
 GT911 -> DeviceUi <- VoiceClient -> ST7789P3
 Ethernet/Wi-Fi -> NetworkBootstrap -> discovered WSS endpoint
@@ -42,19 +46,19 @@ Ethernet/Wi-Fi -> NetworkBootstrap -> discovered WSS endpoint
 
 不存在另一套 `App/Driver/Inf` 平行目录，也没有恢复已删除的通用 worker 或 backend 工厂。
 
-当前源码创建五个工作线程，加上主线程（唯一会话 actor），共六个客户端自有长期执行上下文。
-板端实测总线程数（含链接依赖内部线程）尚需重新采集；依赖库线程不拥有业务状态：
+正常语音与显示在线时，当前源码共有六个客户端自有长期执行上下文；打开摄像头后再增加一个。
+依赖库如果额外创建线程，不得拥有 boomPI 业务状态：
 
 | 执行上下文 | 独占资源与职责 |
 | --- | --- |
-| 主线程（会话 actor） | 帧循环、状态机、turn/epoch、500 ms pre-roll、重连调度；业务状态唯一写者 |
-| 采集线程 | ALSA capture、DSP、Snowboy/VAD；成帧推入固定 4 槽 capture 环 |
-| 播放线程 | 固定 TTS 队列、重采样、gain/饱和钳位和 ALSA playback |
+| 主 application actor | 500 ms pre-roll、状态机、turn 和重连调度；唯一修改业务状态 |
+| capture/DSP 线程 | `SCHED_FIFO 40`；ALSA capture、3A、Snowboy/VAD，并提交到 4 帧固定队列 |
+| 播放线程 | 固定 TTS 队列、重采样、gain/limiter 和 ALSA playback |
 | WebSocket service 线程 | TLS/WSS I/O；回调只向固定 64 项事件环提交结果 |
 | UI 线程 | 合并状态刷新、SPI 写屏和 GT911 触摸；只把用户动作交回主状态机 |
-| 网络启动线程 | DHCP/Wi-Fi 启动、UDP 发现与 endpoint 持久化；服务端晚启动时持续重试 |
+| 网络线程 | DHCP/Wi-Fi 启动、UDP 发现与 endpoint 持久化；服务端晚启动时持续重试 |
 
-业务状态只能由主线程（会话 actor）修改。实时 PCM 使用对象内固定数组；采集帧、播放 PCM 与网络事件通过
+业务状态只能由主 application actor 修改。实时 PCM 使用对象内固定数组；采集 PCM、播放 PCM 与网络事件通过
 预分配有界环传递，不允许逐帧动态分配或无界等待。
 
 有界队列、discontinuity barrier 和 consumer handoff 的具体 ownership 见
@@ -68,11 +72,11 @@ Ethernet/Wi-Fi -> NetworkBootstrap -> discovered WSS endpoint
 和双通道 playback。20 ms capture 保持四通道相位完成 48→16 kHz；
 `RockchipVoiceDsp` 在 vendor 输入边界固定选择 `[mic0,mic1,refL]`，丢弃重复的 `refR`，
 其 mono 输出供 Snowboy、VAD 和 16 kHz 上行。
-24 kHz mono TTS 进入 75 帧/1.5 s 固定队列，经 24→48 kHz、gain/饱和钳位后播放；最终写入
+24 kHz mono TTS 进入 75 帧/1.5 s 固定队列，经 24→48 kHz、gain/limiter 后播放；最终写入
 ALSA 的 PCM 由 Codec Mode1 数字回采到同帧 `refL/refR`，不再维护 software reference ring 或
-60 ms lead。采集帧经固定 4 槽（80 ms）capture 环交给 actor，落后超限显式断帧；采集在网络连接、
-云端等待和播放期间持续运行。xrun 或四通道
-重采样错位会建立 discontinuity 并重置前端历史。
+60 ms lead。高优先级采集线程在网络连接、云端等待和播放期间持续排空 ALSA，再通过
+4 × 20 ms 固定队列交给 application actor；actor 落后超过 80 ms 时清空旧帧并显式提交
+`discontinuity`，不会静默续接时间轴。xrun 或四通道重采样错位同样建立 discontinuity 并重置前端历史。
 
 direct 3A 固定为 `init(16000,16,2,1)`、768-short 输入和 512-byte mono 输出；项目 profile
 使用 mask `1109`，启用 FastAEC、AES、ANR、Dereverberation 和 STDT，vendor AGC 关闭；
@@ -115,21 +119,6 @@ HIL 已确认 Mode1 顺序和 refL/refR 相关性；该结论不能外推到其�
 效果评分。新 utterance 携带当前连续可用、最多 500 ms 的 AEC 后 pre-roll；字幕按 response
 generation 删除。服务端若不能可靠把文本映射到实际播放位置，应删除整个
 被打断 assistant turn，不能把未播放全文留入上下文。
-
-## 服务端数据流
-
-上行二进制帧由 64 字节大端 PCM 头加音频负载组成；`transport` 的 readPump 验头后把
-命令投递给该设备唯一的 session actor，actor 串行消费命令并持有 turn/epoch 状态，
-避免读写 goroutine 直接共享会话状态。当前轮交给对话后端：默认 intelligence 管线
-（ASR→推理→TTS 三级级联），可选 realtime 直通；provider 会话由独立 goroutine 驱动。
-下行文本与音频经有界 sendQueue（容量 32）由 writePump 发出；应用层控制帧（含
-`response.cancelled` ACK）与音频共走 sendQueue，只有心跳 pong 走独立小队列，
-因此取消时必须先排空待发音频再回 ACK。
-
-取消时序与板端探针配套：actor 先在锁内把当前 turn 置为不活动（fence），随后
-`DiscardQueuedPCM` 排空 sendQueue 中尚未发出的音频（保留控制帧），再请求 provider
-取消；无论 provider 是否及时响应都尽力回 `response.cancelled` ACK，不让板端烧掉
-取消超时。fence 之后仍在途的迟到音频由板端 generation/序号检查丢弃。
 
 ## 网络与信任
 

@@ -22,5 +22,9 @@ function(boompi_configure_lvgl)
   set(LV_CONF_PATH "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/lvgl/lv_conf.h" CACHE FILEPATH
     "boomPI LVGL configuration" FORCE)
   add_subdirectory("${BOOMPI_LVGL_ROOT}" "${CMAKE_BINARY_DIR}/_deps/lvgl" EXCLUDE_FROM_ALL)
+  if(CMAKE_C_COMPILER_ID MATCHES "^(GNU|Clang)$")
+    target_compile_options(lvgl PRIVATE
+      "-ffile-prefix-map=${BOOMPI_LVGL_ROOT}=boompi-vendor/lvgl")
+  endif()
   target_link_libraries(lvgl PUBLIC Freetype::Freetype)
 endfunction()

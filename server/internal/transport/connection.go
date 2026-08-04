@@ -15,10 +15,27 @@ import (
 
 const maxWireMessageBytes = protocol.PCMHeaderSize + protocol.MaxPCMPayloadBytes
 
-var (
-	errConnectionClosed = errors.New("transport connection is closed")
-	errSendQueueFull    = errors.New("transport send queue is full")
-)
+var errConnectionClosed = errors.New("transport connection is closed")
+
+// TurnCongestionError reports that one turn exceeded the bounded inbound
+// queue. The WebSocket stays alive; the application cancels only this turn.
+type TurnCongestionError struct {
+	SessionID uint32
+	TurnID    uint32
+	StreamID  uint32
+	Epoch     uint32
+}
+
+func (e *TurnCongestionError) Error() string {
+	return fmt.Sprintf("transport receive queue is full for session=%d turn=%d epoch=%d",
+		e.SessionID, e.TurnID, e.Epoch)
+}
+
+type turnIdentity struct {
+	sessionID uint32
+	turnID    uint32
+	epoch     uint32
+}
 
 // Message contains exactly one decoded control envelope or one parsed PCM frame.
 type Message struct {
@@ -43,8 +60,13 @@ type Connection struct {
 	done   chan struct{}
 
 	receiveQueue chan Message
+	congestion   chan *TurnCongestionError
 	sendQueue    chan outboundMessage
 	controlQueue chan outboundMessage
+
+	congestionMu sync.RWMutex
+	congested    turnIdentity
+	hasCongested bool
 
 	closeOnce sync.Once
 	waitGroup sync.WaitGroup
@@ -59,6 +81,7 @@ func newConnection(parent context.Context, webSocket *websocket.Conn, config Con
 		cancel:       cancel,
 		done:         make(chan struct{}),
 		receiveQueue: make(chan Message, receiveQueueCapacity),
+		congestion:   make(chan *TurnCongestionError, 1),
 		sendQueue:    make(chan outboundMessage, sendQueueCapacity),
 		controlQueue: make(chan outboundMessage, 2),
 	}
@@ -85,20 +108,36 @@ func (connection *Connection) Receive(ctx context.Context) (Message, error) {
 	if ctx == nil {
 		return Message{}, errors.New("receive context is required")
 	}
-	if err := context.Cause(connection.ctx); err != nil {
-		return Message{}, err
-	}
-	select {
-	case <-ctx.Done():
-		return Message{}, context.Cause(ctx)
-	case <-connection.ctx.Done():
-		return Message{}, context.Cause(connection.ctx)
-	case message := <-connection.receiveQueue:
-		return message, nil
+	for {
+		if err := context.Cause(connection.ctx); err != nil {
+			return Message{}, err
+		}
+		// Turn congestion is an urgent business signal. Prefer it over already
+		// queued PCM so the handler can fence the turn before doing more work.
+		select {
+		case err := <-connection.congestion:
+			return Message{}, err
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			return Message{}, context.Cause(ctx)
+		case <-connection.ctx.Done():
+			return Message{}, context.Cause(connection.ctx)
+		case err := <-connection.congestion:
+			return Message{}, err
+		case message := <-connection.receiveQueue:
+			if connection.discardCongested(message) {
+				continue
+			}
+			return message, nil
+		}
 	}
 }
 
-// SendControl validates and queues one JSON control message without blocking.
+// SendControl validates and queues one JSON control message. A bounded queue
+// applies backpressure until the socket writer catches up or the connection
+// closes; a short network stall must not rebuild the persistent AI session.
 func (connection *Connection) SendControl(ctx context.Context, envelope protocol.ControlEnvelope) error {
 	encoded, err := protocol.EncodeControl(envelope)
 	if err != nil {
@@ -107,7 +146,8 @@ func (connection *Connection) SendControl(ctx context.Context, envelope protocol
 	return connection.enqueue(ctx, outboundMessage{messageType: websocket.TextMessage, data: encoded})
 }
 
-// SendPCM validates and queues one complete binary PCM frame without blocking.
+// SendPCM validates and queues one complete binary PCM frame with the same
+// bounded backpressure as control messages, preserving their wire order.
 func (connection *Connection) SendPCM(ctx context.Context, header protocol.PCMHeader, payload []byte) error {
 	if uint32(len(payload)) != header.PayloadLen {
 		return errors.New("outbound PCM payload length does not match its header")
@@ -120,27 +160,6 @@ func (connection *Connection) SendPCM(ctx context.Context, header protocol.PCMHe
 	copy(frame, encodedHeader)
 	copy(frame[len(encodedHeader):], payload)
 	return connection.enqueue(ctx, outboundMessage{messageType: websocket.BinaryMessage, data: frame})
-}
-
-// DiscardQueuedPCM drops queued binary PCM frames after a cancel fence so the
-// cancellation ACK is not delayed behind a cancelled response's audio. Frames
-// already claimed by the write pump stay in flight and are filtered by the
-// board's state and generation checks; queued control frames are preserved.
-func (connection *Connection) DiscardQueuedPCM() {
-	preserved := make([]outboundMessage, 0, len(connection.sendQueue))
-	for {
-		select {
-		case message := <-connection.sendQueue:
-			if message.messageType != websocket.BinaryMessage {
-				preserved = append(preserved, message)
-			}
-		default:
-			for _, message := range preserved {
-				connection.sendQueue <- message
-			}
-			return
-		}
-	}
 }
 
 // Close cancels I/O, sends a bounded close handshake, and waits for both pumps.
@@ -166,8 +185,10 @@ func (connection *Connection) enqueue(ctx context.Context, message outboundMessa
 	select {
 	case connection.sendQueue <- message:
 		return nil
-	default:
-		return errSendQueueFull
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-connection.ctx.Done():
+		return context.Cause(connection.ctx)
 	}
 }
 
@@ -196,21 +217,123 @@ func (connection *Connection) configureReadSide() error {
 
 func (connection *Connection) readPump() {
 	defer connection.waitGroup.Done()
+	var saturatedTurn *turnIdentity
 	for {
 		message, err := connection.readMessage()
 		if err != nil {
 			connection.cancel(err)
 			return
 		}
+		congestionFence := false
+		if saturatedTurn != nil {
+			identity, identified := messageTurnIdentity(message)
+			if identified && identity == *saturatedTurn {
+				continue
+			}
+			if identified && isTurnStart(message) {
+				congestionFence = true
+			}
+		}
+		if congestionFence {
+			// A new turn.start is the protocol fence for all discarded PCM. Wait
+			// only for the handler to drain the old bounded queue; shutdown still
+			// cancels this wait, and the new epoch cannot collide with the old
+			// pending congestion identity.
+			select {
+			case connection.receiveQueue <- message:
+				saturatedTurn = nil
+				continue
+			case <-connection.ctx.Done():
+				return
+			}
+		}
 		select {
 		case connection.receiveQueue <- message:
 		case <-connection.ctx.Done():
 			return
 		default:
-			connection.cancel(errors.New("transport receive queue is full"))
-			return
+			identity, identified := messageTurnIdentity(message)
+			if !identified || !connection.signalTurnCongestion(identity, message) {
+				connection.cancel(errors.New("transport receive queue is full outside one resolvable turn"))
+				return
+			}
+			saturatedTurn = &identity
 		}
 	}
+}
+
+func messageTurnIdentity(message Message) (turnIdentity, bool) {
+	if message.Control != nil {
+		envelope := message.Control
+		if envelope.SessionID == 0 || envelope.TurnID == 0 || envelope.Epoch == 0 {
+			return turnIdentity{}, false
+		}
+		return turnIdentity{sessionID: envelope.SessionID, turnID: envelope.TurnID, epoch: envelope.Epoch}, true
+	}
+	if message.PCMHeader != nil {
+		header := message.PCMHeader
+		if header.SessionID == 0 || header.TurnID == 0 || header.Epoch == 0 {
+			return turnIdentity{}, false
+		}
+		return turnIdentity{sessionID: header.SessionID, turnID: header.TurnID, epoch: header.Epoch}, true
+	}
+	return turnIdentity{}, false
+}
+
+func isTurnStart(message Message) bool {
+	return message.Control != nil && message.Control.Type == "turn.start"
+}
+
+func messageStreamID(message Message) uint32 {
+	if message.Control != nil {
+		return message.Control.StreamID
+	}
+	if message.PCMHeader != nil {
+		return message.PCMHeader.StreamID
+	}
+	return 0
+}
+
+func (connection *Connection) signalTurnCongestion(identity turnIdentity, message Message) bool {
+	connection.congestionMu.Lock()
+	defer connection.congestionMu.Unlock()
+	if connection.hasCongested {
+		return connection.congested == identity
+	}
+	congestion := &TurnCongestionError{
+		SessionID: identity.sessionID,
+		TurnID:    identity.turnID,
+		StreamID:  messageStreamID(message),
+		Epoch:     identity.epoch,
+	}
+	select {
+	case connection.congestion <- congestion:
+		connection.congested = identity
+		connection.hasCongested = true
+		return true
+	default:
+		return false
+	}
+}
+
+// discardCongested drains queued frames for the cancelled turn. FIFO ordering
+// means a later turn.start is the fence after which the old identity can be
+// forgotten without allowing stale PCM back into the handler.
+func (connection *Connection) discardCongested(message Message) bool {
+	identity, identified := messageTurnIdentity(message)
+	connection.congestionMu.Lock()
+	defer connection.congestionMu.Unlock()
+	if !connection.hasCongested || !identified {
+		return false
+	}
+	if identity == connection.congested {
+		return true
+	}
+	if isTurnStart(message) {
+		connection.congested = turnIdentity{}
+		connection.hasCongested = false
+	}
+	return false
 }
 
 func (connection *Connection) readMessage() (Message, error) {
@@ -285,22 +408,8 @@ func (connection *Connection) writePump() {
 		select {
 		case <-connection.ctx.Done():
 			_ = connection.webSocket.SetWriteDeadline(time.Now().Add(writeTimeout))
-			// Final frames (e.g. a best-effort cancel ACK) must not lose the
-			// shutdown race: drop queued PCM, flush remaining control frames,
-			// then close. The queue is bounded and has no live producer now.
-			connection.DiscardQueuedPCM()
-			for {
-				select {
-				case message := <-connection.sendQueue:
-					if err := connection.write(message); err != nil {
-						return
-					}
-				default:
-					_ = connection.webSocket.WriteMessage(websocket.CloseMessage,
-						websocket.FormatCloseMessage(websocket.CloseNormalClosure, "closing"))
-					return
-				}
-			}
+			_ = connection.webSocket.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "closing"))
+			return
 		case message := <-connection.controlQueue:
 			if err := connection.write(message); err != nil {
 				connection.cancel(err)

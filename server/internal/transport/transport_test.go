@@ -335,6 +335,172 @@ func TestConnectionSendsControlAndPCMThroughWriter(t *testing.T) {
 	}
 }
 
+func TestConnectionSendWaitsForQueueSpaceOrCancellation(t *testing.T) {
+	header, payload := validPCMFrame(t)
+	senders := map[string]func(context.Context, *Connection) error{
+		"control": func(ctx context.Context, connection *Connection) error {
+			return connection.SendControl(ctx, validControlEnvelope())
+		},
+		"PCM": func(ctx context.Context, connection *Connection) error {
+			return connection.SendPCM(ctx, header, payload)
+		},
+	}
+
+	for name, send := range senders {
+		t.Run(name+" waits for space", func(t *testing.T) {
+			connection, stopConnection := newQueueOnlyConnection()
+			defer stopConnection(errConnectionClosed)
+			connection.sendQueue <- outboundMessage{}
+
+			result := make(chan error, 1)
+			go func() { result <- send(context.Background(), connection) }()
+			assertSendStillWaiting(t, result)
+
+			<-connection.sendQueue
+			if err := awaitSendResult(t, result); err != nil {
+				t.Fatalf("send after queue space became available: %v", err)
+			}
+		})
+
+		t.Run(name+" observes caller cancellation", func(t *testing.T) {
+			connection, stopConnection := newQueueOnlyConnection()
+			defer stopConnection(errConnectionClosed)
+			connection.sendQueue <- outboundMessage{}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			result := make(chan error, 1)
+			go func() { result <- send(ctx, connection) }()
+			assertSendStillWaiting(t, result)
+			cancel()
+			if err := awaitSendResult(t, result); !errors.Is(err, context.Canceled) {
+				t.Fatalf("send after caller cancellation error = %v", err)
+			}
+		})
+
+		t.Run(name+" observes connection cancellation", func(t *testing.T) {
+			connection, stopConnection := newQueueOnlyConnection()
+			connection.sendQueue <- outboundMessage{}
+
+			result := make(chan error, 1)
+			go func() { result <- send(context.Background(), connection) }()
+			assertSendStillWaiting(t, result)
+			stopConnection(errConnectionClosed)
+			if err := awaitSendResult(t, result); !errors.Is(err, errConnectionClosed) {
+				t.Fatalf("send after connection cancellation error = %v", err)
+			}
+		})
+	}
+}
+
+func TestFullReceiveQueueCancelsOnlyTurnAndKeepsHeartbeatAlive(t *testing.T) {
+	handler := &blockingHandler{connected: make(chan *Connection, 1), release: make(chan struct{})}
+	server, webSocket := startWSS(t, handler)
+	defer stopWSS(server, webSocket)
+	connection := awaitConnection(t, handler.connected)
+
+	header, payload := validPCMFrame(t)
+	frame := marshalPCMFrame(t, header, payload)
+	for range receiveQueueCapacity + 8 {
+		if err := webSocket.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+			t.Fatalf("WriteMessage(fill receive queue) error = %v", err)
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(connection.congestion) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("receive queue saturation did not produce turn congestion")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	var pingCount atomic.Int32
+	webSocket.SetPingHandler(func(data string) error {
+		pingCount.Add(1)
+		return webSocket.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(time.Second))
+	})
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		for {
+			if _, _, err := webSocket.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Stay full past the server's PongTimeout. The read pump must keep parsing
+	// control frames instead of timing out or tearing down the WebSocket.
+	time.Sleep(testPongTimeout + 500*time.Millisecond)
+	select {
+	case <-connection.context().Done():
+		t.Fatalf("full receive queue closed WebSocket: %v", context.Cause(connection.context()))
+	default:
+	}
+	if got := pingCount.Load(); got < 3 {
+		t.Fatalf("server pings while receive queue was full = %d, want at least 3", got)
+	}
+
+	receiveCtx, cancelReceive := context.WithTimeout(context.Background(), time.Second)
+	_, err := connection.Receive(receiveCtx)
+	cancelReceive()
+	var congestion *TurnCongestionError
+	if !errors.As(err, &congestion) || congestion.SessionID != header.SessionID ||
+		congestion.TurnID != header.TurnID || congestion.Epoch != header.Epoch {
+		t.Fatalf("Receive() congestion = %#v / %v, want current turn identity", congestion, err)
+	}
+
+	nextTurn := validControlEnvelope()
+	nextTurn.MessageID = "transport-test-next-turn"
+	nextTurn.TurnID++
+	nextTurn.StreamID++
+	nextTurn.Epoch++
+	encoded, err := protocol.EncodeControl(nextTurn)
+	if err != nil {
+		t.Fatalf("EncodeControl(next turn) error = %v", err)
+	}
+	if err := webSocket.WriteMessage(websocket.TextMessage, encoded); err != nil {
+		t.Fatalf("WriteMessage(next turn) error = %v", err)
+	}
+	receiveCtx, cancelReceive = context.WithTimeout(context.Background(), time.Second)
+	message, err := connection.Receive(receiveCtx)
+	cancelReceive()
+	if err != nil || message.Control == nil || message.Control.MessageID != nextTurn.MessageID {
+		t.Fatalf("Receive(next turn) = %#v / %v", message.Control, err)
+	}
+
+	close(handler.release)
+	select {
+	case <-readDone:
+	case <-time.After(testTimeout):
+		t.Fatal("client reader did not stop after handler release")
+	}
+}
+
+func newQueueOnlyConnection() (*Connection, context.CancelCauseFunc) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	return &Connection{ctx: ctx, sendQueue: make(chan outboundMessage, 1)}, cancel
+}
+
+func assertSendStillWaiting(t *testing.T, result <-chan error) {
+	t.Helper()
+	select {
+	case err := <-result:
+		t.Fatalf("send returned while its queue was full: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+}
+
+func awaitSendResult(t *testing.T, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(time.Second):
+		t.Fatal("send remained blocked after its release condition")
+		return nil
+	}
+}
+
 func TestPongsKeepConnectionAliveWithoutSuppressingServerPings(t *testing.T) {
 	handler := &connectionLifetimeHandler{
 		connected: make(chan *Connection, 1),
@@ -522,31 +688,4 @@ func marshalPCMFrame(t *testing.T, header protocol.PCMHeader, payload []byte) []
 		t.Fatalf("MarshalBinary() error = %v", err)
 	}
 	return append(encoded, payload...)
-}
-
-func TestDiscardQueuedPCMDropsBinaryAndPreservesControl(t *testing.T) {
-	// 不启动读写泵，直接验证队列语义：取消后排空必须丢弃二进制音频，
-	// 且保留的控制帧相对顺序不变（ACK 不得被已取消音频堵住）。
-	connection := &Connection{sendQueue: make(chan outboundMessage, sendQueueCapacity)}
-	connection.sendQueue <- outboundMessage{messageType: websocket.TextMessage, data: []byte("first")}
-	connection.sendQueue <- outboundMessage{messageType: websocket.BinaryMessage, data: []byte("pcm-1")}
-	connection.sendQueue <- outboundMessage{messageType: websocket.BinaryMessage, data: []byte("pcm-2")}
-	connection.sendQueue <- outboundMessage{messageType: websocket.TextMessage, data: []byte("second")}
-
-	connection.DiscardQueuedPCM()
-
-	if len(connection.sendQueue) != 2 {
-		t.Fatalf("queue length after discard = %d, want 2", len(connection.sendQueue))
-	}
-	kept := []string{}
-	for len(connection.sendQueue) > 0 {
-		message := <-connection.sendQueue
-		if message.messageType != websocket.TextMessage {
-			t.Fatalf("surviving message type = %d, want text", message.messageType)
-		}
-		kept = append(kept, string(message.data))
-	}
-	if kept[0] != "first" || kept[1] != "second" {
-		t.Fatalf("preserved control order = %v", kept)
-	}
 }
