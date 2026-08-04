@@ -1,8 +1,9 @@
 # Third-party dependencies
 
-The P1 skeleton does not vendor third-party source code, models, SDK dumps, or
-binary libraries. Before adding any dependency, record its exact version,
-upstream source, license, SHA-256, footprint, and RV1106 ABI requirements.
+The teaching baseline vendors only the reviewed WebSocket++ header subset and
+its notices. It does not vendor models, SDK dumps or third-party binary
+libraries. Before adding any dependency, record its exact version, upstream
+source, license, SHA-256, footprint, and RV1106 ABI requirements.
 
 The following P0 baselines are installed outside this repository and passed an
 initial source, license, checksum, and target-ABI review:

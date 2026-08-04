@@ -28,6 +28,9 @@ class DeviceUi final {
   void SetState(DeviceUiState state) noexcept; void SetText(std::string_view first_line, std::string_view second_line) noexcept;
   // 点击为打断；横屏竖滑调音量，横滑调亮度。
   bool PollAction(DeviceUiAction* action) noexcept; void SetBrightness(std::uint8_t percent) noexcept;
+  // 滑块预览值会合并，只在 committed=true 时由 application 持久化。
+  bool PollVolumeChange(std::uint8_t* percent, bool* committed) noexcept;
+  void SetVolume(std::uint8_t percent) noexcept;
   // 当前 BL 只有 GPIO 开关证据：0 表示关，其余值均表示开，不伪造 PWM 多级亮度。
   void Close() noexcept;
 

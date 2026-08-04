@@ -2,7 +2,7 @@
 
 ## 当前实现
 
-2026-08-03 的板端教学候选在音频主线上只保留三个产品边界和一个私有板级实现：
+`v1.0.0` 板端教学基线在音频主线上只保留三个产品边界和一个私有板级实现：
 
 - `VoiceClient`（`application/`）：语音状态机、重连、turn、pre-roll 和打断编排。
 - `AudioEngine`（`audio/`）：唯一播放线程、固定 TTS 环和播放控制。
@@ -11,8 +11,8 @@
 - 私有 `AudioBackend`（`platform/rv1106/`）：由 `AudioEngine` 独占，内聚 ALSA 全双工、
   重采样、Rockchip 3A、Snowboy、WebRTC VAD 和近讲判定，不向 application 暴露。
 
-逐帧音频主线共 15 个生产 C/C++ 文件、3066 ELOC，其中 280 ELOC 是 Rockchip/Snowboy
-vendor 集成，音频产品逻辑为 2786 ELOC。产品胶水以 2500 ELOC 为设计目标，CI 硬线为
+逐帧音频主线共 15 个生产 C/C++ 文件、3078 ELOC，其中 280 ELOC 是 Rockchip/Snowboy
+vendor 集成，音频产品逻辑为 2798 ELOC。产品胶水以 2500 ELOC 为设计目标，CI 硬线为
 产品 2800、vendor 300、主线总量 3100 ELOC；为教学阅读展开的状态转换不得重新压行。
 LVGL UI 和网络启动独立统计，不介入逐帧 PCM
 路径，也不占音频预算。
@@ -109,9 +109,9 @@ Dereverberation 和 STDT，vendor AGC 关闭；`ALC31/ref1/delay0` 只是当前�
 
 ## 验证边界
 
-当前职责候选的交叉构建、板端加载、Rockchip 3A/Snowboy 初始化、持久 WSS、真人首轮问答、
-3 s 追问、完整播放和播放中打断已经通过。受控 double-talk、量化延迟、噪声误触发和断网恢复
-仍以目标板专项验收为准。
+v1.0.0 的交叉构建、板端加载、Rockchip 3A/Snowboy 初始化、持久 WSS、真人问答、3 s 追问、
+连续播放、播放中同句打断和打断后新 turn 提交已经通过；最终人工窗口未观察到明显自激。
+受控 double-talk、量化延迟、噪声误触发和断网恢复仍以目标板专项验收为准。
 最新同类无人声/嘈杂环境回归为：AGC ON `n=5`，`confirmed=4/5`、`follow=5/5`、
 `attempts=119`；AGC OFF 累计 `n=10`，`confirmed=2/10`、`follow=3/10`、`attempts=43`。
 关闭 AGC 明显改善但尚未充分解决误触发；环境噪声仍是混杂因素。

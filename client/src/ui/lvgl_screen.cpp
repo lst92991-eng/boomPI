@@ -1,5 +1,6 @@
 #include "boompi/ui/lvgl_screen.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -40,7 +41,7 @@ const std::array<AppInfo, 7>& Apps() {
       {"小智", kIconMicrophone, "语音在线", "随时可以说话", "低延迟全双工语音", "开始对话",
        {"唤醒", "麦克风", "状态"}, {"Snowboy", "双麦 AEC", "待命"}, 0x3478F6},
       {"摄像头", kIconCamera, "BSP 已验证", "SC3336", "3MP · MIPI CSI", "轻触启动预览",
-       {"曝光", "帧率", "预览"}, {"自动", "30 FPS", "待启动"}, 0xC64F69},
+       {"曝光", "帧率", "预览"}, {"自动", "4 FPS", "待启动"}, 0xC64F69},
       {"时间", kIconClock, "本地时间", "--:--", "使用系统本地时区", "时钟页面",
        {"闹钟", "计时器", "同步"}, {"待接入", "待接入", "系统时间"}, 0x5A687F},
       {"WiFi", kIconWifi, "配网入口", "boomPI-Setup", "首次联网 · 本地配置", "打开配网向导",
@@ -508,8 +509,41 @@ void LvglScreen::BuildVoice(lv_obj_t* root) noexcept {
   voice_text_ = lv_label_create(voice_);
   StyleLabel(voice_text_, small_font_, 0x8794A7);
   lv_label_set_long_mode(voice_text_, LV_LABEL_LONG_WRAP);
-  lv_obj_set_size(voice_text_, 286, 43);
-  lv_obj_align(voice_text_, LV_ALIGN_BOTTOM_MID, 0, -8);
+  lv_obj_set_size(voice_text_, 286, 27);
+  lv_obj_align(voice_text_, LV_ALIGN_BOTTOM_MID, 0, -25);
+
+  voice_volume_slider_ = lv_slider_create(voice_);
+  lv_slider_set_range(voice_volume_slider_, 0, 100);
+  lv_obj_set_size(voice_volume_slider_, 214, 8);
+  lv_obj_align(voice_volume_slider_, LV_ALIGN_BOTTOM_LEFT, 35, -8);
+  lv_obj_set_style_radius(voice_volume_slider_, LV_RADIUS_CIRCLE,
+                          LV_PART_MAIN);
+  lv_obj_set_style_bg_color(voice_volume_slider_, lv_color_hex(0x263348),
+                            LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(voice_volume_slider_, LV_OPA_COVER,
+                          LV_PART_MAIN);
+  lv_obj_set_style_bg_color(voice_volume_slider_, lv_color_hex(0x4DA6FF),
+                            LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(voice_volume_slider_, LV_OPA_COVER,
+                          LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(voice_volume_slider_, lv_color_hex(0xF3EEE6),
+                            LV_PART_KNOB);
+  lv_obj_set_style_pad_all(voice_volume_slider_, 4, LV_PART_KNOB);
+  lv_obj_add_event_cb(voice_volume_slider_, VolumeChanged, LV_EVENT_PRESSED,
+                      this);
+  lv_obj_add_event_cb(voice_volume_slider_, VolumeChanged,
+                      LV_EVENT_VALUE_CHANGED, this);
+  lv_obj_add_event_cb(voice_volume_slider_, VolumeChanged, LV_EVENT_RELEASED,
+                      this);
+  lv_obj_add_event_cb(voice_volume_slider_, VolumeChanged, LV_EVENT_PRESS_LOST,
+                      this);
+
+  voice_volume_value_ = lv_label_create(voice_);
+  StyleLabel(voice_volume_value_, home_caption_font_, 0xAAB6C7,
+             LV_TEXT_ALIGN_RIGHT);
+  lv_obj_set_size(voice_volume_value_, 48, 16);
+  lv_obj_align(voice_volume_value_, LV_ALIGN_BOTTOM_RIGHT, -9, -3);
+  SetVolume(volume_percent_);
 }
 
 void LvglScreen::BuildCamera(lv_obj_t* root) noexcept {
@@ -839,6 +873,33 @@ void LvglScreen::SetCameraActivityHandler(CameraActivityHandler handler,
   camera_activity_user_data_ = user_data;
 }
 
+void LvglScreen::SetVolumeChangeHandler(VolumeChangeHandler handler,
+                                        void* user_data) noexcept {
+  volume_change_handler_ = handler;
+  volume_change_user_data_ = user_data;
+}
+
+void LvglScreen::SetVolume(const std::uint8_t percent) noexcept {
+  volume_percent_ = std::min<std::uint8_t>(percent, 100U);
+  if (volume_percent_ != 0U) volume_before_mute_ = volume_percent_;
+  muted_ = volume_percent_ == 0U;
+
+  if (voice_volume_slider_ != nullptr &&
+      lv_slider_get_value(voice_volume_slider_) != volume_percent_) {
+    lv_slider_set_value(voice_volume_slider_, volume_percent_, LV_ANIM_OFF);
+  }
+  if (voice_volume_value_ != nullptr) {
+    char text[8]{};
+    std::snprintf(text, sizeof(text), "%u%%",
+                  static_cast<unsigned>(volume_percent_));
+    lv_label_set_text(voice_volume_value_, text);
+  }
+  if (voice_mute_icon_ != nullptr) {
+    lv_label_set_text(voice_mute_icon_,
+                      muted_ ? kIconVolumeOff : kIconVolume);
+  }
+}
+
 void LvglScreen::SetCameraFrame(const std::uint16_t* pixels,
                                 std::size_t pixel_count) noexcept {
   if (camera_image_ == nullptr || pixels == nullptr ||
@@ -1057,9 +1118,31 @@ void LvglScreen::BackClicked(lv_event_t* event) {
 
 void LvglScreen::MuteClicked(lv_event_t* event) {
   auto* screen = static_cast<LvglScreen*>(lv_event_get_user_data(event));
-  screen->muted_ = !screen->muted_;
-  lv_label_set_text(screen->voice_mute_icon_,
-                    screen->muted_ ? kIconVolumeOff : kIconVolume);
+  const std::uint8_t target = screen->volume_percent_ == 0U
+                                  ? screen->volume_before_mute_
+                                  : 0U;
+  screen->SetVolume(target);
+  if (screen->volume_change_handler_ != nullptr) {
+    screen->volume_change_handler_(target, VolumeChangePhase::kCommit,
+                                   screen->volume_change_user_data_);
+  }
+}
+
+void LvglScreen::VolumeChanged(lv_event_t* event) {
+  auto* screen = static_cast<LvglScreen*>(lv_event_get_user_data(event));
+  const auto value = static_cast<std::uint8_t>(std::clamp(
+      lv_slider_get_value(screen->voice_volume_slider_), 0, 100));
+  screen->SetVolume(value);
+  if (screen->volume_change_handler_ == nullptr) return;
+
+  VolumeChangePhase phase = VolumeChangePhase::kPreview;
+  if (lv_event_get_code(event) == LV_EVENT_PRESSED)
+    phase = VolumeChangePhase::kBegin;
+  else if (lv_event_get_code(event) == LV_EVENT_RELEASED ||
+           lv_event_get_code(event) == LV_EVENT_PRESS_LOST)
+    phase = VolumeChangePhase::kCommit;
+  screen->volume_change_handler_(value, phase,
+                                 screen->volume_change_user_data_);
 }
 
 void LvglScreen::VoiceClicked(lv_event_t* event) {
@@ -1141,6 +1224,7 @@ void LvglScreen::Destroy() noexcept {
   voice_orb_image_ = nullptr;
   for (auto*& orbit : voice_orbits_) orbit = nullptr;
   voice_status_ = voice_text_ = voice_mute_icon_ = nullptr;
+  voice_volume_slider_ = voice_volume_value_ = nullptr;
   camera_image_ = camera_status_ = nullptr;
   generic_title_ = generic_hero_ = generic_badge_ = generic_icon_ = nullptr;
   generic_primary_ = generic_secondary_ = generic_action_ = nullptr;
@@ -1148,12 +1232,16 @@ void LvglScreen::Destroy() noexcept {
   for (auto*& value : generic_stat_values_) value = nullptr;
   has_text_ = false;
   muted_ = false;
+  volume_percent_ = 60U;
+  volume_before_mute_ = 60U;
   interrupt_handler_ = nullptr;
   interrupt_user_data_ = nullptr;
   app_action_handler_ = nullptr;
   app_action_user_data_ = nullptr;
   camera_activity_handler_ = nullptr;
   camera_activity_user_data_ = nullptr;
+  volume_change_handler_ = nullptr;
+  volume_change_user_data_ = nullptr;
   camera_descriptor_ = {};
   current_app_ = 0U;
   page_ = Page::kHome;

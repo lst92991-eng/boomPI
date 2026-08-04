@@ -2,15 +2,15 @@
 
 ## 文档状态
 
-本页描述当前教学版的职责和数据流，不给未冻结工作树继承旧候选的验收结论。音频 ELOC 由
+本页描述 `v1.0.0` 教学基线的职责和数据流，不给后续未冻结工作树继承本次验收结论。音频 ELOC 由
 `scripts/tests/test_client_source_contract.py` 按固定集合计算；LVGL UI、网络启动和测试代码单独
-统计。当前冻结源码为 15 个生产文件、3066 ELOC，其中 vendor 集成 280 ELOC、产品胶水
-2786 ELOC。2026-08-03 的 2929 ELOC 以及当日严格交叉构建、板端启动和真人语音结果，只属于
+统计。当前冻结源码为 15 个生产文件、3078 ELOC，其中 vendor 集成 280 ELOC、产品胶水
+2798 ELOC。2026-08-03 的 2929 ELOC 以及当日严格交叉构建、板端启动和真人语音结果，只属于
 对应历史候选。后续修改必须重新完成 Host、严格交叉构建和板端 HIL 后才能声明通过。
 
-当前仍待关闭的硬件项包括受控 double-talk、量化延迟、真实 Wi-Fi 配网、屏幕/触摸目视验收和
-有界稳定性窗口。实现状态以当前测试输出和带日期的板端记录为准；根目录 `AGENTS.md` 是更高
-优先级的开发契约。
+真实 Wi-Fi 配网、屏幕/触摸、摄像头本地预览和完整语音闭环已完成人工验收。受控
+double-talk、量化延迟、最终壳体 ERLE 和有界稳定性窗口仍是后续上限测试。实现状态以当前
+测试输出和带日期的板端记录为准；根目录 `AGENTS.md` 是更高优先级的开发契约。
 
 ## 部署边界
 
@@ -42,7 +42,7 @@ Ethernet/Wi-Fi -> NetworkBootstrap -> discovered WSS endpoint
 | `client/src/audio/` | 唯一公开音频门面、播放线程、TTS 固定环和播放结果 |
 | `client/src/network/` | WSS/TLS、v1 收发、以太网/Wi-Fi 优先级、UDP 发现与 endpoint 持久化 |
 | `client/src/platform/rv1106/` | `AudioEngine` 私有的 ALSA、重采样、Rockchip 3A、Snowboy C ABI、VAD 和近讲门控 |
-| `client/src/ui/` | ST7789P3 刷新、GT911 触摸、表情、两行字幕、音量和亮度手势 |
+| `client/src/ui/` | ST7789P3 刷新、GT911 触摸、动态语音球、字幕、实时音量、配网与摄像头预览 |
 
 不存在另一套 `App/Driver/Inf` 平行目录，也没有恢复已删除的通用 worker 或 backend 工厂。
 
@@ -53,7 +53,7 @@ Ethernet/Wi-Fi -> NetworkBootstrap -> discovered WSS endpoint
 | --- | --- |
 | 主 application actor | 500 ms pre-roll、状态机、turn 和重连调度；唯一修改业务状态 |
 | capture/DSP 线程 | `SCHED_FIFO 40`；ALSA capture、3A、Snowboy/VAD，并提交到 4 帧固定队列 |
-| 播放线程 | 固定 TTS 队列、重采样、gain/limiter 和 ALSA playback |
+| 播放线程 | `SCHED_FIFO 30`；固定 TTS 队列、重采样、gain/limiter 和 ALSA playback |
 | WebSocket service 线程 | TLS/WSS I/O；回调只向固定 64 项事件环提交结果 |
 | UI 线程 | 合并状态刷新、SPI 写屏和 GT911 触摸；只把用户动作交回主状态机 |
 | 网络线程 | DHCP/Wi-Fi 启动、UDP 发现与 endpoint 持久化；服务端晚启动时持续重试 |

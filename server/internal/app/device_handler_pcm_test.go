@@ -296,8 +296,11 @@ func TestBurstProviderAudioIsPacedAtSpeakerRate(t *testing.T) {
 			if header.TimestampUS <= previousTimestampUS {
 				t.Fatalf("paced timestamp %d = %d, previous=%d", index, header.TimestampUS, previousTimestampUS)
 			}
-			if delta := header.TimestampUS - previousTimestampUS; delta < 15_000 {
-				t.Fatalf("paced timestamp delta %d = %d us, want at least 15000 us", index, delta)
+			// The production floor is 15 ms.  Keep 1 ms for timestamp and
+			// scheduler measurement noise while still rejecting the 5-10 ms
+			// catch-up bursts that caused periodic playback stalls.
+			if delta := header.TimestampUS - previousTimestampUS; delta < 14_000 {
+				t.Fatalf("paced timestamp delta %d = %d us, want at least 14000 us", index, delta)
 			}
 		}
 		previousTimestampUS = header.TimestampUS
@@ -316,6 +319,28 @@ func TestBurstProviderAudioIsPacedAtSpeakerRate(t *testing.T) {
 	}
 	if got := readControl(t, connection); got.Type != "response.done" {
 		t.Fatalf("message after paced PCM = %q, want response.done", got.Type)
+	}
+}
+
+func TestNextPacedFrameDeadlineBoundsCatchUp(t *testing.T) {
+	base := time.Unix(100, 0)
+	for _, test := range []struct {
+		name     string
+		previous time.Time
+		sentAt   time.Time
+		want     time.Time
+	}{
+		{name: "first frame", sentAt: base, want: base.Add(20 * time.Millisecond)},
+		{name: "on cadence", previous: base, sentAt: base, want: base.Add(20 * time.Millisecond)},
+		{name: "small overshoot", previous: base, sentAt: base.Add(4 * time.Millisecond), want: base.Add(20 * time.Millisecond)},
+		{name: "catch-up floor", previous: base, sentAt: base.Add(12 * time.Millisecond), want: base.Add(27 * time.Millisecond)},
+		{name: "full frame stall", previous: base, sentAt: base.Add(20 * time.Millisecond), want: base.Add(40 * time.Millisecond)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := nextPacedFrameDeadline(test.previous, test.sentAt); !got.Equal(test.want) {
+				t.Fatalf("next deadline = %s, want %s", got, test.want)
+			}
+		})
 	}
 }
 

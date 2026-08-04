@@ -32,6 +32,9 @@ constexpr int kPanelWidth = 240;
 constexpr int kPanelHeight = 320;
 constexpr int kLogicalWidth = 320;
 constexpr int kLogicalHeight = 240;
+constexpr int kVolumeSliderTouchLeft = 24;
+constexpr int kVolumeSliderTouchRight = 264;
+constexpr int kVolumeSliderTouchTop = 200;
 constexpr int kDrawBufferRows = 32;
 constexpr int kTouchEventLimit = 32;
 constexpr unsigned kSpiSpeedHz = 80000000U;
@@ -188,10 +191,16 @@ struct DeviceUi::Impl final {
   bool worker_succeeded{false};
   bool state_dirty{true};
   bool text_dirty{true};
+  bool volume_dirty{true};
   bool camera_requested{false};
   bool camera_request_dirty{false};
   bool camera_frame_dirty{false};
   DeviceUiState state{DeviceUiState::kIdle};
+  std::uint8_t volume_percent{60U};
+  std::uint8_t pending_volume_percent{60U};
+  bool volume_change_pending{false};
+  bool volume_change_committed{false};
+  bool volume_slider_active{false};
   std::array<std::array<char, 64>, 2> lines{};
   std::array<DeviceUiAction, kActionQueueCapacity> actions{};
   std::size_t action_head{0U};
@@ -287,6 +296,15 @@ struct DeviceUi::Impl final {
     ++action_count;
   }
 
+  void QueueVolumeChange(std::uint8_t percent, bool committed) {
+    std::lock_guard<std::mutex> lock(mutex);
+    // Dragging may emit one event per visual frame.  Keep only the newest
+    // preview so wake/interrupt actions cannot be displaced by slider noise.
+    pending_volume_percent = std::min<std::uint8_t>(percent, 100U);
+    volume_change_pending = true;
+    volume_change_committed = volume_change_committed || committed;
+  }
+
   void BeginTouch() {
     pointer_active = true;
     have_x = false;
@@ -306,6 +324,15 @@ struct DeviceUi::Impl final {
     if (!pointer_active) return;
     pointer_active = false;
     if (!gesture_started) return;
+    // The event backend may deliver press, movement and release in one read.
+    // Reserve the visible slider strip before applying legacy screen gestures.
+    if (start_x >= kVolumeSliderTouchLeft &&
+        start_x <= kVolumeSliderTouchRight &&
+        start_y >= kVolumeSliderTouchTop)
+      return;
+    // LVGL owns this drag.  Its release callback clears the flag after the
+    // input driver reports release, so the legacy screen gesture stays idle.
+    if (volume_slider_active) return;
     const int dx = pointer_x - start_x;
     const int dy = pointer_y - start_y;
     const int horizontal = dx < 0 ? -dx : dx;
@@ -444,6 +471,20 @@ struct DeviceUi::Impl final {
     self->wake.notify_one();
   }
 
+  static void VolumeChanged(std::uint8_t percent,
+                            LvglScreen::VolumeChangePhase phase,
+                            void* user_data) {
+    auto* self = static_cast<Impl*>(user_data);
+    if (phase == LvglScreen::VolumeChangePhase::kBegin) {
+      self->volume_slider_active = true;
+      return;
+    }
+    self->QueueVolumeChange(
+        percent, phase == LvglScreen::VolumeChangePhase::kCommit);
+    if (phase == LvglScreen::VolumeChangePhase::kCommit)
+      self->volume_slider_active = false;
+  }
+
   void CaptureCamera() {
     int output[2]{};
     if (pipe(output) != 0) {
@@ -554,6 +595,7 @@ struct DeviceUi::Impl final {
     screen.SetVoiceInterruptHandler(VoiceInterrupted, this);
     screen.SetAppActionHandler(AppAction, this);
     screen.SetCameraActivityHandler(CameraActivity, this);
+    screen.SetVolumeChangeHandler(VolumeChanged, this);
     return true;
   }
 
@@ -592,16 +634,20 @@ struct DeviceUi::Impl final {
     }
 
     DeviceUiState shown{};
+    std::uint8_t shown_volume = 60U;
     std::array<std::array<char, 64>, 2> text{};
     {
       std::lock_guard<std::mutex> lock(mutex);
       shown = state;
+      shown_volume = volume_percent;
       text = lines;
       state_dirty = false;
       text_dirty = false;
+      volume_dirty = false;
     }
     screen.SetState(shown);
     screen.SetText(text[0].data(), text[1].data());
+    screen.SetVolume(shown_volume);
     SignalStartup(true);
 
     auto previous = std::chrono::steady_clock::now();
@@ -617,6 +663,7 @@ struct DeviceUi::Impl final {
 
       bool update_state = false;
       bool update_text = false;
+      bool update_volume = false;
       bool change_camera = false;
       bool start_camera = false;
       bool update_camera_frame = false;
@@ -625,14 +672,17 @@ struct DeviceUi::Impl final {
         std::lock_guard<std::mutex> lock(mutex);
         update_state = state_dirty;
         update_text = text_dirty;
+        update_volume = volume_dirty;
         change_camera = camera_request_dirty;
         start_camera = camera_requested;
         update_camera_frame = camera_frame_dirty;
         if (update_state) shown = state;
         if (update_text) text = lines;
+        if (update_volume) shown_volume = volume_percent;
         if (update_camera_frame) camera_pixels = camera_frame;
         state_dirty = false;
         text_dirty = false;
+        volume_dirty = false;
         camera_request_dirty = false;
         camera_frame_dirty = false;
       }
@@ -644,6 +694,7 @@ struct DeviceUi::Impl final {
       }
       if (update_state) screen.SetState(shown);
       if (update_text) screen.SetText(text[0].data(), text[1].data());
+      if (update_volume) screen.SetVolume(shown_volume);
       if (update_camera_frame && start_camera)
         screen.SetCameraFrame(camera_pixels.data(), camera_pixels.size());
 
@@ -654,7 +705,7 @@ struct DeviceUi::Impl final {
       // camera lifecycle changes still wake immediately.
       wake.wait_for(lock, kUiRefreshPeriod, [this] {
         return stop.load() || state_dirty ||
-               camera_request_dirty || camera_frame_dirty;
+               volume_dirty || camera_request_dirty || camera_frame_dirty;
       });
     }
 
@@ -798,6 +849,29 @@ bool DeviceUi::PollAction(DeviceUiAction* action) noexcept {
   impl_->action_head = (impl_->action_head + 1U) % impl_->actions.size();
   --impl_->action_count;
   return true;
+}
+
+bool DeviceUi::PollVolumeChange(std::uint8_t* percent,
+                                bool* committed) noexcept {
+  if (percent == nullptr || committed == nullptr || impl_ == nullptr)
+    return false;
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (!impl_->volume_change_pending) return false;
+  *percent = impl_->pending_volume_percent;
+  *committed = impl_->volume_change_committed;
+  impl_->volume_change_pending = false;
+  impl_->volume_change_committed = false;
+  return true;
+}
+
+void DeviceUi::SetVolume(const std::uint8_t percent) noexcept {
+  if (impl_ == nullptr || !impl_->ready.load()) return;
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  const std::uint8_t limited = std::min<std::uint8_t>(percent, 100U);
+  if (impl_->volume_percent == limited) return;
+  impl_->volume_percent = limited;
+  impl_->volume_dirty = true;
+  impl_->wake.notify_one();
 }
 
 void DeviceUi::SetBrightness(std::uint8_t percent) noexcept {

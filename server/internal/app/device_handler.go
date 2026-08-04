@@ -32,6 +32,7 @@ const (
 	outputFrameDurationMS      = 20
 	outputFrameBytes           = outputSampleRateHz * pcmBytesPerSample * outputFrameDurationMS / 1000
 	outputFrameDuration        = time.Duration(outputFrameDurationMS) * time.Millisecond
+	minimumOutputFrameSpacing  = 15 * time.Millisecond
 	downlinkMaxBufferedBytes   = outputSampleRateHz * pcmBytesPerSample * 1500 / 1000
 	maxProviderAudioDeltaBytes = 64 * 1024
 	downlinkReadResumeBytes    = downlinkMaxBufferedBytes - maxProviderAudioDeltaBytes
@@ -963,15 +964,24 @@ func (h *deviceHandler) sendNextPacedFrameWith(
 	if pacer.firstDownlinkQueueAt.IsZero() {
 		pacer.firstDownlinkQueueAt = now
 	}
-	// Preserve the 24 kHz media clock without accumulating normal timer
-	// overshoot. A full-frame stall rebases the deadline instead of sending a
-	// catch-up burst into the client jitter queue.
-	if pacer.nextFrameAt.IsZero() || now.Sub(pacer.nextFrameAt) >= outputFrameDuration {
-		pacer.nextFrameAt = now.Add(outputFrameDuration)
-	} else {
-		pacer.nextFrameAt = pacer.nextFrameAt.Add(outputFrameDuration)
-	}
+	pacer.nextFrameAt = nextPacedFrameDeadline(pacer.nextFrameAt, now)
 	return true, final, nil
+}
+
+func nextPacedFrameDeadline(previousDeadline, sentAt time.Time) time.Time {
+	// Preserve the 24 kHz media clock while preventing a late desktop timer
+	// from being followed by a 5-10 ms catch-up burst.  Small overshoot may be
+	// recovered gradually, but every next deadline keeps 15 ms of spacing.  A
+	// full-frame stall rebases to a fresh 20 ms interval.
+	if previousDeadline.IsZero() || sentAt.Sub(previousDeadline) >= outputFrameDuration {
+		return sentAt.Add(outputFrameDuration)
+	}
+	cadenceDeadline := previousDeadline.Add(outputFrameDuration)
+	minimumDeadline := sentAt.Add(minimumOutputFrameSpacing)
+	if cadenceDeadline.Before(minimumDeadline) {
+		return minimumDeadline
+	}
+	return cadenceDeadline
 }
 
 func (h *deviceHandler) finishPacedResponse(ctx context.Context, connection *transport.Connection, state *connectionState, pacer *pacedDownlink) (bool, error) {

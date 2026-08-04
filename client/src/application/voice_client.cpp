@@ -175,6 +175,7 @@ class VoiceClient final {
     audio_config.right_polarity = config_.capture_right_polarity;
     if (!ui_.Open()) std::cerr << "boompi-client: display unavailable; continuing voice-only\n";
     brightness_ = saved_brightness != 0U;
+    ui_.SetVolume(volume_);
     ui_.SetBrightness(brightness_ ? 100U : 0U);
     ui_.SetState(DeviceUiState::kOffline);
     if (!audio_.Open(audio_config)) return Fail(audio_.last_error());
@@ -279,7 +280,21 @@ class VoiceClient final {
     if (output)
       std::rename(temporary, kUiSettings);
   }
+
+  void ApplyVolume(const std::uint8_t percent, const bool persist) {
+    volume_ = std::min<std::uint8_t>(percent, 100U);
+    audio_.SetPlaybackGain(static_cast<float>(volume_) *
+                           config_.speaker_gain_percent / 10000.0F);
+    ui_.SetVolume(volume_);
+    if (persist) SaveUiSettings();
+  }
+
   void PollUi() {
+    std::uint8_t selected_volume = volume_;
+    bool volume_committed = false;
+    if (ui_.PollVolumeChange(&selected_volume, &volume_committed))
+      ApplyVolume(selected_volume, volume_committed);
+
     DeviceUiAction action{};
     if (!ui_.PollAction(&action)) return;
     if (action == DeviceUiAction::kWake) {
@@ -300,9 +315,9 @@ class VoiceClient final {
     }
     if (action == DeviceUiAction::kVolumeUp || action == DeviceUiAction::kVolumeDown) {
       const int step = action == DeviceUiAction::kVolumeUp ? 5 : -5;
-      volume_ = static_cast<std::uint8_t>(std::clamp(static_cast<int>(volume_) + step, 0, 100));
-      audio_.SetPlaybackGain(static_cast<float>(volume_) * config_.speaker_gain_percent / 10000.0F);
-      SaveUiSettings();
+      ApplyVolume(static_cast<std::uint8_t>(std::clamp(
+                      static_cast<int>(volume_) + step, 0, 100)),
+                  true);
     } else if (action == DeviceUiAction::kBrightnessUp) {
       brightness_ = true;
       ui_.SetBrightness(100U);

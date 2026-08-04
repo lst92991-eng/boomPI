@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(boomPI VERSION 0.1.0 LANGUAGES C CXX)
+project(boomPI VERSION 1.0.0 LANGUAGES C CXX)
 
 # 多配置生成器忽略该值；显式读取可让同一 preset 兼容 VS 与 Unix 单配置生成器。
 if(DEFINED CMAKE_BUILD_TYPE)

@@ -373,6 +373,11 @@ bool DeviceUi::PollAction(DeviceUiAction* const action) noexcept {
   return true;
 }
 
+bool DeviceUi::PollVolumeChange(std::uint8_t*, bool*) noexcept {
+  return false;
+}
+
+void DeviceUi::SetVolume(std::uint8_t) noexcept {}
 void DeviceUi::SetBrightness(std::uint8_t) noexcept {}
 void DeviceUi::Close() noexcept {}
 

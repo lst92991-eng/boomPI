@@ -2,18 +2,14 @@
 
 boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端默认连接 Qwen 中国内地（北京）区，板端不保存云端 API Key。
 
-> **当前工作树是教学版收尾候选：主机自动化、严格 RV1106 交叉构建和板端静态部署均已完成；客户端保持关闭，等待真人完成最终声学与交互复验。**
-> 2026-08-03 的单参考候选曾完成严格交叉构建、固定语音 A/B、板端启动、真实 Qwen 问答以及
-> 静默、完整播放、三秒追问和播放中打断四段真人验收；本次窗口未观察到自激或音频运行错误。
-> 这些结果只属于当日源码与二进制，不自动覆盖后续工作树。当前冻结源码的音频主线为
-> 15 个生产文件、3066 ELOC：其中 vendor 集成 280 ELOC，产品胶水 2786 ELOC；
-> 2026-08-03 的 2929 ELOC 仅作历史快照。
-> 禁止用压行、挪文件或删除有效注释规避统计；LVGL UI 和网络启动独立统计，不计入音频 ELOC；
-> 屏幕/触摸、UDP 发现和 Wi-Fi 二维码配网仍属于同一教学候选。旧版的丢帧、高延迟、`EPIPE` 和 jitter queue 记录仍作为回归风险
-> 保留；最终壳体 ERLE、受控 double-talk 和长期稳定性仍待量化验收。
-> 同日第一块板又完成分阶段打断 A/B：关闭打断后播放恢复流畅，快速候选完成真实 Qwen
-> 播放与多轮打断，用户确认体验可接受；主观结论、日志计数和未量化边界见
-> [P1 分阶段打断与播放连续性人工验证](docs/test/p1-staged-barge-playback-validation-20260803.md)。
+> **`v1.0.0` 是已完成真板人工验收的教学最终基线。** 双麦单参考 Rockchip 3A、Snowboy、
+> WebRTC VAD、真实 Qwen 问答、连续流式播放、三秒追问、播放中同句打断、LVGL 触摸桌面、
+> SC3336 本地预览、Wi-Fi 配网和实时音量控制已经形成闭环；本轮未观察到明显自激。
+> 当前音频主线为 15 个生产文件、3078 ELOC，其中 vendor 集成 280 ELOC、产品胶水
+> 2798 ELOC。LVGL/UI 2117 ELOC、NetworkBootstrap 183 ELOC 单独评审，板端生产 C/C++
+> 总计 5378 ELOC。完整架构、依赖、构建、验收证据和后续边界见
+> [boomPI v1.0.0 教学最终基线](docs/releases/v1.0.0.md)。最终壳体 ERLE、受控 double-talk、
+> 长期稳定性和极限性能仍是后续量化优化项，不由本次主观验收代替。
 
 ## 系统形态
 
@@ -29,7 +25,7 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
        Qwen China (Beijing) API
 ```
 
-第一版目标包括双麦 AEC、Snowboy 英文唤醒、可打断流式 TTS、三秒连续对话、横屏表情与字幕、以太网/Wi-Fi、首次二维码配网和本地服务端发现。SC3336 多模态、在线音乐和长期记忆不属于第一版运行链路。
+v1.0.0 包括双麦 AEC、Snowboy 英文唤醒、可打断流式 TTS、三秒连续对话、横屏动态语音球与字幕、以太网/Wi-Fi、首次二维码配网、本地服务端发现和 SC3336 本地预览。SC3336 多模态、在线音乐和长期记忆不属于第一版运行链路。
 
 详细约束以 [AGENTS.md](AGENTS.md) 为准；架构摘要见 [docs/architecture/system-overview.md](docs/architecture/system-overview.md)，音频 vendor 边界见 [音频后端契约与依赖闸门](docs/architecture/audio-backends.md)，协议设计基线见 [protocol/protocol-v1.md](protocol/protocol-v1.md)。
 
@@ -58,30 +54,29 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
   得到 `confirmed=2/10`、`follow=3/10`、`attempts=43`。AGC OFF 明显改善但没有解决误触发。
 - 播放期的参考探针先以原音量连续确认六帧近讲，然后直接静音，等待 reference 降低和二次
   VAD 确认来抑制自激；失败后恢复播放并冷却，避免瞬态误判反复切断 TTS。这是
-  产品侧 containment 候选，不是 AEC 效果证明。当前环境仍嘈杂，真人双讲和可控噪声条件下的
-  打断验收待完成。
+  产品侧 containment，不是最终 ERLE 证明。真人最终闭环已确认无明显自激且打断后新问题会
+  正常提交；受控噪声、标准 double-talk 和最终壳体仍需量化。
 - Snowboy 已在第三块板加载模型并多次检测到唤醒；误唤醒、漏唤醒、准确率和长期 CPU/RSS
   尚未形成可重复基线。
-- 最终壳体下的 AEC、波束形成、双讲、远场和最大音量表现。
+- 最终壳体下的 AEC、波束形成、双讲、远场和最大音量表现仍是后续量化项。
 - 经 Windows SSH tunnel 的 WSS 真实 Qwen 语音闭环曾跑通，服务端已切到连续
   `server_commit` TTS；教学版 UDP 发现、SPKI 首次保存、以太网优先和 AP 配网页已实现。
-  新服务端与真实 Qwen 的付费联调、真实 Wi-Fi 凭据关联、断网恢复、量化首音延迟和长期运行
-  仍需最终验收。
-- 2026-08-03 教学候选曾部署到板端并进入 `secure session ready`；UI 驱动打开时没有回退日志，该候选
-  实测约 11.8 MiB RSS。当前源码正常语音/显示拓扑为 6 个长期执行上下文，摄像头开启后为 7 个；
-  本轮源码冻结后仍需在板端重新采集线程数、RSS 和日志。屏幕内容、GT911 手势和手机扫描二维码仍需人工目视验收。
+  中国内地（北京）区真实 Qwen、真实 Wi-Fi、屏幕/GT911 和二维码配网已经人工跑通；断网恢复、
+  量化首音延迟和长期运行继续作为上限测试。
+- 最终客户端已部署并进入 `secure session ready`；屏幕、触摸、摄像头和音量滑块均已目视验收。
+  正常语音/显示拓扑为 6 个长期执行上下文，摄像头开启后为 7 个。
 
 ### 软件阶段
 
-当前工作树继续按仓库既定职责整理：
+v1.0.0 按仓库既定职责组织：
 `application` 是会话状态机，`audio` 是有界播放编排，`network` 是持久 WSS/TLS，
 `platform/rv1106` 是 ALSA/libswresample、Rockchip 3A、Snowboy 和 WebRTC VAD；同一
 `network` 目录中的启动模块负责以太网/Wi-Fi/发现，`ui` 直接驱动 ST7789P3 和 GT911。
 它们直接组合现有库，不再保留自写 WSS、重复 wire protocol、通用 playback/capture 框架或
-supervisor/update 占位实现。当前音频主线精确计数为 15 个生产文件、3066 ELOC，其中 vendor
-集成 280 ELOC、产品胶水 2786 ELOC。2026-08-04 严格交叉构建已经通过；stripped RV1106
-客户端 SHA-256 为 `8f07a622a4a23f02495261b668a7afd525550fc83a23a9d94529aa28cebd9ca3`，
-完整自动化证据和仍待人工关闭的板端边界见
+supervisor/update 占位实现。当前音频主线精确计数为 15 个生产文件、3078 ELOC，其中 vendor
+集成 280 ELOC、产品胶水 2798 ELOC。2026-08-04 严格交叉构建已经通过；stripped RV1106
+v1.0.0 严格交叉构建客户端 SHA-256 为 `b8476d42a4520669ed02a8aabd52e5d829fafa5b9252d76bd0cd1d70cb245a37`，
+完整自动化和人工验收证据见
 [教学版软件收口记录](docs/test/software-closeout-20260804.md)。
 2026-08-01 的
 [语音客户端职责重排记录](docs/test/client-responsibility-layout-20260801.md)是纯语音阶段历史快照；

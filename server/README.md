@@ -3,6 +3,10 @@
 每个平台只需要一个 `boompi-server` 可执行文件。程序会自行创建本地 TLS 身份和配置，
 不需要安装数据库、容器或后台服务。
 
+`v1.0.0` Release 提供 Windows amd64、Linux amd64、macOS amd64 和 macOS arm64 单文件产物；
+默认使用 Qwen 中国内地（北京）区。完整架构、校验和与验收边界见
+[v1.0.0 发布说明](../docs/releases/v1.0.0.md)。
+
 ## 三步启动
 
 1. 第一次运行程序，让它生成 `config.yaml`：
