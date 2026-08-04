@@ -1,5 +1,4 @@
-#ifndef BOOMPI_AUDIO_AUDIO_ENGINE_H_
-#define BOOMPI_AUDIO_AUDIO_ENGINE_H_
+#pragma once
 
 #include <array>
 #include <cstddef>
@@ -26,8 +25,10 @@ struct CaptureFrame final {
   std::array<VoiceFrame16k, 4U> aec_input{};
 #endif
   std::uint64_t sequence{0U};
+  float input_dbfs{-120.0F};
   bool wake{false}, vad_now{false}, vad_started{false}, vad_ended{false};
-  bool discontinuity{false}, near_voice{false}, reference_active{false};
+  bool discontinuity{false}, actor_overrun{false};
+  bool near_voice{false}, reference_active{false};
 };
 
 /// @brief 板端音频引擎的启动配置。
@@ -35,18 +36,18 @@ struct CaptureFrame final {
 /// 配置只在 `Open` 时复制；capture/playback 热路径不读取环境变量，也不创建 ALSA 或模型资源。
 struct AudioEngineConfig final {
   std::string capture_pcm, playback_pcm;
-  std::string snowboy_resource, snowboy_model, snowboy_sensitivity{"0.5"};
-  float snowboy_gain{1.0F};
+  std::string snowboy_resource, snowboy_model, snowboy_sensitivity{"0.7"};
   float playback_gain{1.8F};
+  float vad_min_dbfs{-35.0F};
   std::int8_t left_polarity{1}, right_polarity{1};
-  std::int32_t vad_mode{3}; std::uint16_t vad_start_ms{120U}, vad_end_ms{700U};
 };
 
 /// @brief 对话业务使用的音频门面。
 ///
-/// application 层只看到固定 20 ms 帧和播放控制。内部唯一播放线程消费有界 TTS 环形队列；
+/// application 层只看到固定 20 ms 帧和播放控制。内部高优先级采集线程持续排空 ALSA 并执行 3A，
+/// 次高优先级播放线程消费有界 TTS 环形队列；两者通过固定容量队列与 application 交换数据。
 /// AEC 使用 Codec Mode1 同步采集的 REF-L；REF-R 仍保留在四通道采集数据中。Close 会先唤醒并 join
-/// 播放线程，随后才释放 platform 层的 ALSA、模型、DSP 和临时 mixer 配置。
+/// 两条音频线程，随后才释放 platform 层的 ALSA、模型和 DSP。
 class AudioEngine final {
  public:
   AudioEngine() noexcept = default;
@@ -54,13 +55,13 @@ class AudioEngine final {
   AudioEngine(const AudioEngine&) = delete;
   AudioEngine& operator=(const AudioEngine&) = delete;
 
-  /// @brief 一次性打开 ALSA、重采样器、Rockchip 3A、Snowboy、VAD，并启动唯一播放线程。
+  /// @brief 打开音频资源并启动独立 capture/playback 实时线程。
   /// @return 成功后才能调用其余方法；失败时对象仍可安全 `Close`，原因由 `last_error` 返回。
   bool Open(const AudioEngineConfig& config) noexcept;
 
-  /// @brief 阻塞采集并处理一个 20 ms 帧。
+  /// @brief 阻塞取得一个由采集线程处理完成的 20 ms 帧。
   ///
-  /// 只能由 application actor 调用；一次读取同步的 `[mic0,mic1,refL,refR]` period。
+  /// 只能由 application actor 调用；不会直接访问 ALSA、3A 或模型资源。
   bool Capture(CaptureFrame* frame) noexcept;
 
   /// @brief 清空 Snowboy/VAD 的当前判定历史，不停止持续采集或 Rockchip 3A。
@@ -78,18 +79,19 @@ class AudioEngine final {
   bool EndPlayback() noexcept;
 
   /// `SetPlaybackScale` 只调整后续渲染增益；`DropPlayback` 异步唤醒播放线程并清空尚未渲染的 TTS。
+  void SetPlaybackGain(float gain) noexcept;
   void SetPlaybackScale(float scale) noexcept;
   void DropPlayback() noexcept;
 
   /// 前两个查询是无锁快照；`playback_failed` 只表示最近一次已结束的流发生硬件/渲染失败，
   /// 用户主动 drop 不计为失败。BeginPlayback 会清除此状态。
-  bool playing() const noexcept; bool playback_done() const noexcept;
+  bool playing() const noexcept { return !playback_done(); } bool playback_done() const noexcept;
   bool playback_failed() const noexcept;
 
   /// 返回 AudioEngine 或板级后端最近一次错误；允许 application 与播放线程并发读取。
   std::string last_error() const;
 
-  /// 幂等停止：先唤醒/打断 ALSA 播放并 join，再释放 DSP、模型、重采样器和 PCM。
+  /// 幂等停止：先唤醒并 join capture/playback，再释放 DSP、模型、重采样器和 PCM。
   void Close() noexcept;
 
  private:
@@ -98,5 +100,3 @@ class AudioEngine final {
 };
 
 }  // namespace boompi::audio
-
-#endif  // BOOMPI_AUDIO_AUDIO_ENGINE_H_

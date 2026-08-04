@@ -7,6 +7,12 @@ endif()
 option(BOOMPI_ENABLE_ALSA_PLAYBACK "Build the RV1106 ALSA voice path" ${_boompi_alsa_default})
 option(BOOMPI_ENABLE_WSS_CLIENT "Build the persistent WSS voice transport" OFF)
 option(BOOMPI_ENABLE_WEBRTC_VAD "Build the 16 kHz WebRTC VAD" OFF)
+set(_boompi_ui_simulator_default ON)
+if(BOOMPI_TARGET_RV1106)
+  set(_boompi_ui_simulator_default OFF)
+endif()
+option(BOOMPI_BUILD_UI_SIMULATOR "Build the 320x240 LVGL desktop preview"
+  ${_boompi_ui_simulator_default})
 option(BOOMPI_BUILD_AEC_LOOP_HIL
   "Build the opt-in RV1106 local-playback AEC regression probe" OFF)
 option(BOOMPI_AEC_LOOP_ENABLE_STDT
@@ -21,6 +27,54 @@ set(BOOMPI_OPENSSL_ROOT "" CACHE PATH "Pinned OpenSSL 3.5.7 package root")
 set(BOOMPI_BOOST_INCLUDE_DIR "" CACHE PATH "External Boost header root")
 set(BOOMPI_WEBRTC_VAD_INCLUDE_DIR "" CACHE PATH "Directory containing webrtc_vad.h")
 set(BOOMPI_WEBRTC_VAD_LIBRARY "" CACHE FILEPATH "RV1106 WebRTC VAD archive")
+set(BOOMPI_LVGL_ROOT "" CACHE PATH "Validated LVGL 8.2 source root")
+if(BOOMPI_LVGL_ROOT STREQUAL "" AND DEFINED ENV{BOOMPI_LVGL_ROOT})
+  file(TO_CMAKE_PATH "$ENV{BOOMPI_LVGL_ROOT}" BOOMPI_LVGL_ROOT)
+endif()
+
+if(BOOMPI_TARGET_RV1106 OR BOOMPI_BUILD_UI_SIMULATOR)
+  find_package(Threads REQUIRED)
+  find_package(Freetype REQUIRED)
+  include(cmake/BoompiLvgl.cmake)
+  boompi_configure_lvgl()
+
+  set(_boompi_voice_orb_asset "${CMAKE_CURRENT_SOURCE_DIR}/assets/ui/voice-orb-v2.rgb565")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_boompi_voice_orb_asset}")
+  file(READ "${_boompi_voice_orb_asset}" _boompi_voice_orb_hex HEX)
+  string(REGEX REPLACE "(..)" "0x\\1," BOOMPI_VOICE_ORB_BYTES
+    "${_boompi_voice_orb_hex}")
+  file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  configure_file(cmake/lvgl/voice_orb_rgb565.inc.in
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/voice_orb_rgb565.inc" @ONLY)
+  unset(_boompi_voice_orb_hex)
+  unset(BOOMPI_VOICE_ORB_BYTES)
+
+  add_library(boompi_lvgl_ui STATIC
+    src/ui/lvgl_screen.cpp
+    src/ui/voice_orb_asset.cpp)
+  target_compile_features(boompi_lvgl_ui PRIVATE cxx_std_17)
+  target_compile_options(boompi_lvgl_ui PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<BOOL:${BOOMPI_STRICT_WARNINGS}>>:-Werror>)
+  target_include_directories(boompi_lvgl_ui PUBLIC include PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  target_link_libraries(boompi_lvgl_ui PUBLIC lvgl::lvgl Freetype::Freetype)
+endif()
+
+if(BOOMPI_BUILD_UI_SIMULATOR)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
+  add_executable(boompi_ui_simulator apps/boompi_ui_simulator/main.cpp)
+  target_compile_features(boompi_ui_simulator PRIVATE cxx_std_17)
+  target_compile_definitions(boompi_ui_simulator PRIVATE
+    BOOMPI_ICON_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/tabler-icons-200-subset.ttf")
+  target_compile_options(boompi_ui_simulator PRIVATE -Wall -Wextra -Wpedantic
+    $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:-Werror>)
+  target_link_libraries(boompi_ui_simulator PRIVATE boompi_lvgl_ui
+    PkgConfig::SDL2 Threads::Threads)
+  set_target_properties(boompi_ui_simulator PROPERTIES OUTPUT_NAME boompi-ui-simulator)
+endif()
 
 if(NOT BOOMPI_TARGET_RV1106)
   message(STATUS "boompi-client is a board-only target; configure with BOOMPI_TARGET_RV1106=ON")
@@ -39,7 +93,6 @@ foreach(_target IN ITEMS boompi_vendor::rockchip_3a_aec boompi_vendor::snowboy)
   endif()
 endforeach()
 
-find_package(Threads REQUIRED)
 find_package(ALSA REQUIRED)
 find_library(BOOMPI_SWRESAMPLE_LIBRARY NAMES swresample REQUIRED)
 find_library(BOOMPI_AVUTIL_LIBRARY NAMES avutil REQUIRED)
@@ -94,10 +147,11 @@ add_executable(boompi_client
   src/application/voice_client.cpp
   src/audio/audio_engine.cpp
   src/config/voice_client_config.cpp
-  src/event/status.cpp
+  src/network/network_bootstrap.cpp
   src/network/voice_transport.cpp
   src/platform/rv1106/audio_backend.cpp
-  src/platform/rv1106/rockchip_voice_dsp.cpp)
+  src/platform/rv1106/rockchip_voice_dsp.cpp
+  src/ui/device_ui.cpp)
 target_compile_features(boompi_client PRIVATE cxx_std_17)
 target_compile_definitions(boompi_client PRIVATE BOOMPI_TARGET_RV1106=1
   BOOST_ERROR_CODE_HEADER_ONLY=1 BOOST_SYSTEM_NO_DEPRECATED=1)
@@ -110,18 +164,29 @@ target_include_directories(boompi_client SYSTEM PRIVATE
   "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}"
   "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}")
 target_link_libraries(boompi_client PRIVATE
+  boompi_lvgl_ui
   boompi_snowboy_bridge
   boompi_vendor::rockchip_3a_aec
   boompi_webrtc_vad
   ALSA::ALSA
   "${BOOMPI_SWRESAMPLE_LIBRARY}"
   "${BOOMPI_AVUTIL_LIBRARY}"
+  Freetype::Freetype
   OpenSSL::SSL OpenSSL::Crypto
   Threads::Threads ${CMAKE_DL_LIBS} atomic)
 set_target_properties(boompi_client PROPERTIES OUTPUT_NAME boompi-client
   SKIP_BUILD_RPATH TRUE BUILD_RPATH "" INSTALL_RPATH ""
   BUILD_WITH_INSTALL_RPATH FALSE INSTALL_RPATH_USE_LINK_PATH FALSE)
-install(TARGETS boompi_client RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS boompi_client RUNTIME DESTINATION /userdata/boompi/bin)
+install(FILES assets/icons/tabler-icons-200-subset.ttf
+  DESTINATION /userdata/boompi/fonts)
+install(FILES assets/icons/TABLER-LICENSE.txt
+  DESTINATION /userdata/boompi/licenses/tabler-icons
+  RENAME LICENSE.txt)
+install(PROGRAMS scripts/boompi-clientctl scripts/boompi-provision
+  DESTINATION /usr/sbin)
+install(PROGRAMS scripts/boompi-provision.py DESTINATION /usr/lib/boompi)
+install(PROGRAMS scripts/S99boompi-client DESTINATION /etc/init.d)
 
 if(BOOMPI_BUILD_AEC_LOOP_HIL)
   if(NOT BOOMPI_AEC_LOOP_REFERENCE_CHANNELS MATCHES "^[12]$")
@@ -134,7 +199,6 @@ if(BOOMPI_BUILD_AEC_LOOP_HIL)
     tests/hil/aec_loop_hil.cpp
     src/audio/audio_engine.cpp
     src/config/voice_client_config.cpp
-    src/event/status.cpp
     src/platform/rv1106/audio_backend.cpp
     src/platform/rv1106/rockchip_voice_dsp.cpp)
   target_compile_features(boompi_aec_loop_hil PRIVATE cxx_std_17)

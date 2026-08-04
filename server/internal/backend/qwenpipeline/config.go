@@ -32,8 +32,8 @@ type Config struct {
 }
 
 func (c Config) validate() error {
-	if strings.TrimSpace(c.APIKey) == "" || strings.TrimSpace(c.WorkspaceID) == "" {
-		return errors.New("Qwen API key and workspace ID are required")
+	if strings.TrimSpace(c.APIKey) == "" {
+		return errors.New("Qwen API key is required")
 	}
 	if strings.ContainsAny(c.WorkspaceID, "/?#@") {
 		return errors.New("Qwen workspace ID contains invalid characters")
@@ -70,6 +70,12 @@ func (c Config) validate() error {
 }
 
 func (c Config) compatibleBaseURL() string {
+	if strings.TrimSpace(c.WorkspaceID) == "" {
+		if c.Region == RegionSingapore {
+			return "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+		}
+		return "https://dashscope.aliyuncs.com/compatible-mode/v1"
+	}
 	domain := "cn-beijing.maas.aliyuncs.com"
 	if c.Region == RegionSingapore {
 		domain = "ap-southeast-1.maas.aliyuncs.com"

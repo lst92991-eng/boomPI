@@ -2,7 +2,7 @@
 
 ## 当前实现
 
-2026-08-01 的板端候选只保留三个产品边界和一个私有板级实现：
+2026-08-03 的板端教学候选在音频主线上只保留三个产品边界和一个私有板级实现：
 
 - `VoiceClient`（`application/`）：语音状态机、重连、turn、pre-roll 和打断编排。
 - `AudioEngine`（`audio/`）：唯一播放线程、固定 TTS 环和播放控制。
@@ -11,8 +11,9 @@
 - 私有 `AudioBackend`（`platform/rv1106/`）：由 `AudioEngine` 独占，内聚 ALSA 全双工、
   重采样、Rockchip 3A、Snowboy、WebRTC VAD 和近讲判定，不向 application 暴露。
 
-整套生产 C++ 共 17 个文件、2300 ELOC，其中 439 ELOC 是 Rockchip/Snowboy vendor 集成，
-产品核心为 1861 ELOC。旧 `manual_single_turn`、独立 capture pump、
+包含 UI 与网络启动在内的整套生产 C/C++ 共 19 个文件、2500 ELOC，其中 280 ELOC 是
+Rockchip/Snowboy vendor 集成，产品逻辑为 2220 ELOC。UI 和网络启动不介入逐帧 PCM 路径。
+旧 `manual_single_turn`、独立 capture pump、
 通用 EventBus、自写 WSS/parser、renderer/resampler/gain 框架和 playback
 control/committer/worker 已删除；不得为了恢复历史测试结构重新引入。
 
@@ -54,7 +55,7 @@ ALSA 精确协商为 capture `960/1920`、playback `960/3840` frame period/buffe
 
 ## 执行上下文与所有权
 
-当前源码只创建两个工作线程，加上调用 `VoiceClient::Run` 的主线程，共三个客户端自有长期执行
+当前源码创建三个工作线程，加上调用 `VoiceClient::Run` 的主线程，共四个客户端自有长期执行
 上下文：
 
 | 上下文 | 独占职责 |
@@ -62,8 +63,9 @@ ALSA 精确协商为 capture `960/1920`、playback `960/3840` frame period/buffe
 | 控制/采集线程 | ALSA capture、DSP、Snowboy/VAD、状态机、turn 和重连调度 |
 | 播放线程 | 激活期间独占 TTS 渲染、gain/limiter 和 ALSA playback |
 | WebSocket service 线程 | TLS/WSS I/O；回调只向 64 项事件环提交结果 |
+| UI 线程 | 合并低频状态刷新、SPI 写屏和 GT911 触摸，不处理 PCM |
 
-当前重排候选在第三块板观测为 4 个线程；额外一个由链接依赖内部创建，不拥有 boomPI 业务状态。若后续
+当前候选在板端观测为 5 个线程；额外一个由链接依赖内部创建，不拥有 boomPI 业务状态。若后续
 出现更多依赖线程，必须重新记录来源、优先级和退出行为。
 
 业务状态只由控制/采集线程修改。播放线程不切换 turn，网络回调不直接调用状态机。播放开始前，
@@ -75,12 +77,12 @@ actor 只在 `active=false` 且受 `AudioEngine` mutex 保护时复位播放重�
 - Snowboy 命中后重置 Snowboy/VAD 历史，最多等待 6 s 用户开口。
 - VAD 连续静音 700 ms 后提交；单轮语音硬上限 60 s。
 - 正常回复结束后进入 3 s 免唤醒追问。
-- 播放时先保持原音量连续确认 2 帧（40 ms）近端候选，再把播放降到 30% 并确认 2 帧
-  （40 ms）；候选持续才硬静音，等待硬参考连续 2 帧降为低电平（最多 8 帧），再等待 3 帧
-  （60 ms）清除声学尾音、重置 listener，并以连续 3 帧（60 ms）重新确认近端语音。
-  失败恢复播放并冷却 15 帧（300 ms）。只有二次确认成功才执行
-  `DropPlayback`、清空本地 TTS、向服务端发送 cancel，并把已经采集的
-  连续近端 pre-roll 作为新 utterance；参考未降低或二次确认失败时恢复播放。
+- 播放时先保持原音量连续确认 6 帧（120 ms）近端候选，再一次性静音；不使用中间音量。
+  随后最多等待 15 帧取得连续 3 帧低 reference，等待 3 帧（60 ms）清除声学尾音、重置
+  listener，并以连续 3 帧（60 ms）重新确认近端语音。只有二次确认成功才执行
+  `DropPlayback`、清空本地 TTS 和发送 cancel；cancel ACK 本身不能启动新 turn，新 turn
+  还需有效 VAD start、连续 20 帧（400 ms）低 reference，并受 500 ms 准入窗口约束。
+  参考未降低或二次确认失败时恢复播放并冷却 15 帧（300 ms）。
 - 自然播放结束不走上述主动探针：backend 先抑制 15 帧（300 ms）尾音并重置 VAD，
   follow-up 随后必须连续 20 帧（400 ms）才开始新轮。
 
@@ -104,9 +106,9 @@ Dereverberation 和 STDT，vendor AGC 关闭；`ALC31/ref1/delay0` 只是当前�
 
 ## 验证边界
 
-当前职责重排候选的交叉构建、板端加载、Rockchip 3A/Snowboy 初始化、持久 WSS 和空闲运行
-已经通过。真人
-首轮问答、3 s 追问、长回复、播放中打断、噪声误触发及断网恢复仍以目标板人工验收为准。
+当前职责候选的交叉构建、板端加载、Rockchip 3A/Snowboy 初始化、持久 WSS、真人首轮问答、
+3 s 追问、完整播放和播放中打断已经通过。受控 double-talk、量化延迟、噪声误触发和断网恢复
+仍以目标板专项验收为准。
 最新同类无人声/嘈杂环境回归为：AGC ON `n=5`，`confirmed=4/5`、`follow=5/5`、
 `attempts=119`；AGC OFF 累计 `n=10`，`confirmed=2/10`、`follow=3/10`、`attempts=43`。
 关闭 AGC 明显改善但尚未充分解决误触发；环境噪声仍是混杂因素。

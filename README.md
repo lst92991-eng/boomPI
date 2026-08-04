@@ -2,12 +2,12 @@
 
 boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客户端，本地电脑运行跨平台 Go 服务端；服务端负责连接 Qwen 新加坡区，板端不保存云端 API Key。
 
-> **语音链路的关键能力已经在第三块 RV1106 上完成组合验收，但当前候选仍不是发布版。**
+> **语音链路的关键能力已经在 RV1106 上完成组合验收，教学版功能也已合入，但当前候选仍不是量产发布版。**
 > 2026-08-03 的单参考候选已完成严格交叉构建、固定语音 A/B、板端启动、真实 Qwen 问答以及
 > 静默、完整播放、三秒追问和播放中打断四段真人验收；本次窗口未观察到自激或音频运行错误。
-> 当前候选为 17 个生产 C++ 文件、2300 ELOC；扣除
-> 439 ELOC 的 Rockchip/Snowboy vendor 集成后，
-> 产品核心为 1861 ELOC。旧版的丢帧、高延迟、`EPIPE` 和 jitter queue 记录仍作为回归风险
+> 当前候选为 19 个生产 C/C++ 文件、2500 ELOC；其中
+> Rockchip/Snowboy vendor 集成 280 ELOC，产品逻辑 2220 ELOC。屏幕/触摸、网络启动、UDP
+> 发现和 Wi-Fi 二维码配网已进入同一教学候选。旧版的丢帧、高延迟、`EPIPE` 和 jitter queue 记录仍作为回归风险
 > 保留；最终壳体 ERLE、受控 double-talk 和长期稳定性仍待量化验收。
 > 同日第一块板又完成分阶段打断 A/B：关闭打断后播放恢复流畅，快速候选完成真实 Qwen
 > 播放与多轮打断，用户确认体验可接受；主观结论、日志计数和未量化边界见
@@ -20,14 +20,14 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
               |
       RV1106 boompi-client
               |
-      目标：局域网 WSS（当前开发链路经 Windows SSH tunnel）
+      局域网 WSS（自动发现或显式地址）
               |
        boompi-server（Go）
               |
        Qwen Singapore API
 ```
 
-第一版目标包括双麦 AEC、Snowboy 英文唤醒、可打断流式 TTS、三秒连续对话、横屏表情与字幕、以太网/Wi-Fi、首次配网与本地服务端配对。SC3336 多模态、在线音乐和长期记忆不属于第一版运行链路。
+第一版目标包括双麦 AEC、Snowboy 英文唤醒、可打断流式 TTS、三秒连续对话、横屏表情与字幕、以太网/Wi-Fi、首次二维码配网和本地服务端发现。SC3336 多模态、在线音乐和长期记忆不属于第一版运行链路。
 
 详细约束以 [AGENTS.md](AGENTS.md) 为准；架构摘要见 [docs/architecture/system-overview.md](docs/architecture/system-overview.md)，音频 vendor 边界见 [音频后端契约与依赖闸门](docs/architecture/audio-backends.md)，协议设计基线见 [protocol/protocol-v1.md](protocol/protocol-v1.md)。
 
@@ -62,19 +62,23 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
   尚未形成可重复基线。
 - 最终壳体下的 AEC、波束形成、双讲、远场和最大音量表现。
 - 经 Windows SSH tunnel 的 WSS 真实 Qwen 语音闭环曾跑通，服务端已切到连续
-  `server_commit` TTS；正常局域网发现/配对、断网恢复、输入丢帧、首音延迟、播放稳定性、
-  长期运行和 A/B 回滚仍未通过。
+  `server_commit` TTS；教学版 UDP 发现、SPKI 首次保存、以太网优先和 AP 配网页已实现。
+  新服务端与真实 Qwen 的付费联调、真实 Wi-Fi 凭据关联、断网恢复、量化首音延迟和长期运行
+  仍需最终验收。
+- 当前教学候选已部署到板端并进入 `secure session ready`；UI 驱动打开时没有回退日志，进程
+  实测约 11.8 MiB RSS、5 个线程。屏幕内容、GT911 手势和手机扫描二维码仍需人工目视验收。
 
 ### 软件阶段
 
-2026-08-01 板端生产目标按仓库既定职责整理；当前为 17 个 C++ 文件、2300 ELOC，其中
-Rockchip/Snowboy vendor 集成为 439 ELOC，产品核心为 1861 ELOC：
+2026-08-03 教学候选按仓库既定职责整理；当前为 19 个生产 C/C++ 文件、2500 ELOC，其中
+Rockchip/Snowboy vendor 集成为 280 ELOC，产品逻辑为 2220 ELOC：
 `application` 是会话状态机，`audio` 是有界播放编排，`network` 是持久 WSS/TLS，
-`platform/rv1106` 是 ALSA/libswresample、Rockchip 3A、Snowboy 和 WebRTC VAD。它们直接组合
-外部库，不再保留自写 WSS、重复 wire protocol、
-通用 playback/capture 框架或未接入的 supervisor/UI/update 占位实现。精确范围、计数口径、
-回滚位置和当前验证结果见
-[语音客户端职责重排记录](docs/test/client-responsibility-layout-20260801.md)。
+`platform/rv1106` 是 ALSA/libswresample、Rockchip 3A、Snowboy 和 WebRTC VAD；同一
+`network` 目录中的启动模块负责以太网/Wi-Fi/发现，`ui` 直接驱动 ST7789P3 和 GT911。
+它们直接组合现有库，不再保留自写 WSS、重复 wire protocol、通用 playback/capture 框架或
+supervisor/update 占位实现。2026-08-01 的
+[语音客户端职责重排记录](docs/test/client-responsibility-layout-20260801.md)是纯语音阶段历史快照；
+当前整体验证见 [教学版第一版集成验证](docs/test/teaching-v1-integration-20260803.md)。
 
 Mode1 四通道相关性和历史 2 mic + 2 ref direct 3A ABI、算法 profile、启动/退出和仍未关闭的
 真人声学边界见
@@ -166,58 +170,23 @@ go vet ./...
 go build -trimpath ./cmd/boompi-server
 ```
 
-服务端第一版以前台终端程序运行，不要求安装 Windows Service。运行前应从 `server/configs/config.example.yaml` 创建本机配置，并先执行：
+服务端以前台单文件程序运行，不要求安装数据库、容器或 Windows Service。教学部署只有三步：
 
-Windows：
+1. 直接运行一次，程序在当前目录创建私有的 `config.yaml` 和 TLS 身份。
+2. 打开 `config.yaml`，只填写 `qwen_api_key: "sk-..."`。
+3. 再次运行；看到 `boomPI server started` 后即可让同一局域网内的板端自动发现。
 
-```text
-.\boompi-server.exe --check-config --config configs/config.yaml
-```
+所有非密钥字段都有可运行默认值。也可以用 `DASHSCOPE_API_KEY` 覆盖 YAML；有专属
+Workspace 时再选填 `DASHSCOPE_WORKSPACE_ID`。教学版客户端和服务端内置相同的共享设备令牌，
+只适合可信局域网；需要隔离时在两端设置同一个随机 `BOOMPI_DEVICE_TOKEN`。
 
-Linux/macOS：
+当前实现提供 `wss://<host>:17806/ws`、稳定本地 TLS 身份、UDP `17807` 自动发现、16 kHz PCM
+上行、Qwen Realtime 流式转发、24 kHz PCM/文本下行与响应取消。完整操作见
+[服务端三步启动说明](server/README.md)。不要把真实 API Key、设备令牌、`config.yaml` 或
+`state/` 提交到 Git；任何曾出现在聊天或公开日志中的 Key 都应在控制台吊销并重新生成。
 
-```text
-./boompi-server --check-config --config configs/config.yaml
-```
-
-配置检查通过后，直接以前台进程启动最小服务端：
-
-```powershell
-# Windows
-.\boompi-server.exe --config configs/config.yaml
-```
-
-```bash
-# Linux/macOS
-./boompi-server --config configs/config.yaml
-```
-
-当前实现提供单设备 `wss://<host>:17806/ws`、稳定本地 TLS 身份、16 kHz PCM 上行、Qwen Realtime 流式转发、24 kHz PCM/文本下行与响应取消。开发阶段要求客户端在 `hello.payload.device_token` 中提交一个环境变量注入的共享令牌；服务端会在打开付费 provider 会话之前验证它。受控 reverse-tunnel 下的持久 WSS、真全双工、自动重连和板端语音状态机已接通；UDP 发现、六位码配对、每设备独立 Token、最终声学验收和完整生产信任链仍是后续工作。
-
-Qwen 凭据只能通过当前进程环境提供：
-
-- `DASHSCOPE_API_KEY`
-- `DASHSCOPE_WORKSPACE_ID`
-
-开发设备令牌同样只能通过当前进程环境提供：
-
-- `BOOMPI_DEVICE_TOKEN`：32–256 字节、不得包含空白；第一版客户端与服务端配置相同的随机值
-
-可在 PowerShell 中生成并配置当前终端的临时令牌：
-
-```powershell
-[byte[]]$tokenBytes = New-Object byte[] 32
-$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-$rng.GetBytes($tokenBytes)
-$rng.Dispose()
-$env:BOOMPI_DEVICE_TOKEN = [Convert]::ToBase64String($tokenBytes)
-```
-
-Linux/macOS 可使用 `export BOOMPI_DEVICE_TOKEN="$(openssl rand -base64 32)"`。这只是首次配对功能落地前的开发保护，不应让多个部署共用同一令牌。
-
-不要把 API Key 或设备令牌的真实值写进 YAML、`.env`、命令示例、日志、截图或 Git。任何曾出现在聊天或日志中的 Key 都应在控制台吊销并重新生成。默认 provider 使用新加坡区 `qwen3.5-omni-plus-realtime`，接入时仍必须重新核对官方 endpoint、事件和音频格式。
-
-需要显式验证真实 Qwen 凭据和 WebSocket 握手时，在已导出上述变量的同一终端进入 `server/`，执行：
+需要显式验证真实 Qwen 凭据和 WebSocket 握手时，在已设置 `DASHSCOPE_API_KEY` 的终端进入
+`server/`，执行：
 
 ```text
 BOOMPI_QWEN_LIVE_TEST=1 go test -count=1 -run '^TestLiveOpenSession$' ./internal/backend/qwen
@@ -329,7 +298,8 @@ raw MPI 对照使用独立的
 
 ## 协议与隐私
 
-- 板端和本地服务端最终使用 WSS；UDP 发现包本身不可信，必须经过六位码配对和 SPKI 固定。
+- 板端和本地服务端使用 WSS；教学版 UDP 发现包只给出端口和 SPKI，首次连接采用 TOFU 保存
+  SPKI，只适用于可信局域网。
 - 音频采用二进制帧，控制事件采用 JSON；C++ 和 Go 必须读取同一份 [golden fixture](protocol/fixtures/protocol-v1-golden.json)。
 - 断线或取消时丢弃当前 turn，不重传过期实时语音。
 - 默认不保存原始录音、播放参考或完整对话文本，不自动上传遥测或崩溃信息。
@@ -337,17 +307,16 @@ raw MPI 对照使用独立的
 
 ## 路线图
 
-1. **P0 可行性闸门（进行中）**：direct ALSA Mode1 四通道全双工、capture/reference layout
-   和历史 2 mic + 2 ref direct Rockchip 3A 板端调用已通过；现行生产改用 2 mic + refL，继续关闭
-   raw rk_mpi、真人 double-talk、
-   最终壳体声学、长期实时率，以及 Wi-Fi AP/UI backend 探测。
+1. **P0 可行性闸门（主体完成）**：direct ALSA Mode1 四通道全双工、capture/reference layout
+   和历史 2 mic + 2 ref direct Rockchip 3A 板端调用已通过；现行生产改用 2 mic + refL。raw
+   rk_mpi、真人 double-talk、最终壳体声学和长期实时率仍是独立验收项。
 2. **P1 工程骨架（已完成）**：CMake/Go 目录、配置、日志、事件、共享协议 fixture 和基础 CI。
 3. **P2 本地音频（进行中）**：只保留已进入真实客户端或直接支撑 HIL 的音频代码；以
    vendor raw PCM 最小闭环和板端实测为边界，不预建通用 worker/control 层。
-4. **P3 服务端**：discovery、pairing、Qwen adapter、Session Actor 和 ToolRegistry。
-5. **P4 端到端对话**：流式文字/音频、取消、上下文、断网和延迟测量。
-6. **P5 UI 与配网**：表情、字幕、触摸、二维码和网络优先级。
-7. **P6 产品化**：supervisor、局域网签名 A/B 应用更新、回滚与完整 HIL。
+4. **P3 服务端（教学版完成）**：首启配置、UDP discovery、Qwen adapter 和会话状态。
+5. **P4 端到端对话（主链完成）**：流式文字/音频、取消、上下文和自动重连；断网与延迟量化待验收。
+6. **P5 UI 与配网（实现完成）**：表情、字幕、触摸、二维码和网络优先级；真实 Wi-Fi/目视验收待完成。
+7. **P6 产品化（后置）**：supervisor、签名 A/B 应用更新和量产级配对不阻断教学版。
 8. **P7 后续能力**：SC3336、多模态、音乐和其他 provider。
 
 仓库许可证尚未确定。不要擅自添加许可证声明，也不要提交 Snowboy、Rockchip 或其他第三方二进制，除非来源、版本、校验和与再分发许可均已确认。

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const validTestDeviceToken = "0123456789abcdef0123456789abcdef"
@@ -15,10 +16,36 @@ func TestDefaultsUseSingapore(t *testing.T) {
 	if cfg.Region != "singapore" {
 		t.Fatalf("Region = %q, want singapore", cfg.Region)
 	}
+	if cfg.ConversationMode != "intelligence" || cfg.TTSVoice != "Cherry" {
+		t.Fatalf("teaching defaults = mode %q, TTS voice %q", cfg.ConversationMode, cfg.TTSVoice)
+	}
+	if cfg.HeartbeatInterval != 10*time.Second || cfg.ConnectionTimeout != 30*time.Second ||
+		cfg.FirstResponseTimeout != 30*time.Second {
+		t.Fatalf("teaching timeouts = heartbeat %s, connection %s, first response %s",
+			cfg.HeartbeatInterval, cfg.ConnectionTimeout, cfg.FirstResponseTimeout)
+	}
+}
+
+func TestLoadNeedsOnlyYAMLAPIKey(t *testing.T) {
+	t.Setenv("DASHSCOPE_API_KEY", "")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "")
+	setValidDeviceToken(t)
+	path := writeConfig(t, "qwen_api_key: yaml-secret\n")
+
+	cfg, err := Load(path, nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Credentials.APIKey() != "yaml-secret" || cfg.Credentials.Source() != "config.yaml" {
+		t.Fatalf("YAML credential source = %q", cfg.Credentials.Source())
+	}
+	if cfg.Credentials.WorkspaceID() != "" {
+		t.Fatalf("workspace ID = %q, want optional empty value", cfg.Credentials.WorkspaceID())
+	}
 }
 
 func TestLoadExampleAndEnvironmentCredential(t *testing.T) {
-	setValidDeviceToken(t)
+	t.Setenv("BOOMPI_DEVICE_TOKEN", "")
 	t.Setenv("DASHSCOPE_API_KEY", "dashscope-secret")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "workspace-1")
 
@@ -35,8 +62,8 @@ func TestLoadExampleAndEnvironmentCredential(t *testing.T) {
 	if cfg.Credentials.WorkspaceID() != "workspace-1" {
 		t.Fatalf("workspace ID = %q", cfg.Credentials.WorkspaceID())
 	}
-	if cfg.DeviceToken.Value() != validTestDeviceToken {
-		t.Fatal("device token was not loaded from BOOMPI_DEVICE_TOKEN")
+	if cfg.DeviceToken.Value() != "boompi-teaching-shared-token-v1-2026" {
+		t.Fatal("example device token does not match the teaching client default")
 	}
 	if cfg.ConversationMode != "intelligence" || cfg.ASRModel != "qwen3-asr-flash" ||
 		cfg.ReasoningModel != "qwen3.6-flash" || cfg.ReasoningEffort != "none" ||
@@ -44,8 +71,11 @@ func TestLoadExampleAndEnvironmentCredential(t *testing.T) {
 		t.Fatalf("intelligence pipeline config = mode %q, ASR %q, reasoning %q, TTS %q",
 			cfg.ConversationMode, cfg.ASRModel, cfg.ReasoningModel, cfg.TTSModel)
 	}
+	if cfg.FirstResponseTimeout != 30*time.Second {
+		t.Fatalf("example first response timeout = %s, want 30s", cfg.FirstResponseTimeout)
+	}
 	formatted := fmt.Sprintf("%+v", cfg)
-	if strings.Contains(formatted, "dashscope-secret") || strings.Contains(formatted, validTestDeviceToken) {
+	if strings.Contains(formatted, "dashscope-secret") || strings.Contains(formatted, "boompi-teaching-shared-token-v1-2026") {
 		t.Fatal("formatted configuration leaked a credential")
 	}
 }
@@ -56,7 +86,7 @@ func TestLoadRejectsSecretAndUnknownYAMLKeys(t *testing.T) {
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
 	for _, content := range []string{
 		"api_key: do-not-store-this\n",
-		"device_token: do-not-store-this\n",
+		"dashscope_api_key: do-not-store-this\n",
 		"unexpected_option: true\n",
 	} {
 		path := writeConfig(t, content)
@@ -67,6 +97,16 @@ func TestLoadRejectsSecretAndUnknownYAMLKeys(t *testing.T) {
 		if strings.Contains(err.Error(), "do-not-store-this") || strings.Contains(err.Error(), "environment-secret") {
 			t.Fatalf("error leaked a secret: %v", err)
 		}
+	}
+}
+
+func TestLoadRejectsServerSideFirstResponseWarning(t *testing.T) {
+	setValidDeviceToken(t)
+	t.Setenv("DASHSCOPE_API_KEY", "environment-secret")
+	path := writeConfig(t, "first_response_warning: 15s\n")
+
+	if _, err := Load(path, nil); err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("server-side first response warning error = %v", err)
 	}
 }
 
@@ -120,13 +160,16 @@ func TestLoadRequiresEnvironmentCredential(t *testing.T) {
 	}
 }
 
-func TestLoadRequiresWorkspaceID(t *testing.T) {
+func TestLoadAllowsMissingWorkspaceID(t *testing.T) {
 	setValidDeviceToken(t)
 	t.Setenv("DASHSCOPE_API_KEY", "test-secret")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "")
-	_, err := Load("", nil)
-	if err == nil || !strings.Contains(err.Error(), "DASHSCOPE_WORKSPACE_ID") {
-		t.Fatalf("missing workspace ID error = %v", err)
+	cfg, err := Load("", nil)
+	if err != nil {
+		t.Fatalf("missing optional workspace ID error = %v", err)
+	}
+	if cfg.Credentials.WorkspaceID() != "" {
+		t.Fatalf("workspace ID = %q, want empty", cfg.Credentials.WorkspaceID())
 	}
 }
 
@@ -254,6 +297,36 @@ func TestValidateRejectsUnsupportedRegion(t *testing.T) {
 	cfg.DeviceToken = DeviceToken{value: validTestDeviceToken}
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "china-beijing or singapore") {
 		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestValidateKeepsHeartbeatWithinClientTimeout(t *testing.T) {
+	valid := Defaults()
+	valid.Credentials = Credentials{apiKey: "test-secret"}
+	valid.DeviceToken = DeviceToken{value: validTestDeviceToken}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("default heartbeat validation error = %v", err)
+	}
+
+	for name, mutate := range map[string]func(*Config){
+		"heartbeat-over-ten-seconds": func(cfg *Config) {
+			cfg.HeartbeatInterval = maxHeartbeatInterval + time.Millisecond
+		},
+		"connection-over-client-timeout": func(cfg *Config) {
+			cfg.ConnectionTimeout = 30*time.Second + time.Millisecond
+		},
+		"connection-under-three-heartbeats": func(cfg *Config) {
+			cfg.HeartbeatInterval = 5 * time.Second
+			cfg.ConnectionTimeout = 15*time.Second - time.Millisecond
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := valid
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("Validate() unexpectedly accepted a server timeout that exceeds the client contract")
+			}
+		})
 	}
 }
 

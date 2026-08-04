@@ -76,6 +76,9 @@ func openRealtimeASRAt(ctx context.Context, config Config, endpoint string) (*as
 	header := make(http.Header)
 	header.Set("Authorization", "Bearer "+config.APIKey)
 	header.Set("OpenAI-Beta", "realtime=v1")
+	if strings.TrimSpace(config.WorkspaceID) != "" {
+		header.Set("X-DashScope-WorkSpace", config.WorkspaceID)
+	}
 	connection, response, err := dialer.DialContext(connectCtx, endpoint, header)
 	if response != nil && response.Body != nil {
 		response.Body.Close()
@@ -124,6 +127,14 @@ func openRealtimeASRAt(ctx context.Context, config Config, endpoint string) (*as
 }
 
 func (c Config) asrRealtimeURL() string {
+	if strings.TrimSpace(c.WorkspaceID) == "" {
+		domain := "dashscope.aliyuncs.com"
+		if c.Region == RegionSingapore {
+			domain = "dashscope-intl.aliyuncs.com"
+		}
+		return fmt.Sprintf("wss://%s/api-ws/v1/realtime?model=%s",
+			domain, url.QueryEscape(realtimeASRModelName))
+	}
 	domain := "cn-beijing.maas.aliyuncs.com"
 	if c.Region == RegionSingapore {
 		domain = "ap-southeast-1.maas.aliyuncs.com"

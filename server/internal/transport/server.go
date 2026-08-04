@@ -19,6 +19,8 @@ const (
 	defaultPath          = "/ws"
 	defaultPingInterval  = 10 * time.Second
 	defaultPongTimeout   = 30 * time.Second
+	maxPingInterval      = 10 * time.Second
+	maxPongTimeout       = 30 * time.Second
 	writeTimeout         = 5 * time.Second
 	sendQueueCapacity    = 32
 	receiveQueueCapacity = 32
@@ -150,11 +152,11 @@ func normalizeConfig(config Config) (Config, error) {
 	if config.PongTimeout == 0 {
 		config.PongTimeout = defaultPongTimeout
 	}
-	if config.PingInterval < time.Second || config.PingInterval >= config.PongTimeout {
-		return Config{}, errors.New("ping interval must be at least 1s and shorter than pong timeout")
+	if config.PingInterval < time.Second || config.PingInterval > maxPingInterval {
+		return Config{}, errors.New("ping interval must be between 1s and 10s")
 	}
-	if config.PongTimeout < 2*time.Second || config.PongTimeout > 5*time.Minute {
-		return Config{}, errors.New("pong timeout must be between 2s and 5m")
+	if config.PongTimeout < 3*config.PingInterval || config.PongTimeout > maxPongTimeout {
+		return Config{}, errors.New("pong timeout must cover at least three ping intervals and be at most 30s")
 	}
 	return config, nil
 }

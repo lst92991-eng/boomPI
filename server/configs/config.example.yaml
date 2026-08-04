@@ -1,12 +1,12 @@
-# boomPI server configuration.
-# Copy this file to config.yaml and edit only non-secret settings.
-# API credentials are read only from the environment:
-#   DASHSCOPE_API_KEY
-#   DASHSCOPE_WORKSPACE_ID
-# The temporary development device token is also environment-only:
-#   BOOMPI_DEVICE_TOKEN (32..256 bytes, no whitespace)
-# P1 accepts flat key/value scalars only; nested YAML is rejected deliberately.
-# Quote free-form text when it contains YAML comment syntax.
+# boomPI 教学版服务端完整配置示例。
+# 正常使用无需复制本文件：直接运行 boompi-server 会生成最小 config.yaml。
+# 最小配置只需替换 qwen_api_key；环境变量 DASHSCOPE_API_KEY 的优先级更高。
+# DASHSCOPE_WORKSPACE_ID 和 BOOMPI_DEVICE_TOKEN 都是可选环境覆盖。
+
+qwen_api_key: "replace-with-your-qwen-api-key"
+# 教学局域网默认令牌与客户端默认值一致；复制本文件时只填 key 即可运行。
+device_token: "boompi-teaching-shared-token-v1-2026"
+# 正式部署时应同时替换服务端与客户端令牌。
 
 listen_address: "0.0.0.0"
 wss_port: 17806
@@ -27,10 +27,9 @@ search_mode: "off"
 system_prompt: "You are boomPI, a concise and helpful voice assistant. Reply in Simplified Chinese unless the user asks for another language."
 persona: "Natural, young, friendly, and not overly cute."
 
-heartbeat_interval: "10s"
-connection_timeout: "30s"
-first_response_warning: "15s"
-first_response_timeout: "2m"
+heartbeat_interval: "10s" # 板端 30s 心跳超时；服务端只接受 1s..10s。
+connection_timeout: "30s" # 至少覆盖三个心跳周期，且不超过 30s。
+first_response_timeout: "30s"
 session_idle_timeout: "30m"
 max_turns: 20
 max_context_tokens: 24000

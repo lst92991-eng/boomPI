@@ -26,6 +26,16 @@ func TestRegionalEndpoint(t *testing.T) {
 	if _, err := RegionalEndpoint("unknown", "ws-test_123"); err == nil {
 		t.Fatal("RegionalEndpoint() accepted an unsupported region")
 	}
+	publicTests := map[string]string{
+		RegionChinaBeijing: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+		RegionSingapore:    "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime",
+	}
+	for region, want := range publicTests {
+		got, err := RegionalEndpoint(region, "")
+		if err != nil || got != want {
+			t.Errorf("RegionalEndpoint(%q, empty) = %q, %v; want %q", region, got, err, want)
+		}
+	}
 }
 
 func TestConfigValidateRejectsInsecureRemoteEndpoint(t *testing.T) {

@@ -103,6 +103,48 @@ func TestServerRequiresTLSConfiguration(t *testing.T) {
 	}
 }
 
+func TestServerHeartbeatContractMatchesTeachingClient(t *testing.T) {
+	base := Config{TLSConfig: &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return nil, errors.New("test certificate")
+		},
+	}}
+	normalized, err := normalizeConfig(base)
+	if err != nil {
+		t.Fatalf("normalizeConfig(defaults) error = %v", err)
+	}
+	if normalized.PingInterval != 10*time.Second || normalized.PongTimeout != 30*time.Second {
+		t.Fatalf("heartbeat defaults = %s/%s, want 10s/30s",
+			normalized.PingInterval, normalized.PongTimeout)
+	}
+
+	for name, timing := range map[string]struct {
+		ping time.Duration
+		pong time.Duration
+	}{
+		"ping-over-client-contract":       {ping: 10*time.Second + time.Nanosecond, pong: 30 * time.Second},
+		"pong-over-client-contract":       {ping: 10 * time.Second, pong: 30*time.Second + time.Nanosecond},
+		"pong-under-three-ping-intervals": {ping: 10 * time.Second, pong: 30*time.Second - time.Nanosecond},
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := base
+			config.PingInterval = timing.ping
+			config.PongTimeout = timing.pong
+			if _, err := normalizeConfig(config); err == nil {
+				t.Fatal("normalizeConfig() unexpectedly accepted an incompatible heartbeat contract")
+			}
+		})
+	}
+
+	compatible := base
+	compatible.PingInterval = 9 * time.Second
+	compatible.PongTimeout = 27 * time.Second
+	if _, err := normalizeConfig(compatible); err != nil {
+		t.Fatalf("normalizeConfig(9s/27s) error = %v", err)
+	}
+}
+
 func TestServerRejectsPlaintextUpgrade(t *testing.T) {
 	server := newTestTransportServer(t, newReceiveHandler())
 	plainServer := httptest.NewServer(httpHandler(server))
@@ -293,7 +335,7 @@ func TestConnectionSendsControlAndPCMThroughWriter(t *testing.T) {
 	}
 }
 
-func TestUnsolicitedPongsSuppressPingsAndThenTimeout(t *testing.T) {
+func TestPongsKeepConnectionAliveWithoutSuppressingServerPings(t *testing.T) {
 	handler := &connectionLifetimeHandler{
 		connected: make(chan *Connection, 1),
 		done:      make(chan error, 1),
@@ -341,8 +383,9 @@ func TestUnsolicitedPongsSuppressPingsAndThenTimeout(t *testing.T) {
 	}
 
 keptAlivePastTimeout:
-	if got := pingCount.Load(); got != 0 {
-		t.Fatalf("server Ping count while unsolicited Pongs were active = %d, want 0", got)
+	pingsWhileAlive := pingCount.Load()
+	if pingsWhileAlive < 2 || pingsWhileAlive > 5 {
+		t.Fatalf("server Ping count while Pongs were active = %d, want 2..5", pingsWhileAlive)
 	}
 
 	select {
@@ -353,9 +396,8 @@ keptAlivePastTimeout:
 	case <-time.After(testPongTimeout + time.Second):
 		t.Fatal("connection did not time out after unsolicited Pongs stopped")
 	}
-	maxPingsAfterStop := int32((testPongTimeout + testPingInterval - 1) / testPingInterval)
-	if got := pingCount.Load(); got == 0 || got > maxPingsAfterStop {
-		t.Fatalf("server Ping count after unsolicited Pongs stopped = %d, want 1..%d", got, maxPingsAfterStop)
+	if got := pingCount.Load(); got <= pingsWhileAlive {
+		t.Fatalf("server Pings stopped with peer Pongs: before=%d after=%d", pingsWhileAlive, got)
 	}
 	select {
 	case <-readDone:

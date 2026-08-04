@@ -42,6 +42,7 @@ func TestCppManualSingleTurnExternalHILServer(t *testing.T) {
 	}
 	cfg.ListenAddress = "0.0.0.0"
 	cfg.WSSPort = freePort(t)
+	cfg.DiscoveryPort = freeUDPPort(t)
 
 	provider := newManualSingleTurnHILBackend()
 	if got := len(provider.session.tonePCM); got != manualSingleTurnHILSampleCount*2 {

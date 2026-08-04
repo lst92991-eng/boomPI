@@ -46,10 +46,8 @@ type Connection struct {
 	sendQueue    chan outboundMessage
 	controlQueue chan outboundMessage
 
-	lastPongMu sync.Mutex
-	lastPongAt time.Time
-	closeOnce  sync.Once
-	waitGroup  sync.WaitGroup
+	closeOnce sync.Once
+	waitGroup sync.WaitGroup
 }
 
 func newConnection(parent context.Context, webSocket *websocket.Conn, config Config) (*Connection, error) {
@@ -158,14 +156,7 @@ func (connection *Connection) configureReadSide() error {
 		return fmt.Errorf("set initial WebSocket read deadline: %w", err)
 	}
 	connection.webSocket.SetPongHandler(func(string) error {
-		now := time.Now()
-		if err := connection.webSocket.SetReadDeadline(now.Add(connection.config.PongTimeout)); err != nil {
-			return err
-		}
-		connection.lastPongMu.Lock()
-		connection.lastPongAt = now
-		connection.lastPongMu.Unlock()
-		return nil
+		return connection.webSocket.SetReadDeadline(time.Now().Add(connection.config.PongTimeout))
 	})
 	connection.webSocket.SetPingHandler(func(data string) error {
 		message := outboundMessage{messageType: websocket.PongMessage, data: []byte(data)}
@@ -258,6 +249,17 @@ func (connection *Connection) writePump() {
 			}
 		default:
 		}
+		// A continuously ready PCM queue must not delay the heartbeat. Once the
+		// ticker is pending, send its Ping before selecting normal data again.
+		select {
+		case <-ticker.C:
+			if err := connection.write(outboundMessage{messageType: websocket.PingMessage}); err != nil {
+				connection.cancel(err)
+				return
+			}
+			continue
+		default:
+		}
 
 		select {
 		case <-connection.ctx.Done():
@@ -274,23 +276,13 @@ func (connection *Connection) writePump() {
 				connection.cancel(err)
 				return
 			}
-		case now := <-ticker.C:
-			if connection.receivedRecentPong(now) {
-				continue
-			}
+		case <-ticker.C:
 			if err := connection.write(outboundMessage{messageType: websocket.PingMessage}); err != nil {
 				connection.cancel(err)
 				return
 			}
 		}
 	}
-}
-
-func (connection *Connection) receivedRecentPong(now time.Time) bool {
-	connection.lastPongMu.Lock()
-	lastPongAt := connection.lastPongAt
-	connection.lastPongMu.Unlock()
-	return !lastPongAt.IsZero() && now.Sub(lastPongAt) <= connection.config.PingInterval
 }
 
 func (connection *Connection) write(message outboundMessage) error {

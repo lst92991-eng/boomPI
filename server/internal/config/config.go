@@ -15,6 +15,10 @@ import (
 
 const maxConfigBytes = 64 * 1024
 
+const APIKeyPlaceholder = "replace-with-your-qwen-api-key"
+
+const maxHeartbeatInterval = 10 * time.Second
+
 var configKeys = []string{
 	"listen_address",
 	"wss_port",
@@ -35,13 +39,14 @@ var configKeys = []string{
 	"persona",
 	"heartbeat_interval",
 	"connection_timeout",
-	"first_response_warning",
 	"first_response_timeout",
 	"session_idle_timeout",
 	"max_turns",
 	"max_context_tokens",
 	"pairing_code_ttl",
 	"pairing_max_attempts",
+	"qwen_api_key",
+	"device_token",
 }
 
 type Overrides map[string]string
@@ -92,7 +97,6 @@ type Config struct {
 	Persona              string
 	HeartbeatInterval    time.Duration
 	ConnectionTimeout    time.Duration
-	FirstResponseWarning time.Duration
 	FirstResponseTimeout time.Duration
 	SessionIdleTimeout   time.Duration
 	MaxTurns             int
@@ -111,20 +115,19 @@ func Defaults() Config {
 		LogLevel:             "info",
 		Provider:             "qwen",
 		Region:               "singapore",
-		ConversationMode:     "realtime",
+		ConversationMode:     "intelligence",
 		Model:                "qwen3.5-omni-plus-realtime",
 		ASRModel:             "qwen3-asr-flash",
 		ReasoningModel:       "qwen3.6-flash",
 		ReasoningEffort:      "none",
 		TTSModel:             "qwen3-tts-flash-realtime",
-		TTSVoice:             "Ethan",
+		TTSVoice:             "Cherry",
 		Voice:                "Ethan",
 		SearchMode:           "off",
 		SystemPrompt:         "You are boomPI, a concise and helpful voice assistant. Reply in Simplified Chinese unless the user asks for another language.",
 		Persona:              "Natural, young, friendly, and not overly cute.",
 		HeartbeatInterval:    10 * time.Second,
 		ConnectionTimeout:    30 * time.Second,
-		FirstResponseWarning: 15 * time.Second,
 		FirstResponseTimeout: 30 * time.Second,
 		SessionIdleTimeout:   30 * time.Minute,
 		MaxTurns:             20,
@@ -154,9 +157,9 @@ func Load(path string, cli Overrides) (Config, error) {
 		return Config{}, err
 	}
 
-	apiKey, source := lookupAPIKey(os.LookupEnv)
+	apiKey, source := lookupAPIKey(os.LookupEnv, cfg.Credentials.apiKey, cfg.Credentials.source)
 	if apiKey == "" {
-		return Config{}, errors.New("missing API credential: set DASHSCOPE_API_KEY")
+		return Config{}, errors.New("missing Qwen API key: edit qwen_api_key in config.yaml or set DASHSCOPE_API_KEY")
 	}
 	workspaceID, _ := os.LookupEnv("DASHSCOPE_WORKSPACE_ID")
 	cfg.Credentials = Credentials{
@@ -164,11 +167,9 @@ func Load(path string, cli Overrides) (Config, error) {
 		source:      source,
 		workspaceID: strings.TrimSpace(workspaceID),
 	}
-	deviceToken, ok := os.LookupEnv("BOOMPI_DEVICE_TOKEN")
-	if !ok || strings.TrimSpace(deviceToken) == "" {
-		return Config{}, errors.New("missing device credential: set BOOMPI_DEVICE_TOKEN")
+	if deviceToken, ok := os.LookupEnv("BOOMPI_DEVICE_TOKEN"); ok && strings.TrimSpace(deviceToken) != "" {
+		cfg.DeviceToken = DeviceToken{value: deviceToken}
 	}
-	cfg.DeviceToken = DeviceToken{value: deviceToken}
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -178,6 +179,9 @@ func Load(path string, cli Overrides) (Config, error) {
 
 func applyEnvironment(cfg *Config, lookup func(string) (string, bool)) error {
 	for _, key := range configKeys {
+		if isSecretConfigKey(key) {
+			continue
+		}
 		environmentKey := "BOOMPI_" + strings.ToUpper(key)
 		if value, ok := lookup(environmentKey); ok {
 			if err := applyValue(cfg, key, value); err != nil {
@@ -190,6 +194,9 @@ func applyEnvironment(cfg *Config, lookup func(string) (string, bool)) error {
 
 func applyOverrides(cfg *Config, overrides Overrides) error {
 	for key, value := range overrides {
+		if isSecretConfigKey(key) {
+			return fmt.Errorf("CLI override %q is not supported", key)
+		}
 		if !isKnownConfigKey(key) {
 			return fmt.Errorf("CLI override %q is not supported", key)
 		}
@@ -200,11 +207,11 @@ func applyOverrides(cfg *Config, overrides Overrides) error {
 	return nil
 }
 
-func lookupAPIKey(lookup func(string) (string, bool)) (string, string) {
+func lookupAPIKey(lookup func(string) (string, bool), fallback, fallbackSource string) (string, string) {
 	if value, ok := lookup("DASHSCOPE_API_KEY"); ok && strings.TrimSpace(value) != "" {
 		return strings.TrimSpace(value), "DASHSCOPE_API_KEY"
 	}
-	return "", ""
+	return strings.TrimSpace(fallback), fallbackSource
 }
 
 func (c Config) Validate() error {
@@ -264,17 +271,18 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.Persona) == "" || len(c.Persona) > 2048 {
 		return errors.New("persona must contain 1..2048 characters")
 	}
-	if c.HeartbeatInterval < time.Second || c.HeartbeatInterval > 5*time.Minute {
-		return errors.New("heartbeat_interval must be between 1s and 5m")
+	// The teaching client declares the server unavailable after 30 seconds
+	// without an inbound heartbeat. Keep at least three heartbeat opportunities
+	// in that window, and retire a half-open server connection no later than the
+	// client so its single-device slot is available to the reconnect.
+	if c.HeartbeatInterval < time.Second || c.HeartbeatInterval > maxHeartbeatInterval {
+		return errors.New("heartbeat_interval must be between 1s and 10s")
 	}
-	if c.ConnectionTimeout <= c.HeartbeatInterval || c.ConnectionTimeout > 15*time.Minute {
-		return errors.New("connection_timeout must exceed heartbeat_interval and be at most 15m")
+	if c.ConnectionTimeout < 3*c.HeartbeatInterval || c.ConnectionTimeout > 30*time.Second {
+		return errors.New("connection_timeout must cover at least three heartbeat intervals and be at most 30s")
 	}
-	if c.FirstResponseWarning < time.Second || c.FirstResponseWarning >= c.FirstResponseTimeout {
-		return errors.New("first_response_warning must be at least 1s and less than first_response_timeout")
-	}
-	if c.FirstResponseTimeout > 5*time.Minute {
-		return errors.New("first_response_timeout must be at most 5m")
+	if c.FirstResponseTimeout < time.Second || c.FirstResponseTimeout > 5*time.Minute {
+		return errors.New("first_response_timeout must be between 1s and 5m")
 	}
 	if c.SessionIdleTimeout < time.Minute || c.SessionIdleTimeout > 24*time.Hour {
 		return errors.New("session_idle_timeout must be between 1m and 24h")
@@ -291,11 +299,12 @@ func (c Config) Validate() error {
 	if c.PairingMaxAttempts < 1 || c.PairingMaxAttempts > 10 {
 		return errors.New("pairing_max_attempts must be between 1 and 10")
 	}
-	if strings.TrimSpace(c.Credentials.apiKey) == "" {
-		return errors.New("API credential is required")
+	apiKey := strings.TrimSpace(c.Credentials.apiKey)
+	if apiKey == "" || apiKey == APIKeyPlaceholder {
+		return errors.New("Qwen API key is missing: edit qwen_api_key in config.yaml or set DASHSCOPE_API_KEY")
 	}
-	if strings.TrimSpace(c.Credentials.workspaceID) == "" {
-		return errors.New("DASHSCOPE_WORKSPACE_ID is required for the selected Qwen region")
+	if workspaceID := strings.TrimSpace(c.Credentials.workspaceID); strings.ContainsAny(workspaceID, "/?#@") {
+		return errors.New("DASHSCOPE_WORKSPACE_ID contains invalid characters")
 	}
 	trimmedDeviceToken := strings.TrimSpace(c.DeviceToken.value)
 	if len([]byte(trimmedDeviceToken)) < 32 || len([]byte(trimmedDeviceToken)) > 256 {
@@ -506,12 +515,6 @@ func applyValue(cfg *Config, key, value string) error {
 			return err
 		}
 		cfg.ConnectionTimeout = parsed
-	case "first_response_warning":
-		parsed, err := parseDuration()
-		if err != nil {
-			return err
-		}
-		cfg.FirstResponseWarning = parsed
 	case "first_response_timeout":
 		parsed, err := parseDuration()
 		if err != nil {
@@ -548,12 +551,21 @@ func applyValue(cfg *Config, key, value string) error {
 			return err
 		}
 		cfg.PairingMaxAttempts = parsed
-	case "api_key", "dashscope_api_key", "workspace_id", "device_token":
-		return errors.New("secrets and workspace identifiers must come from environment variables")
+	case "qwen_api_key":
+		cfg.Credentials.apiKey = value
+		cfg.Credentials.source = "config.yaml"
+	case "device_token":
+		cfg.DeviceToken.value = value
+	case "api_key", "dashscope_api_key", "workspace_id":
+		return errors.New("use qwen_api_key or the documented environment variable")
 	default:
 		return errors.New("unknown configuration key")
 	}
 	return nil
+}
+
+func isSecretConfigKey(key string) bool {
+	return key == "qwen_api_key" || key == "device_token"
 }
 
 func validatePort(name string, value int) error {

@@ -1088,11 +1088,10 @@ extern "C" const char* boompi_fake_contract_error();
 
 int main() {
   using boompi::platform::rv1106::RockchipVoiceDsp;
-  using boompi::platform::rv1106::RockchipVoiceDspStatus;
   using boompi::platform::rv1106::RockchipVoiceFrame16k;
 
   RockchipVoiceDsp dsp;
-  if (dsp.Open() != RockchipVoiceDspStatus::kOk) {
+  if (!dsp.Open()) {
     std::fprintf(stderr, "production adapter open failed: %s\\n",
                  boompi_fake_contract_error());
     return 1;
@@ -1110,9 +1109,8 @@ int main() {
     reference_right[sample] = static_cast<short>(4000 + sample);
   }
 
-  const auto status = dsp.Process(mic_left, mic_right, reference_left,
-                                  reference_right, &output);
-  if (status != RockchipVoiceDspStatus::kOk) {
+  if (!dsp.Process(mic_left, mic_right, reference_left,
+                   reference_right, &output)) {
     std::fprintf(stderr, "production adapter process failed: %s\\n",
                  boompi_fake_contract_error());
     return 2;

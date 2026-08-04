@@ -38,7 +38,10 @@ const (
 	helloAuthenticationTimeout = 5 * time.Second
 )
 
-var errDeviceAuthentication = errors.New("device authentication failed")
+var (
+	errDeviceAuthentication     = errors.New("device authentication failed")
+	errDeviceSessionIdleTimeout = errors.New("device session idle timeout")
+)
 
 type deviceHandler struct {
 	cfg      config.Config
@@ -184,14 +187,21 @@ func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connec
 	workerCtx, stopWorker := context.WithCancelCause(ctx)
 	sessionCtx = workerCtx
 	workerDone := make(chan error, 1)
+	activity := make(chan struct{}, 1)
+	idleDone := make(chan struct{})
 	go func() {
-		err := h.forwardEvents(workerCtx, connection, actor, state)
+		defer close(idleDone)
+		watchDeviceSessionIdle(workerCtx, h.cfg.SessionIdleTimeout, activity, stopWorker)
+	}()
+	go func() {
+		err := h.forwardEvents(workerCtx, connection, actor, state, activity)
 		workerDone <- err
 		stopWorker(err)
 	}()
 	defer func() {
 		stopWorker(context.Canceled)
 		<-workerDone
+		<-idleDone
 	}()
 
 	for {
@@ -199,6 +209,7 @@ func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connec
 		if receiveErr != nil {
 			return receiveErr
 		}
+		signalDeviceSessionActivity(activity)
 		if message.Control != nil {
 			if err := h.handleControl(workerCtx, connection, actor, state, *message.Control); err != nil {
 				_ = sendProtocolError(workerCtx, connection, state, err)
@@ -227,6 +238,9 @@ func deviceSessionErrorCode(ctx context.Context, result error) (string, bool) {
 		errors.Is(errorToClassify, io.EOF) {
 		return "", false
 	}
+	if errors.Is(errorToClassify, errDeviceSessionIdleTimeout) {
+		return "session_idle_timeout", true
+	}
 	var closeError *websocket.CloseError
 	if errors.As(errorToClassify, &closeError) {
 		if closeError.Code == websocket.CloseNormalClosure ||
@@ -246,6 +260,31 @@ func deviceSessionErrorCode(ctx context.Context, result error) (string, bool) {
 		return "network_error", true
 	}
 	return "session_error", true
+}
+
+func signalDeviceSessionActivity(activity chan<- struct{}) {
+	// Ping/pong is consumed inside transport and never reaches this business
+	// activity channel.
+	select {
+	case activity <- struct{}{}:
+	default:
+	}
+}
+
+func watchDeviceSessionIdle(ctx context.Context, timeout time.Duration, activity <-chan struct{}, stop context.CancelCauseFunc) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-activity:
+			resetTimer(timer, timeout)
+		case <-timer.C:
+			stop(errDeviceSessionIdleTimeout)
+			return
+		}
+	}
 }
 
 func authenticateHello(payload json.RawMessage, expectedToken string) error {
@@ -471,7 +510,7 @@ func flushFinalInput(ctx context.Context, actor *session.Actor, turn *activeTurn
 	return actor.AppendPCM(ctx, uint64(turn.epoch), frame)
 }
 
-func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport.Connection, actor *session.Actor, state *connectionState) error {
+func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport.Connection, actor *session.Actor, state *connectionState, activity chan<- struct{}) error {
 	pacer := &pacedDownlink{}
 	timer := time.NewTimer(time.Hour)
 	stopTimer(timer)
@@ -544,6 +583,7 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 			if !turn.active || event.Epoch != uint64(turn.epoch) {
 				continue
 			}
+			signalDeviceSessionActivity(activity)
 			switch event.Type {
 			case backend.EventStarted:
 				if pacer.epoch != 0 {

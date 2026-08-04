@@ -2,10 +2,10 @@
 
 ## 文档状态
 
-本文区分当前整理为 2300 ELOC（扣除 439 ELOC vendor 集成后的产品核心为
-1861 ELOC）的语音客户端与后续产品规划。其底层能力来自此前已在第三块 RV1106 上运行的候选；
-本次目录重排已完成严格交叉构建和板端启动回归；真人语音人工体验已通过，受控双讲、量化延迟
-和长期稳定性仍待完成。
+当前教学候选包含 19 个生产 C/C++ 文件、2500 ELOC，其中 Rockchip/Snowboy vendor 集成
+280 ELOC，产品逻辑 2220 ELOC。语音人工体验、严格交叉构建和板端启动已通过；屏幕/触摸、
+网络启动、UDP 发现和二维码配网已进入同一候选。受控双讲、量化延迟、真实 Wi-Fi 配网和长期
+稳定性仍待完成。
 实现状态以测试和真实板端记录为准；根目录 `AGENTS.md` 是更高优先级的开发契约。
 
 ## 部署边界
@@ -18,12 +18,15 @@ ALSA capture -> [private AudioBackend] -> AudioEngine -> VoiceClient
         |              3A/VAD/AEC       fixed queues   VoiceTransport
 ALSA playback -> Mode1 hard ref -> AudioBackend             |
                                                       boompi-server -> Qwen Singapore
+
+GT911 -> DeviceUi <- VoiceClient -> ST7789P3
+Ethernet/Wi-Fi -> NetworkBootstrap -> discovered WSS endpoint
 ```
 
-- RV1106 当前客户端负责实时音频、唤醒、VAD、打断和本地语音状态机。
-- Go 服务端负责设备 session、Qwen adapter、工具 allowlist、会话上下文和应用包分发。
+- RV1106 当前客户端负责实时音频、唤醒、VAD、打断、本地语音状态机、显示、触摸和网络启动。
+- Go 服务端负责设备 session、Qwen adapter、当前会话上下文、TLS 身份和 UDP 发现。
 - 板端不保存 Qwen Key，也不直接连接 Qwen。
-- 屏幕、触摸、配网 UI、应用更新和守护进程属于后续产品阶段，未计入当前语音 ELF。
+- 企业配对、守护进程和签名更新属于后续产品阶段，不进入当前教学版 C++。
 
 ## 客户端所有权
 
@@ -33,19 +36,22 @@ ALSA playback -> Mode1 hard ref -> AudioBackend             |
 | --- | --- |
 | `client/src/application/` | 唯一会话 actor、pre-roll、turn/epoch、超时和打断状态转换 |
 | `client/src/audio/` | 唯一公开音频门面、播放线程、TTS 固定环和播放结果 |
-| `client/src/network/` | WebSocketpp/ASIO、TLS SPKI 固定、v1 收发和严格身份/序号校验 |
+| `client/src/network/` | WSS/TLS、v1 收发、以太网/Wi-Fi 优先级、UDP 发现与 endpoint 持久化 |
 | `client/src/platform/rv1106/` | `AudioEngine` 私有的 ALSA、重采样、Rockchip 3A、Snowboy C ABI、VAD 和近讲门控 |
+| `client/src/ui/` | ST7789P3 刷新、GT911 触摸、表情、两行字幕、音量和亮度手势 |
 
 不存在另一套 `App/Driver/Inf` 平行目录，也没有恢复已删除的通用 worker 或 backend 工厂。
 
-当前源码只创建两个工作线程，加上主线程，共三个客户端自有长期执行上下文；当前重排候选
-在第三块板观测为 4 个线程，额外一个来自链接依赖内部且不拥有业务状态：
+当前源码创建四个工作线程，加上主线程，共五个客户端自有长期执行上下文。新的网络工作线程
+尚需在板端重新采集总线程数；依赖库内部线程不拥有业务状态：
 
 | 执行上下文 | 独占资源与职责 |
 | --- | --- |
 | 控制/采集线程 | ALSA capture、DSP、Snowboy/VAD、500 ms pre-roll、状态机和重连调度 |
 | 播放线程 | 固定 TTS 队列、重采样、gain/limiter 和 ALSA playback |
 | WebSocket service 线程 | TLS/WSS I/O；回调只向固定 64 项事件环提交结果 |
+| UI 线程 | 合并状态刷新、SPI 写屏和 GT911 触摸；只把用户动作交回主状态机 |
+| 网络线程 | DHCP/Wi-Fi 启动、UDP 发现与 endpoint 持久化；服务端晚启动时持续重试 |
 
 业务状态只能由控制/采集线程修改。实时 PCM 使用对象内固定数组；播放 PCM 与网络事件通过
 预分配有界环传递，不允许逐帧动态分配或无界等待。
@@ -97,38 +103,37 @@ HIL 已确认 Mode1 顺序和 refL/refR 相关性；该结论不能外推到其�
 
 会话状态和网络状态相互正交。application actor 创建 `turn_id` 和 `epoch`；网络重连、取消或打断后递增 generation，所有迟到帧必须被丢弃。
 
-播放期间先以原音量连续确认 2 帧（40 ms）近端候选，再降到 30% 并确认 2 帧（40 ms）；候选
-持续才硬静音，等待硬参考连续 2 帧降低（最多 8 帧），再留出 3 帧（60 ms）清尾、重置
-listener，并以连续 3 帧（60 ms）二次确认近端语音。失败恢复播放并冷却 15 帧（300 ms），
-成功后才
-清空本地 TTS 并请求服务端取消。自然播放结束时，backend 独立抑制 15 帧（300 ms）尾音，
+播放期间先以原音量连续确认 6 帧（120 ms）近端候选，再一次性静音；不使用中间音量。
+随后最多等待 15 帧取得连续 3 帧低 reference，清尾 3 帧（60 ms）、重置 listener，并以
+连续 3 帧（60 ms）二次确认近端语音。成功后才清空本地 TTS 并请求服务端取消；新 turn
+另需有效 VAD start 和连续 20 帧（400 ms）低 reference，取消确认后的窗口上限为 500 ms。
+失败恢复播放并冷却 15 帧（300 ms）。自然播放结束时，backend 独立抑制 15 帧（300 ms）尾音，
 随后 follow-up 以连续 20 帧（400 ms）确认新一轮近讲。该主动硬参考探针是
 防自激的 containment 候选，不证明 AEC 已通过；其故意静音区间不得用于 AEC
-效果评分。新 utterance 携带当前连续可用、最多 500 ms 的 AEC 后 pre-roll；UI 接入后，
-字幕再按 response generation 删除。服务端若不能可靠把文本映射到实际播放位置，应删除整个
+效果评分。新 utterance 携带当前连续可用、最多 500 ms 的 AEC 后 pre-roll；字幕按 response
+generation 删除。服务端若不能可靠把文本映射到实际播放位置，应删除整个
 被打断 assistant turn，不能把未播放全文留入上下文。
 
 ## 网络与信任
 
-设备按“缓存 endpoint、UDP 发现、手动 IP”寻找本地服务端。UDP 发现未经认证；首次连接必须在显式 pairing 状态，以屏幕六位码确认当前 TLS SPKI 和 pairing transcript。之后固定 SPKI，并使用独立 device token。
+显式配置的 endpoint 不发起发现；未显式配置时广播固定 UDP 请求。响应主机只取 UDP 来源 IP；
+首次成功发现采用 TOFU 保存 SPKI，已有缓存时只接受相同 SPKI 的新地址，否则回退缓存地址。
+后续 TLS 握手仍必须匹配该 SPKI。客户端 `hello` 还携带教学版共享令牌，服务端在打开付费
+provider 会话前验证。此方案仅适合可信局域网，不声称提供企业级设备身份或抗恶意局域网攻击。
 
-在完整 pairing 落地前，当前开发服务端要求 `hello` 携带环境变量人工下发的共享设备令牌，并在打开云端 provider 会话前验证；该措施只用于受控局域网联调，不能替代每设备令牌和 SPKI 配对。
-
-WSS 承载 JSON 控制帧和二进制 PCM。协议细节见 `protocol/protocol-v1.md`。断线后当前 turn 失败，实时语音不做应用层重传。
+WSS 承载 JSON 控制帧和二进制 PCM；心跳由服务端每 10 s 驱动，客户端自动回 pong。
+音频、Snowboy 和 UI 在网络工作线程之前打开；无缓存 endpoint 或服务端晚启动时，板端保持离线状态并继续发现，
+不再因三次失败停机。协议细节见 `protocol/protocol-v1.md`。断线后当前 turn 失败，实时语音不做应用层重传。
 
 ## 守护与更新
 
-```text
-BusyBox init
-  -> boompi-supervisor
-       -> active slot/bin/boompi-client --foreground
-```
-
-supervisor 属于稳定系统层，不随普通应用包更新。局域网应用更新写入 inactive slot，验证离线 release key 生成的签名后切换 pending slot；候选连续启动失败三次回滚。BSP、内核和系统镜像第一版仍由人工烧录。
+教学版使用 `/usr/sbin/boompi-clientctl` 启停前台客户端：异常退出后总计最多启动三次，手工更新只保留
+一个 `.bak`。它不是常驻 C++ supervisor，也不实现 A/B OTA、远程刷机或签名发布；BSP、内核
+和系统镜像仍由人工烧录。
 
 ## 隐私边界
 
-- API Key 只存在于服务端进程环境。
+- API Key 只存在于服务端私有 `config.yaml` 或进程环境，不下发到板端。
 - 默认不持久化 PCM、播放参考或完整会话文本。
 - 日志只记录脱敏状态、耗时、计数、错误码和 buffer 水位。
 - 诊断包不默认包含录音、完整对话、token、证书私钥或 Wi-Fi 凭据。

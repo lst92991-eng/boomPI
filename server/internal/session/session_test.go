@@ -184,6 +184,45 @@ func TestActorCancelRemainsResponsiveWhenOutputIsFull(t *testing.T) {
 	}
 }
 
+func TestActorCancelDiscardsResponseCompletedDuringCancelFence(t *testing.T) {
+	provider := newFakeProvider()
+	actor := openTestActor(t, context.Background(), provider)
+	defer actor.Close()
+
+	frame := make([]byte, pcmFrameBytes16kMono)
+	requireOK(t, actor.StartTurn(context.Background(), 1))
+	requireOK(t, actor.AppendPCM(context.Background(), 1, frame))
+	requireOK(t, actor.Commit(context.Background(), 1))
+	provider.session.emit(backend.ConversationEvent{Type: backend.EventStarted, ResponseID: "response-race"})
+	if got := receiveEvent(t, actor); got.Type != backend.EventStarted {
+		t.Fatalf("started event = %+v", got)
+	}
+
+	provider.session.mu.Lock()
+	provider.session.emitDoneOnCancel = true
+	provider.session.mu.Unlock()
+	requireOK(t, actor.Cancel(context.Background(), 1))
+	assertNoEvent(t, actor)
+
+	provider.session.mu.Lock()
+	discards := provider.session.discards
+	order := append([]string(nil), provider.session.shutdownOrder...)
+	provider.session.mu.Unlock()
+	if discards != 1 || len(order) != 2 || order[0] != "cancel" || order[1] != "discard" {
+		t.Fatalf("cancel fence cleanup: discards=%d order=%v", discards, order)
+	}
+
+	// Cancelling only buffered user input must not remove the preceding response.
+	requireOK(t, actor.StartTurn(context.Background(), 2))
+	requireOK(t, actor.Cancel(context.Background(), 2))
+	provider.session.mu.Lock()
+	discards = provider.session.discards
+	provider.session.mu.Unlock()
+	if discards != 1 {
+		t.Fatalf("input-only cancellation discards = %d, want 1", discards)
+	}
+}
+
 func TestActorParentCancellationOrdersProviderShutdown(t *testing.T) {
 	provider := newFakeProvider()
 	parent, cancel := context.WithCancel(context.Background())
@@ -254,12 +293,14 @@ func (p *fakeProvider) Open(context.Context, backend.SessionConfig) (backend.Con
 type fakeConversationSession struct {
 	mu sync.Mutex
 
-	events        chan backend.ConversationEvent
-	audio         [][]byte
-	commits       int
-	cancels       int
-	closes        int
-	shutdownOrder []string
+	events           chan backend.ConversationEvent
+	audio            [][]byte
+	commits          int
+	cancels          int
+	discards         int
+	closes           int
+	emitDoneOnCancel bool
+	shutdownOrder    []string
 }
 
 func (s *fakeConversationSession) SendAudio(_ context.Context, pcm []byte) error {
@@ -281,6 +322,18 @@ func (s *fakeConversationSession) Cancel(context.Context) error {
 	defer s.mu.Unlock()
 	s.cancels++
 	s.shutdownOrder = append(s.shutdownOrder, "cancel")
+	if s.emitDoneOnCancel {
+		s.events <- backend.ConversationEvent{Type: backend.EventDone, ResponseID: "response-race"}
+		s.emitDoneOnCancel = false
+	}
+	return nil
+}
+
+func (s *fakeConversationSession) DiscardLastResponse(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.discards++
+	s.shutdownOrder = append(s.shutdownOrder, "discard")
 	return nil
 }
 

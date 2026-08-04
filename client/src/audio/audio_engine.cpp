@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <mutex>
 #include <new>
+#include <pthread.h>
+#include <sched.h>
 #include <thread>
 
 #include "audio_backend.h"
@@ -16,23 +18,50 @@ namespace boompi::audio { namespace {
 constexpr std::size_t kTts24FrameSamples = 480U;
 constexpr std::size_t kTtsSlots = 75U;       // 75 × 20 ms = 1.5 s，下行抖动上限。
 constexpr std::size_t kInitialTtsSlots = 9U; // 首播累积 180 ms；EOS 短回复例外。
+constexpr std::size_t kCaptureSlots = 4U;    // actor 最多落后 80 ms；再慢就显式断帧。
+constexpr int kCapturePriority = 40;
+constexpr int kPlaybackPriority = 30;
+
+void SetRealtimePriority(const char* name, int priority) noexcept {
+  static_cast<void>(pthread_setname_np(pthread_self(), name));
+  sched_param parameters{};
+  parameters.sched_priority = priority;
+  const int result = pthread_setschedparam(
+      pthread_self(), SCHED_FIFO, &parameters);
+  if (result != 0) {
+    std::fprintf(stderr,
+                 "boompi-client: warning: %s realtime priority %d failed (%d)\n",
+                 name, priority, result);
+  }
+}
 }
 
 struct AudioEngine::Impl final {
   struct TtsSlot final { std::array<std::int16_t, kTts24FrameSamples> pcm{}; std::size_t used{0U}; };
+  enum class CaptureCommand : std::uint8_t {
+    kNone, kResetListener, kPreparePlayback
+  };
 
-  // backend 本身没有线程；本类规定主线程使用 capture 侧，playback_thread 使用播放侧。
-  AudioEngineConfig config{};
+  // capture_thread 独占采集/3A；playback_thread 独占播放热路径。application 仅消费固定环。
   platform::rv1106::AudioBackend backend{};
-  std::thread playback_thread{}; mutable std::mutex mutex{}, error_mutex{};
-  std::condition_variable condition{}; std::array<char, 192U> error{};
+  std::thread capture_thread{}, playback_thread{};
+  mutable std::mutex mutex{}, capture_mutex{}, error_mutex{};
+  std::condition_variable condition{}, capture_condition{};
+  std::array<char, 192U> error{};
+  std::array<CaptureFrame, kCaptureSlots> capture{};
+  std::size_t capture_head{0U}, capture_count{0U};
+  CaptureCommand capture_command{CaptureCommand::kNone};
+  std::uint64_t command_requested{0U}, command_completed{0U};
+  bool command_succeeded{false};
   std::array<TtsSlot, kTtsSlots> tts{};
   std::size_t tts_head{0U}, tts_tail{0U}, tts_count{0U}, queued_samples{0U};
   std::uint64_t capture_sequence{0U}, next_tts_sequence{0U};
-  bool open{false}, stop{false}, active{false}, ending{false}, playback_started{false};
+  bool open{false}, capture_failed{false};
+  bool active{false}, ending{false}, playback_started{false};
   bool drop{false}, sequence_set{false};
-  std::atomic<float> playback_scale{1.0F};
-  std::atomic<bool> is_playing{false}, is_done{true}, playback_failed{false};
+  std::atomic<bool> stop{false};
+  std::atomic<float> playback_gain{1.0F}, playback_scale{1.0F};
+  std::atomic<bool> is_done{true}, playback_failed{false};
 
   void SetError(const char* text) noexcept {
     std::lock_guard<std::mutex> lock(error_mutex); std::snprintf(error.data(), error.size(), "%s", text);
@@ -42,9 +71,95 @@ struct AudioEngine::Impl final {
     tts_head = tts_tail = tts_count = queued_samples = 0U;
   }
 
+  void ClearCaptureQueue() noexcept {
+    for (auto& frame : capture) frame = {};
+    capture_head = capture_count = 0U;
+  }
+
+  bool RunCaptureCommand(CaptureCommand command) noexcept {
+    std::unique_lock<std::mutex> lock(capture_mutex);
+    if (stop.load(std::memory_order_acquire) || capture_failed ||
+        command_requested != command_completed) return false;
+    capture_command = command;
+    const std::uint64_t requested = ++command_requested;
+    capture_condition.notify_all();
+    capture_condition.wait(lock, [this, requested] {
+      return stop.load(std::memory_order_acquire) || capture_failed ||
+             command_completed >= requested;
+    });
+    return !stop.load(std::memory_order_acquire) && !capture_failed &&
+           command_completed >= requested && command_succeeded;
+  }
+
+  bool ApplyCaptureCommand() noexcept {
+    CaptureCommand command = CaptureCommand::kNone;
+    std::uint64_t requested = 0U;
+    {
+      std::lock_guard<std::mutex> lock(capture_mutex);
+      if (command_requested == command_completed) return true;
+      command = capture_command;
+      requested = command_requested;
+    }
+    const bool succeeded = command == CaptureCommand::kResetListener
+                               ? backend.ResetListener()
+                               : command == CaptureCommand::kPreparePlayback
+                                     ? backend.PreparePlayback()
+                                     : false;
+    {
+      std::lock_guard<std::mutex> lock(capture_mutex);
+      if (command == CaptureCommand::kResetListener) ClearCaptureQueue();
+      command_succeeded = succeeded;
+      command_completed = requested;
+      capture_command = CaptureCommand::kNone;
+    }
+    capture_condition.notify_all();
+    return succeeded;
+  }
+
+  void CaptureLoop() noexcept {
+    SetRealtimePriority("boompi-capture", kCapturePriority);
+    for (;;) {
+      if (!ApplyCaptureCommand()) {
+        std::lock_guard<std::mutex> lock(capture_mutex);
+        capture_failed = true;
+        capture_condition.notify_all();
+        break;
+      }
+      if (stop.load(std::memory_order_acquire)) break;
+      CaptureFrame frame{};
+      bool discontinuity = false;
+      bool succeeded = backend.ReadCapture20ms(&discontinuity);
+      if (succeeded && !stop.load(std::memory_order_acquire))
+        succeeded = backend.ProcessCapture20ms(discontinuity, &frame);
+      if (succeeded && !stop.load(std::memory_order_acquire)) {
+        frame.sequence = capture_sequence++;
+        std::lock_guard<std::mutex> queue_lock(capture_mutex);
+        if (frame.discontinuity || capture_count == capture.size()) {
+          const bool actor_overrun = !frame.discontinuity;
+          ClearCaptureQueue();
+          frame.discontinuity = true;
+          frame.actor_overrun = actor_overrun;
+        }
+        const std::size_t tail =
+            (capture_head + capture_count) % capture.size();
+        capture[tail] = frame;
+        ++capture_count;
+      }
+      if (stop.load(std::memory_order_acquire)) break;
+      if (!succeeded) {
+        std::lock_guard<std::mutex> lock(capture_mutex);
+        capture_failed = true;
+        capture_condition.notify_all();
+        break;
+      }
+      capture_condition.notify_one();
+    }
+  }
+
   /// 播放线程只负责下行渲染；AEC reference 由 Codec Mode1 与双麦在同一 capture period 回采。
   bool Render(const TtsSlot& slot) noexcept {
-    const float gain = config.playback_gain * playback_scale.load(std::memory_order_relaxed);
+    const float gain = playback_gain.load(std::memory_order_relaxed) *
+                       playback_scale.load(std::memory_order_relaxed);
     return backend.Render20ms(slot.pcm.data(), slot.used, gain);
   }
 
@@ -61,23 +176,24 @@ struct AudioEngine::Impl final {
     active = ending = drop = playback_started = false; ClearQueue();
     playback_scale.store(1.0F, std::memory_order_release);
     playback_failed.store(failed, std::memory_order_release);
-    is_playing.store(false, std::memory_order_release); is_done.store(true, std::memory_order_release);
+    is_done.store(true, std::memory_order_release);
     condition.notify_all();
   }
 
   /// 此线程只消费 TTS 并写 ALSA；绝不访问 capture、会话状态或网络。
   void PlaybackLoop() noexcept {
+    SetRealtimePriority("boompi-playback", kPlaybackPriority);
     for (;;) {
       TtsSlot slot{}; bool have_slot = false, finish = false, must_drop = false;
       {
         std::unique_lock<std::mutex> lock(mutex);
         condition.wait(lock, [this] {
           const bool initial_ready = queued_samples >= kInitialTtsSlots * kTts24FrameSamples;
-          return stop || drop || (active && ((tts_count != 0U &&
+          return stop.load(std::memory_order_acquire) || drop || (active && ((tts_count != 0U &&
               (tts[tts_head].used == kTts24FrameSamples || ending) &&
               (playback_started || initial_ready || ending)) || (ending && tts_count == 0U)));
         });
-        if (stop) break;
+        if (stop.load(std::memory_order_acquire)) break;
         must_drop = drop;
         if (!must_drop && tts_count != 0U) {
           playback_started = true;
@@ -102,26 +218,49 @@ bool AudioEngine::Open(const AudioEngineConfig& config) noexcept {
   if (config.playback_gain < 0.0F) {
     impl_->SetError("invalid playback gain configuration"); return false;
   }
-  try {
-    impl_->config = config;
-  } catch (...) { impl_->SetError("audio configuration allocation failed"); return false; }
   if (!impl_->backend.Open(config)) return false;
-  impl_->stop = false; impl_->open = true;
-  try { impl_->playback_thread = std::thread(&Impl::PlaybackLoop, impl_); }
-  catch (...) { impl_->SetError("playback thread creation failed"); Close(); return false; }
+  impl_->playback_gain.store(config.playback_gain, std::memory_order_release);
+  impl_->stop.store(false, std::memory_order_release);
+  impl_->capture_failed = false;
+  impl_->capture_command = Impl::CaptureCommand::kNone;
+  impl_->command_requested = impl_->command_completed = 0U;
+  impl_->command_succeeded = false;
+  impl_->capture_sequence = 0U;
+  impl_->ClearCaptureQueue();
+  impl_->open = true;
+  try {
+    impl_->capture_thread = std::thread(&Impl::CaptureLoop, impl_);
+    impl_->playback_thread = std::thread(&Impl::PlaybackLoop, impl_);
+  } catch (...) {
+    impl_->SetError("audio realtime thread creation failed");
+    Close();
+    return false;
+  }
   return true;
 }
 
 bool AudioEngine::Capture(CaptureFrame* const frame) noexcept {
-  // 四通道 period 同时包含双麦和两个硬件 reference；3A 生产配置只消费 REF-L。
+  // 高优先级采集线程持续排空 ALSA；application actor 只消费已处理的固定帧。
   if (impl_ == nullptr || !impl_->open || frame == nullptr) return false;
-  bool discontinuity = false;
-  if (!impl_->backend.ReadCapture20ms(&discontinuity)) return false;
-  if (!impl_->backend.ProcessCapture20ms(discontinuity, frame)) return false;
-  frame->sequence = impl_->capture_sequence++; return true;
+  std::unique_lock<std::mutex> lock(impl_->capture_mutex);
+  impl_->capture_condition.wait(lock, [this] {
+    return impl_->stop.load(std::memory_order_acquire) ||
+           impl_->capture_failed || impl_->capture_count != 0U;
+  });
+  if (impl_->stop.load(std::memory_order_acquire) ||
+      impl_->capture_failed) return false;
+  *frame = impl_->capture[impl_->capture_head];
+  impl_->capture[impl_->capture_head] = {};
+  impl_->capture_head = (impl_->capture_head + 1U) % impl_->capture.size();
+  --impl_->capture_count;
+  return true;
 }
 
-bool AudioEngine::ResetListener() noexcept { return impl_ != nullptr && impl_->open && impl_->backend.ResetListener(); }
+bool AudioEngine::ResetListener() noexcept {
+  if (impl_ == nullptr || !impl_->open ||
+      impl_->stop.load(std::memory_order_acquire)) return false;
+  return impl_->RunCaptureCommand(Impl::CaptureCommand::kResetListener);
+}
 
 bool AudioEngine::QueueTts24k(const std::uint8_t* const bytes, const std::size_t byte_count,
                         const std::uint64_t sequence) noexcept {
@@ -157,12 +296,13 @@ bool AudioEngine::BeginPlayback() noexcept {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (impl_->active) return false;
   impl_->ClearQueue();
-  // active=false 保证播放线程没有使用重采样器，主线程此刻可以安全复位其相位。
-  if (!impl_->backend.PreparePlayback()) return false;
+  // capture 线程在帧边界执行 prepare，后端控制字段不跨线程读写。
+  if (!impl_->RunCaptureCommand(Impl::CaptureCommand::kPreparePlayback))
+    return false;
   impl_->sequence_set = impl_->ending = impl_->drop = impl_->playback_started = false; impl_->active = true;
   impl_->playback_scale.store(1.0F, std::memory_order_release);
   impl_->playback_failed.store(false, std::memory_order_release);
-  impl_->is_playing.store(true, std::memory_order_release); impl_->is_done.store(false, std::memory_order_release);
+  impl_->is_done.store(false, std::memory_order_release);
   return true;
 }
 
@@ -173,6 +313,9 @@ bool AudioEngine::EndPlayback() noexcept {
   impl_->ending = true; impl_->condition.notify_one(); return true;
 }
 
+void AudioEngine::SetPlaybackGain(const float gain) noexcept {
+  if (impl_ != nullptr) impl_->playback_gain.store(std::max(0.0F, gain), std::memory_order_release);
+}
 void AudioEngine::SetPlaybackScale(const float scale) noexcept {
   if (impl_ != nullptr) impl_->playback_scale.store(std::clamp(scale, 0.0F, 1.0F), std::memory_order_release);
 }
@@ -185,7 +328,6 @@ void AudioEngine::DropPlayback() noexcept {
     impl_->backend.InterruptPlayback(); impl_->condition.notify_one();
   }
 }
-bool AudioEngine::playing() const noexcept { return impl_ != nullptr && impl_->is_playing.load(std::memory_order_acquire); }
 bool AudioEngine::playback_done() const noexcept { return impl_ == nullptr || impl_->is_done.load(std::memory_order_acquire); }
 bool AudioEngine::playback_failed() const noexcept { return impl_ != nullptr && impl_->playback_failed.load(std::memory_order_acquire); }
 
@@ -198,18 +340,27 @@ std::string AudioEngine::last_error() const {
 void AudioEngine::Close() noexcept {
   if (impl_ == nullptr) return;
   if (impl_->open) {
-    { std::lock_guard<std::mutex> lock(impl_->mutex); impl_->stop = true; }
-    // snd_pcm_drop 用于打断可能阻塞的 write/drain；join 完成前不得销毁 backend。
-    impl_->condition.notify_all(); impl_->backend.InterruptPlayback();
+    impl_->stop.store(true, std::memory_order_release);
+    // capture read 最迟在一个 20 ms period 后返回；backend 只能在两条音频线程 join 后释放。
+    impl_->capture_condition.notify_all();
+    impl_->condition.notify_all();
+    impl_->backend.InterruptPlayback();
+    if (impl_->capture_thread.joinable()) impl_->capture_thread.join();
     if (impl_->playback_thread.joinable()) impl_->playback_thread.join();
   }
   impl_->backend.Close();
-  impl_->open = impl_->stop = impl_->active = impl_->ending = impl_->drop = impl_->playback_started = false;
+  impl_->open = impl_->active = impl_->ending = impl_->drop = impl_->playback_started = false;
+  impl_->stop.store(false, std::memory_order_release);
+  impl_->capture_failed = false;
+  impl_->capture_command = Impl::CaptureCommand::kNone;
+  impl_->command_requested = impl_->command_completed = 0U;
+  impl_->command_succeeded = false;
   impl_->sequence_set = false; impl_->capture_sequence = 0U;
+  impl_->ClearCaptureQueue();
   impl_->ClearQueue();
   impl_->playback_failed.store(false, std::memory_order_release);
   impl_->playback_scale.store(1.0F, std::memory_order_release);
-  impl_->is_playing.store(false, std::memory_order_release); impl_->is_done.store(true, std::memory_order_release);
+  impl_->is_done.store(true, std::memory_order_release);
 }
 
 }  // namespace boompi::audio

@@ -9,11 +9,18 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/lst92991-eng/boomPI/server/internal/backend"
 )
 
 const maxInputPCMBytes = 60 * 16000 * 2
+
+const clearConversationConfirmation = "对话已清空。"
+
+type ttsStreamSynthesizer interface {
+	synthesizeStream(context.Context, <-chan string, func([]byte) error) error
+}
 
 type Backend struct {
 	config Config
@@ -65,7 +72,7 @@ type Session struct {
 	config        Config
 	sessionConfig backend.SessionConfig
 	http          *httpClients
-	tts           *ttsClient
+	tts           ttsStreamSynthesizer
 	ctx           context.Context
 	cancel        context.CancelFunc
 	events        chan backend.ConversationEvent
@@ -217,15 +224,7 @@ func (s *Session) DiscardLastResponse(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("context is required")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.history) > 0 && s.history[len(s.history)-1].Role == "assistant" {
-		s.history = s.history[:len(s.history)-1]
-		if len(s.history) > 0 && s.history[len(s.history)-1].Role == "user" {
-			s.history = s.history[:len(s.history)-1]
-		}
-	}
-	s.lastResponseDiscardable = false
+	s.discardCompletedResponseIfNeeded()
 	return nil
 }
 
@@ -312,6 +311,17 @@ func (s *Session) run(ctx context.Context, pcm []byte, asr *asrRealtimeStream, d
 		return
 	}
 	timing.markASRDone(time.Now())
+	if handled, commandErr := s.handleClearConversation(ctx, responseID, transcript, timing); handled {
+		if commandErr != nil {
+			status, failureStage = turnFailure(ctx, "clear_conversation")
+			if ctx.Err() == nil {
+				s.emitError(ctx, responseID, "clear_conversation", commandErr)
+			}
+			return
+		}
+		status = "completed"
+		return
+	}
 
 	s.mu.Lock()
 	history := append([]chatMessage(nil), s.history...)
@@ -408,6 +418,60 @@ func (s *Session) run(ctx context.Context, pcm []byte, asr *asrRealtimeStream, d
 		return
 	}
 	status = "completed"
+}
+
+func (s *Session) handleClearConversation(
+	ctx context.Context,
+	responseID string,
+	transcript string,
+	timing *turnTiming,
+) (bool, error) {
+	if !isClearConversationCommand(transcript) {
+		return false, nil
+	}
+
+	// Clear the old context before any confirmation I/O. Even if TTS fails or
+	// the device disconnects, the next turn must not recover the old history.
+	s.mu.Lock()
+	clear(s.history)
+	s.history = nil
+	s.lastResponseDiscardable = false
+	s.mu.Unlock()
+
+	if !s.emit(ctx, backend.ConversationEvent{
+		Type: backend.EventTextDelta, ResponseID: responseID, Text: clearConversationConfirmation,
+	}) {
+		return true, context.Canceled
+	}
+	fragments := make(chan string, 1)
+	fragments <- clearConversationConfirmation
+	close(fragments)
+	if err := s.tts.synthesizeStream(ctx, fragments, func(pcm []byte) error {
+		timing.markTTSFirstPCM(time.Now())
+		if !s.emit(ctx, backend.ConversationEvent{
+			Type: backend.EventAudio, ResponseID: responseID,
+			PCM: append([]byte(nil), pcm...), SampleRateHz: 24000,
+		}) {
+			return context.Canceled
+		}
+		return nil
+	}); err != nil {
+		return true, fmt.Errorf("synthesize clear-conversation confirmation: %w", err)
+	}
+	if !s.emit(ctx, backend.ConversationEvent{Type: backend.EventDone, ResponseID: responseID}) {
+		return true, context.Canceled
+	}
+	return true, nil
+}
+
+func isClearConversationCommand(transcript string) bool {
+	normalized := strings.Map(func(current rune) rune {
+		if unicode.IsSpace(current) || unicode.IsPunct(current) {
+			return -1
+		}
+		return current
+	}, transcript)
+	return normalized == "清空对话"
 }
 
 func (s *Session) disableRealtimeASR(stream *asrRealtimeStream, cause error) {

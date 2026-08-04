@@ -61,22 +61,28 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// RegionalEndpoint builds a workspace-specific Model Studio Realtime URL.
+// RegionalEndpoint uses the public DashScope endpoint when workspaceID is
+// empty and keeps the existing workspace-specific endpoint as an optimization.
 func RegionalEndpoint(region, workspaceID string) (string, error) {
 	workspaceID = strings.TrimSpace(workspaceID)
-	if !workspaceIDPattern.MatchString(workspaceID) {
-		return "", errors.New("qwen workspace ID is required and contains invalid characters")
-	}
-	var domain string
+	var publicDomain, workspaceDomain string
 	switch strings.ToLower(strings.TrimSpace(region)) {
 	case RegionChinaBeijing:
-		domain = "cn-beijing.maas.aliyuncs.com"
+		publicDomain = "dashscope.aliyuncs.com"
+		workspaceDomain = "cn-beijing.maas.aliyuncs.com"
 	case RegionSingapore:
-		domain = "ap-southeast-1.maas.aliyuncs.com"
+		publicDomain = "dashscope-intl.aliyuncs.com"
+		workspaceDomain = "ap-southeast-1.maas.aliyuncs.com"
 	default:
 		return "", fmt.Errorf("unsupported qwen region %q", region)
 	}
-	return fmt.Sprintf("wss://%s.%s/api-ws/v1/realtime", workspaceID, domain), nil
+	if workspaceID == "" {
+		return "wss://" + publicDomain + "/api-ws/v1/realtime", nil
+	}
+	if !workspaceIDPattern.MatchString(workspaceID) {
+		return "", errors.New("qwen workspace ID contains invalid characters")
+	}
+	return fmt.Sprintf("wss://%s.%s/api-ws/v1/realtime", workspaceID, workspaceDomain), nil
 }
 
 var (

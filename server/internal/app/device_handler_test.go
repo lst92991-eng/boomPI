@@ -18,7 +18,9 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/lst92991-eng/boomPI/server/internal/backend"
 	"github.com/lst92991-eng/boomPI/server/internal/config"
+	"github.com/lst92991-eng/boomPI/server/internal/identity"
 	"github.com/lst92991-eng/boomPI/server/internal/protocol"
+	"github.com/lst92991-eng/boomPI/server/internal/transport"
 )
 
 const (
@@ -36,6 +38,7 @@ func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 	}
 	cfg.ListenAddress = "127.0.0.1"
 	cfg.WSSPort = freePort(t)
+	cfg.DiscoveryPort = freeUDPPort(t)
 	provider := newRoundTripBackend()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	application, err := newWithBackend(cfg, logger, t.TempDir(), provider)
@@ -195,6 +198,7 @@ func TestDeviceHelloRejectsInvalidTokenBeforeProviderOpen(t *testing.T) {
 			}
 			cfg.ListenAddress = "127.0.0.1"
 			cfg.WSSPort = freePort(t)
+			cfg.DiscoveryPort = freeUDPPort(t)
 			provider := newRoundTripBackend()
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 			application, err := newWithBackend(cfg, logger, t.TempDir(), provider)
@@ -240,6 +244,7 @@ func TestDeviceHelloTimesOutBeforeProviderOpen(t *testing.T) {
 	}
 	cfg.ListenAddress = "127.0.0.1"
 	cfg.WSSPort = freePort(t)
+	cfg.DiscoveryPort = freeUDPPort(t)
 	provider := newRoundTripBackend()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	application, err := newWithBackend(cfg, logger, t.TempDir(), provider)
@@ -277,6 +282,97 @@ func TestDeviceHelloTimesOutBeforeProviderOpen(t *testing.T) {
 	}
 }
 
+func TestDeviceSessionIdleTimeoutUsesBusinessActivityAndReleasesDevice(t *testing.T) {
+	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
+	t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
+	cfg, err := config.Load("", nil)
+	if err != nil {
+		t.Fatalf("config.Load() error = %v", err)
+	}
+	cfg.ListenAddress = "127.0.0.1"
+	cfg.WSSPort = freePort(t)
+	cfg.SessionIdleTimeout = 1500 * time.Millisecond
+
+	serverIdentity, err := identity.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatalf("identity.LoadOrCreate() error = %v", err)
+	}
+	provider := newRoundTripBackend()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := &deviceHandler{cfg: cfg, logger: logger, provider: provider}
+	wss, err := transport.NewServer(transport.Config{
+		Address:      fmt.Sprintf("127.0.0.1:%d", cfg.WSSPort),
+		TLSConfig:    serverIdentity.TLSConfig,
+		PingInterval: time.Second,
+		PongTimeout:  3 * time.Second,
+	}, handler)
+	if err != nil {
+		t.Fatalf("transport.NewServer() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- wss.Serve(ctx) }()
+	webSocket := dialTestServer(t, cfg.WSSPort)
+	defer webSocket.Close()
+	writeControl(t, webSocket, protocol.ControlEnvelope{
+		Version: protocol.Version, Type: "hello", MessageID: "client-1", DeviceID: testDeviceID,
+		Payload: json.RawMessage(`{"device_token":"` + testDeviceToken + `"}`),
+	})
+	helloAck := readControl(t, webSocket)
+	if helloAck.Type != "hello.ack" {
+		t.Fatalf("hello.ack = %+v", helloAck)
+	}
+	if err := webSocket.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	peerDone := make(chan error, 1)
+	go func() {
+		for {
+			if _, _, err := webSocket.ReadMessage(); err != nil {
+				peerDone <- err
+				return
+			}
+		}
+	}()
+
+	time.Sleep(900 * time.Millisecond)
+	writeControl(t, webSocket, protocol.ControlEnvelope{
+		Version: protocol.Version, Type: "turn.start", MessageID: "client-2", DeviceID: testDeviceID,
+		SessionID: helloAck.SessionID, TurnID: 11, StreamID: 12, Epoch: 2,
+		Payload: json.RawMessage(`{"sample_rate_hz":16000}`),
+	})
+	select {
+	case <-provider.session.closed:
+		t.Fatal("session expired at the original deadline despite business activity")
+	case <-time.After(800 * time.Millisecond):
+	}
+	select {
+	case <-provider.session.closed:
+	case <-time.After(1300 * time.Millisecond):
+		t.Fatal("transport ping incorrectly kept the idle provider session open")
+	}
+	select {
+	case <-peerDone:
+	case <-time.After(time.Second):
+		t.Fatal("idle session did not close its WebSocket")
+	}
+
+	second := dialTestServer(t, cfg.WSSPort)
+	_ = second.Close()
+	cancel()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("transport.Serve() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("transport server did not stop")
+	}
+}
+
 func TestDeviceSessionErrorCode(t *testing.T) {
 	abnormalClose := &websocket.CloseError{
 		Code: websocket.CloseAbnormalClosure,
@@ -284,6 +380,8 @@ func TestDeviceSessionErrorCode(t *testing.T) {
 	}
 	workerFailureCtx, cancelWorkerFailure := context.WithCancelCause(context.Background())
 	cancelWorkerFailure(abnormalClose)
+	idleCtx, cancelIdle := context.WithCancelCause(context.Background())
+	cancelIdle(errDeviceSessionIdleTimeout)
 	cleanupCtx, cancelCleanup := context.WithCancelCause(context.Background())
 	cancelCleanup(context.Canceled)
 
@@ -313,6 +411,10 @@ func TestDeviceSessionErrorCode(t *testing.T) {
 		{
 			name: "actual close is not masked by cleanup cancellation", ctx: cleanupCtx,
 			err: abnormalClose, wantCode: "peer_disconnected", wantReport: true,
+		},
+		{
+			name: "session idle timeout", ctx: idleCtx,
+			err: context.Canceled, wantCode: "session_idle_timeout", wantReport: true,
 		},
 		{
 			name: "deadline", ctx: context.Background(), err: context.DeadlineExceeded,

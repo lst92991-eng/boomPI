@@ -1,5 +1,4 @@
-#ifndef BOOMPI_PLATFORM_RV1106_AUDIO_BACKEND_H_
-#define BOOMPI_PLATFORM_RV1106_AUDIO_BACKEND_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -13,7 +12,7 @@ using audio::AudioEngineConfig; using audio::CaptureFrame;
 
 /// @brief RV1106 同步音频后端，不是对 application 暴露的第二套音频接口。
 ///
-/// 主 actor 独占 capture/3A/Snowboy/VAD。播放激活期间，AudioEngine 的播放线程独占 TTS
+/// AudioEngine 的 capture 线程独占 capture/3A/Snowboy/VAD。播放激活期间，播放线程独占 TTS
 /// 重采样和 playback PCM；AEC reference 由 capture PCM 的 Mode1 硬件回采提供。
 /// 类内不创建线程或队列。
 class AudioBackend final {
@@ -49,5 +48,3 @@ class AudioBackend final {
 };
 
 }  // namespace boompi::platform::rv1106
-
-#endif  // BOOMPI_PLATFORM_RV1106_AUDIO_BACKEND_H_

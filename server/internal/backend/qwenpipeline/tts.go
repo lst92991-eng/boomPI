@@ -58,7 +58,9 @@ func (c *ttsClient) synthesizeStream(
 ) error {
 	header := make(http.Header)
 	header.Set("Authorization", "Bearer "+c.config.APIKey)
-	header.Set("X-DashScope-WorkSpace", c.config.WorkspaceID)
+	if strings.TrimSpace(c.config.WorkspaceID) != "" {
+		header.Set("X-DashScope-WorkSpace", c.config.WorkspaceID)
+	}
 	connection, response, err := c.dialer.DialContext(ctx, c.config.ttsURL(), header)
 	if response != nil && response.Body != nil {
 		response.Body.Close()

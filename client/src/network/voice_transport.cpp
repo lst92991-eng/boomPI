@@ -26,9 +26,10 @@ namespace boompi::network {
 namespace {
 
 constexpr std::size_t kHeaderBytes = 64;
-constexpr std::size_t kMaxPcmBytes = 64U * 1024U;
 constexpr std::size_t kMaxUplinkPcmBytes = 640U;
 constexpr std::size_t kMaxDownlinkPcmBytes = Inbound::kMaximumPcmBytes;
+constexpr std::size_t kMaxMessageBytes = kHeaderBytes + 64U * 1024U;
+constexpr std::size_t kMaxBufferedBytes = 28U * 1024U;  // 约 800 ms 上行帧。
 constexpr std::uint16_t kKnownFlags = 7;
 
 void Put16(std::uint16_t v, std::uint8_t* p) {
@@ -89,13 +90,11 @@ class VoiceTransport::Impl final {
  public:
   ~Impl() { Close(); }
 
-  bool Connect(TransportConfig c, InboundHandler in, ErrorHandler err, CloseHandler close) {
+  bool Connect(TransportConfig c, InboundHandler in, ErrorHandler err) {
     // UUID 与 SPKI pin 在启动线程前一次性验证；普通连接绝不降级为明文或 VERIFY_NONE。
     if (thread_.joinable() || c.host.empty() || !ParseUuid(c.device_id, &uuid_) ||
-        !DecodePin(c.spki_sha256_base64) || c.port == 0 || c.connect_timeout_ms == 0 ||
-        c.maximum_message_bytes < kHeaderBytes || c.maximum_message_bytes > kHeaderBytes + kMaxPcmBytes ||
-        c.maximum_buffered_bytes < kHeaderBytes + kMaxUplinkPcmBytes) return false;
-    config_ = std::move(c); inbound_ = std::move(in); error_ = std::move(err); closed_ = std::move(close);
+        !DecodePin(c.spki_sha256_base64) || c.port == 0) return false;
+    config_ = std::move(c); inbound_ = std::move(in); error_ = std::move(err);
     client_.clear_access_channels(websocketpp::log::alevel::all);
     client_.clear_error_channels(websocketpp::log::elevel::all);
     client_.init_asio(); client_.start_perpetual();
@@ -113,16 +112,17 @@ class VoiceTransport::Impl final {
     client_.set_fail_handler([this](Hdl h) { Fail(client_.get_con_from_hdl(h)->get_ec().message()); });
     client_.set_close_handler([this](Hdl h) {
       connected_ = false; auto c = client_.get_con_from_hdl(h);
-      SafeClose(static_cast<std::uint16_t>(c->get_remote_close_code()), c->get_remote_close_reason());
+      if (!closing_) Fail(c->get_remote_close_reason().empty() ? "connection closed" :
+                                                           c->get_remote_close_reason());
     });
     client_.set_message_handler([this](Hdl, Client::message_ptr m) { OnMessage(m); });
-    client_.set_ping_handler([](Hdl, const std::string&) { return true; });
+    client_.set_ping_handler([this](Hdl, const std::string&) { Inbound e{}; e.kind = InboundKind::kHeartbeat; Emit(std::move(e)); return true; });
     websocketpp::lib::error_code ec;
     const std::string uri = "wss://" + config_.host + ":" + std::to_string(config_.port) + "/ws";
     auto con = client_.get_connection(uri, ec);
     if (ec) return false;
-    con->set_open_handshake_timeout(config_.connect_timeout_ms);
-    con->set_max_message_size(config_.maximum_message_bytes);
+    con->set_open_handshake_timeout(5000);
+    con->set_max_message_size(kMaxMessageBytes);
     client_.connect(con);
     try { thread_ = std::thread([this] { client_.run(); }); }
     catch (...) { client_.stop_perpetual(); return false; }
@@ -140,7 +140,7 @@ class VoiceTransport::Impl final {
         if (c.ids.session || c.ids.turn || c.ids.stream || c.ids.epoch || c.device_token.empty()) return false;
         type = "hello"; payload = "{\"device_token\":" + Quote(c.device_token) + "}"; break;
       case ControlKind::kTurnStart:
-        if (!ValidIds(c.ids) || c.sample_rate_hz != 16000 || active_ ||
+        if (!ValidIds(c.ids) || active_ ||
             c.ids.session != session_ || c.ids.epoch < session_epoch_ ||
             (turn_.epoch != 0U && c.ids.epoch <= turn_.epoch)) return false;
         type = "turn.start"; payload = "{\"sample_rate_hz\":16000}"; break;
@@ -165,7 +165,7 @@ class VoiceTransport::Impl final {
       ",\"payload\":" + payload + "}";
     if (!SendText(json)) return false;
     if (c.kind == ControlKind::kTurnStart) {
-      turn_ = c.ids; response_ = {}; response_id_.clear(); active_ = true; committed_ = false;
+      turn_ = c.ids; response_ = {}; active_ = true; committed_ = false;
       uplink_ended_ = audio_started_ = audio_ended_ = response_done_ = false;
       response_cancel_sent_ = discard_downlink_ = false; uplink_sequence_ = downlink_sequence_ = 0;
     }
@@ -184,14 +184,14 @@ class VoiceTransport::Impl final {
 
   bool SendPcm(const Pcm64Header& h, const std::uint8_t* pcm, std::size_t bytes) {
     std::lock_guard<std::mutex> state_lock(protocol_mutex_);
-    if (!connected_ || !pcm || bytes == 0 || bytes > kMaxUplinkPcmBytes || bytes % 2 || h.kind != 1 ||
-        h.flags & ~kKnownFlags || h.sample_rate_hz != 16000 || !active_ || committed_ || uplink_ended_ ||
+    if (!connected_ || !pcm || bytes == 0 || bytes > kMaxUplinkPcmBytes || bytes % 2 ||
+        h.flags & ~kKnownFlags || !active_ || committed_ || uplink_ended_ ||
         !SameTurn(h.ids, turn_) || h.ids.stream != turn_.stream || h.sequence != uplink_sequence_ ||
         h.sequence == std::numeric_limits<std::uint32_t>::max() || ((h.sequence == 0) != ((h.flags & 1U) != 0))) return false;
     // 字段逐个按网络字节序写入，不能直接发送 C++ struct（padding/endianness 不稳定）。
     std::array<std::uint8_t, kHeaderBytes + kMaxUplinkPcmBytes> frame; auto* p = frame.data();
     std::memcpy(p, "BPV1", 4); p[4] = 1; p[5] = 1; Put16(h.flags, p + 6); Put16(64, p + 8);
-    p[10] = 1; p[11] = 1; Put32(h.sample_rate_hz, p + 12); Put32(static_cast<std::uint32_t>(bytes), p + 16);
+    p[10] = 1; p[11] = 1; Put32(16000U, p + 12); Put32(static_cast<std::uint32_t>(bytes), p + 16);
     Put32(h.sequence, p + 20); Put64(h.timestamp_us, p + 24); Put32(h.ids.epoch, p + 32);
     std::memcpy(p + 36, uuid_.data(), uuid_.size()); Put32(h.ids.session, p + 52);
     Put32(h.ids.turn, p + 56); Put32(h.ids.stream, p + 60); std::memcpy(p + 64, pcm, bytes);
@@ -229,11 +229,10 @@ class VoiceTransport::Impl final {
   bool CanQueue(std::size_t bytes) {
     try {
       const std::size_t queued = client_.get_con_from_hdl(hdl_)->get_buffered_amount();
-      return queued <= config_.maximum_buffered_bytes && bytes <= config_.maximum_buffered_bytes - queued;
+      return queued <= kMaxBufferedBytes && bytes <= kMaxBufferedBytes - queued;
     } catch (...) { return false; }
   }
   void Fail(std::string why) { connected_ = false; if (error_) try { error_(std::move(why)); } catch (...) {} }
-  void SafeClose(std::uint16_t code, std::string why) { if (closed_) try { closed_(code, std::move(why)); } catch (...) {} }
   void Emit(Inbound event) { if (inbound_) try { inbound_(std::move(event)); } catch (...) { Fail("inbound callback threw"); } }
 
   bool DecodePin(const std::string& text) {
@@ -283,17 +282,18 @@ class VoiceTransport::Impl final {
         const auto& body = p.get_child("payload"); const std::string type = p.get<std::string>("type");
         if (type == "hello.ack") {
           if (session_ || e.ids.session == 0 || e.ids.turn || e.ids.stream || e.ids.epoch == 0) throw std::runtime_error("invalid hello.ack identity");
-          e.kind = InboundKind::kHelloAck; e.input_sample_rate_hz = body.get<std::uint32_t>("input_sample_rate_hz");
-          e.output_sample_rate_hz = body.get<std::uint32_t>("output_sample_rate_hz"); e.input_frame_ms = body.get<std::uint32_t>("input_frame_ms");
-          if (e.input_sample_rate_hz != 16000 || e.output_sample_rate_hz != 24000 || e.input_frame_ms != 20) throw std::runtime_error("unsupported hello audio contract");
+          e.kind = InboundKind::kHelloAck;
+          if (body.get<std::uint32_t>("input_sample_rate_hz") != 16000 ||
+              body.get<std::uint32_t>("output_sample_rate_hz") != 24000 ||
+              body.get<std::uint32_t>("input_frame_ms") != 20) throw std::runtime_error("unsupported hello audio contract");
           session_ = e.ids.session; session_epoch_ = e.ids.epoch;
         } else if (type == "response.start") {
           if (IsStale(e.ids)) return;
           if (!active_ || !committed_ || ValidIds(response_) ||
               !SameTurn(e.ids, turn_) || e.ids.stream == 0) throw std::runtime_error("wrong response.start identity or order");
-          e.kind = InboundKind::kResponseStart; e.response_id = body.get<std::string>("response_id");
-          if (e.response_id.empty() || e.response_id.size() > 128) throw std::runtime_error("invalid response_id");
-          response_ = e.ids; response_id_ = e.response_id; downlink_sequence_ = 0;
+          e.kind = InboundKind::kResponseStart;
+          if (body.get<std::string>("response_id").empty()) throw std::runtime_error("missing response_id");
+          response_ = e.ids; downlink_sequence_ = 0;
           audio_started_ = audio_ended_ = response_done_ = false;
           if (response_cancel_sent_) { discard_downlink_ = true; return; }
           discard_downlink_ = false;
@@ -303,8 +303,8 @@ class VoiceTransport::Impl final {
                                                             e.ids.stream != 0U;
           if (!active_ || !response_cancel_sent_ || !SameTurn(e.ids, turn_) || !stream_matches)
             throw std::runtime_error("wrong cancellation identity");
-          e.kind = InboundKind::kCancelled; e.reason = body.get<std::string>("reason");
-          if (e.reason.empty() || e.reason.size() > 64) throw std::runtime_error("invalid cancellation reason");
+          e.kind = InboundKind::kCancelled; const std::string reason = body.get<std::string>("reason");
+          if (reason.empty() || reason.size() > 64) throw std::runtime_error("invalid cancellation reason");
           active_ = response_cancel_sent_ = discard_downlink_ = false;
         } else if (type == "error") {
           if (IsStale(e.ids)) return;
@@ -319,16 +319,14 @@ class VoiceTransport::Impl final {
           if (IsStale(e.ids)) return;
           if (!active_ || !ValidIds(response_) || e.ids.session != response_.session || e.ids.turn != response_.turn ||
               e.ids.stream != response_.stream || e.ids.epoch != response_.epoch) throw std::runtime_error("wrong response identity");
-          e.response_id = body.get<std::string>("response_id");
-          if (e.response_id != response_id_) throw std::runtime_error("response_id changed");
           if (type == "response.text_delta") {
             if (Discarding(e.ids)) return;
             e.kind = InboundKind::kTextDelta; e.text = body.get<std::string>("text");
             if (e.text.empty() || e.text.size() > 4096) throw std::runtime_error("invalid text delta");
           } else if (type == "response.audio_start") {
             if (Discarding(e.ids)) return;
-            e.kind = InboundKind::kAudioStart; e.output_sample_rate_hz = body.get<std::uint32_t>("sample_rate_hz");
-            if (audio_started_ || e.output_sample_rate_hz != 24000) {
+            e.kind = InboundKind::kAudioStart;
+            if (audio_started_ || body.get<std::uint32_t>("sample_rate_hz") != 24000) {
               throw std::runtime_error("invalid audio contract");
             }
             audio_started_ = true;
@@ -349,12 +347,12 @@ class VoiceTransport::Impl final {
     if (bytes.size() < kHeaderBytes || std::memcmp(p, "BPV1", 4) != 0 || p[4] != 1 || p[5] != 2 ||
         Get16(p + 8) != 64 || p[10] != 1 || p[11] != 1) return ProtocolError("invalid PCM header");
     const std::size_t payload = Get32(p + 16); const std::uint16_t flags = Get16(p + 6);
-    Inbound e; e.kind = InboundKind::kPcm; e.pcm.kind = p[5]; e.pcm.flags = flags; e.pcm.sample_rate_hz = Get32(p + 12);
+    Inbound e; e.kind = InboundKind::kPcm; e.pcm.flags = flags;
     e.pcm.sequence = Get32(p + 20); e.pcm.timestamp_us = Get64(p + 24);
     e.pcm.ids = {Get32(p + 52), Get32(p + 56), Get32(p + 60), Get32(p + 32)}; e.ids = e.pcm.ids;
     if (payload == 0 || payload > kMaxDownlinkPcmBytes || payload % 2 ||
         bytes.size() != kHeaderBytes + payload || flags & ~kKnownFlags ||
-        e.pcm.sample_rate_hz != 24000 || std::memcmp(p + 36, uuid_.data(), uuid_.size()) != 0)
+        Get32(p + 12) != 24000 || std::memcmp(p + 36, uuid_.data(), uuid_.size()) != 0)
       return ProtocolError("invalid PCM framing");
     {
       std::unique_lock<std::mutex> state_lock(protocol_mutex_);
@@ -375,7 +373,7 @@ class VoiceTransport::Impl final {
     std::copy_n(p + kHeaderBytes, payload, e.audio.begin()); e.audio_size = payload; Emit(std::move(e));
   }
   void OnMessage(const Client::message_ptr& message) {
-    if (message->get_payload().size() > config_.maximum_message_bytes) return ProtocolError("message too large");
+    if (message->get_payload().size() > kMaxMessageBytes) return ProtocolError("message too large");
     if (message->get_opcode() == websocketpp::frame::opcode::text) OnText(message->get_payload());
     else if (message->get_opcode() == websocketpp::frame::opcode::binary) OnBinary(message->get_payload());
     else ProtocolError("unsupported WebSocket opcode");
@@ -386,11 +384,11 @@ class VoiceTransport::Impl final {
   }
 
   // ASIO 线程拥有 client_/hdl_ 回调；protocol_mutex_ 是它与 application actor 的唯一协议共享边界。
-  Client client_; Hdl hdl_; TransportConfig config_; InboundHandler inbound_; ErrorHandler error_; CloseHandler closed_;
+  Client client_; Hdl hdl_; TransportConfig config_; InboundHandler inbound_; ErrorHandler error_;
   std::thread thread_; std::mutex send_mutex_, protocol_mutex_;
   std::atomic<bool> connected_{false}, closing_{false};
   std::array<std::uint8_t, 16> uuid_{}; std::array<unsigned char, 32> pin_{};
-  WireIds turn_{}, response_{}; std::string response_id_; std::uint32_t session_{0}, session_epoch_{0};
+  WireIds turn_{}, response_{}; std::uint32_t session_{0}, session_epoch_{0};
   std::uint32_t uplink_sequence_{0}, downlink_sequence_{0};
   bool active_{false}, committed_{false}, uplink_ended_{false}, audio_started_{false}, audio_ended_{false};
   bool response_done_{false}, response_cancel_sent_{false}, discard_downlink_{false};
@@ -398,7 +396,7 @@ class VoiceTransport::Impl final {
 
 VoiceTransport::VoiceTransport() : impl_(std::make_unique<Impl>()) {}
 VoiceTransport::~VoiceTransport() = default;
-bool VoiceTransport::Connect(TransportConfig c, InboundHandler i, ErrorHandler e, CloseHandler x) { return impl_->Connect(std::move(c), std::move(i), std::move(e), std::move(x)); }
+bool VoiceTransport::Connect(TransportConfig c, InboundHandler i, ErrorHandler e) { return impl_->Connect(std::move(c), std::move(i), std::move(e)); }
 bool VoiceTransport::SendControl(const Control& c) { return impl_->Send(c); }
 bool VoiceTransport::SendPcm64(const Pcm64Header& h, const std::uint8_t* p, std::size_t n) { return impl_->SendPcm(h, p, n); }
 void VoiceTransport::Close() noexcept { impl_->Close(); }

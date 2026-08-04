@@ -11,6 +11,7 @@ import (
 	"github.com/lst92991-eng/boomPI/server/internal/backend/qwen"
 	"github.com/lst92991-eng/boomPI/server/internal/backend/qwenpipeline"
 	"github.com/lst92991-eng/boomPI/server/internal/config"
+	"github.com/lst92991-eng/boomPI/server/internal/discovery"
 	"github.com/lst92991-eng/boomPI/server/internal/identity"
 	"github.com/lst92991-eng/boomPI/server/internal/transport"
 )
@@ -21,6 +22,7 @@ type App struct {
 	cfg       config.Config
 	logger    *slog.Logger
 	transport *transport.Server
+	discovery *discovery.Responder
 	spkiPin   string
 }
 
@@ -79,6 +81,14 @@ func newWithBackend(cfg config.Config, logger *slog.Logger, identityDirectory st
 	if err != nil {
 		return nil, fmt.Errorf("load server TLS identity: %w", err)
 	}
+	udpDiscovery, err := discovery.NewResponder(discovery.Config{
+		BindAddress: cfg.ListenAddress,
+		UDPPort:     cfg.DiscoveryPort,
+		WSSPort:     cfg.WSSPort,
+	}, serverIdentity.SPKISHA256)
+	if err != nil {
+		return nil, fmt.Errorf("configure UDP discovery: %w", err)
+	}
 	handler := &deviceHandler{cfg: cfg, logger: logger, provider: provider}
 	wss, err := transport.NewServer(transport.Config{
 		Address:      net.JoinHostPort(cfg.ListenAddress, fmt.Sprint(cfg.WSSPort)),
@@ -89,15 +99,19 @@ func newWithBackend(cfg config.Config, logger *slog.Logger, identityDirectory st
 	if err != nil {
 		return nil, err
 	}
-	return &App{cfg: cfg, logger: logger, transport: wss, spkiPin: serverIdentity.SPKISHA256}, nil
+	return &App{
+		cfg: cfg, logger: logger, transport: wss, discovery: udpDiscovery,
+		spkiPin: serverIdentity.SPKISHA256,
+	}, nil
 }
 
 func (a *App) Run(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("context is required")
 	}
-	a.logger.Info("boomPI server started",
+	a.logger.Info("boomPI server starting",
 		"wss_address", net.JoinHostPort(a.cfg.ListenAddress, fmt.Sprint(a.cfg.WSSPort)),
+		"discovery_address", net.JoinHostPort(a.cfg.ListenAddress, fmt.Sprint(a.cfg.DiscoveryPort)),
 		"provider", a.cfg.Provider,
 		"region", a.cfg.Region,
 		"conversation_mode", a.cfg.ConversationMode,
@@ -109,10 +123,20 @@ func (a *App) Run(ctx context.Context) error {
 		"credential_source", a.cfg.Credentials.Source(),
 		"tls_spki_sha256", a.spkiPin,
 	)
-	err := a.transport.Serve(ctx)
-	if err == nil || ctx.Err() != nil {
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	results := make(chan error, 2)
+	go func() { results <- a.transport.Serve(runCtx) }()
+	go func() { results <- a.discovery.Serve(runCtx) }()
+	first := <-results
+	stop()
+	second := <-results
+	if ctx.Err() != nil {
 		a.logger.Info("boomPI server stopped")
 		return nil
 	}
-	return err
+	if first != nil {
+		return first
+	}
+	return second
 }

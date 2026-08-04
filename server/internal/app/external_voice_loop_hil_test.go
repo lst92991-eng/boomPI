@@ -41,6 +41,7 @@ func TestExternalVoiceLoopHILServer(t *testing.T) {
 		port = freePort(t)
 	}
 	cfg.WSSPort = port
+	cfg.DiscoveryPort = freeUDPPort(t)
 
 	provider := &voiceLoopHILBackend{session: &voiceLoopHILSession{
 		events: make(chan backend.ConversationEvent, 64),

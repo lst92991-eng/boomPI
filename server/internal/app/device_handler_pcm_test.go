@@ -430,6 +430,7 @@ func startPCMOutputTestWithCancelCounter(t *testing.T, events []backend.Conversa
 	}
 	cfg.ListenAddress = "127.0.0.1"
 	cfg.WSSPort = freePort(t)
+	cfg.DiscoveryPort = freeUDPPort(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	application, err := newWithBackend(cfg, logger, t.TempDir(), &pcmBoundaryBackend{
 		events: events, cancelCount: cancelCount,

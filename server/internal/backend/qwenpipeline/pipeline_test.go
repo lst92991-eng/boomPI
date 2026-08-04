@@ -105,19 +105,45 @@ func TestEmitErrorLogsOnlySafeClassification(t *testing.T) {
 	}
 }
 
-func TestDiscardLastResponseRemovesCanceledUserAssistantPair(t *testing.T) {
+func TestDiscardLastResponseKeepsPreviousPairWhileCurrentResponseIsIncomplete(t *testing.T) {
+	session := &Session{history: []chatMessage{
+		{Role: "user", Content: "previous"},
+		{Role: "assistant", Content: "previous answer"},
+	}, lastResponseDiscardable: true}
+	if err := session.SendAudio(context.Background(), []byte{0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.DiscardLastResponse(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(session.history) != 2 || session.history[0].Content != "previous" ||
+		session.history[1].Content != "previous answer" {
+		t.Fatalf("incomplete response removed previous history = %#v", session.history)
+	}
+}
+
+func TestDiscardLastResponseRemovesOnlyMarkedCompletedPair(t *testing.T) {
 	session := &Session{history: []chatMessage{
 		{Role: "user", Content: "first"},
 		{Role: "assistant", Content: "answer"},
-		{Role: "user", Content: "interrupted"},
-		{Role: "assistant", Content: "partial"},
-	}}
+		{Role: "user", Content: "completed"},
+		{Role: "assistant", Content: "completed answer"},
+	}, lastResponseDiscardable: true}
 	if err := session.DiscardLastResponse(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(session.history) != 2 || session.history[0].Content != "first" ||
 		session.history[1].Content != "answer" {
 		t.Fatalf("history after discard = %#v", session.history)
+	}
+	if session.lastResponseDiscardable {
+		t.Fatal("discardable marker remained set after deletion")
+	}
+	if err := session.DiscardLastResponse(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(session.history) != 2 {
+		t.Fatalf("second discard removed an older pair = %#v", session.history)
 	}
 }
 
@@ -188,5 +214,110 @@ func TestBoundedHistoryDoesNotStartWithOrphanAssistant(t *testing.T) {
 	if len(bounded) != 3 || bounded[0].Role != "user" ||
 		bounded[0].Content != "u2" || bounded[2].Content != "u3" {
 		t.Fatalf("bounded in-progress history = %#v", bounded)
+	}
+}
+
+type recordingTTSSynthesizer struct {
+	text  strings.Builder
+	pcm   []byte
+	err   error
+	calls int
+}
+
+func (s *recordingTTSSynthesizer) synthesizeStream(
+	_ context.Context,
+	fragments <-chan string,
+	emit func([]byte) error,
+) error {
+	s.calls++
+	for fragment := range fragments {
+		s.text.WriteString(fragment)
+	}
+	if s.err != nil {
+		return s.err
+	}
+	return emit(s.pcm)
+}
+
+func TestClearConversationCommandClearsHistoryAndConfirmsLocally(t *testing.T) {
+	synthesizer := &recordingTTSSynthesizer{pcm: []byte{1, 2, 3, 4}}
+	session := &Session{
+		tts:    synthesizer,
+		ctx:    context.Background(),
+		events: make(chan backend.ConversationEvent, 3),
+		history: []chatMessage{
+			{Role: "user", Content: "旧问题"},
+			{Role: "assistant", Content: "旧回答"},
+		},
+		lastResponseDiscardable: true,
+	}
+	timing := newTurnTiming(nil, "response-clear", time.Now(), 640)
+
+	handled, err := session.handleClearConversation(
+		context.Background(), "response-clear", " 清空对话。 ", timing,
+	)
+	if err != nil || !handled {
+		t.Fatalf("handleClearConversation() = %t, %v", handled, err)
+	}
+	if len(session.history) != 0 || session.lastResponseDiscardable {
+		t.Fatalf("history was not reset = %#v, discardable=%t",
+			session.history, session.lastResponseDiscardable)
+	}
+	if synthesizer.calls != 1 || synthesizer.text.String() != clearConversationConfirmation {
+		t.Fatalf("TTS calls/text = %d/%q", synthesizer.calls, synthesizer.text.String())
+	}
+
+	wantTypes := []backend.EventType{backend.EventTextDelta, backend.EventAudio, backend.EventDone}
+	for index, wantType := range wantTypes {
+		event := <-session.events
+		if event.Type != wantType || event.ResponseID != "response-clear" {
+			t.Fatalf("event %d = %+v, want type %d for response-clear", index, event, wantType)
+		}
+		if event.Type == backend.EventTextDelta && event.Text != clearConversationConfirmation {
+			t.Fatalf("confirmation text = %q", event.Text)
+		}
+		if event.Type == backend.EventAudio &&
+			(event.SampleRateHz != 24000 || !bytes.Equal(event.PCM, synthesizer.pcm)) {
+			t.Fatalf("confirmation audio = rate %d pcm %v", event.SampleRateHz, event.PCM)
+		}
+	}
+}
+
+func TestClearConversationCommandKeepsHistoryClearedWhenConfirmationFails(t *testing.T) {
+	synthesizer := &recordingTTSSynthesizer{err: errors.New("TTS unavailable")}
+	session := &Session{
+		tts:     synthesizer,
+		ctx:     context.Background(),
+		events:  make(chan backend.ConversationEvent, 1),
+		history: []chatMessage{{Role: "user", Content: "must disappear"}},
+	}
+
+	handled, err := session.handleClearConversation(
+		context.Background(), "response-clear", "清空对话", newTurnTiming(nil, "response-clear", time.Now(), 640),
+	)
+	if !handled || err == nil || !strings.Contains(err.Error(), "TTS unavailable") {
+		t.Fatalf("handleClearConversation() = %t, %v", handled, err)
+	}
+	if len(session.history) != 0 {
+		t.Fatalf("history survived failed confirmation = %#v", session.history)
+	}
+}
+
+func TestClearConversationCommandMatching(t *testing.T) {
+	for _, testCase := range []struct {
+		transcript string
+		want       bool
+	}{
+		{transcript: "清空对话", want: true},
+		{transcript: " 清空 对话。", want: true},
+		{transcript: "“清空对话！”", want: true},
+		{transcript: "请清空对话", want: false},
+		{transcript: "清空对话记录", want: false},
+		{transcript: "", want: false},
+	} {
+		if got := isClearConversationCommand(testCase.transcript); got != testCase.want {
+			t.Errorf("isClearConversationCommand(%q) = %t, want %t",
+				testCase.transcript, got, testCase.want)
+		}
 	}
 }

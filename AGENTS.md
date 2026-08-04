@@ -4,6 +4,26 @@
 
 本文中的“必须”“禁止”“不得”是强约束；“建议”可以在有实测数据或 ADR（Architecture Decision Record）支持时调整。用户最新的明确要求优先于本文，但发生架构变化时必须同步更新本文和相关文档。
 
+## 0. 当前教学版冻结范围（2026-08-03，优先于全文其余路线图）
+
+当前目标不是企业级量产平台，而是一套学生可以读懂、配置 Qwen API Key 后即可运行的
+完整教学版本。下列约束覆盖本文后续与之冲突的旧路线图：
+
+- 板端只保留已经跑通的双麦、Rockchip 3A、Snowboy、VAD、WSS、流式 TTS、打断和三秒追问主线。
+- 本版补齐最小屏幕状态/字幕/触摸、以太网优先、已保存 Wi-Fi 接入、简单局域网发现和配置持久化。
+- Go 服务端提供跨平台单二进制；除 Qwen API Key 外均给出可运行默认值，并提供三步启动说明。
+- 首次 Wi-Fi 二维码只负责把 SSID/密码交给板端；不引入账户系统、设备授权或云端控制面。
+- 使用现有共享令牌和 SPKI 固定即可；六位码配对、多设备管理、复杂 flow-credit、工具系统、
+  独立 C++ supervisor、签名 A/B 更新、掉电事务和 24 小时 soak 均后置。
+- 教学版仅保留缓冲区边界、超时、秘密不落日志和硬件安全等最低防线，不为未验证场景增加框架。
+- 全部板端生产 C/C++（包含 Rockchip/Snowboy 适配、UI 和网络启动）硬上限为 **2500 ELOC**；
+  辅助 Shell/Python 也必须单独公开行数，禁止通过挪文件、压行或删除有价值注释规避统计。
+- 新功能先复用 BSP 已验证的设备节点、命令和成熟库；在出现第二种真实后端前，不增加工厂、
+  虚接口、插件、通用 worker 或占位模块。
+
+本节完成后，后文的六位码配对、`boompi-supervisor`、签名 A/B 更新和完整企业发布闸门仅作
+未来参考，不属于当前教学版交付阻断项。
+
 ## 1. 项目目标与第一版边界
 
 boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运行 C++ 客户端，本地电脑运行跨平台 Go 服务端，服务端再访问 Qwen 新加坡区。第一版形态是“小智”式全双工语音聊天机器人。
@@ -37,11 +57,12 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
   硬参考探针确认打断后，把该预卷作为新用户 utterance 的开头，不能吃掉句首。
 - 唤醒后等待首次说话 6 秒；正常结束说话静音阈值 700 ms；单次用户语音最长 60 秒。
 - TTS 结束后进入 3 秒 `FOLLOW_UP`，期间无需再次唤醒。
-- 播放期间先要求连续 2 帧（40 ms）近端候选，保持原音量；随后把播放降到 30%，再要求
-  连续 2 帧（40 ms）近端证据。只有候选持续时才硬静音，等待硬参考连续 2 帧降为低电平
-  （最多 8 帧），再留出 3 帧（60 ms）清除声学尾音、重置 listener，并以连续 3 帧
-  （60 ms）重新确认近端语音；确认后才清空播放队列并取消云端回答。任一阶段失败须恢复
-  播放并冷却 15 帧（300 ms），防止恢复瞬态反复切断 TTS。自然播放结束走另一条路径：
+- 播放期间先以原音量要求连续 6 帧（120 ms）近端候选，随后一次性静音；不再使用 30%
+  中间音量。静音后最多等待 15 帧取得连续 3 帧低 reference，再清尾 3 帧（60 ms）、重置
+  listener，并以连续 3 帧（60 ms）重新确认近端语音；确认后才清空播放队列并取消云端回答。
+  播放取消和新用户 turn 分为两个决定：新 turn 还必须出现有效 VAD start，并满足连续 20 帧
+  （400 ms）低 reference，取消确认后的准入窗口最多 500 ms。任一探针阶段失败须恢复播放并
+  冷却 15 帧（300 ms）。自然播放结束走另一条路径：
   backend 先抑制 15 帧（300 ms）尾音，follow-up 随后必须连续 20 帧（400 ms）才开始新轮。
   该主动探针是防自激的 containment 候选，不是 AEC 效果结论；取消
   时延及真人双讲灵敏度必须在安静可控环境重新测量。
@@ -53,33 +74,32 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
 - 网络断开时丢弃当前轮次，不缓存并补发过期语音；本地唤醒、UI 和离线提示仍工作。
 - 默认女声方向是自然、年轻、不过度卖萌。具体 Qwen voice 必须在真实扬声器上试听至少三个候选后再固化。
 
-## 2.1 当前板端实现边界（2026-08-01，优先于后文路线图）
+## 2.1 当前板端实现边界（2026-08-03，优先于后文路线图）
 
-现役 `boompi-client` 产品核心 C++ 的硬上限是 2000 ELOC；计数排除直接适配既有
-Rockchip/Snowboy vendor 的集成代码，但必须同时公开其中的纯 ABI 桥、硬件适配逻辑和含适配
-总量，且当前总量上限为 2300 ELOC。当前候选为 17 个文件、2300 ELOC，其中 vendor 集成
-439 ELOC、产品核心
-1861 ELOC；精确范围见 `docs/test/client-responsibility-layout-20260801.md`。后文关于完整目录、
-supervisor、UI、update、target 分层和发布架构的内容是后续路线图，不授权提前恢复占位层。
+现役 `boompi-client` 包含 19 个生产 C/C++ 文件、2500 ELOC，其中 Rockchip/Snowboy vendor
+集成 280 ELOC，产品逻辑 2220 ELOC。计数口径是非空行减去纯 `//` 注释，完整范围由
+`scripts/tests/test_client_source_contract.py` 固定；2026-08-01 的
+`docs/test/client-responsibility-layout-20260801.md` 保留为纯语音阶段历史快照。后文关于完整
+supervisor、update、target 分层和发布架构的内容是未来路线图，不授权提前恢复占位层。
 
 - 生产目标按仓库既定职责落位：`application/voice_client` 独占会话状态，
   `audio/audio_engine` 管理播放线程和有界 TTS 环，`network/voice_transport` 管理
   持久 WSS/TLS 与会话身份/序号校验，`platform/rv1106/audio_backend` 管理 ALSA、重采样、
-  Snowboy/VAD/近讲判定，并只调用一次 Rockchip 3A；其余只有环境配置、`Status`、
+  Snowboy/VAD/近讲判定，并只调用一次 Rockchip 3A；`network/network_bootstrap` 只处理链路
+  优先级、已保存 Wi-Fi 与服务发现，`ui/device_ui` 只处理当前屏幕和触摸；其余只有环境配置、
   Snowboy C ABI 桥和 composition root。
 - `AudioBackend` 是 `AudioEngine` 的私有板级实现，不是 application 可见的第二套接口；
   在出现第二种已验证硬件后端前，不建立工厂、虚基类或通用 backend 层。
 - 以上职责目录是当前实现，不是恢复旧的通用框架。不得另建 `App/Driver/Inf` 平行目录，
   也不得用目录重排为理由增加 worker、虚接口、工厂或占位 target。
 - 禁止恢复已删除的 `manual_single_turn`、自写 WebSocket/TLS/JSON、重复 wire protocol、
-  通用 capture/playback/control/committer/worker、host fake 音频和未接入产品的 UI/update
-  占位实现。
+  通用 capture/playback/control/committer/worker、host fake 音频和未接入产品的 update
+  占位实现；当前 UI 与配网是实际硬件功能，不是抽象框架。
 - WebSocketpp、Boost、OpenSSL、ALSA、libswresample、Rockchip 3A、Snowboy 和 WebRTC VAD
   作为外部实现使用；不得复制它们的功能到自写生产层，也不得把自写业务代码移进
   `third_party/` 规避计数。
-- 增加产品核心代码前必须先删减或用实测证明必要性，且保持产品核心低于 2000 ELOC、
-  含 vendor 集成总量不超过 2300 ELOC。未来 UI、
-  配网和 supervisor 按实际硬件阶段单独核定预算，不能无声挤入当前语音客户端。
+- 增加生产 C/C++ 前必须先删减或用实测证明必要性，含 vendor、UI 和网络启动的总量不得超过
+  2500 ELOC。辅助运维与配网脚本单独计数；未来 supervisor 不得挤入当前客户端预算。
 
 ## 3. 硬件基线与事实来源
 

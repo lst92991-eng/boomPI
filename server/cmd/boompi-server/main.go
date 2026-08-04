@@ -37,7 +37,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	var opts options
 	opts.overrides = make(config.Overrides)
-	flags.StringVar(&opts.configPath, "config", "configs/config.yaml", "path to the non-secret YAML configuration")
+	flags.StringVar(&opts.configPath, "config", "config.yaml", "path to the YAML configuration")
 	flags.BoolVar(&opts.checkConfig, "check-config", false, "validate configuration and exit")
 	addOverrideFlag(flags, opts.overrides, "listen-address", "listen_address", "override the server listen address")
 	addOverrideFlag(flags, opts.overrides, "wss-port", "wss_port", "override the WSS port")
@@ -57,6 +57,21 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if flags.NArg() != 0 {
 		fmt.Fprintln(stderr, "unexpected positional arguments")
 		return 2
+	}
+
+	created, err := config.CreateStarter(opts.configPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "configuration setup error: %v\n", err)
+		return 1
+	}
+	if created {
+		absolutePath, pathErr := filepath.Abs(opts.configPath)
+		if pathErr != nil {
+			absolutePath = opts.configPath
+		}
+		fmt.Fprintf(stdout, "Created starter configuration: %s\n", absolutePath)
+		fmt.Fprintln(stdout, "Edit qwen_api_key, save the file, then run boompi-server again.")
+		return 0
 	}
 
 	cfg, err := config.Load(opts.configPath, opts.overrides)

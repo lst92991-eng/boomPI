@@ -288,8 +288,16 @@ func (a *Actor) apply(cmd command, state *actorState) error {
 		if cmd.epoch != state.epoch {
 			return ErrInvalidTransition
 		}
+		responseWasActive := state.phase == thinking || state.phase == speaking
 		if err := a.provider.Cancel(cmd.ctx); err != nil {
 			return fmt.Errorf("cancel response: %w", err)
+		}
+		if responseWasActive {
+			if discarder, ok := a.provider.(backend.CompletedResponseDiscarder); ok {
+				if err := discarder.DiscardLastResponse(cmd.ctx); err != nil {
+					return fmt.Errorf("discard cancelled response: %w", err)
+				}
+			}
 		}
 		a.drainProviderEvents()
 		if state.pending != nil && state.pending.Epoch == state.epoch {

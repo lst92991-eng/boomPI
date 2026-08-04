@@ -8,6 +8,7 @@
 #define BOOMPI_ROCKCHIP_DELAY_SAMPLES 0
 #endif
 #include <algorithm>
+#include <cstring>
 #include <cstdint>
 #include <new>
 #include <type_traits>
@@ -42,11 +43,6 @@ static_assert(std::is_same<decltype(&rkaudio_preprocess_short), ProcessSignature
               "unexpected rkaudio_preprocess_short signature");
 static_assert(std::is_same<decltype(&rkaudio_preprocess_destory), DestroySignature>::value,
               "unexpected rkaudio_preprocess_destory signature");
-static_assert(RKAUDIO_EN_AEC == (1 << 0), "unexpected AEC feature bit");
-static_assert(RKAUDIO_EN_BF == (1 << 1), "unexpected BF feature bit");
-static_assert(EN_Anr == (1 << 6), "unexpected ANR feature bit");
-static_assert(EN_STDT == (1 << 10), "unexpected STDT feature bit");
-static_assert(EN_Fix == (1 << 9), "unexpected fixed-beam feature bit");
 static_assert(kBeamformingFeatureMask ==
                   (BOOMPI_ROCKCHIP_ENABLE_STDT != 0 ? 1109 : 85),
               "validated Rockchip 3A profile changed");
@@ -115,14 +111,14 @@ RockchipVoiceDsp::~RockchipVoiceDsp() noexcept {
   Close();
 }
 
-RockchipVoiceDspStatus RockchipVoiceDsp::Open() noexcept {
-  if (handle_ != nullptr || parameters_ != nullptr) return RockchipVoiceDspStatus::kAlreadyOpen;
+bool RockchipVoiceDsp::Open() noexcept {
+  if (handle_ != nullptr || parameters_ != nullptr) return false;
 
   auto* const parameters = new (std::nothrow) RKAUDIOParam{};
-  if (parameters == nullptr) return RockchipVoiceDspStatus::kParameterAllocationFailed;
+  if (parameters == nullptr) return false;
   if (!PrepareParameters(parameters)) {
     ReleaseParameters(parameters);
-    return RockchipVoiceDspStatus::kParameterInitializationFailed;
+    return false;
   }
 
   void* const handle = rkaudio_preprocess_init(
@@ -130,7 +126,7 @@ RockchipVoiceDspStatus RockchipVoiceDsp::Open() noexcept {
       kReferenceChannels, parameters);
   if (handle == nullptr) {
     ReleaseParameters(parameters);
-    return RockchipVoiceDspStatus::kBackendInitializationFailed;
+    return false;
   }
 
   parameters_ = parameters;
@@ -138,7 +134,7 @@ RockchipVoiceDspStatus RockchipVoiceDsp::Open() noexcept {
   // vendor 256-sample block 与产品 320-sample frame 不整除；prime 一帧输出让每次 API
   // 调用仍保持严格 320 in / 320 out，代价是固定 20 ms 启动延迟。
   ResetFifos(true);
-  return RockchipVoiceDspStatus::kOk;
+  return true;
 }
 
 void RockchipVoiceDsp::Close() noexcept {
@@ -153,103 +149,56 @@ void RockchipVoiceDsp::Close() noexcept {
   ResetFifos(false);
 }
 
-RockchipVoiceDspStatus RockchipVoiceDsp::Process(
+bool RockchipVoiceDsp::Process(
     const RockchipVoiceFrame16k& mic_left,
     const RockchipVoiceFrame16k& mic_right,
     const RockchipVoiceFrame16k& reference_left,
     const RockchipVoiceFrame16k& reference_right,
     RockchipVoiceFrame16k* const output) noexcept {
-  if (output == nullptr) return RockchipVoiceDspStatus::kInvalidArgument;
+  if (output == nullptr) return false;
   output->fill(0);
-  if (!is_open()) return RockchipVoiceDspStatus::kNotOpen;
-  if (!PushInput(mic_left, mic_right, reference_left, reference_right)) {
-    Close();
-    return RockchipVoiceDspStatus::kFifoOverflow;
+  if (!is_open()) return false;
+  if (input_count_ > kInputFifoFrames - kRockchipVoiceFrameSamples16k) return false;
+  // Mode1 仍采集 REF-R；生产单参考只在送入 vendor 前丢弃它。
+  for (std::size_t i = 0U; i < kRockchipVoiceFrameSamples16k; ++i) {
+    const std::size_t base = (input_count_ + i) * kVendorInputChannels;
+    input_fifo_[base] = mic_left[i]; input_fifo_[base + 1U] = mic_right[i];
+    input_fifo_[base + 2U] = reference_left[i];
+    if constexpr (kVendorInputChannels == 4U) input_fifo_[base + 3U] = reference_right[i];
   }
+  input_count_ += kRockchipVoiceFrameSamples16k;
   while (input_count_ >= kVendorBlockSamples) {
-    if (!ProcessVendorBlock()) {
-      Close();
-      return RockchipVoiceDspStatus::kBackendProcessFailed;
+    int wakeup_status = 0;
+    const int result = rkaudio_preprocess_short(
+        handle_, reinterpret_cast<short*>(input_fifo_.data()),
+        reinterpret_cast<short*>(vendor_output_.data()), kVendorInputShorts,
+        &wakeup_status);
+    if (result != kVendorOutputBytes ||
+        output_count_ > kOutputFifoSamples - kVendorBlockSamples) {
+      Close(); return false;
     }
+    input_count_ -= kVendorBlockSamples;
+    std::memmove(input_fifo_.data(), input_fifo_.data() +
+                     kVendorBlockSamples * kVendorInputChannels,
+                 input_count_ * kVendorInputChannels * sizeof(std::int16_t));
+    std::copy_n(vendor_output_.data(), kVendorBlockSamples,
+                output_fifo_.data() + output_count_);
+    output_count_ += kVendorBlockSamples;
   }
-  if (!PopOutput(output)) {
-    Close();
-    return RockchipVoiceDspStatus::kFifoUnderflow;
-  }
-  return RockchipVoiceDspStatus::kOk;
+  if (output_count_ < output->size()) { Close(); return false; }
+  std::copy_n(output_fifo_.data(), output->size(), output->data());
+  output_count_ -= output->size();
+  std::memmove(output_fifo_.data(), output_fifo_.data() + output->size(),
+               output_count_ * sizeof(std::int16_t));
+  return true;
 }
 
 void RockchipVoiceDsp::ResetFifos(const bool prime_output) noexcept {
   input_fifo_.fill(0);
   output_fifo_.fill(0);
-  vendor_input_.fill(0);
   vendor_output_.fill(0);
-  input_head_ = input_count_ = output_head_ = 0U;
+  input_count_ = 0U;
   output_count_ = prime_output ? kRockchipVoiceFrameSamples16k : 0U;
-}
-
-bool RockchipVoiceDsp::PushInput(
-    const RockchipVoiceFrame16k& mic_left,
-    const RockchipVoiceFrame16k& mic_right,
-    const RockchipVoiceFrame16k& reference_left,
-    const RockchipVoiceFrame16k& reference_right) noexcept {
-  if (input_count_ > kInputFifoFrames - kRockchipVoiceFrameSamples16k) return false;
-  // Mode1 仍保留四通道采集；生产只把 REF-L 送入 3A，丢弃重复的 REF-R。
-  static_cast<void>(reference_right);
-  for (std::size_t sample = 0U; sample < kRockchipVoiceFrameSamples16k;
-       ++sample) {
-    const std::size_t frame =
-        (input_head_ + input_count_ + sample) % kInputFifoFrames;
-    const std::size_t base = frame * kVendorInputChannels;
-    input_fifo_[base] = mic_left[sample];
-    input_fifo_[base + 1U] = mic_right[sample];
-    input_fifo_[base + 2U] = reference_left[sample];
-    if constexpr (kReferenceChannels == 2) input_fifo_[base + 3U] = reference_right[sample];
-  }
-  input_count_ += kRockchipVoiceFrameSamples16k;
-  return true;
-}
-
-bool RockchipVoiceDsp::ProcessVendorBlock() noexcept {
-  if (output_count_ > kOutputFifoSamples - kVendorBlockSamples) return false;
-  for (std::size_t sample = 0U; sample < kVendorBlockSamples; ++sample) {
-    const std::size_t frame = (input_head_ + sample) % kInputFifoFrames;
-    const std::size_t source = frame * kVendorInputChannels;
-    const std::size_t target = sample * kVendorInputChannels;
-    std::copy_n(input_fifo_.data() + source, kVendorInputChannels,
-                vendor_input_.data() + target);
-  }
-
-  // wakeup_status 是 vendor ABI 的必填输出；本产品唤醒固定由 Snowboy 处理，不消费它。
-  int wakeup_status = 0;
-  const int result = rkaudio_preprocess_short(
-      handle_, reinterpret_cast<short*>(vendor_input_.data()),
-      reinterpret_cast<short*>(vendor_output_.data()), kVendorInputShorts,
-      &wakeup_status);
-  if (result != kVendorOutputBytes) return false;
-
-  input_head_ = (input_head_ + kVendorBlockSamples) % kInputFifoFrames;
-  input_count_ -= kVendorBlockSamples;
-  for (std::size_t sample = 0U; sample < kVendorBlockSamples; ++sample) {
-    const std::size_t target =
-        (output_head_ + output_count_ + sample) % kOutputFifoSamples;
-    output_fifo_[target] = vendor_output_[sample];
-  }
-  output_count_ += kVendorBlockSamples;
-  return true;
-}
-
-bool RockchipVoiceDsp::PopOutput(RockchipVoiceFrame16k* const output) noexcept {
-  if (output == nullptr || output_count_ < kRockchipVoiceFrameSamples16k) return false;
-  for (std::size_t sample = 0U; sample < kRockchipVoiceFrameSamples16k;
-       ++sample) {
-    (*output)[sample] =
-        output_fifo_[(output_head_ + sample) % kOutputFifoSamples];
-  }
-  output_head_ =
-      (output_head_ + kRockchipVoiceFrameSamples16k) % kOutputFifoSamples;
-  output_count_ -= kRockchipVoiceFrameSamples16k;
-  return true;
 }
 
 }  // namespace boompi::platform::rv1106

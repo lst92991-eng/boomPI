@@ -27,16 +27,15 @@ constexpr unsigned kPreadaptRepeats = 4U;
 constexpr unsigned kPlaybackRepeats = 6U;
 constexpr unsigned kPreadaptGuardFrames = 1U;  // 对齐 3A 固定的 20 ms 输出启动延迟。
 constexpr unsigned kMaximumCaptureFrames = 500U;
-constexpr unsigned kBargeCandidateFrames = 2U, kBargeSoftDuckFrames = 2U, kBargeConfirmFrames = 3U;
+constexpr unsigned kBargeCandidateFrames = 6U, kBargeConfirmFrames = 3U;
 constexpr unsigned kFollowUpConfirmFrames = 20U;
-constexpr unsigned kBargeReferenceLowFrames = 2U, kBargeReferenceWaitFrames = 8U;
+constexpr unsigned kBargeReferenceLowFrames = 3U, kBargeReferenceWaitFrames = 15U;
 constexpr unsigned kBargeEchoClearFrames = 3U, kBargeRetryCooldownFrames = 15U;
-constexpr float kBargeSoftPlaybackScale = 0.30F;
 constexpr std::size_t kPrequeueFrames = 8U;
 constexpr int kCorrelationStrideSamples = 4;
 constexpr double kDbfsFloor = -120.0;
 using SignalSet = std::array<std::vector<std::int16_t>, 5U>;
-enum class ProbeState : std::uint8_t { kIdle, kSoftDuck, kWaitReferenceLow, kClear, kVerify };
+enum class ProbeState : std::uint8_t { kIdle, kWaitReferenceLow, kClear, kVerify };
 
 struct Metrics final {
   std::uint64_t squared_sum{0U};
@@ -240,11 +239,10 @@ int main(int argc, char* argv[]) {
   }
 
   boompi::config::VoiceClientConfig client_config;
-  const boompi::Status loaded =
-      boompi::config::LoadVoiceClientConfigFromEnvironment(&client_config);
-  if (!loaded.ok()) {
-    std::cerr << "boompi-aec-loop-hil: configuration failed: "
-              << loaded.message() << '\n';
+  std::string error;
+  if (!boompi::config::LoadVoiceClientConfigFromEnvironment(&client_config,
+                                                             &error)) {
+    std::cerr << "boompi-aec-loop-hil: configuration failed: " << error << '\n';
     return EXIT_FAILURE;
   }
 
@@ -254,6 +252,7 @@ int main(int argc, char* argv[]) {
   audio_config.snowboy_resource = client_config.snowboy_resource_path;
   audio_config.snowboy_model = client_config.snowboy_model_path;
   audio_config.snowboy_sensitivity = client_config.snowboy_sensitivity;
+  audio_config.vad_min_dbfs = client_config.vad_min_dbfs;
   audio_config.playback_gain =
       static_cast<float>(client_config.volume_percent) *
       client_config.speaker_gain_percent / 10000.0F;
@@ -359,12 +358,6 @@ int main(int argc, char* argv[]) {
           else if (!frame.near_voice) probe_near_frames = 0U;
           else if (++probe_near_frames >= kBargeCandidateFrames) {
             ++probe_attempts; probe_frames = probe_near_frames = 0U;
-            probe_state = ProbeState::kSoftDuck; audio.SetPlaybackScale(kBargeSoftPlaybackScale);
-          }
-        } else if (probe_state == ProbeState::kSoftDuck) {
-          if (!frame.near_voice) reset_probe(true);
-          else if (++probe_frames >= kBargeSoftDuckFrames) {
-            probe_frames = probe_near_frames = 0U;
             probe_state = ProbeState::kWaitReferenceLow; audio.SetPlaybackScale(0.0F);
           }
         } else if (probe_state == ProbeState::kWaitReferenceLow) {

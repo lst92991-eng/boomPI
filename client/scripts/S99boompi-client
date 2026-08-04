@@ -1,0 +1,9 @@
+#!/bin/sh
+# Buildroot/SysV boot hook. Start is detached so first-time AP provisioning
+# cannot block the rest of the board boot sequence.
+case ${1:-} in
+  start) /usr/sbin/boompi-clientctl start >/dev/null 2>&1 & ;;
+  stop) /usr/sbin/boompi-clientctl stop ;;
+  restart|reload) /usr/sbin/boompi-clientctl restart >/dev/null 2>&1 & ;;
+  *) echo 'usage: S99boompi-client start|stop|restart' >&2; exit 2 ;;
+esac

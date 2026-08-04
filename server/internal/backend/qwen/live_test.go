@@ -25,8 +25,8 @@ func TestLiveOpenSession(t *testing.T) {
 	}
 	apiKey := strings.TrimSpace(os.Getenv("DASHSCOPE_API_KEY"))
 	workspaceID := strings.TrimSpace(os.Getenv("DASHSCOPE_WORKSPACE_ID"))
-	if apiKey == "" || workspaceID == "" {
-		t.Fatal("DASHSCOPE_API_KEY and DASHSCOPE_WORKSPACE_ID are required")
+	if apiKey == "" {
+		t.Fatal("DASHSCOPE_API_KEY is required")
 	}
 	model := strings.TrimSpace(os.Getenv("BOOMPI_QWEN_LIVE_MODEL"))
 	if model == "" {

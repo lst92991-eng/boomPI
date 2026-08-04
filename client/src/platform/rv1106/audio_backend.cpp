@@ -29,7 +29,14 @@ namespace {
 constexpr std::size_t kCaptureChannels = 4U, kPlaybackChannels = 2U;
 constexpr std::size_t kCapture48Frames = 960U, kTts24Frames = 480U;
 constexpr std::size_t kMaximumPlayback48Frames = 2U * kCapture48Frames;
+// The controller exposes at most 16 KiB DMA. Four-channel S16 therefore fits
+// only two 960-frame periods (15,360 bytes); continuity comes from the
+// dedicated realtime capture thread rather than an impossible larger buffer.
+constexpr snd_pcm_uframes_t kCaptureBufferPeriods = 2U;
+constexpr snd_pcm_uframes_t kPlaybackBufferPeriods = 4U;
 constexpr std::uint32_t kFrameMs = 20U;
+constexpr std::uint32_t kVadStartMs = 120U, kVadEndMs = 700U;
+constexpr int kVadMode = 3;
 constexpr unsigned kAecWarmupFrames = 30U;
 constexpr unsigned kAecTailFrames = 15U;
 constexpr int kReferencePeakThreshold = 64;
@@ -48,7 +55,9 @@ int ConfigurePcm(snd_pcm_t* pcm, snd_pcm_stream_t stream,
   snd_pcm_hw_params_t* hw = nullptr; snd_pcm_hw_params_alloca(&hw);
   unsigned rate = 48000U; snd_pcm_uframes_t period = kCapture48Frames;
   const snd_pcm_uframes_t buffer_periods =
-      stream == SND_PCM_STREAM_CAPTURE ? 2U : 4U;
+      stream == SND_PCM_STREAM_CAPTURE ? kCaptureBufferPeriods
+                                       : kPlaybackBufferPeriods;
+  unsigned period_count = static_cast<unsigned>(buffer_periods);
   snd_pcm_uframes_t buffer = buffer_periods * kCapture48Frames; int direction = 0;
   *stage = "ALSA hw params any"; int rc = snd_pcm_hw_params_any(pcm, hw);
   if (rc >= 0) { *stage = "ALSA interleaved access"; rc = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED); }
@@ -56,14 +65,17 @@ int ConfigurePcm(snd_pcm_t* pcm, snd_pcm_stream_t stream,
   if (rc >= 0) { *stage = "ALSA channel count"; rc = snd_pcm_hw_params_set_channels(pcm, hw, channels); }
   if (rc >= 0) { *stage = "ALSA 48 kHz rate"; rc = snd_pcm_hw_params_set_rate(pcm, hw, rate, 0); }
   if (rc >= 0) { *stage = "ALSA period size"; rc = snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, &direction); }
+  direction = 0;
+  if (rc >= 0) { *stage = "ALSA period count"; rc = snd_pcm_hw_params_set_periods_near(pcm, hw, &period_count, &direction); }
   if (rc >= 0) { *stage = "ALSA buffer size"; rc = snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer); }
   if (rc >= 0) { *stage = "ALSA apply hw params"; rc = snd_pcm_hw_params(pcm, hw); }
   if (rc < 0) return rc;
-  if (period != kCapture48Frames ||
+  if (period != kCapture48Frames || period_count != buffer_periods ||
       buffer != buffer_periods * kCapture48Frames) {
     std::fprintf(stderr,
-                 "boompi-client: ALSA negotiated period=%lu buffer=%lu\n",
+                 "boompi-client: ALSA negotiated period=%lu periods=%u buffer=%lu\n",
                  static_cast<unsigned long>(period),
+                 period_count,
                  static_cast<unsigned long>(buffer));
     *stage = "ALSA exact period/buffer contract"; return -EINVAL;
   }
@@ -102,42 +114,30 @@ int ReadLoopbackValue(snd_ctl_t* control, snd_ctl_elem_id_t* id,
 }
 
 int WriteLoopbackValue(snd_ctl_t* control, snd_ctl_elem_id_t* id,
-                       unsigned target, bool* wrote = nullptr) noexcept {
+                       unsigned target) noexcept {
   snd_ctl_elem_value_t* value = nullptr; snd_ctl_elem_value_alloca(&value);
   snd_ctl_elem_value_set_id(value, id); snd_ctl_elem_value_set_enumerated(value, 0U, target);
   int rc = snd_ctl_elem_write(control, value); unsigned actual = target;
-  if (rc >= 0 && wrote != nullptr) *wrote = true;
   if (rc >= 0) rc = ReadLoopbackValue(control, id, &actual);
   return rc >= 0 && actual != target ? -EIO : rc;
 }
 
-int ConfigureLoopbackMode1(snd_pcm_t* capture, int* card,
-                           unsigned* previous, bool* changed) noexcept {
-  *card = -1; *previous = 0U; *changed = false;
+int ConfigureLoopbackMode1(snd_pcm_t* capture) noexcept {
   snd_pcm_info_t* pcm_info = nullptr; snd_pcm_info_alloca(&pcm_info);
   int rc = snd_pcm_info(capture, pcm_info); if (rc < 0) return rc;
-  *card = snd_pcm_info_get_card(pcm_info);
+  const int card = snd_pcm_info_get_card(pcm_info);
   snd_ctl_t* control = nullptr; snd_ctl_elem_id_t* id = nullptr; snd_ctl_elem_info_t* info = nullptr;
   snd_ctl_elem_id_alloca(&id); snd_ctl_elem_info_alloca(&info);
-  rc = OpenLoopbackControl(*card, &control, id, info); if (rc < 0) return rc;
+  rc = OpenLoopbackControl(card, &control, id, info); if (rc < 0) return rc;
   const unsigned items = snd_ctl_elem_info_get_items(info); unsigned target = items;
   for (unsigned item = 0U; item < items && rc >= 0; ++item) {
     snd_ctl_elem_info_set_item(info, item); rc = snd_ctl_elem_info(control, info);
     if (rc >= 0 && std::strcmp(snd_ctl_elem_info_get_item_name(info), kLoopbackMode) == 0) target = item;
   }
   if (rc >= 0 && target == items) rc = -ENOENT;
-  if (rc >= 0) rc = ReadLoopbackValue(control, id, previous);
-  if (rc >= 0 && *previous >= items) rc = -EINVAL;
-  if (rc >= 0 && *previous != target) rc = WriteLoopbackValue(control, id, target, changed);
-  snd_ctl_close(control); return rc;
-}
-
-int RestoreLoopbackMode(int card, unsigned previous) noexcept {
-  snd_ctl_t* control = nullptr; snd_ctl_elem_id_t* id = nullptr; snd_ctl_elem_info_t* info = nullptr;
-  snd_ctl_elem_id_alloca(&id); snd_ctl_elem_info_alloca(&info);
-  int rc = OpenLoopbackControl(card, &control, id, info); if (rc < 0) return rc;
-  if (previous >= snd_ctl_elem_info_get_items(info)) rc = -EINVAL;
-  if (rc >= 0) rc = WriteLoopbackValue(control, id, previous);
+  unsigned current = target;
+  if (rc >= 0) rc = ReadLoopbackValue(control, id, &current);
+  if (rc >= 0 && current != target) rc = WriteLoopbackValue(control, id, target);
   snd_ctl_close(control); return rc;
 }
 
@@ -156,10 +156,24 @@ bool ReferenceActive(const VoiceFrame16k& reference) noexcept {
   });
 }
 
+float AcRmsDbfs(const VoiceFrame16k& samples) noexcept {
+  double sum = 0.0;
+  for (const std::int16_t sample : samples) sum += sample;
+  const double mean = sum / static_cast<double>(samples.size());
+  double energy = 0.0;
+  for (const std::int16_t sample : samples) {
+    const double centered = static_cast<double>(sample) - mean;
+    energy += centered * centered;
+  }
+  if (energy <= 0.0) return -120.0F;
+  const double rms = std::sqrt(energy / static_cast<double>(samples.size()));
+  return static_cast<float>(20.0 * std::log10(rms / 32768.0));
+}
+
 }
 
 struct AudioBackend::Impl final {
-  // capture/DSP/Snowboy/VAD 归 actor；playback PCM 与重采样器归唯一播放线程。
+  // capture/DSP/Snowboy/VAD 归高优先级采集线程；playback 热路径归播放线程。
   AudioEngineConfig config{}; snd_pcm_t *capture_pcm{nullptr}, *playback_pcm{nullptr};
   SwrContext *capture_swr{nullptr}, *playback_swr{nullptr}; RockchipVoiceDsp dsp{};
   BoompiSnowboyLegacyHandle* snowboy{nullptr}; VadInst* vad{nullptr};
@@ -170,9 +184,9 @@ struct AudioBackend::Impl final {
   std::array<std::int16_t, kMaximumPlayback48Frames> playback48{};
   std::array<std::int16_t, kMaximumPlayback48Frames * kPlaybackChannels> playback_stereo{};
   VoiceFrame16k mic_left{}, mic_right{}, reference_left{}, reference_right{}, processed{};
-  std::uint32_t vad_speech_ms{0U}, vad_silence_ms{0U}; int loopback_card{-1};
-  unsigned loopback_previous{0U}, aec_warmup_remaining{0U}, aec_tail_remaining{0U};
-  bool open{false}, vad_in_speech{false}, loopback_changed{false};
+  std::uint32_t vad_speech_ms{0U}, vad_silence_ms{0U};
+  unsigned aec_warmup_remaining{0U}, aec_tail_remaining{0U};
+  bool open{false}, vad_in_speech{false};
   bool playback_session_active{false}, aec_warmup_armed{false};
   std::atomic<bool> playback_interrupted{false};
   std::atomic<bool> playback_ended{false};
@@ -190,19 +204,18 @@ struct AudioBackend::Impl final {
     return swr_convert(swr, out, output_frames, in, input_frames) >= 0;
   }
   bool ResetVad() noexcept {
-    if (vad == nullptr || WebRtcVad_Init(vad) != 0 || WebRtcVad_set_mode(vad, config.vad_mode) != 0) return false;
+    if (vad == nullptr || WebRtcVad_Init(vad) != 0 || WebRtcVad_set_mode(vad, kVadMode) != 0) return false;
     vad_speech_ms = vad_silence_ms = 0U; vad_in_speech = false; return true;
   }
   bool ResetListener() noexcept {
-    int reset = 0; return snowboy != nullptr && boompi_snowboy_legacy_reset(snowboy, &reset) ==
-        BOOMPI_SNOWBOY_LEGACY_OK && ResetVad();
+    return snowboy != nullptr && boompi_snowboy_legacy_reset(snowboy) && ResetVad();
   }
   bool ResetFrontEnd() noexcept {
     // discontinuity 后联合复位四通道重采样、3A FIFO、唤醒和 VAD 历史。
     capture48.fill(0);
     if (!ResetSwr(capture_swr, capture48.data(), kCapture48Frames,
                   kVoiceFrameSamples16k, capture16.data())) return false;
-    dsp.Close(); return dsp.Open() == RockchipVoiceDspStatus::kOk && ResetListener();
+    dsp.Close(); return dsp.Open() && ResetListener();
   }
   bool WritePlayback(const std::int16_t* mono, std::size_t frames) noexcept {
     // TTS 是 mono；复制到 L/R，Mode1 同步回采两个数字参考。
@@ -229,11 +242,25 @@ struct AudioBackend::Impl final {
   bool UpdateVad(CaptureFrame* frame) noexcept {
     const int speech = WebRtcVad_Process(vad, 16000, processed.data(), processed.size());
     if (speech < 0) return false;
-    frame->vad_now = speech == 1;
-    if (frame->vad_now) { vad_speech_ms = std::min<std::uint32_t>(vad_speech_ms + kFrameMs, config.vad_start_ms); vad_silence_ms = 0U; }
-    else { vad_silence_ms = std::min<std::uint32_t>(vad_silence_ms + kFrameMs, config.vad_end_ms); vad_speech_ms = 0U; }
-    if (!vad_in_speech && vad_speech_ms >= config.vad_start_ms) { vad_in_speech = true; frame->vad_started = true; }
-    else if (vad_in_speech && vad_silence_ms >= config.vad_end_ms) { vad_in_speech = false; frame->vad_ended = true; }
+    // WebRTC determines whether the spectrum resembles speech.  The raw-mic
+    // dBFS gate is evaluated before Rockchip AGC, so distant speech and room
+    // noise cannot become a trigger merely because AGC amplified them.
+    const float input_dbfs = std::max(AcRmsDbfs(mic_left), AcRmsDbfs(mic_right));
+    frame->input_dbfs = input_dbfs;
+    const bool webrtc_voice = speech == 1;
+    // The dBFS threshold is only an admission gate.  Once an utterance has
+    // started, WebRTC VAD alone keeps it alive so quiet syllable tails are not
+    // clipped merely because they fall back below the start threshold.
+    frame->vad_now = vad_in_speech
+                         ? webrtc_voice
+                         : webrtc_voice && input_dbfs >= config.vad_min_dbfs;
+    if (frame->vad_now) { vad_speech_ms = std::min(vad_speech_ms + kFrameMs, kVadStartMs); vad_silence_ms = 0U; }
+    else { vad_silence_ms = std::min(vad_silence_ms + kFrameMs, kVadEndMs); vad_speech_ms = 0U; }
+    if (!vad_in_speech && vad_speech_ms >= kVadStartMs) {
+      vad_in_speech = true;
+      frame->vad_started = true;
+    }
+    else if (vad_in_speech && vad_silence_ms >= kVadEndMs) { vad_in_speech = false; frame->vad_ended = true; }
     return true;
   }
 
@@ -273,21 +300,19 @@ AudioBackend::~AudioBackend() noexcept { Close(); delete impl_; }
 bool AudioBackend::Open(const AudioEngineConfig& config) noexcept {
   if (impl_ == nullptr) impl_ = new (std::nothrow) Impl;
   if (impl_ == nullptr) return false;
-  if (impl_->loopback_changed) {
-    impl_->SetError("previous loopback mode has not been restored"); return false;
-  }
   if (impl_->open) { impl_->SetError("audio backend is already open"); return false; }
   if (config.capture_pcm.empty() || config.playback_pcm.empty() || config.snowboy_resource.empty() ||
       config.snowboy_model.empty() || (config.left_polarity != 1 && config.left_polarity != -1) ||
-      (config.right_polarity != 1 && config.right_polarity != -1) || config.vad_mode < 0 || config.vad_mode > 3 ||
-      config.vad_start_ms == 0U || config.vad_end_ms == 0U) { impl_->SetError("invalid audio backend configuration"); return false; }
+      (config.right_polarity != 1 && config.right_polarity != -1) ||
+      !std::isfinite(config.vad_min_dbfs) || config.vad_min_dbfs < -90.0F ||
+      config.vad_min_dbfs > 0.0F) { impl_->SetError("invalid audio backend configuration"); return false; }
   try { impl_->config = config; } catch (...) { impl_->SetError("audio configuration allocation failed"); return false; }
 
   const char* stage = "ALSA capture open";
   int rc = OpenPcmHandle(config.capture_pcm, SND_PCM_STREAM_CAPTURE, &impl_->capture_pcm);
   // 驱动在 PCM open 时锁定通道布局：先用探测句柄取得 card，切 Mode1 后必须重新 open。
-  if (rc >= 0) { stage = "ALSA Mode1 hardware reference"; rc = ConfigureLoopbackMode1(
-      impl_->capture_pcm, &impl_->loopback_card, &impl_->loopback_previous, &impl_->loopback_changed); }
+  if (rc >= 0) { stage = "ALSA Mode1 hardware reference";
+                 rc = ConfigureLoopbackMode1(impl_->capture_pcm); }
   if (rc >= 0) {
     snd_pcm_close(impl_->capture_pcm); impl_->capture_pcm = nullptr;
     stage = "ALSA capture reopen after Mode1";
@@ -302,19 +327,22 @@ bool AudioBackend::Open(const AudioEngineConfig& config) noexcept {
   if (rc < 0) { Close(); impl_->SetError(stage, rc); return false; }
 
   impl_->capture_swr = NewResampler(48000, kCaptureChannels, 16000, kCaptureChannels);
-  impl_->playback_swr = NewResampler(24000, 1, 48000, 1); BoompiSnowboyLegacyInfo info{};
+  impl_->playback_swr = NewResampler(24000, 1, 48000, 1);
   if (impl_->capture_swr == nullptr || impl_->playback_swr == nullptr ||
       boompi_snowboy_legacy_create(config.snowboy_resource.c_str(), config.snowboy_model.c_str(),
-          config.snowboy_sensitivity.c_str(), config.snowboy_gain, 0, &impl_->snowboy, &info) != BOOMPI_SNOWBOY_LEGACY_OK ||
-      info.sample_rate_hz != 16000U || info.channels != 1U || info.bits_per_sample != 16U || info.keyword_count == 0U) {
+          config.snowboy_sensitivity.c_str(), 1.0F, &impl_->snowboy) == 0) {
     Close(); impl_->SetError("audio DSP, resampler, or Snowboy initialization failed"); return false;
   }
   impl_->vad = WebRtcVad_Create();
-  if (impl_->vad == nullptr || WebRtcVad_Init(impl_->vad) != 0 || WebRtcVad_set_mode(impl_->vad, config.vad_mode) != 0 ||
+  if (impl_->vad == nullptr || WebRtcVad_Init(impl_->vad) != 0 || WebRtcVad_set_mode(impl_->vad, kVadMode) != 0 ||
       WebRtcVad_ValidRateAndFrameLength(16000, kVoiceFrameSamples16k) != 0 || !impl_->ResetFrontEnd()) {
     Close(); impl_->SetError("WebRTC VAD or voice front end initialization failed"); return false;
   }
-  impl_->open = true; return true;
+  impl_->open = true;
+  std::fprintf(stderr,
+               "boompi-client: VAD configured; mode=%d; min_dbfs=%.1f; source=raw-mic-max\n",
+               kVadMode, static_cast<double>(config.vad_min_dbfs));
+  return true;
 }
 
 bool AudioBackend::ReadCapture20ms(bool* const discontinuity) noexcept {
@@ -377,13 +405,15 @@ bool AudioBackend::ProcessCapture20ms(bool discontinuity, CaptureFrame* const fr
   frame->aec_input[3] = impl_->reference_right;
 #endif
   // 每个 sample 只进入这一条 Rockchip 3A 路径；STDT 在 vendor 内部保护双讲。
-  if (impl_->dsp.Process(impl_->mic_left, impl_->mic_right, impl_->reference_left,
-                         impl_->reference_right, &impl_->processed) != RockchipVoiceDspStatus::kOk) {
+  if (!impl_->dsp.Process(impl_->mic_left, impl_->mic_right, impl_->reference_left,
+                          impl_->reference_right, &impl_->processed)) {
     impl_->SetError("Rockchip 3A rejected a frame"); return false;
   }
   std::int32_t detection = 0;
-  if (boompi_snowboy_legacy_process_s16(impl_->snowboy, impl_->processed.data(), impl_->processed.size(), &detection) !=
-      BOOMPI_SNOWBOY_LEGACY_OK) { impl_->SetError("Snowboy processing failed"); return false; }
+  if (!boompi_snowboy_legacy_process_s16(impl_->snowboy, impl_->processed.data(),
+                                         impl_->processed.size(), &detection)) {
+    impl_->SetError("Snowboy processing failed"); return false;
+  }
   frame->wake = detection > 0;
   if (!impl_->UpdateVad(frame)) { impl_->SetError("WebRTC VAD processing failed"); return false; }
   // librkaudio 不公开 DTD 结果；近讲事件只能来自 AEC/STDT 后的真实输出。
@@ -466,22 +496,10 @@ std::string AudioBackend::last_error() const {
 }
 void AudioBackend::Close() noexcept {
   if (impl_ == nullptr) return;
+  // boomPI 独占这块板的音频链路，Mode1 是运行状态；退出时无需切回会破坏通道布局的默认值。
   if (impl_->capture_pcm != nullptr) snd_pcm_close(impl_->capture_pcm);
   if (impl_->playback_pcm != nullptr) snd_pcm_close(impl_->playback_pcm);
   impl_->capture_pcm = impl_->playback_pcm = nullptr;
-  if (impl_->loopback_changed) {
-    int rc = RestoreLoopbackMode(impl_->loopback_card, impl_->loopback_previous);
-    if (rc < 0) rc = RestoreLoopbackMode(impl_->loopback_card, impl_->loopback_previous);
-    if (rc < 0) impl_->SetError("ALSA loopback restore", rc);
-    else {
-      impl_->loopback_card = -1;
-      impl_->loopback_previous = 0U;
-      impl_->loopback_changed = false;
-    }
-  } else {
-    impl_->loopback_card = -1;
-    impl_->loopback_previous = 0U;
-  }
   swr_free(&impl_->capture_swr); swr_free(&impl_->playback_swr); impl_->dsp.Close();
   if (impl_->snowboy != nullptr) boompi_snowboy_legacy_destroy(impl_->snowboy);
   if (impl_->vad != nullptr) WebRtcVad_Free(impl_->vad);

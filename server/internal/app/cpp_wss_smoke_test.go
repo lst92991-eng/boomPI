@@ -46,6 +46,7 @@ func TestCppWSSHappyPath(t *testing.T) {
 	}
 	cfg.ListenAddress = "127.0.0.1"
 	cfg.WSSPort = freePort(t)
+	cfg.DiscoveryPort = freeUDPPort(t)
 	provider := newRoundTripBackend()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	identityDirectory := t.TempDir()
@@ -151,6 +152,7 @@ func TestCppManualSingleTurnHappyPath(t *testing.T) {
 	}
 	cfg.ListenAddress = "127.0.0.1"
 	cfg.WSSPort = freePort(t)
+	cfg.DiscoveryPort = freeUDPPort(t)
 	provider := newRoundTripBackend()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	identityDirectory := t.TempDir()
@@ -229,6 +231,7 @@ func TestCppWSSExternalHILServer(t *testing.T) {
 	}
 	cfg.ListenAddress = "0.0.0.0"
 	cfg.WSSPort = freePort(t)
+	cfg.DiscoveryPort = freeUDPPort(t)
 	provider := newRoundTripBackend()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	identityDirectory := t.TempDir()

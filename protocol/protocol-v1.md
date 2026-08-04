@@ -2,18 +2,18 @@
 
 ## 1. Status and scope
 
-This document is the P1 wire-contract baseline shared by the RV1106 C++ client and the Go server. It defines framing, identifiers, bounds and cancellation semantics. The Go MVP implements the WSS and streaming subset listed in section 4.2. Discovery, pairing, device-token authentication, reconnect and flow credit are still pending.
+This document is the P1 wire-contract baseline shared by the RV1106 C++ client and the Go server. It defines framing, identifiers, bounds and cancellation semantics. The Go MVP implements the WSS and streaming subset listed in section 4.2, the fixed discovery exchange in section 8, and shared development-token authentication. Pairing, per-device token provisioning, reconnect and flow credit are still pending.
 
 Normative words `MUST`, `MUST NOT`, `SHOULD` and `MAY` are used deliberately. Protocol implementations must reject malformed lengths before allocation or state mutation.
 
 ## 2. Transports
 
 - UDP port `17807`: unauthenticated LAN discovery only.
-- TCP/WSS port `17806`: one persistent TLS connection carrying UTF-8 JSON text frames and binary PCM frames. The current server limits this to one device; it is not considered authenticated until pairing and device tokens are implemented.
-- WebSocket ping/pong: default idle ping interval 10 seconds and dead-connection timeout 30 seconds; both are configurable but a finite deadline is mandatory.
+- TCP/WSS port `17806`: one persistent TLS connection carrying UTF-8 JSON text frames and binary PCM frames. The current server limits this to one device and authenticates it with a shared development token; pairing and per-device token provisioning are not yet implemented.
+- WebSocket ping/pong: the server sends a periodic Ping every 1–10 seconds (10 seconds by default), and requires the Pong timeout to cover at least three Ping intervals without exceeding 30 seconds. The teaching client automatically replies with Pong and declares the server unavailable after 30 seconds without an inbound Ping. Receiving a Pong refreshes the server deadline but never suppresses its next periodic Ping.
 - Application audio is real-time and is never retransmitted after reconnect.
 
-UDP discovery is not a trust mechanism. An offer only supplies a candidate endpoint; first connection still requires the six-digit pairing flow and TLS SPKI confirmation described by the root development contract.
+UDP discovery is not a trust mechanism. A response supplies only a candidate endpoint and its TLS SPKI digest. The current teaching build checks the configured shared token and SPKI pin; production pairing and per-device provisioning remain future work.
 
 ## 3. Identifier model
 
@@ -85,7 +85,7 @@ The current Go server accepts one device on `wss://<host>:17806/ws`. Its first m
 
 For each manual-VAD turn, the device sends `turn.start` with nonzero `session_id`, `turn_id`, `stream_id` and monotonic `epoch`; its payload is `{"sample_rate_hz":16000}`. Binary uplink frames then use those identifiers and consecutive sequence numbers starting at zero. `turn.commit` ends the input. The server may return `response.start`, `response.text_delta`, `response.audio_start`, binary 24 kHz PCM, and `response.done`. `turn.cancel` and `response.cancel` retire the active epoch and return `response.cancelled`.
 
-This subset deliberately omits discovery, pairing, per-device token provisioning, conversation persistence, tools and flow credit. The shared development token is only a fail-closed guard against unauthenticated LAN clients triggering provider calls; it is not a replacement for pairing. Until pairing lands, the generated stable SPKI digest and manually provisioned token must be treated as development information rather than a complete production trust flow.
+This subset deliberately omits pairing, per-device token provisioning, conversation persistence, tools and flow credit. Discovery uses the fixed teaching exchange in section 8. The shared development token is only a fail-closed guard against unauthenticated LAN clients triggering provider calls; it is not a replacement for pairing. Until pairing lands, the generated stable SPKI digest and manually provisioned token must be treated as development information rather than a complete production trust flow.
 
 ## 5. Binary audio frame
 
@@ -177,9 +177,17 @@ Late text/audio/cancel acknowledgements from the old generation are discarded. I
 
 ## 8. Discovery baseline
 
-Discovery datagrams are UTF-8 JSON and must remain below 1,200 bytes. A request contains `version`, type `discover`, a random nonce and `device_id`. An offer echoes the nonce and contains type `offer`, `server_id`, `wss_port`, protocol versions and capabilities. It must never contain a device token, certificate private material, Wi-Fi credentials or provider credentials.
+The request payload is exactly the UTF-8 text `BOOMPI_DISCOVER_V1`, with no JSON wrapper or trailing newline. The server ignores every other datagram.
 
-Because discovery is unauthenticated, the device treats all offers as hints. A cached SPKI pin is still mandatory for a paired server; a new server key requires explicit re-pairing.
+The response payload is exactly one space-delimited UTF-8 line, also without a trailing newline:
+
+```text
+BOOMPI_SERVER_V1 <wss_port> <spki_sha256_base64>
+```
+
+`wss_port` is a decimal integer from 1 through 65535. `spki_sha256_base64` is standard Base64 encoding of the 32-byte SHA-256 digest of the server certificate's SubjectPublicKeyInfo. The device uses the UDP source address as the candidate WSS host. Neither request nor response contains a device token, certificate private material, Wi-Fi credentials or provider credentials.
+
+Because discovery is unauthenticated, the device treats every response as a hint. It must validate the advertised SPKI digest during TLS setup; a changed server key requires explicit user approval or a future re-pairing flow.
 
 ## 9. Compatibility
 
