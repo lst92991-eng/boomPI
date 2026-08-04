@@ -28,7 +28,7 @@ using Clock = std::chrono::steady_clock;
 using audio::AudioEngine; using audio::AudioEngineConfig; using audio::CaptureFrame;
 using network::Control; using network::ControlKind; using network::Inbound; using network::InboundKind;
 using network::NetworkBootstrap; using network::NetworkBootstrapResult;
-using network::Pcm64Header; using network::TransportConfig; using network::VoiceTransport; using network::WireIds;
+using network::Pcm64Header; using network::SendOutcome; using network::TransportConfig; using network::VoiceTransport; using network::WireIds;
 using ui::DeviceUiAction; using ui::DeviceUiState;
 constexpr std::size_t kPreRollFrames = 25U;
 constexpr unsigned kBargeCandidateFrames = 6U, kBargeReferenceLowFrames = 3U;
@@ -211,11 +211,14 @@ class VoiceClient final {
     near_frames_ = probe_frames_ = cooldown_frames_ = 0U;
     barge_probe_ = BargeProbe::kIdle; audio_.SetPlaybackScale(1.0F);
   }
+  // 轮次级 barge 证据的统一复位：探针拒绝、取消、断线、回合结束共用，避免多处漂移。
+  void ResetBargeState() {
+    barge_ended_ = barge_turn_admitted_ = barge_vad_started_seen_ = false;
+    barge_quiet_frames_ = barge_silence_frames_ = 0U; barge_tail_frozen_ = false;
+  }
   void RejectBargeProbe() {
     std::cout << "boompi-client: barge-in probe rejected" << std::endl;
-    ResetBargeProbe(); cooldown_frames_ = kBargeRetryCooldownFrames;
-    barge_quiet_frames_ = 0U; barge_vad_started_seen_ = false;
-    barge_silence_frames_ = 0U; barge_tail_frozen_ = false;
+    ResetBargeProbe(); ResetBargeState(); cooldown_frames_ = kBargeRetryCooldownFrames;
   }
 
   void BeginListening(const char* reason) {
@@ -273,10 +276,7 @@ class VoiceClient final {
     transport_.reset(); events_.Clear(); audio_.DropPlayback(); audio_.SetPlaybackScale(1.0F);
     ui_.SetState(DeviceUiState::kOffline);
     state_ = State::kWake; ids_ = response_ = {};
-    pre_head_ = pre_count_ = 0U; ResetBargeProbe();
-    barge_ended_ = barge_turn_admitted_ = barge_vad_started_seen_ = false;
-    barge_silence_frames_ = 0U; barge_tail_frozen_ = false;
-    barge_quiet_frames_ = 0U;
+    pre_head_ = pre_count_ = 0U; ResetBargeProbe(); ResetBargeState();
     finish_after_start_ = finish_after_cancel_ = false;
     ResetListener();
     const unsigned seconds = reconnect_attempt_ < 5U ? 1U << reconnect_attempt_ : 30U;
@@ -364,10 +364,7 @@ class VoiceClient final {
 
   // 正常结束和异常取消都推进 epoch 并进入 follow-up；异常路径还会立即丢弃残余播放。
   void FinishTurn(bool normal) {
-    ResetBargeProbe();
-    barge_ended_ = barge_turn_admitted_ = barge_vad_started_seen_ = false;
-    barge_silence_frames_ = 0U; barge_tail_frozen_ = false;
-    barge_quiet_frames_ = 0U;
+    ResetBargeProbe(); ResetBargeState();
     finish_after_start_ = finish_after_cancel_ = false;
     if (!normal) audio_.DropPlayback();
     AdvanceTurn();
@@ -468,7 +465,8 @@ class VoiceClient final {
   }
 
   // 上行失败按语义分流：瞬时背压只作废当前轮（云端 sequence 将出现缺口，
-  // 继续发帧必被拒），连接/协议错误才重建会话。
+  // 继续发帧必被拒），连接/协议错误才重建会话。极端背压下取消帧自身也可能
+  // 被缓冲拒绝，此时退化为重建连接——有界且可恢复。
   bool SendAudioOrRecover(const CaptureFrame& frame, bool end, const char* rejected_reason) {
     const SendOutcome outcome = SendAudio(frame, end);
     if (outcome == SendOutcome::kOk) return true;

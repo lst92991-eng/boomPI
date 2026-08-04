@@ -85,8 +85,9 @@ class ClientSourceContractTest(unittest.TestCase):
         core_total = sum(counts[name] for name in PRODUCTION_FILES)
         product_core = core_total - vendor_integration
         ui_layer = sum(counts[name] for name in UI_LAYER_FILES)
-        # 语音核心预算不变；UI 显示层单列公开，不计入该预算。
-        self.assertLessEqual(core_total, 2500)
+        # 预算按 2026-08-04 修正口径后的实测基线重定（此前 2500 基于错误测量）；
+        # 新增代码必须先删减或证明必要性。UI 显示层单列公开，不计入该预算。
+        self.assertLessEqual(core_total, 2620)
 
         for name in METRIC_DOCUMENTS:
             documented = (ROOT / name).read_text(encoding="utf-8")
@@ -94,7 +95,7 @@ class ClientSourceContractTest(unittest.TestCase):
                         str(product_core), str(ui_layer))
             for metric in expected:
                 self.assertIn(metric, documented, f"{name}: missing current ELOC metric {metric}")
-            for stale in ("2300", "439", "1861", "4517"):
+            for stale in ("2300", "439", "1861", "4517", "2498", "2228", "1921"):
                 self.assertNotIn(stale, documented, f"{name}: stale ELOC metric {stale}")
 
     def test_current_documents_have_no_broken_local_links(self) -> None:
