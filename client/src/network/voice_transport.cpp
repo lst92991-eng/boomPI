@@ -182,12 +182,13 @@ class VoiceTransport::Impl final {
     client_.send(hdl_, json, websocketpp::frame::opcode::text, ec); return !ec;
   }
 
-  bool SendPcm(const Pcm64Header& h, const std::uint8_t* pcm, std::size_t bytes) {
+  SendOutcome SendPcm(const Pcm64Header& h, const std::uint8_t* pcm, std::size_t bytes) {
     std::lock_guard<std::mutex> state_lock(protocol_mutex_);
     if (!connected_ || !pcm || bytes == 0 || bytes > kMaxUplinkPcmBytes || bytes % 2 ||
         h.flags & ~kKnownFlags || !active_ || committed_ || uplink_ended_ ||
         !SameTurn(h.ids, turn_) || h.ids.stream != turn_.stream || h.sequence != uplink_sequence_ ||
-        h.sequence == std::numeric_limits<std::uint32_t>::max() || ((h.sequence == 0) != ((h.flags & 1U) != 0))) return false;
+        h.sequence == std::numeric_limits<std::uint32_t>::max() || ((h.sequence == 0) != ((h.flags & 1U) != 0)))
+      return SendOutcome::kRejected;
     // 字段逐个按网络字节序写入，不能直接发送 C++ struct（padding/endianness 不稳定）。
     std::array<std::uint8_t, kHeaderBytes + kMaxUplinkPcmBytes> frame; auto* p = frame.data();
     std::memcpy(p, "BPV1", 4); p[4] = 1; p[5] = 1; Put16(h.flags, p + 6); Put16(64, p + 8);
@@ -196,10 +197,12 @@ class VoiceTransport::Impl final {
     std::memcpy(p + 36, uuid_.data(), uuid_.size()); Put32(h.ids.session, p + 52);
     Put32(h.ids.turn, p + 56); Put32(h.ids.stream, p + 60); std::memcpy(p + 64, pcm, bytes);
     websocketpp::lib::error_code ec; std::lock_guard<std::mutex> lock(send_mutex_);
-    if (!CanQueue(kHeaderBytes + bytes)) return false;
+    // 缓冲满只是瞬时背压：本帧未发、sequence 不前移，由调用方取消本轮。
+    if (!CanQueue(kHeaderBytes + bytes)) return SendOutcome::kBackpressure;
     client_.send(hdl_, frame.data(), kHeaderBytes + bytes, websocketpp::frame::opcode::binary, ec);
-    if (!ec) { ++uplink_sequence_; uplink_ended_ = (h.flags & 2U) != 0; }
-    return !ec;
+    if (ec) return SendOutcome::kRejected;
+    ++uplink_sequence_; uplink_ended_ = (h.flags & 2U) != 0;
+    return SendOutcome::kOk;
   }
 
   void Close() noexcept {
@@ -398,7 +401,7 @@ VoiceTransport::VoiceTransport() : impl_(std::make_unique<Impl>()) {}
 VoiceTransport::~VoiceTransport() = default;
 bool VoiceTransport::Connect(TransportConfig c, InboundHandler i, ErrorHandler e) { return impl_->Connect(std::move(c), std::move(i), std::move(e)); }
 bool VoiceTransport::SendControl(const Control& c) { return impl_->Send(c); }
-bool VoiceTransport::SendPcm64(const Pcm64Header& h, const std::uint8_t* p, std::size_t n) { return impl_->SendPcm(h, p, n); }
+SendOutcome VoiceTransport::SendPcm64(const Pcm64Header& h, const std::uint8_t* p, std::size_t n) { return impl_->SendPcm(h, p, n); }
 void VoiceTransport::Close() noexcept { impl_->Close(); }
 bool VoiceTransport::connected() const noexcept { return impl_->connected(); }
 

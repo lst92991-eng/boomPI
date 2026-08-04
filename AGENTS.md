@@ -16,7 +16,8 @@
 - 使用现有共享令牌和 SPKI 固定即可；六位码配对、多设备管理、复杂 flow-credit、工具系统、
   独立 C++ supervisor、签名 A/B 更新、掉电事务和 24 小时 soak 均后置。
 - 教学版仅保留缓冲区边界、超时、秘密不落日志和硬件安全等最低防线，不为未验证场景增加框架。
-- 全部板端生产 C/C++（包含 Rockchip/Snowboy 适配、UI 和网络启动）硬上限为 **2500 ELOC**；
+- 板端语音核心生产 C/C++（含 Rockchip/Snowboy 适配与网络启动，不含 UI 显示层）硬上限为 **2500 ELOC**；
+  UI 显示层（LVGL 渲染与屏幕/触摸驱动）单独公开行数，不占该预算；
   辅助 Shell/Python 也必须单独公开行数，禁止通过挪文件、压行或删除有价值注释规避统计。
 - 新功能先复用 BSP 已验证的设备节点、命令和成熟库；在出现第二种真实后端前，不增加工厂、
   虚接口、插件、通用 worker 或占位模块。
@@ -76,8 +77,9 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
 
 ## 2.1 当前板端实现边界（2026-08-03，优先于后文路线图）
 
-现役 `boompi-client` 包含 19 个生产 C/C++ 文件、2500 ELOC，其中 Rockchip/Snowboy vendor
-集成 280 ELOC，产品逻辑 2220 ELOC。计数口径是非空行减去纯 `//` 注释，完整范围由
+现役 `boompi-client` 的语音核心包含 18 个生产 C/C++ 文件、2498 ELOC，其中 Rockchip/Snowboy vendor
+集成 270 ELOC，产品逻辑 2228 ELOC；UI 显示层（LVGL 渲染与 ST7789P3/GT911 驱动）另计 1921 ELOC，
+不占语音核心预算。计数口径是非空行减去纯 `//` 注释，完整范围由
 `scripts/tests/test_client_source_contract.py` 固定；2026-08-01 的
 `docs/test/client-responsibility-layout-20260801.md` 保留为纯语音阶段历史快照。后文关于完整
 supervisor、update、target 分层和发布架构的内容是未来路线图，不授权提前恢复占位层。
@@ -98,8 +100,8 @@ supervisor、update、target 分层和发布架构的内容是未来路线图，
 - WebSocketpp、Boost、OpenSSL、ALSA、libswresample、Rockchip 3A、Snowboy 和 WebRTC VAD
   作为外部实现使用；不得复制它们的功能到自写生产层，也不得把自写业务代码移进
   `third_party/` 规避计数。
-- 增加生产 C/C++ 前必须先删减或用实测证明必要性，含 vendor、UI 和网络启动的总量不得超过
-  2500 ELOC。辅助运维与配网脚本单独计数；未来 supervisor 不得挤入当前客户端预算。
+- 增加生产 C/C++ 前必须先删减或用实测证明必要性，语音核心（含 vendor 与网络启动）不得超过
+  2500 ELOC；UI 显示层单独公开行数、按需增长但需评审。辅助运维与配网脚本单独计数；未来 supervisor 不得挤入当前客户端预算。
 
 ## 3. 硬件基线与事实来源
 

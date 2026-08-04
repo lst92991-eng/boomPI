@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
       boompi::ui::DeviceUiState::kIdle, boompi::ui::DeviceUiState::kListening,
       boompi::ui::DeviceUiState::kThinking, boompi::ui::DeviceUiState::kSpeaking,
       boompi::ui::DeviceUiState::kHappy, boompi::ui::DeviceUiState::kOffline,
-      boompi::ui::DeviceUiState::kError};
+      boompi::ui::DeviceUiState::kError, boompi::ui::DeviceUiState::kSpeakingTail};
   std::size_t state = 0;
   auto apply_state = [&] {
     screen.SetState(states[state]);

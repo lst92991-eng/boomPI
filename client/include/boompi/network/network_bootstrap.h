@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -16,7 +17,10 @@ class NetworkBootstrap final {
  public:
   static bool SaveWifi(const std::string& ssid, const std::string& password);
   static bool SaveServer(const NetworkBootstrapResult& server);
-  static bool Start(bool enable_discovery, NetworkBootstrapResult* output);
+  /// stop 非空时，长阻塞步骤（DHCP 等待、重试间隙）会观察它并提前退出，
+  /// 保证进程退出路径不会被最长 12 秒的外部工具等待卡住。
+  static bool Start(bool enable_discovery, NetworkBootstrapResult* output,
+                    const std::atomic<bool>* stop = nullptr);
 };
 
 }  // namespace boompi::network

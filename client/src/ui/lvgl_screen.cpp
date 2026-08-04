@@ -63,7 +63,8 @@ struct VoiceView final {
 };
 
 const VoiceView& Voice(DeviceUiState state) {
-  static const std::array<VoiceView, 7> views{{
+  // 条目顺序必须与 DeviceUiState 枚举一致（新状态追加在末尾）。
+  static const std::array<VoiceView, 8> views{{
       {"随时可以说话", "说出唤醒词开始对话", 2, 2200},
       {"正在聆听", "我在听，请继续", 8, 760},
       {"正在思考", "正在组织回答", 5, 1200},
@@ -71,6 +72,7 @@ const VoiceView& Voice(DeviceUiState state) {
       {"回答完成", "随时可以继续问我", 3, 1800},
       {"暂时离线", "等待网络恢复", 0, 2400},
       {"发生错误", "请检查网络后重试", 1, 2000},
+      {"即将说完", "轻触屏幕仍可打断", 4, 1500},
   }};
   return views[static_cast<std::size_t>(state)];
 }
@@ -854,7 +856,8 @@ void LvglScreen::SetState(DeviceUiState state) noexcept {
   const bool conversation = state == DeviceUiState::kListening ||
                             state == DeviceUiState::kThinking ||
                             state == DeviceUiState::kSpeaking ||
-                            state == DeviceUiState::kHappy;
+                            state == DeviceUiState::kHappy ||
+                            state == DeviceUiState::kSpeakingTail;
   if (conversation && page_ == Page::kHome) ShowApp(0U);
   UpdateVoice();
 }
@@ -876,6 +879,9 @@ void LvglScreen::UpdateVoice() noexcept {
     accent = 0x36D9C0;
     recolor_opacity = LV_OPA_10;
   } else if (state_ == DeviceUiState::kHappy) {
+    accent = 0x48CFA4;
+    recolor_opacity = LV_OPA_10;
+  } else if (state_ == DeviceUiState::kSpeakingTail) {
     accent = 0x48CFA4;
     recolor_opacity = LV_OPA_10;
   } else if (state_ == DeviceUiState::kOffline) {
@@ -1058,11 +1064,18 @@ void LvglScreen::MuteClicked(lv_event_t* event) {
 
 void LvglScreen::VoiceClicked(lv_event_t* event) {
   auto* screen = static_cast<LvglScreen*>(lv_event_get_user_data(event));
-  if (screen->state_ != DeviceUiState::kSpeaking) return;
+  // 正在回答与尾播阶段都允许触屏打断；是否真正可打断由应用侧状态机裁决
+  // （voice_client.cpp PollUi 只在 kSpeak/kDrain 消费 kInterrupt）。
+  const bool interruptible = screen->state_ == DeviceUiState::kSpeaking ||
+                             screen->state_ == DeviceUiState::kSpeakingTail;
+  if (!interruptible) return;
   if (screen->interrupt_handler_ != nullptr) {
     screen->interrupt_handler_(screen->interrupt_user_data_);
   }
-  screen->SetState(DeviceUiState::kListening);
+  // 仅完整播报时乐观切到聆听；尾播打断后由应用侧 FinishTurn 刷新 UI。
+  if (screen->state_ == DeviceUiState::kSpeaking) {
+    screen->SetState(DeviceUiState::kListening);
+  }
 }
 
 void LvglScreen::AppActionClicked(lv_event_t* event) {

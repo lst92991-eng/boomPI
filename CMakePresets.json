@@ -54,7 +54,11 @@
       "name": "rv1106-release",
       "inherits": "rv1106-base",
       "cacheVariables": {
+        "BOOMPI_ENABLE_ALSA_PLAYBACK": "ON",
         "BOOMPI_ENABLE_WSS_CLIENT": "ON",
+        "BOOMPI_ENABLE_ROCKCHIP_3A": "ON",
+        "BOOMPI_ENABLE_SNOWBOY": "ON",
+        "BOOMPI_ENABLE_WEBRTC_VAD": "ON",
         "CMAKE_BUILD_TYPE": "Release"
       }
     }

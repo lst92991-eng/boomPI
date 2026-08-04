@@ -37,7 +37,8 @@ constexpr unsigned kBargeConfirmFrames = 3U;
 constexpr unsigned kBargeAdmissionQuietFrames = 20U;
 constexpr unsigned kBargeTailFreezeFrames = 10U;
 constexpr unsigned kBargeRetryCooldownFrames = 15U;
-constexpr std::uint32_t kMaximumTurnFrames = 1500U;  // 30 s hard safety limit.
+constexpr std::uint32_t kMaximumTurnFrames = 3000U;  // 60 s：AGENTS.md 单次用户语音最长 60 秒。
+constexpr auto kFirstResponseHint = std::chrono::seconds(15);  // AGENTS.md：首响等 15 秒给本地提示，30 秒取消。
 constexpr auto kBargeAdmissionWait = std::chrono::milliseconds(500);
 // Follow-up has no wake word, so it must be stricter than an in-playback barge.
 // The 300 ms backend tail guard clears the known render tail first; these
@@ -230,7 +231,8 @@ class VoiceClient final {
     while (!stop_network_.load(std::memory_order_acquire)) {
       if (!network_needed_.load(std::memory_order_acquire)) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
       NetworkBootstrapResult found{};
-      if (NetworkBootstrap::Start(discover, &found)) {
+      // 传入 stop 观察点：退出时 DHCP/配网等待不再阻塞最长 12 秒。
+      if (NetworkBootstrap::Start(discover, &found, &stop_network_)) {
         std::lock_guard<std::mutex> lock(network_mutex_);
         config_.server_ip = std::move(found.host); config_.server_port = found.port;
         config_.server_spki_sha256 = std::move(found.spki_sha256_base64);
@@ -344,7 +346,9 @@ class VoiceClient final {
         break;
       case InboundKind::kDone:
         if (audio_.playing() && !audio_.EndPlayback()) LoseConnection("playback finish failed");
-        else { state_ = State::kDrain; ui_.SetState(DeviceUiState::kHappy); }
+        // 尾播仍出声，UI 用 kSpeakingTail 保留触屏打断入口；
+        // kHappy 留给 FinishTurn 后的追问窗口（不可打断）。
+        else { state_ = State::kDrain; ui_.SetState(DeviceUiState::kSpeakingTail); }
         break;
       case InboundKind::kCancelled:
         if (state_ == State::kBarge) CompleteCancel();
@@ -451,15 +455,26 @@ class VoiceClient final {
     if (frame.vad_ended) { barge_ended_ = true; barge_tail_frozen_ = true; }
   }
 
-  bool SendAudio(const CaptureFrame& frame, bool end) {
+  SendOutcome SendAudio(const CaptureFrame& frame, bool end) {
     Pcm64Header h{};
     h.flags = static_cast<std::uint16_t>(
         (uplink_sequence_ == 0U ? 1U : 0U) | (end ? 2U : 0U));
     h.sequence = uplink_sequence_; h.timestamp_us = audio_origin_us_ + frame.sequence * 20000U; h.ids = ids_;
-    if (!transport_->SendPcm64(
-            h, reinterpret_cast<const std::uint8_t*>(frame.pcm.data()),
-            frame.pcm.size() * sizeof(frame.pcm[0]))) return false;
-    ++uplink_sequence_; ++turn_frames_; return true;
+    const SendOutcome outcome = transport_->SendPcm64(
+        h, reinterpret_cast<const std::uint8_t*>(frame.pcm.data()),
+        frame.pcm.size() * sizeof(frame.pcm[0]));
+    if (outcome == SendOutcome::kOk) { ++uplink_sequence_; ++turn_frames_; }
+    return outcome;
+  }
+
+  // 上行失败按语义分流：瞬时背压只作废当前轮（云端 sequence 将出现缺口，
+  // 继续发帧必被拒），连接/协议错误才重建会话。
+  bool SendAudioOrRecover(const CaptureFrame& frame, bool end, const char* rejected_reason) {
+    const SendOutcome outcome = SendAudio(frame, end);
+    if (outcome == SendOutcome::kOk) return true;
+    if (outcome == SendOutcome::kBackpressure) { std::cout << "boompi-client: uplink backpressure; aborting turn" << std::endl; AbortCurrent("uplink backpressure cancel failed"); }
+    else LoseConnection(rejected_reason);
+    return false;
   }
 
   // turn.start 成功后先发送最老的 pre-roll，再发送实时帧，确保唤醒/打断不吃掉句首。
@@ -471,20 +486,18 @@ class VoiceClient final {
     uplink_sequence_ = turn_frames_ = 0U; state_ = State::kCapture;
     ui_.SetState(DeviceUiState::kListening);
     for (std::size_t i = 0U; i < pre_count_; ++i)
-      if (!SendAudio(pre_[(pre_head_ + i) % pre_.size()], false)) {
-        LoseConnection("pre-roll upload failed"); return false;
-      }
+      if (!SendAudioOrRecover(pre_[(pre_head_ + i) % pre_.size()], false,
+                              "pre-roll upload failed")) return false;
     std::cout << "boompi-client: VAD speech started; pre_roll_frames=" << pre_count_ << std::endl;
     pre_head_ = pre_count_ = 0U;
     return true;
   }
 
   void Commit(const CaptureFrame& frame) {
-    if (!SendAudio(frame, true) ||
-        !SendControl(ControlKind::kTurnCommit, ids_)) {
-      LoseConnection("turn commit failed"); return;
-    }
+    if (!SendAudioOrRecover(frame, true, "turn commit failed")) return;
+    if (!SendControl(ControlKind::kTurnCommit, ids_)) { LoseConnection("turn commit failed"); return; }
     state_ = State::kAwait; deadline_ = Clock::now() + std::chrono::seconds(30);
+    await_hint_at_ = Clock::now() + kFirstResponseHint; await_hint_shown_ = false;
     ui_.SetState(DeviceUiState::kThinking);
     std::cout << "boompi-client: VAD speech ended; voice turn committed" << std::endl;
   }
@@ -599,6 +612,11 @@ class VoiceClient final {
       else AbortCurrent("voice timeout cancel failed");
       return;
     }
+    // 首响等待超过 15 秒时给一次本地状态提示（AGENTS.md）；不改变 30 秒取消线。
+    if (state_ == State::kAwait && !await_hint_shown_ && now >= await_hint_at_) {
+      await_hint_shown_ = true; ui_.SetText("还在思考", "云端正在组织回答，请稍候");
+      std::cout << "boompi-client: first response pending 15s; showing local hint" << std::endl;
+    }
     switch (state_) {
       case State::kWake:
         if (frame.wake || std::exchange(manual_wake_pending_, false)) {
@@ -630,7 +648,7 @@ class VoiceClient final {
         else if (finish_after_start_ || frame.vad_ended) {
           finish_after_start_ = false; Commit(frame);
         }
-        else if (!SendAudio(frame, false)) LoseConnection("uplink PCM send failed");
+        else if (!SendAudioOrRecover(frame, false, "uplink PCM send failed")) return;
         break;
       case State::kSpeak: HandleBarge(frame, true); break;
       case State::kBarge: ObserveBargeAdmission(frame); break;
@@ -664,7 +682,8 @@ class VoiceClient final {
   std::size_t pre_head_{0U}, pre_count_{0U};
   WireIds ids_{}, response_{};
   State state_{State::kWake};
-  Clock::time_point deadline_{}, next_connect_{}, heartbeat_deadline_{};
+  Clock::time_point deadline_{}, next_connect_{}, heartbeat_deadline_{}, await_hint_at_{};
+  bool await_hint_shown_{false}, manual_wake_pending_{false};
   std::uint64_t audio_origin_us_{0U};
   std::uint32_t message_{1U}, uplink_sequence_{0U}, turn_frames_{0U};
   std::string subtitle_;
@@ -672,7 +691,6 @@ class VoiceClient final {
   unsigned barge_quiet_frames_{0U}, barge_silence_frames_{0U};
   std::uint8_t volume_{60U};
   bool brightness_{true};
-  bool manual_wake_pending_{false};
   BargeProbe barge_probe_{BargeProbe::kIdle};
   bool hello_sent_{false}, barge_ended_{false}, barge_turn_admitted_{false};
   bool barge_vad_started_seen_{false}, barge_tail_frozen_{false};

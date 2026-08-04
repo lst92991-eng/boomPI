@@ -341,8 +341,12 @@ void AudioEngine::Close() noexcept {
   if (impl_ == nullptr) return;
   if (impl_->open) {
     impl_->stop.store(true, std::memory_order_release);
-    // capture read 最迟在一个 20 ms period 后返回；backend 只能在两条音频线程 join 后释放。
+    // 经典 lost-wakeup：若 waiter 在“谓词已检查、尚未登记到等待队列”的窗口内，
+    // 锁外 notify 会被丢掉导致永久阻塞。短暂持锁建立同步边界后再通知，
+    // 保证 waiter 要么已看到 stop=true，要么在 notify 之前尚未进入等待。
+    { std::lock_guard<std::mutex> lock(impl_->capture_mutex); }
     impl_->capture_condition.notify_all();
+    { std::lock_guard<std::mutex> lock(impl_->mutex); }
     impl_->condition.notify_all();
     impl_->backend.InterruptPlayback();
     if (impl_->capture_thread.joinable()) impl_->capture_thread.join();

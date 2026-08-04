@@ -16,6 +16,10 @@
 
 namespace boompi::network { namespace {
 
+bool StopRequested(const std::atomic<bool>* stop) {
+  return stop != nullptr && stop->load(std::memory_order_acquire);
+}
+
 constexpr char kEthernet[] = "eth0", kWifi[] = "wlan0", kWifiConfig[] = "/etc/wpa_supplicant.conf";
 constexpr char kConfigDir[] = "/userdata/boompi/config", kServerConfig[] = "/userdata/boompi/config/server.conf";
 
@@ -65,7 +69,7 @@ bool HasIpv4(const char* interface) {
   const bool found = ioctl(fd, SIOCGIFADDR, &request) == 0; close(fd); return found;
 }
 
-bool RunNetworkTool(bool start_wifi, const char* interface) {
+bool RunNetworkTool(bool start_wifi, const char* interface, const std::atomic<bool>* stop) {
   const pid_t child = fork();
   if (child == 0) {
     const int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
@@ -81,6 +85,8 @@ bool RunNetworkTool(bool start_wifi, const char* interface) {
   if (child < 0) return false;
   int status = 0;
   for (std::uint32_t waited = 0; waited <= 12000U; waited += 100U) {
+    // 观察 stop：进程退出时不再等满 12 秒外部工具超时。
+    if (StopRequested(stop)) { kill(child, SIGKILL); waitpid(child, &status, 0); return false; }
     const pid_t result = waitpid(child, &status, WNOHANG);
     if (result == child) return WIFEXITED(status) && WEXITSTATUS(status) == 0;
     if (result < 0 && errno != EINTR) return false;
@@ -140,20 +146,21 @@ bool NetworkBootstrap::SaveServer(const NetworkBootstrapResult& server) {
   return AtomicWrite(kServerConfig, server.host + " " + std::to_string(server.port) + " " + server.spki_sha256_base64 + "\n");
 }
 
-bool NetworkBootstrap::Start(bool enable_discovery, NetworkBootstrapResult* output) {
+bool NetworkBootstrap::Start(bool enable_discovery, NetworkBootstrapResult* output, const std::atomic<bool>* stop) {
   if (output == nullptr) return false;
   *output = {}; const char* selected = nullptr;
   // 有线已有地址时不重复 DHCP，链路本地地址同样可用于局域网。
   if (NetValueIs(kEthernet, "carrier", "1") &&
-      (HasIpv4(kEthernet) || (RunNetworkTool(false, kEthernet) && HasIpv4(kEthernet)))) {
+      (HasIpv4(kEthernet) || (RunNetworkTool(false, kEthernet, stop) && HasIpv4(kEthernet)))) {
     selected = kEthernet;
   } else {
     if (access("/sys/class/net/wlan0", F_OK) != 0 || access(kWifiConfig, R_OK) != 0) return false;
     if (!HasIpv4(kWifi) &&
-        ((!NetValueIs(kWifi, "operstate", "up") && !RunNetworkTool(true, kWifi)) ||
-         !RunNetworkTool(false, kWifi) || !HasIpv4(kWifi))) return false;
+        ((!NetValueIs(kWifi, "operstate", "up") && !RunNetworkTool(true, kWifi, stop)) ||
+         !RunNetworkTool(false, kWifi, stop) || !HasIpv4(kWifi))) return false;
     selected = kWifi;
   }
+  if (StopRequested(stop)) return false;
   NetworkBootstrapResult saved{}, found{}; const bool have_saved = LoadServer(&saved);
   if (enable_discovery) {
     if (Discover(selected, &found) && (!have_saved || found.spki_sha256_base64 == saved.spki_sha256_base64) &&

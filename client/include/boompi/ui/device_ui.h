@@ -9,6 +9,9 @@ namespace boompi::ui {
 
 enum class DeviceUiState : std::uint8_t {
   kIdle, kListening, kThinking, kSpeaking, kHappy, kOffline, kError,
+  // 尾播阶段：TTS 数据已收完、仍在出声，轻触可打断；与 kHappy（追问窗口）区分。
+  // 新状态必须追加在枚举末尾：lvgl_screen.cpp 的 Voice() 按枚举序号直接索引。
+  kSpeakingTail,
 };
 
 enum class DeviceUiAction : std::uint8_t {
