@@ -57,9 +57,10 @@ func LoadOrCreate(directory string) (ServerIdentity, error) {
 		// Orphaned private key from an interrupted first-start: without the
 		// certificate no device can hold a matching SPKI pin, so it is safe
 		// to remove it and regenerate instead of refusing to boot forever.
-		if err := os.Remove(privateKeyPath); err != nil {
+		if err := os.Remove(privateKeyPath); err != nil && !os.IsNotExist(err) {
 			return ServerIdentity{}, fmt.Errorf("remove orphaned server private key: %w", err)
 		}
+		privateKeyExists = false
 	}
 	if !certificateExists {
 		if err := createIdentity(certificatePath, privateKeyPath); err != nil {

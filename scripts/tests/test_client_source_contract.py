@@ -148,24 +148,50 @@ class ClientSourceContractTest(unittest.TestCase):
 
     def test_no_client_source_escapes_the_counted_roots(self) -> None:
         # 把生产 C/C++ 挪到三个扫描根之外不得静默逃逸 ELOC 统计。
-        # 豁免三类 AGENTS.md 口径外的既有文件：桌面预览工具（不占预算）、
-        # 图像资产与 LVGL 构建配置（非逻辑代码）、板端 HIL/link 验证程序
-        # （不进 boompi-client，由 ctest/板端单独运行）。
+        # 豁免采用精确文件清单而非目录前缀：AGENTS.md 口径外的桌面预览工具、
+        # 图像资产、LVGL 构建配置和板端 HIL/link 验证程序（不进 boompi-client，
+        # 也不注册 CTest，仅板端按需单独运行）。新增豁免必须显式改本清单。
         suffixes = {".c", ".cc", ".cpp", ".h", ".hpp"}
-        exempt_prefixes = (
-            "client/apps/boompi_ui_simulator/",
-            "client/assets/",
-            "client/cmake/",
-            "client/tests/",
-        )
+        non_budget_files = {
+            "client/apps/boompi_ui_simulator/main.cpp",
+            "client/assets/xiaozhi/emoji_1f606_64.c",
+            "client/assets/xiaozhi/emoji_1f614_64.c",
+            "client/assets/xiaozhi/emoji_1f62f_64.c",
+            "client/assets/xiaozhi/emoji_1f634_64.c",
+            "client/assets/xiaozhi/emoji_1f636_64.c",
+            "client/assets/xiaozhi/emoji_1f642_64.c",
+            "client/assets/xiaozhi/emoji_1f914_64.c",
+            "client/assets/xiaozhi/twemoji_64.h",
+            "client/cmake/lvgl/lv_conf.h",
+            "client/tests/hil/aec_loop_hil.cpp",
+            "client/tests/hil/rockchip_3a_hil.cpp",
+            "client/tests/hil/rockchip_mpi_audio_hil.cpp",
+            "client/tests/link/rockchip_3a_link_check.cpp",
+            "client/tests/link/rockchip_mpi_audio_link_check.cpp",
+        }
         declared = PRODUCTION_FILES | UI_LAYER_FILES
         for path in (ROOT / "client").rglob("*"):
             if not path.is_file() or path.suffix not in suffixes:
                 continue
             relative = path.relative_to(ROOT).as_posix()
-            if relative in declared or relative.startswith(exempt_prefixes):
+            if relative in declared or relative in non_budget_files:
                 continue
             self.fail(f"uncounted client source escapes the contract: {relative}")
+
+    def test_boompi_client_target_only_builds_declared_sources(self) -> None:
+        # 豁免清单的前提是“不进 boompi-client”；把豁免文件加进目标源列表
+        # 就是真逃逸，必须被契约抓住。
+        cmake_text = (ROOT / "client/CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertNotIn("target_sources(boompi_client", cmake_text,
+                         "boompi_client sources must stay in the add_executable block")
+        block = cmake_text.split("add_executable(boompi_client", 1)[1].split(")", 1)[0]
+        declared = PRODUCTION_FILES | UI_LAYER_FILES
+        for line in block.splitlines():
+            source = line.strip()
+            if not source or source.startswith("#"):
+                continue
+            self.assertIn(f"client/{source}", declared,
+                          f"boompi_client builds undeclared source: {source}")
 
     def test_current_documents_have_no_broken_local_links(self) -> None:
         link_pattern = re.compile(r"\[[^]]*]\(([^)]+)\)")
