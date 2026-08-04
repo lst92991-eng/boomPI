@@ -122,6 +122,27 @@ func (connection *Connection) SendPCM(ctx context.Context, header protocol.PCMHe
 	return connection.enqueue(ctx, outboundMessage{messageType: websocket.BinaryMessage, data: frame})
 }
 
+// DiscardQueuedPCM drops queued binary PCM frames after a cancel fence so the
+// cancellation ACK is not delayed behind a cancelled response's audio. Frames
+// already claimed by the write pump stay in flight and are filtered by the
+// board's state and generation checks; queued control frames are preserved.
+func (connection *Connection) DiscardQueuedPCM() {
+	preserved := make([]outboundMessage, 0, len(connection.sendQueue))
+	for {
+		select {
+		case message := <-connection.sendQueue:
+			if message.messageType != websocket.BinaryMessage {
+				preserved = append(preserved, message)
+			}
+		default:
+			for _, message := range preserved {
+				connection.sendQueue <- message
+			}
+			return
+		}
+	}
+}
+
 // Close cancels I/O, sends a bounded close handshake, and waits for both pumps.
 func (connection *Connection) Close() error {
 	connection.closeOnce.Do(func() {

@@ -92,17 +92,19 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	absoluteConfigPath, err := filepath.Abs(opts.configPath)
 	if err != nil {
-		logger.Error("resolve configuration path", "error", err)
+		// Startup errors are local (path/TLS/bind) and already scrubbed upstream;
+		// log them as strings because the redactor drops KindAny values wholesale.
+		logger.Error("resolve configuration path", "error", err.Error())
 		return 1
 	}
 	identityDirectory := filepath.Join(filepath.Dir(absoluteConfigPath), "state")
 	application, err := app.New(cfg, logger, identityDirectory)
 	if err != nil {
-		logger.Error("application initialization failed", "error", err)
+		logger.Error("application initialization failed", "error", err.Error())
 		return 1
 	}
 	if err := application.Run(ctx); err != nil {
-		logger.Error("application stopped with an error", "error", err)
+		logger.Error("application stopped with an error", "error", err.Error())
 		return 1
 	}
 	return 0

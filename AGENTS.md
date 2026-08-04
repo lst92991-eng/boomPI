@@ -479,10 +479,14 @@ Wi-Fi 首次配置流程：
 
 ## 10. 配置、日志与隐私
 
-服务端使用人类可编辑的 `config.yaml`。非敏感配置优先级为 CLI -> environment -> YAML -> defaults。Qwen 凭据只从以下环境变量读取，不写入 YAML：
+服务端使用人类可编辑的 `config.yaml`。非敏感配置优先级为 CLI -> environment -> YAML -> defaults。Qwen 凭据优先从以下环境变量读取：
 
 - `DASHSCOPE_API_KEY`
 - `DASHSCOPE_WORKSPACE_ID`
+
+教学版例外（与第 0 节冻结范围一致）：允许 `config.yaml` 的 `qwen_api_key` 作为回退，保证三步启动；
+该文件必须 `0600` 权限、不得提交 Git，starter 模板只使用明显占位符；环境变量始终优先于 YAML。
+量产版必须移除 YAML 回退，只保留环境变量。
 
 客户端的配网结果、音量、亮度、UUID、endpoint、SPKI pin 和 token 使用原子写入的持久配置；POSIX 配置目录权限至少 `0700`、敏感文件至少 `0600`，Windows 服务端使用当前用户最小 ACL。建议复用协议 JSON 解析能力，避免仅为板端配置引入第二套大型解析器。配置损坏时回退到上一个有效副本或安全默认值，不带着半写文件启动。
 

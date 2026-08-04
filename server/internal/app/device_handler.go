@@ -413,7 +413,13 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 			state.turn.pendingPCM = nil
 		}
 		state.mu.Unlock()
+		// Drop already-queued PCM of the cancelled response so the ACK below is
+		// not delayed behind up to a queueful of audio the board must ignore.
+		connection.DiscardQueuedPCM()
 		if err := actor.Cancel(ctx, uint64(turn.epoch)); err != nil {
+			// The fence already stopped downlink; acknowledge best-effort so the
+			// board does not burn its bounded cancel timeout on a provider fault.
+			_ = sendControl(ctx, connection, state, "response.cancelled", turn, map[string]any{"reason": "client_request"})
 			return err
 		}
 		turn.active = false
