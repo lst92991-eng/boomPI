@@ -5,8 +5,8 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 > **语音链路的关键能力已经在 RV1106 上完成组合验收，教学版功能也已合入，但当前候选仍不是量产发布版。**
 > 2026-08-03 的单参考候选已完成严格交叉构建、固定语音 A/B、板端启动、真实 Qwen 问答以及
 > 静默、完整播放、三秒追问和播放中打断四段真人验收；本次窗口未观察到自激或音频运行错误。
-> 当前候选的语音核心为 18 个生产 C/C++ 文件、2666 ELOC；其中
-> Rockchip/Snowboy vendor 集成 280 ELOC，产品逻辑 2386 ELOC；UI 显示层另计 1926 ELOC，不占语音核心预算。屏幕/触摸、网络启动、UDP
+> 当前候选的语音核心为 18 个生产 C/C++ 文件、2665 ELOC；其中
+> Rockchip/Snowboy vendor 集成 280 ELOC，产品逻辑 2385 ELOC；UI 显示层另计 1926 ELOC，不占语音核心预算。屏幕/触摸、网络启动、UDP
 > 发现和 Wi-Fi 二维码配网已进入同一教学候选。旧版的丢帧、高延迟、`EPIPE` 和 jitter queue 记录仍作为回归风险
 > 保留；最终壳体 ERLE、受控 double-talk 和长期稳定性仍待量化验收。
 > 同日第一块板又完成分阶段打断 A/B：关闭打断后播放恢复流畅，快速候选完成真实 Qwen
@@ -70,8 +70,8 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 ### 软件阶段
 
-2026-08-03 教学候选按仓库既定职责整理（2026-08-04 对标业界后重定基线）；语音核心为 18 个生产 C/C++ 文件、2666 ELOC，其中
-Rockchip/Snowboy vendor 集成为 280 ELOC，产品逻辑为 2386 ELOC；UI 显示层（LVGL 渲染与屏幕/触摸驱动）另计 1926 ELOC：
+2026-08-03 教学候选按仓库既定职责整理（2026-08-04 对标业界后重定基线）；语音核心为 18 个生产 C/C++ 文件、2665 ELOC，其中
+Rockchip/Snowboy vendor 集成为 280 ELOC，产品逻辑为 2385 ELOC；UI 显示层（LVGL 渲染与屏幕/触摸驱动）另计 1926 ELOC：
 `application` 是会话状态机，`audio` 是有界播放编排，`network` 是持久 WSS/TLS，
 `platform/rv1106` 是 ALSA/libswresample、Rockchip 3A、Snowboy 和 WebRTC VAD；同一
 `network` 目录中的启动模块负责以太网/Wi-Fi/发现，`ui` 直接驱动 ST7789P3 和 GT911。

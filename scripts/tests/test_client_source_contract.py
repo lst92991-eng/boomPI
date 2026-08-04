@@ -78,6 +78,8 @@ STRUCTURE_ANCHORS = (
         "constexpr unsigned kBargeConfirmFrames = 3U;",
         "constexpr unsigned kBargeAdmissionQuietFrames = 20U;",
         "constexpr unsigned kBargeRetryCooldownFrames = 15U;",
+        # 打断确认时必须清空探针期残留的准入证据，否则 400 ms 承诺被压缩。
+        "ResetBargeState(); finish_after_cancel_ = false;",
     )),
     (AUDIO_ENGINE_HEADER, (
         "bool stream_open() const noexcept { return !playback_done(); }",
@@ -120,8 +122,9 @@ class ClientSourceContractTest(unittest.TestCase):
         # 预算按实测基线重定：2026-08-04 修正统计口径后为 2620，Phase 2 结构性重构
         # （探针状态机提取、超时/断帧出口收敛）净开销 +23；Phase 3 对标业界后的
         # 正确性修复（ALSA 句柄串行化、underrun 续写、流切换有界等待、xrun 计数）
-        # 净开销 +23。再新增代码必须先删减或证明必要性。UI 显示层单列公开，不计入该预算。
-        self.assertLessEqual(core_total, 2666)
+        # 净开销 +23；打断准入证据重置合并重复复位后净减 1。再新增代码必须先删减
+        # 或证明必要性。UI 显示层单列公开，不计入该预算。
+        self.assertLessEqual(core_total, 2665)
 
         for name in METRIC_DOCUMENTS:
             documented = (ROOT / name).read_text(encoding="utf-8")
@@ -130,7 +133,7 @@ class ClientSourceContractTest(unittest.TestCase):
             for metric in expected:
                 self.assertIn(metric, documented, f"{name}: missing current ELOC metric {metric}")
             for stale in ("2300", "439", "1861", "4517", "2498", "2228", "1921",
-                          "2620", "2340", "2643", "2363"):
+                          "2620", "2340", "2643", "2363", "2666", "2386"):
                 self.assertNotIn(stale, documented, f"{name}: stale ELOC metric {stale}")
 
     def test_architecture_anchors_present(self) -> None:

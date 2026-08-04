@@ -153,7 +153,8 @@ class VoiceTransport::Impl final {
       case ControlKind::kResponseCancel:
         if (!SameTurn(c.ids, turn_) ||
             (c.ids.stream != turn_.stream && c.ids.stream != response_.stream)) return false;
-        // ASIO 可能已解析 response.done，但 application 还没消费该事件；此时取消已自然完成。
+        // ASIO 可能已解析 response.done，但 application 还没消费该事件；此时取消已自然完成，
+        // 不会再有 cancelled ACK：返回 true 只表示无需重发，调用方不得据此等待 cancelled。
         if (!active_) return response_done_ && ValidIds(response_) && SameIds(c.ids, response_);
         if (response_cancel_sent_) return true;
         type = "response.cancel"; payload = "{}"; break;

@@ -398,6 +398,7 @@ class VoiceClient final {
       else FinishTurn(false);
       return;
     }
+    // 服务端 writePump 无条件每 ≤10s 发 ping（配置校验强制上限），30s 判活留足余量。
     if (event.kind == InboundKind::kHeartbeat) { heartbeat_deadline_ = Clock::now() + std::chrono::seconds(30); return; }
     if (state_ == State::kBarge && event.kind == InboundKind::kDone) { CompleteCancel(); return; }
     if (state_ == State::kBarge && event.kind != InboundKind::kCancelled) return;
@@ -581,8 +582,9 @@ class VoiceClient final {
   void ConfirmBarge(bool response_active, const CaptureFrame& frame) {
     audio_.DropPlayback(); ResetBargeProbe();
     subtitle_.clear(); ui_.SetText({}, {});
-    barge_ended_ = barge_turn_admitted_ = finish_after_cancel_ = false;
-    barge_silence_frames_ = 0U; barge_tail_frozen_ = false;
+    // 准入证据（连续参考安静时长与新 VAD start）必须在 kBarge 内重新积累：
+    // 探针期残留的旧值会把承诺的 400 ms 压缩到不足十帧。
+    ResetBargeState(); finish_after_cancel_ = false;
     std::cout << "boompi-client: barge-in playback cancelled; input_dbfs="
               << frame.input_dbfs << std::endl;
     if (!response_active) { CompleteCancel(); return; }

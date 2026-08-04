@@ -11,8 +11,8 @@
 - 私有 `AudioBackend`（`platform/rv1106/`）：由 `AudioEngine` 独占，内聚 ALSA 全双工、
   重采样、Rockchip 3A、Snowboy、WebRTC VAD 和近讲判定，不向 application 暴露。
 
-语音核心生产 C/C++ 共 18 个文件、2666 ELOC，其中 280 ELOC 是
-Rockchip/Snowboy vendor 集成，产品逻辑为 2386 ELOC；UI 显示层另计 1926 ELOC，不占语音核心预算。UI 和网络启动不介入逐帧 PCM 路径。
+语音核心生产 C/C++ 共 18 个文件、2665 ELOC，其中 280 ELOC 是
+Rockchip/Snowboy vendor 集成，产品逻辑为 2385 ELOC；UI 显示层另计 1926 ELOC，不占语音核心预算。UI 和网络启动不介入逐帧 PCM 路径。
 旧 `manual_single_turn`、独立 capture pump、
 通用 EventBus、自写 WSS/parser、renderer/resampler/gain 框架和 playback
 control/committer/worker 已删除；不得为了恢复历史测试结构重新引入。
