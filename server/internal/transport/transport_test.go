@@ -523,3 +523,30 @@ func marshalPCMFrame(t *testing.T, header protocol.PCMHeader, payload []byte) []
 	}
 	return append(encoded, payload...)
 }
+
+func TestDiscardQueuedPCMDropsBinaryAndPreservesControl(t *testing.T) {
+	// 不启动读写泵，直接验证队列语义：取消后排空必须丢弃二进制音频，
+	// 且保留的控制帧相对顺序不变（ACK 不得被已取消音频堵住）。
+	connection := &Connection{sendQueue: make(chan outboundMessage, sendQueueCapacity)}
+	connection.sendQueue <- outboundMessage{messageType: websocket.TextMessage, data: []byte("first")}
+	connection.sendQueue <- outboundMessage{messageType: websocket.BinaryMessage, data: []byte("pcm-1")}
+	connection.sendQueue <- outboundMessage{messageType: websocket.BinaryMessage, data: []byte("pcm-2")}
+	connection.sendQueue <- outboundMessage{messageType: websocket.TextMessage, data: []byte("second")}
+
+	connection.DiscardQueuedPCM()
+
+	if len(connection.sendQueue) != 2 {
+		t.Fatalf("queue length after discard = %d, want 2", len(connection.sendQueue))
+	}
+	kept := []string{}
+	for len(connection.sendQueue) > 0 {
+		message := <-connection.sendQueue
+		if message.messageType != websocket.TextMessage {
+			t.Fatalf("surviving message type = %d, want text", message.messageType)
+		}
+		kept = append(kept, string(message.data))
+	}
+	if kept[0] != "first" || kept[1] != "second" {
+		t.Fatalf("preserved control order = %v", kept)
+	}
+}

@@ -285,8 +285,22 @@ func (connection *Connection) writePump() {
 		select {
 		case <-connection.ctx.Done():
 			_ = connection.webSocket.SetWriteDeadline(time.Now().Add(writeTimeout))
-			_ = connection.webSocket.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "closing"))
-			return
+			// Final frames (e.g. a best-effort cancel ACK) must not lose the
+			// shutdown race: drop queued PCM, flush remaining control frames,
+			// then close. The queue is bounded and has no live producer now.
+			connection.DiscardQueuedPCM()
+			for {
+				select {
+				case message := <-connection.sendQueue:
+					if err := connection.write(message); err != nil {
+						return
+					}
+				default:
+					_ = connection.webSocket.WriteMessage(websocket.CloseMessage,
+						websocket.FormatCloseMessage(websocket.CloseNormalClosure, "closing"))
+					return
+				}
+			}
 		case message := <-connection.controlQueue:
 			if err := connection.write(message); err != nil {
 				connection.cancel(err)

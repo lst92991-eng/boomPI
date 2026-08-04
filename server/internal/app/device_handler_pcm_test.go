@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -338,6 +339,74 @@ func TestActiveResponseCancelPreemptsPacedAudio(t *testing.T) {
 	}
 }
 
+func TestCancelStillAcknowledgesWhenProviderCancelFails(t *testing.T) {
+	// provider 取消失败时 fence 已停下行；仍要 best-effort 回 ACK，
+	// 不让板端烧掉取消超时，随后错误照常上报（连接关闭）。
+	connection := startPCMOutputTestWithOptions(t, []backend.ConversationEvent{
+		{Type: backend.EventStarted, ResponseID: "response-cancel-fault"},
+		{
+			Type:         backend.EventAudio,
+			ResponseID:   "response-cancel-fault",
+			PCM:          pcmBoundaryFixture(outputFrameBytes, 0),
+			SampleRateHz: outputSampleRateHz,
+		},
+	}, nil, errors.New("provider fault"))
+	started := readControl(t, connection)
+	if started.Type != "response.start" {
+		t.Fatalf("first response = %+v, want response.start", started)
+	}
+	if got := readControl(t, connection); got.Type != "response.audio_start" {
+		t.Fatalf("second response type = %q, want response.audio_start", got.Type)
+	}
+
+	writeControl(t, connection, protocol.ControlEnvelope{
+		Version: protocol.Version, Type: "response.cancel", MessageID: "client-cancel-fault",
+		DeviceID: testDeviceID, SessionID: started.SessionID, TurnID: started.TurnID,
+		StreamID: started.StreamID, Epoch: started.Epoch, Payload: json.RawMessage(`{}`),
+	})
+
+	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline(cancel) error = %v", err)
+	}
+	acknowledged := false
+	for !acknowledged {
+		messageType, data, err := connection.ReadMessage()
+		if err != nil {
+			t.Fatalf("provider cancel failed but no response.cancelled arrived: %v", err)
+		}
+		if messageType == websocket.BinaryMessage {
+			continue
+		}
+		ack, err := protocol.DecodeControl(data)
+		if err != nil {
+			t.Fatalf("DecodeControl(cancel ack) error = %v", err)
+		}
+		if ack.Type != "response.cancelled" {
+			t.Fatalf("control before cancellation ack = %q", ack.Type)
+		}
+		if ack.SessionID != started.SessionID || ack.TurnID != started.TurnID ||
+			ack.StreamID != started.StreamID || ack.Epoch != started.Epoch {
+			t.Fatalf("response.cancelled identity = %+v, want active response", ack)
+		}
+		acknowledged = true
+	}
+
+	// 错误仍要上报：handler 返回错误后服务端关闭连接。
+	// 关闭前可能先到达尾随的协议错误帧，循环消费直至读到关闭错误；
+	// 并用 Timeout 反向区分"服务端关闭"与"2 秒 deadline 到期"。
+	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline(post-cancel) error = %v", err)
+	}
+	for {
+		if _, _, err := connection.ReadMessage(); err != nil {
+			if networkError, ok := err.(net.Error); ok && networkError.Timeout() {
+				t.Fatal("connection stayed open after provider cancel failure")
+			}
+			break
+		}
+	}
+}
+
 func TestUplinkFramingStateMachine(t *testing.T) {
 	t.Run("multi-frame happy path then rejects PCM after END", func(t *testing.T) {
 		turn := activeTurn{}
@@ -416,10 +485,14 @@ func pcmBoundaryFixture(length int, offset int) []byte {
 }
 
 func startPCMOutputTest(t *testing.T, events []backend.ConversationEvent) *websocket.Conn {
-	return startPCMOutputTestWithCancelCounter(t, events, nil)
+	return startPCMOutputTestWithOptions(t, events, nil, nil)
 }
 
 func startPCMOutputTestWithCancelCounter(t *testing.T, events []backend.ConversationEvent, cancelCount *atomic.Int32) *websocket.Conn {
+	return startPCMOutputTestWithOptions(t, events, cancelCount, nil)
+}
+
+func startPCMOutputTestWithOptions(t *testing.T, events []backend.ConversationEvent, cancelCount *atomic.Int32, cancelErr error) *websocket.Conn {
 	t.Helper()
 	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
@@ -433,7 +506,7 @@ func startPCMOutputTestWithCancelCounter(t *testing.T, events []backend.Conversa
 	cfg.DiscoveryPort = freeUDPPort(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	application, err := newWithBackend(cfg, logger, t.TempDir(), &pcmBoundaryBackend{
-		events: events, cancelCount: cancelCount,
+		events: events, cancelCount: cancelCount, cancelErr: cancelErr,
 	})
 	if err != nil {
 		t.Fatalf("newWithBackend() error = %v", err)
@@ -492,6 +565,7 @@ func startPCMOutputTestWithCancelCounter(t *testing.T, events []backend.Conversa
 type pcmBoundaryBackend struct {
 	events      []backend.ConversationEvent
 	cancelCount *atomic.Int32
+	cancelErr   error
 }
 
 func (b *pcmBoundaryBackend) Open(context.Context, backend.SessionConfig) (backend.ConversationSession, error) {
@@ -499,6 +573,7 @@ func (b *pcmBoundaryBackend) Open(context.Context, backend.SessionConfig) (backe
 		eventsToSend: append([]backend.ConversationEvent(nil), b.events...),
 		events:       make(chan backend.ConversationEvent, len(b.events)+1),
 		cancelCount:  b.cancelCount,
+		cancelErr:    b.cancelErr,
 	}, nil
 }
 
@@ -506,6 +581,7 @@ type pcmBoundarySession struct {
 	eventsToSend []backend.ConversationEvent
 	events       chan backend.ConversationEvent
 	cancelCount  *atomic.Int32
+	cancelErr    error
 	closeOnce    sync.Once
 }
 
@@ -522,7 +598,7 @@ func (s *pcmBoundarySession) Cancel(context.Context) error {
 	if s.cancelCount != nil {
 		s.cancelCount.Add(1)
 	}
-	return nil
+	return s.cancelErr
 }
 
 func (s *pcmBoundarySession) Events() <-chan backend.ConversationEvent { return s.events }
