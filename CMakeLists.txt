@@ -19,12 +19,14 @@ if(BOOMPI_BUILD_TESTS)
   enable_testing()
   # 源码契约测试（ELOC 预算、文档数字、结构锚点）只需 Python，
   # 挂进 ctest 避免 enable_testing 后零测试的假门；无 Python 时安静跳过。
+  # 只挂契约测试：scripts/tests 其余 probe/HIL 脚本依赖 POSIX，
+  # 与 CI 的 runner.os != 'Windows' 守卫保持同一范围。
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_FOUND)
     add_test(NAME boompi_source_contract
              COMMAND ${Python3_EXECUTABLE} -m unittest discover
                      -s "${CMAKE_SOURCE_DIR}/scripts/tests"
-                     -t "${CMAKE_SOURCE_DIR}" -p "test_*.py")
+                     -t "${CMAKE_SOURCE_DIR}" -p "test_client_source_contract.py")
   endif()
 endif()
 

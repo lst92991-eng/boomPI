@@ -79,7 +79,8 @@ boomPI 是面向 RV1106 自研板的本地服务型语音 AI 产品：板端运�
 
 现役 `boompi-client` 的语音核心包含 18 个生产 C/C++ 文件、2643 ELOC，其中 Rockchip/Snowboy vendor
 集成 280 ELOC，产品逻辑 2363 ELOC；UI 显示层（LVGL 渲染与 ST7789P3/GT911 驱动）另计 1926 ELOC，
-不占语音核心预算。计数口径是非空行减去纯 `//` 注释，完整范围由
+不占语音核心预算。宿主 SDL2 预览工具 `client/apps/boompi_ui_simulator` 不属于以上四个
+预算，仅用于桌面预览 UI，不得反向引入语音业务逻辑。计数口径是非空行减去纯 `//` 注释，完整范围由
 `scripts/tests/test_client_source_contract.py` 固定；复现这四个数字只需运行
 `python3 -m unittest discover -s scripts/tests -p 'test_*.py'`，它会用同一 `eloc()` 口径
 重算并校验文档。2026-08-01 的
