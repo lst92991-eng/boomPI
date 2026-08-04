@@ -95,6 +95,13 @@ supervisor、update、target 分层和发布架构的内容是未来路线图，
   150 ms 有界等待，避免把新回复误升级为会话重连；xrun 原子计数与限速日志。需服务端配合的
   机制（打断时长过滤、误打断恢复、played_samples 上报）未在本版实现，归入后文路线图。
 
+- 2026-08-04 Phase 4 服务端与基建对抗审计轮：取消 fence 后 `DiscardQueuedPCM` 排空待发音频、
+  provider 异常时仍尽力回 `response.cancelled` ACK；identity 半写自愈（孤儿私钥重建、孤儿证书
+  fail-closed）；控制帧 JSON 嵌套深度上限 32；客户端源码契约增加扫描根外逃逸守卫与
+  `boompi_client` 源列表校验。再次对标 Azure/OpenAI Realtime 的 `conversation.item.truncate`
+  （audio_end_ms 与播放位置同步）与 LiveKit 的误打断自动恢复后确认：无 played_samples 上报时
+  “整轮删除被打断回答”是教学级合理简化，深度对齐归入路线图。
+
 - 生产目标按仓库既定职责落位：`application/voice_client` 独占会话状态，
   `audio/audio_engine` 管理播放线程和有界 TTS 环，`network/voice_transport` 管理
   持久 WSS/TLS 与会话身份/序号校验，`platform/rv1106/audio_backend` 管理 ALSA、重采样、
