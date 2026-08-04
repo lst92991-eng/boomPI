@@ -31,6 +31,18 @@ boomPI 是面向自研 RV1106 板卡的语音 AI 项目。板端运行 C++17 客
 
 详细约束以 [AGENTS.md](AGENTS.md) 为准；架构摘要见 [docs/architecture/system-overview.md](docs/architecture/system-overview.md)，音频 vendor 边界见 [音频后端契约与依赖闸门](docs/architecture/audio-backends.md)，协议设计基线见 [protocol/protocol-v1.md](protocol/protocol-v1.md)。
 
+## 从零复现
+
+完整语音链路依赖 RV1106 真板与 vendor SDK；没有板卡无法复现语音对话，桌面
+`client/apps/boompi_ui_simulator` 只预览屏幕渲染，不含语音业务。具备板端条件时按顺序：
+
+1. 服务端：Go ≥ 1.26，按 [server/README.md](server/README.md) 三步启动（首次运行生成
+   `config.yaml` 后自动退出属正常行为，填入 Key 再运行）。
+2. Host 验证：Python 3 跑 [Host 构建与测试](#host-构建与测试) 的 fixture 与契约测试。
+3. 客户端：按 [RV1106 交叉编译](#rv1106-交叉编译) 准备工具链与 vendor 依赖并交叉构建。
+4. 上板：按 [client/README.md](client/README.md) 安装、启动与验收。
+5. 服务端启动后板端经 UDP 17807 自动发现；唤醒后对话，验证可打断的多轮流式回答。
+
 ## 当前真实状态
 
 ### 已有硬件单项结果
@@ -181,7 +193,7 @@ Workspace 时再选填 `DASHSCOPE_WORKSPACE_ID`。教学版客户端和服务端
 只适合可信局域网；需要隔离时在两端设置同一个随机 `BOOMPI_DEVICE_TOKEN`。
 
 当前实现提供 `wss://<host>:17806/ws`、稳定本地 TLS 身份、UDP `17807` 自动发现、16 kHz PCM
-上行、Qwen Realtime 流式转发、24 kHz PCM/文本下行与响应取消。完整操作见
+上行、默认 intelligence 管线（ASR→推理→TTS 三级级联，可切 `realtime` 直通模式）、24 kHz PCM/文本下行与响应取消。完整操作见
 [服务端三步启动说明](server/README.md)。不要把真实 API Key、设备令牌、`config.yaml` 或
 `state/` 提交到 Git；任何曾出现在聊天或公开日志中的 Key 都应在控制台吊销并重新生成。
 

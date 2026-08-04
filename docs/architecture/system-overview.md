@@ -116,6 +116,20 @@ HIL 已确认 Mode1 顺序和 refL/refR 相关性；该结论不能外推到其�
 generation 删除。服务端若不能可靠把文本映射到实际播放位置，应删除整个
 被打断 assistant turn，不能把未播放全文留入上下文。
 
+## 服务端数据流
+
+上行二进制帧由 64 字节大端 PCM 头加音频负载组成；`transport` 的 readPump 验头后把
+命令投递给该设备唯一的 session actor，actor 串行消费命令并持有 turn/epoch 状态，
+避免读写 goroutine 直接共享会话状态。当前轮交给对话后端：默认 intelligence 管线
+（ASR→推理→TTS 三级级联），可选 realtime 直通；provider 会话由独立 goroutine 驱动。
+下行文本与音频经有界 sendQueue（容量 32）由 writePump 发出，控制帧走独立控制队列，
+不被音频积压阻塞。
+
+取消时序与板端探针配套：actor 先在锁内把当前 turn 置为不活动（fence），随后
+`DiscardQueuedPCM` 排空 sendQueue 中尚未发出的音频（保留控制帧），再请求 provider
+取消；无论 provider 是否及时响应都尽力回 `response.cancelled` ACK，不让板端烧掉
+取消超时。fence 之后仍在途的迟到音频由板端 generation/序号检查丢弃。
+
 ## 网络与信任
 
 显式配置的 endpoint 不发起发现；未显式配置时广播固定 UDP 请求。响应主机只取 UDP 来源 IP；

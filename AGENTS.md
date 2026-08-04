@@ -421,12 +421,13 @@ Qwen 24 kHz S16_LE mono downlink
 
 后端接口：
 
-- `ConversationBackend`：第一版 Qwen Omni Realtime 的直接语音对话路径。
-- `ASRBackend`、`LLMBackend`、`TTSBackend`：未来拆分组合路径。
+- `ConversationBackend`：Qwen Omni Realtime 直通语音对话路径（`conversation_mode: realtime`）。
+- `ASRBackend`、`LLMBackend`、`TTSBackend`：intelligence 管线（`conversation_mode: intelligence`，
+  当前默认）的 ASR→推理→TTS 三级级联，默认模型 `qwen3-asr-flash`/`qwen3.6-flash`/`qwen3-tts-flash-realtime`。
 - 编译期 registry 根据配置选择实现；第一版不加载外部动态插件。
 - 生产二进制不得包含 `MockBackend`。测试替身只能位于测试包或 `boompi_test_support`。
 
-Qwen 默认配置：
+Qwen 默认配置（以下为 realtime 路径参数；默认模式 intelligence 使用上面列出的三级模型）：
 
 - region: Singapore
 - model: `qwen3.5-omni-plus-realtime`

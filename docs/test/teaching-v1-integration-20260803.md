@@ -18,6 +18,9 @@
 
 ## 代码体量
 
+> 本节的文件数与上限已被 2026-08-04 基线取代：当前为 18 个生产文件、2665 ELOC，
+> 以 AGENTS.md 第 2.1 节与 `scripts/tests/test_client_source_contract.py` 为准。
+
 统一口径为非空行减去纯 `//` 注释：
 
 | 范围 | 文件数 | ELOC |

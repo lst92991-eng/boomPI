@@ -69,6 +69,9 @@ sh -n scripts/hil/rv1106_alsa_full_duplex.sh
 
 ## 2026-08-01 当前验收状态
 
+> 本节体量数字是 2026-08-01 历史快照，已被 2026-08-04 基线（18 个生产文件、2665 ELOC，
+> 见 AGENTS.md 第 2.1 节）取代。
+
 当前候选为 17 个生产 C++ 文件、2257 ELOC，其中 Rockchip/Snowboy vendor 集成 458 ELOC，
 产品核心 1799 ELOC。严格交叉构建、Mode1 四通道全双工、历史 2 mic + 2 ref direct 3A 调用、
 `voice loop ready`/`secure session ready` 启动和 SIGTERM 自动恢复 mixer 已通过。有限低幅 997 Hz
