@@ -21,7 +21,7 @@ namespace {
 constexpr int kSampleRateHz = 16000;
 constexpr int kBitsPerSample = 16;
 constexpr int kMicrophoneChannels = 2;
-constexpr int kReferenceChannels = BOOMPI_ROCKCHIP_REFERENCE_CHANNELS;
+constexpr int kReferenceChannels = 1;
 constexpr int kVendorBlockSamples = 256;
 constexpr int kVendorInputShorts =
     kVendorBlockSamples * (kMicrophoneChannels + kReferenceChannels);
@@ -153,18 +153,17 @@ bool RockchipVoiceDsp::Process(
     const RockchipVoiceFrame16k& mic_left,
     const RockchipVoiceFrame16k& mic_right,
     const RockchipVoiceFrame16k& reference_left,
-    const RockchipVoiceFrame16k& reference_right,
     RockchipVoiceFrame16k* const output) noexcept {
   if (output == nullptr) return false;
   output->fill(0);
   if (!is_open()) return false;
   if (input_count_ > kInputFifoFrames - kRockchipVoiceFrameSamples16k) return false;
-  // Mode1 仍采集 REF-R；生产单参考只在送入 vendor 前丢弃它。
+  // REF-R 在调用本 API 前已经丢弃；vendor 永远只看到双麦和一个同步参考。
   for (std::size_t i = 0U; i < kRockchipVoiceFrameSamples16k; ++i) {
     const std::size_t base = (input_count_ + i) * kVendorInputChannels;
-    input_fifo_[base] = mic_left[i]; input_fifo_[base + 1U] = mic_right[i];
+    input_fifo_[base] = mic_left[i];
+    input_fifo_[base + 1U] = mic_right[i];
     input_fifo_[base + 2U] = reference_left[i];
-    if constexpr (kVendorInputChannels == 4U) input_fifo_[base + 3U] = reference_right[i];
   }
   input_count_ += kRockchipVoiceFrameSamples16k;
   while (input_count_ >= kVendorBlockSamples) {

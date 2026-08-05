@@ -40,17 +40,6 @@ type PCMHeader struct {
 	StreamID     uint32
 }
 
-type PCMStreamContext struct {
-	Kind             uint8
-	SampleRateHz     uint32
-	DeviceUUID       [16]byte
-	Epoch            uint32
-	SessionID        uint32
-	TurnID           uint32
-	StreamID         uint32
-	ExpectedSequence uint32
-}
-
 func (h PCMHeader) Validate() error {
 	if h.Version != Version {
 		return fmt.Errorf("unsupported PCM protocol version %d", h.Version)
@@ -84,47 +73,6 @@ func (h PCMHeader) Validate() error {
 	}
 	return nil
 }
-
-func (c PCMStreamContext) ValidateHeader(header PCMHeader) error {
-	if err := header.Validate(); err != nil {
-		return err
-	}
-	if c.Kind != AudioKindUplink && c.Kind != AudioKindDownlink {
-		return errors.New("PCM stream context kind is invalid")
-	}
-	if c.SampleRateHz < 8000 || c.SampleRateHz > 96000 {
-		return errors.New("PCM stream context sample rate is invalid")
-	}
-	if c.DeviceUUID == ([16]byte{}) || c.Epoch == 0 || c.SessionID == 0 || c.TurnID == 0 || c.StreamID == 0 {
-		return errors.New("PCM stream context identifiers must be nonzero")
-	}
-	if header.Kind != c.Kind {
-		return errors.New("PCM kind does not match the active stream")
-	}
-	if header.SampleRateHz != c.SampleRateHz {
-		return errors.New("PCM sample rate does not match the active stream")
-	}
-	if header.DeviceUUID != c.DeviceUUID {
-		return errors.New("PCM device UUID does not match the active stream")
-	}
-	if header.Epoch != c.Epoch {
-		return errors.New("PCM epoch does not match the active stream")
-	}
-	if header.SessionID != c.SessionID {
-		return errors.New("PCM session ID does not match the active stream")
-	}
-	if header.TurnID != c.TurnID {
-		return errors.New("PCM turn ID does not match the active stream")
-	}
-	if header.StreamID != c.StreamID {
-		return errors.New("PCM stream ID does not match the active stream")
-	}
-	if header.Sequence != c.ExpectedSequence {
-		return errors.New("PCM sequence does not match the active stream")
-	}
-	return nil
-}
-
 func ParseDeviceUUID(value string) ([16]byte, error) {
 	var result [16]byte
 	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {

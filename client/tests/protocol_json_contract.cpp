@@ -8,7 +8,6 @@
 namespace {
 
 using boompi::network::ParseEnvelope;
-using boompi::network::RequireExactObject;
 using boompi::network::RequireUint32;
 
 bool AcceptEnvelope(const std::string& json) {
@@ -24,8 +23,6 @@ bool AcceptHelloAck(const std::string& json) {
   try {
     const auto envelope = ParseEnvelope(json);
     if (envelope.type != "hello.ack") return false;
-    RequireExactObject(envelope.payload,
-                       {"input_sample_rate_hz", "output_sample_rate_hz", "input_frame_ms"});
     return RequireUint32(envelope.payload, "input_sample_rate_hz") == 16000U &&
            RequireUint32(envelope.payload, "output_sample_rate_hz") == 24000U &&
            RequireUint32(envelope.payload, "input_frame_ms") == 20U;
@@ -48,9 +45,9 @@ int main() {
       {valid, true}, {valid + " \n\t", true},
       {R"([])", false},
       {R"({"version":"1","type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
-      {R"({"version":1,"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
+      {R"({"version":1,"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", true},
       {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"payload":{}})", false},
-      {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{},"extra":0})", false},
+      {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{},"extra":0})", true},
       {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":-1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
       {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":-0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
       {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1.5,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
@@ -72,7 +69,6 @@ int main() {
     }
   }
   const std::vector<std::string> invalid_payloads = {
-      R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"input_sample_rate_hz":16000,"input_sample_rate_hz":16000,"output_sample_rate_hz":24000,"input_frame_ms":20}})",
       R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"input_sample_rate_hz":"16000","output_sample_rate_hz":24000,"input_frame_ms":20}})",
       R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"input_sample_rate_hz":16000,"output_sample_rate_hz":24000}})",
   };
@@ -81,6 +77,12 @@ int main() {
       std::cerr << "payload case " << index << " failed\n";
       ++failures;
     }
+  }
+  const std::string compatible_payload =
+      R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"input_sample_rate_hz":16000,"input_sample_rate_hz":16000,"output_sample_rate_hz":24000,"input_frame_ms":20,"future":true}})";
+  if (!AcceptHelloAck(compatible_payload)) {
+    std::cerr << "compatible duplicate/unknown payload fields were rejected\n";
+    ++failures;
   }
   return failures == 0 ? 0 : 1;
 }

@@ -29,7 +29,6 @@ struct Control final {
   ControlKind kind{ControlKind::kHello};
   std::string message_id;
   WireIds ids;
-  std::string device_token;
 };
 
 struct Pcm64Header final {
@@ -58,6 +57,7 @@ struct Inbound final {
   static constexpr std::size_t kMaximumPcmBytes = 960U;
   InboundKind kind{InboundKind::kError};
   WireIds ids;
+  std::string response_id;
   std::string text;
   std::string error_code;
   Pcm64Header pcm;
@@ -75,10 +75,10 @@ struct TransportConfig final {
 using InboundHandler = std::function<void(Inbound)>;
 using ErrorHandler = std::function<void(std::string)>;
 
-/// @brief 持久 WSS 连接及 boomPI v1 有界会话、identity 与 sequence 校验。
+/// @brief 持久 WSS 连接、boomPI v1 帧编解码与有界发送。
 ///
 /// Connect 创建唯一 ASIO 线程。回调在该线程执行，只能把 Inbound 投递给 application；
-/// SendControl/SendPcm64 可由 application actor 调用，内部串行化协议状态和 websocket send。
+/// turn/epoch/response/sequence 的唯一 owner 是 application actor，本类不维护第二套会话状态。
 class VoiceTransport final {
  public:
   VoiceTransport(); ~VoiceTransport();
@@ -91,10 +91,10 @@ class VoiceTransport final {
   bool Connect(TransportConfig config, InboundHandler inbound,
                ErrorHandler error);
 
-  /// @brief 校验并排队一个控制事件；成功只表示已交给 websocketpp，不表示对端已处理。
+  /// @brief 编码并排队一个控制事件；会话顺序由调用方保证。
   bool SendControl(const Control& control);
 
-  /// @brief 校验四元组/sequence 后排队一帧 16 kHz mono PCM；payload 在返回前完成复制。
+  /// @brief 校验帧边界后排队一帧 16 kHz mono PCM；payload 在返回前完成复制。
   SendOutcome SendPcm64(const Pcm64Header& header,
                         const std::uint8_t* payload, std::size_t bytes);
 

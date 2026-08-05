@@ -51,17 +51,17 @@ jobs:
       - name: Validate protocol fixtures
         run: python scripts/verify_protocol_fixtures.py
 
-      - name: Validate audio vendor dependency gates
-        run: python -m unittest scripts.tests.test_audio_vendor_cmake -v
+      - name: Run Python checks
+        run: python -m unittest discover -s scripts/tests -p "test_*.py" -v
 
-      - name: Validate client source and documentation contracts
-        run: python -m unittest scripts.tests.test_client_source_contract -v
+      - name: Configure C++ host tests
+        run: cmake --preset host-debug
 
-      - name: Validate POSIX P0 probes
-        if: runner.os != 'Windows'
-        run: |
-          sh -n scripts/probes/rv1106_p0_probe.sh
-          python -m unittest discover -s scripts/tests -p 'test_*.py' -v
+      - name: Build C++ host tests
+        run: cmake --build --preset host-debug --parallel
+
+      - name: Run C++ host tests
+        run: ctest --preset host-debug
 
       - name: Run Go tests
         working-directory: server

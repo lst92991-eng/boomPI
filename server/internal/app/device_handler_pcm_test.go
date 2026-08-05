@@ -439,6 +439,37 @@ func TestActiveResponseCancelPreemptsPacedAudio(t *testing.T) {
 	}
 }
 
+func TestValidateUplinkHeaderRejectsTurnMismatches(t *testing.T) {
+	device, err := protocol.ParseDeviceUUID(testDeviceID)
+	if err != nil {
+		t.Fatalf("ParseDeviceUUID() error = %v", err)
+	}
+	turn := activeTurn{
+		deviceUUID: device, sessionID: 8, turnID: 9, uplinkStream: 10,
+		epoch: 7, expectedInput: 42,
+	}
+	header := protocol.PCMHeader{
+		Kind: protocol.AudioKindUplink, SampleRateHz: 16_000, DeviceUUID: device,
+		SessionID: 8, TurnID: 9, StreamID: 10, Epoch: 7, Sequence: 42,
+	}
+	if err := validateUplinkHeader(turn, header); err != nil {
+		t.Fatalf("validateUplinkHeader() valid header error = %v", err)
+	}
+	for name, mutate := range map[string]func(*protocol.PCMHeader){
+		"epoch":       func(value *protocol.PCMHeader) { value.Epoch++ },
+		"sample_rate": func(value *protocol.PCMHeader) { value.SampleRateHz = 24_000 },
+		"sequence":    func(value *protocol.PCMHeader) { value.Sequence++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := header
+			mutate(&candidate)
+			if err := validateUplinkHeader(turn, candidate); err == nil {
+				t.Fatal("validateUplinkHeader() accepted a turn mismatch")
+			}
+		})
+	}
+}
+
 func TestUplinkFramingStateMachine(t *testing.T) {
 	t.Run("multi-frame happy path then rejects PCM after END", func(t *testing.T) {
 		turn := activeTurn{}
@@ -530,8 +561,7 @@ func startPCMOutputTestWithBackend(t *testing.T, provider backend.ConversationBa
 	t.Helper()
 	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
-	t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
-	cfg, err := config.Load("", nil)
+	cfg, err := config.Load("")
 	if err != nil {
 		t.Fatalf("config.Load() error = %v", err)
 	}

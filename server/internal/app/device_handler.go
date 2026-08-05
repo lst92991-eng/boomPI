@@ -12,10 +12,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 	"github.com/lst92991-eng/boomPI/server/internal/backend"
@@ -35,6 +35,7 @@ const (
 	minimumOutputFrameSpacing  = 15 * time.Millisecond
 	downlinkMaxBufferedBytes   = outputSampleRateHz * pcmBytesPerSample * 1500 / 1000
 	maxProviderAudioDeltaBytes = 64 * 1024
+	maxTextDeltaBytes          = 4096
 	downlinkReadResumeBytes    = downlinkMaxBufferedBytes - maxProviderAudioDeltaBytes
 	helloAuthenticationTimeout = 5 * time.Second
 )
@@ -139,9 +140,9 @@ func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connec
 	deviceRef := "unidentified"
 	sessionCtx := ctx
 	defer func() {
-		if errorCode, report := deviceSessionErrorCode(sessionCtx, result); report {
+		if sessionErr := reportableSessionError(sessionCtx, result); sessionErr != nil {
 			h.logger.Warn("device session ended with error", "device_ref", deviceRef,
-				"error_code", errorCode)
+				"error", sessionErr)
 		}
 	}()
 	helloCtx, cancelHello := context.WithTimeout(ctx, helloAuthenticationTimeout)
@@ -311,17 +312,14 @@ func (h *deviceHandler) retireActiveTurn(
 ) error {
 	state.mu.Lock()
 	turn := state.turn
+	state.mu.Unlock()
 	if !turn.active {
-		state.mu.Unlock()
 		return cause
 	}
-	state.turn.active = false
-	state.turn.pendingPCM = nil
-	stopDownlink := state.turn.stopDownlink
-	state.mu.Unlock()
-
-	if stopDownlink != nil {
-		stopDownlink()
+	var retired bool
+	turn, retired = deactivateActiveTurn(state, turn)
+	if !retired {
+		return cause
 	}
 	if err := actor.Cancel(ctx, uint64(turn.epoch)); err != nil {
 		return err
@@ -416,42 +414,22 @@ func staleRetiredTurnControl(state *connectionState, envelope protocol.ControlEn
 		envelope.StreamID == turn.uplinkStream && envelope.Epoch == turn.epoch
 }
 
-func deviceSessionErrorCode(ctx context.Context, result error) (string, bool) {
+func reportableSessionError(ctx context.Context, result error) error {
 	if result == nil {
-		return "", false
+		return nil
 	}
-	errorToClassify := result
 	if errors.Is(result, context.Canceled) && ctx != nil {
 		if cause := context.Cause(ctx); cause != nil {
-			errorToClassify = cause
+			result = cause
 		}
 	}
-	if errors.Is(errorToClassify, context.Canceled) ||
-		errors.Is(errorToClassify, io.EOF) {
-		return "", false
+	if errors.Is(result, context.Canceled) || errors.Is(result, io.EOF) {
+		return nil
 	}
-	if errors.Is(errorToClassify, errDeviceSessionIdleTimeout) {
-		return "session_idle_timeout", true
+	if websocket.IsCloseError(result, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+		return nil
 	}
-	var closeError *websocket.CloseError
-	if errors.As(errorToClassify, &closeError) {
-		if closeError.Code == websocket.CloseNormalClosure ||
-			closeError.Code == websocket.CloseGoingAway {
-			return "", false
-		}
-		return "peer_disconnected", true
-	}
-	if errors.Is(errorToClassify, context.DeadlineExceeded) {
-		return "timeout", true
-	}
-	var networkError net.Error
-	if errors.As(errorToClassify, &networkError) {
-		if networkError.Timeout() {
-			return "network_timeout", true
-		}
-		return "network_error", true
-	}
-	return "session_error", true
+	return result
 }
 
 func signalDeviceSessionActivity(activity chan<- struct{}) {
@@ -493,33 +471,18 @@ func authenticateHello(payload json.RawMessage, expectedToken string) error {
 }
 
 func parseHelloDeviceToken(payload json.RawMessage) (string, error) {
+	var hello struct {
+		DeviceToken string `json:"device_token"`
+	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
-	opening, err := decoder.Token()
-	if err != nil || opening != json.Delim('{') {
-		return "", errDeviceAuthentication
-	}
-	if !decoder.More() {
-		return "", errDeviceAuthentication
-	}
-	key, err := decoder.Token()
-	if err != nil || key != "device_token" {
-		return "", errDeviceAuthentication
-	}
-	var token string
-	if err := decoder.Decode(&token); err != nil || token == "" {
-		return "", errDeviceAuthentication
-	}
-	if decoder.More() {
-		return "", errDeviceAuthentication
-	}
-	closing, err := decoder.Token()
-	if err != nil || closing != json.Delim('}') {
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&hello); err != nil || hello.DeviceToken == "" {
 		return "", errDeviceAuthentication
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
 		return "", errDeviceAuthentication
 	}
-	return token, nil
+	return hello.DeviceToken, nil
 }
 
 func (h *deviceHandler) handleControl(ctx context.Context, connection *transport.Connection, actor *session.Actor, state *connectionState, envelope protocol.ControlEnvelope) error {
@@ -625,15 +588,7 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 		}
 		// Fence downlink immediately. Provider cancellation may wait for a remote
 		// acknowledgement, but no event from this epoch should be queued meanwhile.
-		state.mu.Lock()
-		if sameTurn(state.turn, turn) {
-			state.turn.active = false
-			state.turn.pendingPCM = nil
-			if state.turn.stopDownlink != nil {
-				state.turn.stopDownlink()
-			}
-		}
-		state.mu.Unlock()
+		_, _ = deactivateActiveTurn(state, turn)
 		if err := actor.Cancel(ctx, uint64(turn.epoch)); err != nil {
 			// The local downlink fence is already established. Acknowledge it even
 			// when provider cleanup fails so the board does not wait for its full
@@ -642,8 +597,6 @@ func (h *deviceHandler) handleControl(ctx context.Context, connection *transport
 				map[string]any{"reason": "client_request"})
 			return err
 		}
-		turn.active = false
-		turn.pendingPCM = nil
 		return sendControl(ctx, connection, state, "response.cancelled", turn, map[string]any{"reason": "client_request"})
 	default:
 		return fmt.Errorf("unsupported control type %q", envelope.Type)
@@ -662,12 +615,7 @@ func (h *deviceHandler) handlePCM(ctx context.Context, actor *session.Actor, sta
 		state.mu.Unlock()
 		return errors.New("PCM arrived without an active turn")
 	}
-	stream := protocol.PCMStreamContext{
-		Kind: protocol.AudioKindUplink, SampleRateHz: 16_000, DeviceUUID: turn.deviceUUID,
-		Epoch: turn.epoch, SessionID: turn.sessionID, TurnID: turn.turnID,
-		StreamID: turn.uplinkStream, ExpectedSequence: turn.expectedInput,
-	}
-	if err := stream.ValidateHeader(header); err != nil {
+	if err := validateUplinkHeader(*turn, header); err != nil {
 		state.mu.Unlock()
 		return err
 	}
@@ -689,6 +637,23 @@ func (h *deviceHandler) handlePCM(ctx context.Context, actor *session.Actor, sta
 		if err := actor.AppendPCM(ctx, uint64(epoch), completePCM[offset:offset+inputFrameBytes]); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// 传输层解包时已经检查了 PCM 的结构和长度；这里仅比对当前对话轮次，
+// 避免把“会话属于谁”的业务状态塞回纯二进制协议代码。
+func validateUplinkHeader(turn activeTurn, header protocol.PCMHeader) error {
+	if header.Kind != protocol.AudioKindUplink || header.SampleRateHz != 16_000 {
+		return errors.New("PCM format does not match the active uplink")
+	}
+	if header.DeviceUUID != turn.deviceUUID || header.SessionID != turn.sessionID ||
+		header.TurnID != turn.turnID || header.StreamID != turn.uplinkStream ||
+		header.Epoch != turn.epoch {
+		return errors.New("PCM identifiers do not match the active uplink")
+	}
+	if header.Sequence != turn.expectedInput {
+		return errors.New("PCM sequence does not match the active uplink")
 	}
 	return nil
 }
@@ -838,8 +803,14 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 				if !pacer.matches(turn, event.ResponseID) {
 					return errors.New("provider text delta does not match the active response")
 				}
-				if err := sendControlIfActive(ctx, connection, state, "response.text_delta", turn, map[string]any{"response_id": event.ResponseID, "text": event.Text}); err != nil {
+				chunks, err := splitTextDelta(event.Text)
+				if err != nil {
 					return err
+				}
+				for _, chunk := range chunks {
+					if err := sendControlIfActive(ctx, connection, state, "response.text_delta", turn, map[string]any{"response_id": event.ResponseID, "text": chunk}); err != nil {
+						return err
+					}
 				}
 			case backend.EventAudio:
 				if err := validateProviderAudio(event.SampleRateHz, event.PCM); err != nil {
@@ -884,18 +855,10 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 				pacer.responseID = event.ResponseID
 				pacer.providerDone = true
 			case backend.EventError:
-				state.mu.Lock()
-				if !sameActiveTurn(state.turn, turn) {
-					state.mu.Unlock()
+				var retired bool
+				turn, retired = deactivateActiveTurn(state, turn)
+				if !retired {
 					continue
-				}
-				turn = state.turn
-				state.turn.active = false
-				state.turn.pendingPCM = nil
-				stopDownlink := state.turn.stopDownlink
-				state.mu.Unlock()
-				if stopDownlink != nil {
-					stopDownlink()
 				}
 				if err := sendControl(ctx, connection, state, "error", turn, map[string]any{
 					"code": "provider_error", "message": "AI provider request failed",
@@ -1000,18 +963,10 @@ func (h *deviceHandler) finishPacedResponse(ctx context.Context, connection *tra
 		return false, err
 	}
 
-	state.mu.Lock()
-	if !sameActiveTurn(state.turn, turn) {
-		state.mu.Unlock()
+	var retired bool
+	turn, retired = deactivateActiveTurn(state, turn)
+	if !retired {
 		return false, nil
-	}
-	turn = state.turn
-	turn.active = false
-	state.turn = turn
-	stopDownlink := turn.stopDownlink
-	state.mu.Unlock()
-	if stopDownlink != nil {
-		stopDownlink()
 	}
 
 	h.logger.Info("voice response timing",
@@ -1059,6 +1014,27 @@ func validateProviderAudio(sampleRateHz int, pcm []byte) error {
 	return nil
 }
 
+// splitTextDelta 把协议文本限制在 4096 字节内，同时不截断中文或 emoji。
+func splitTextDelta(text string) ([]string, error) {
+	if text == "" {
+		return nil, errors.New("provider emitted an empty text delta")
+	}
+	if !utf8.ValidString(text) {
+		return nil, errors.New("provider emitted invalid UTF-8 text")
+	}
+	chunks := make([]string, 0, (len(text)+maxTextDeltaBytes-1)/maxTextDeltaBytes)
+	for len(text) > maxTextDeltaBytes {
+		end := maxTextDeltaBytes
+		for end > 0 && !utf8.RuneStart(text[end]) {
+			end--
+		}
+		chunks = append(chunks, text[:end])
+		text = text[end:]
+	}
+	chunks = append(chunks, text)
+	return chunks, nil
+}
+
 func sendDownlinkPCM(ctx context.Context, connection *transport.Connection, state *connectionState, turn activeTurn, payload []byte, final bool) error {
 	if len(payload) == 0 || len(payload) > outputFrameBytes || len(payload)%pcmBytesPerSample != 0 {
 		return fmt.Errorf("downlink PCM payload has %d bytes; want one non-empty aligned frame of at most %d bytes", len(payload), outputFrameBytes)
@@ -1101,6 +1077,25 @@ func sameTurn(current activeTurn, expected activeTurn) bool {
 
 func sameActiveTurn(current activeTurn, expected activeTurn) bool {
 	return current.active && sameTurn(current, expected)
+}
+
+// 先在锁内关闭轮次，再在锁外取消可能阻塞的下行发送。
+// 这样打断形成同一条栅栏，同时接收线程不会被网络背压卡在互斥锁上。
+func deactivateActiveTurn(state *connectionState, expected activeTurn) (activeTurn, bool) {
+	state.mu.Lock()
+	if !sameActiveTurn(state.turn, expected) {
+		state.mu.Unlock()
+		return activeTurn{}, false
+	}
+	turn := state.turn
+	state.turn.active = false
+	state.turn.pendingPCM = nil
+	stopDownlink := state.turn.stopDownlink
+	state.mu.Unlock()
+	if stopDownlink != nil {
+		stopDownlink()
+	}
+	return turn, true
 }
 
 func sendControlIfActive(ctx context.Context, connection *transport.Connection, state *connectionState, messageType string, turn activeTurn, payload any) error {

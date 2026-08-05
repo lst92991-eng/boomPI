@@ -10,17 +10,6 @@ import (
 	"github.com/lst92991-eng/boomPI/server/internal/backend"
 )
 
-func TestLimitsValidate(t *testing.T) {
-	limits := Limits{IdleTimeout: 30 * time.Minute, MaxTurns: 20, MaxContextTokens: 24_000}
-	if err := limits.Validate(); err != nil {
-		t.Fatalf("Validate() error = %v", err)
-	}
-	limits.MaxTurns = 0
-	if err := limits.Validate(); err == nil {
-		t.Fatal("Validate() accepted zero max turns")
-	}
-}
-
 func TestActorForwardsOneTurnInOrder(t *testing.T) {
 	provider := newFakeProvider()
 	actor := openTestActor(t, context.Background(), provider)
@@ -91,9 +80,6 @@ func TestActorRejectsIllegalAndDuplicateTransitions(t *testing.T) {
 	requireOK(t, actor.StartTurn(context.Background(), 1))
 	if err := actor.StartTurn(context.Background(), 1); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("duplicate StartTurn error = %v", err)
-	}
-	if err := actor.Commit(context.Background(), 1); !errors.Is(err, ErrInvalidTransition) {
-		t.Fatalf("empty Commit error = %v", err)
 	}
 	if err := actor.AppendPCM(context.Background(), 2, frame); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("future epoch Append error = %v", err)

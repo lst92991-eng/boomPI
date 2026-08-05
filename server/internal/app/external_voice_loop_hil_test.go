@@ -37,8 +37,7 @@ func TestExternalVoiceLoopHILServer(t *testing.T) {
 	// in-memory backend below never constructs or contacts Qwen.
 	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
-	t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
-	cfg, err := config.Load("", nil)
+	cfg, err := config.Load("")
 	if err != nil {
 		t.Fatalf("config.Load() error = %v", err)
 	}

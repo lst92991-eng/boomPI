@@ -7,31 +7,25 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
-const starterTemplate = `# boomPI 教学版服务端配置
-#
-# 只需把下一行替换成中国内地（北京）区 Model Studio 的 Qwen API Key，然后重新运行。
-# 也可以不修改本行，改用 DASHSCOPE_API_KEY 环境变量覆盖。
-qwen_api_key: %q
-
-# 教学版默认令牌与板端默认值一致；可信局域网之外请用 BOOMPI_DEVICE_TOKEN 覆盖。
-# 不要把本文件、API Key 或 device token 提交到 Git。
-device_token: "boompi-teaching-shared-token-v1-2026"
-
-# 以下均有可用默认值；需要时取消注释再调整。
-# listen_address: "0.0.0.0"
-# wss_port: 17806
-# region: "china-beijing"
-# conversation_mode: "intelligence"
-# log_level: "info"
+const starterHeader = `# boomPI 教学版服务端配置
+# 首次运行已写入中国内地 DashScope API Key，其他参数使用代码默认值。
+# 不要把本文件提交到 Git，也不要把它发送给他人。
 `
 
-// CreateStarter creates a private, self-contained teaching configuration.
-// Existing files are never overwritten.
-func CreateStarter(path string) (bool, error) {
+// CreateStarter 写入只有 Key 的教学配置，已有文件绝不覆盖。
+func CreateStarter(path, apiKey string) (bool, error) {
 	if strings.TrimSpace(path) == "" {
 		return false, errors.New("configuration path is required")
+	}
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" || apiKey == APIKeyPlaceholder || strings.IndexFunc(apiKey, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == 0
+	}) >= 0 {
+		return false, errors.New("Qwen API key is empty or invalid")
 	}
 	directory := filepath.Dir(path)
 	if directory != "." {
@@ -40,7 +34,13 @@ func CreateStarter(path string) (bool, error) {
 		}
 	}
 
-	contents := fmt.Sprintf(starterTemplate, APIKeyPlaceholder)
+	encoded, err := yaml.Marshal(struct {
+		QwenAPIKey string `yaml:"qwen_api_key"`
+	}{QwenAPIKey: apiKey})
+	if err != nil {
+		return false, fmt.Errorf("encode starter configuration: %w", err)
+	}
+	contents := starterHeader + string(encoded)
 
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, fs.ErrExist) {

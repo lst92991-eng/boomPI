@@ -32,9 +32,6 @@ constexpr int kPanelWidth = 240;
 constexpr int kPanelHeight = 320;
 constexpr int kLogicalWidth = 320;
 constexpr int kLogicalHeight = 240;
-constexpr int kVolumeSliderTouchLeft = 24;
-constexpr int kVolumeSliderTouchRight = 264;
-constexpr int kVolumeSliderTouchTop = 200;
 constexpr int kDrawBufferRows = 32;
 constexpr int kTouchEventLimit = 32;
 constexpr unsigned kSpiSpeedHz = 80000000U;
@@ -59,6 +56,9 @@ constexpr char kGt911I2cDevice[] = "/dev/i2c-3";
 constexpr char kPrimaryFont[] = "/userdata/boompi/fonts/NotoSansCJK-Regular.ttc";
 constexpr char kFallbackFont[] = "/oem/usr/share/simsun_en.ttf";
 constexpr char kIconFont[] = "/userdata/boompi/fonts/tabler-icons-200-subset.ttf";
+constexpr char kUiSettings[] = "/userdata/boompi/config/ui.settings";
+constexpr char kUiSettingsTemporary[] =
+    "/userdata/boompi/config/ui.settings.tmp";
 constexpr char kCameraPipeline[] =
     "/usr/bin/v4l2-ctl -d /dev/video14 "
     "--set-fmt-video=width=576,height=324,pixelformat=NV12 "
@@ -174,12 +174,7 @@ struct DeviceUi::Impl final {
   int slot{0};
   int pointer_x{0};
   int pointer_y{0};
-  int start_x{0};
-  int start_y{0};
   bool pointer_active{false};
-  bool have_x{false};
-  bool have_y{false};
-  bool gesture_started{false};
 
   std::atomic<bool> ready{false};
   std::atomic<bool> stop{false};
@@ -199,8 +194,8 @@ struct DeviceUi::Impl final {
   std::uint8_t volume_percent{60U};
   std::uint8_t pending_volume_percent{60U};
   bool volume_change_pending{false};
-  bool volume_change_committed{false};
-  bool volume_slider_active{false};
+  std::uint8_t settings_volume_percent{60U};
+  bool settings_save_pending{false};
   std::array<std::array<char, 64>, 2> lines{};
   std::array<DeviceUiAction, kActionQueueCapacity> actions{};
   std::size_t action_head{0U};
@@ -302,48 +297,44 @@ struct DeviceUi::Impl final {
     // preview so wake/interrupt actions cannot be displaced by slider noise.
     pending_volume_percent = std::min<std::uint8_t>(percent, 100U);
     volume_change_pending = true;
-    volume_change_committed = volume_change_committed || committed;
+    if (committed) {
+      // 单槽只保留最后一次提交，拖动过程不会反复写 flash。
+      settings_volume_percent = pending_volume_percent;
+      settings_save_pending = true;
+    }
+  }
+
+  void SavePendingVolumeSetting() {
+    std::uint8_t percent = 0U;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!settings_save_pending) return;
+      percent = settings_volume_percent;
+      settings_save_pending = false;
+    }
+
+    char text[16]{};
+    const int length = std::snprintf(text, sizeof(text), "%u\n",
+                                     static_cast<unsigned>(percent));
+    const int fd = open(kUiSettingsTemporary,
+                        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    const bool wrote = fd >= 0 && length > 0 &&
+                       static_cast<std::size_t>(length) < sizeof(text) &&
+                       WriteAll(fd, text, static_cast<std::size_t>(length));
+    if (fd >= 0) close(fd);
+    if (!wrote || std::rename(kUiSettingsTemporary, kUiSettings) != 0) {
+      unlink(kUiSettingsTemporary);
+      std::fprintf(stderr, "boompi-ui: volume setting save failed: %s\n",
+                   std::strerror(errno));
+    }
   }
 
   void BeginTouch() {
     pointer_active = true;
-    have_x = false;
-    have_y = false;
-    gesture_started = false;
-  }
-
-  void StartGestureIfReady() {
-    if (pointer_active && have_x && have_y && !gesture_started) {
-      start_x = pointer_x;
-      start_y = pointer_y;
-      gesture_started = true;
-    }
   }
 
   void EndTouch() {
-    if (!pointer_active) return;
     pointer_active = false;
-    if (!gesture_started) return;
-    // The event backend may deliver press, movement and release in one read.
-    // Reserve the visible slider strip before applying legacy screen gestures.
-    if (start_x >= kVolumeSliderTouchLeft &&
-        start_x <= kVolumeSliderTouchRight &&
-        start_y >= kVolumeSliderTouchTop)
-      return;
-    // LVGL owns this drag.  Its release callback clears the flag after the
-    // input driver reports release, so the legacy screen gesture stays idle.
-    if (volume_slider_active) return;
-    const int dx = pointer_x - start_x;
-    const int dy = pointer_y - start_y;
-    const int horizontal = dx < 0 ? -dx : dx;
-    const int vertical = dy < 0 ? -dy : dy;
-    if (horizontal < 24 && vertical < 24) return;
-    if (horizontal > vertical)
-      QueueAction(dx > 0 ? DeviceUiAction::kBrightnessUp
-                         : DeviceUiAction::kBrightnessDown);
-    else
-      QueueAction(dy < 0 ? DeviceUiAction::kVolumeUp
-                         : DeviceUiAction::kVolumeDown);
   }
 
   void HandleEvent(const input_event& event) {
@@ -355,17 +346,14 @@ struct DeviceUi::Impl final {
     if (slot != 0) return;
     if (event.code == ABS_MT_POSITION_X) {
       pointer_y = std::clamp(event.value, 0, kPanelWidth - 1);
-      have_y = true;
     } else if (event.code == ABS_MT_POSITION_Y) {
       pointer_x = kPanelHeight - 1 -
                   std::clamp(event.value, 0, kPanelHeight - 1);
-      have_x = true;
     } else if (event.code == ABS_MT_TRACKING_ID && event.value >= 0) {
       BeginTouch();
     } else if (event.code == ABS_MT_TRACKING_ID && event.value < 0) {
       EndTouch();
     }
-    StartGestureIfReady();
   }
 
   bool ReadGt911(std::uint16_t address, std::uint8_t* data,
@@ -414,8 +402,6 @@ struct DeviceUi::Impl final {
         pointer_y = std::clamp(raw_x, 0, kPanelWidth - 1);
         pointer_x = kPanelHeight - 1 -
                     std::clamp(raw_y, 0, kPanelHeight - 1);
-        have_x = have_y = true;
-        StartGestureIfReady();
       }
     }
     ClearGt911Status();
@@ -475,14 +461,9 @@ struct DeviceUi::Impl final {
                             LvglScreen::VolumeChangePhase phase,
                             void* user_data) {
     auto* self = static_cast<Impl*>(user_data);
-    if (phase == LvglScreen::VolumeChangePhase::kBegin) {
-      self->volume_slider_active = true;
-      return;
-    }
+    if (phase == LvglScreen::VolumeChangePhase::kBegin) return;
     self->QueueVolumeChange(
         percent, phase == LvglScreen::VolumeChangePhase::kCommit);
-    if (phase == LvglScreen::VolumeChangePhase::kCommit)
-      self->volume_slider_active = false;
   }
 
   void CaptureCamera() {
@@ -699,6 +680,7 @@ struct DeviceUi::Impl final {
         screen.SetCameraFrame(camera_pixels.data(), camera_pixels.size());
 
       static_cast<void>(lv_timer_handler());
+      SavePendingVolumeSetting();
       if (display_failed.load()) break;
       std::unique_lock<std::mutex> lock(mutex);
       // Subtitle deltas coalesce until the next visual frame.  State/page and
@@ -716,6 +698,16 @@ struct DeviceUi::Impl final {
 };
 
 DeviceUi::~DeviceUi() noexcept { Close(); }
+
+std::uint8_t DeviceUi::LoadVolume(const std::uint8_t fallback) noexcept {
+  unsigned saved = 0U;
+  std::FILE* input = std::fopen(kUiSettings, "r");
+  if (input == nullptr) return std::min<std::uint8_t>(fallback, 100U);
+  const bool valid = std::fscanf(input, "%u", &saved) == 1 && saved <= 100U;
+  std::fclose(input);
+  return valid ? static_cast<std::uint8_t>(saved)
+               : std::min<std::uint8_t>(fallback, 100U);
+}
 
 bool DeviceUi::Open() noexcept {
   Close();
@@ -851,16 +843,12 @@ bool DeviceUi::PollAction(DeviceUiAction* action) noexcept {
   return true;
 }
 
-bool DeviceUi::PollVolumeChange(std::uint8_t* percent,
-                                bool* committed) noexcept {
-  if (percent == nullptr || committed == nullptr || impl_ == nullptr)
-    return false;
+bool DeviceUi::PollVolumeChange(std::uint8_t* percent) noexcept {
+  if (percent == nullptr || impl_ == nullptr) return false;
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (!impl_->volume_change_pending) return false;
   *percent = impl_->pending_volume_percent;
-  *committed = impl_->volume_change_committed;
   impl_->volume_change_pending = false;
-  impl_->volume_change_committed = false;
   return true;
 }
 
@@ -872,11 +860,6 @@ void DeviceUi::SetVolume(const std::uint8_t percent) noexcept {
   impl_->volume_percent = limited;
   impl_->volume_dirty = true;
   impl_->wake.notify_one();
-}
-
-void DeviceUi::SetBrightness(std::uint8_t percent) noexcept {
-  if (impl_ != nullptr && impl_->ready.load() && impl_->backlight >= 0)
-    SetGpio(impl_->backlight, percent != 0U);
 }
 
 void DeviceUi::Close() noexcept {

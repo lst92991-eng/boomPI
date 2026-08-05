@@ -12,49 +12,34 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lst92991-eng/boomPI/server/internal/backend/qwen"
 	"github.com/lst92991-eng/boomPI/server/internal/backend/qwenpipeline"
 	"github.com/lst92991-eng/boomPI/server/internal/config"
 	"github.com/lst92991-eng/boomPI/server/internal/discovery"
 	"github.com/lst92991-eng/boomPI/server/internal/logging"
 )
 
-func TestQwenBackendSelectionKeepsDefaultAndDirectModesDistinct(t *testing.T) {
+func TestQwenBackendUsesTeachingPipeline(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
-	t.Setenv("BOOMPI_DEVICE_TOKEN", "0123456789abcdef0123456789abcdef")
-	cfg, err := config.Load("", nil)
+	cfg, err := config.Load("")
 	if err != nil {
 		t.Fatalf("config.Load() error = %v", err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	if cfg.ConversationMode != "intelligence" {
-		t.Fatalf("default conversation mode = %q, want intelligence", cfg.ConversationMode)
-	}
 	provider, err := newQwenBackend(cfg, logger)
 	if err != nil {
 		t.Fatalf("newQwenBackend(default) error = %v", err)
 	}
 	if _, ok := provider.(*qwenpipeline.Backend); !ok {
-		t.Fatalf("default backend type = %T, want intelligence pipeline", provider)
-	}
-
-	cfg.ConversationMode = "realtime"
-	provider, err = newQwenBackend(cfg, logger)
-	if err != nil {
-		t.Fatalf("newQwenBackend(realtime) error = %v", err)
-	}
-	if _, ok := provider.(*qwen.Backend); !ok {
-		t.Fatalf("realtime backend type = %T, want direct Qwen", provider)
+		t.Fatalf("backend type = %T, want ASR/LLM/TTS pipeline", provider)
 	}
 }
 
 func TestRunStopsWhenContextIsCanceled(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "never-log-this-secret")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "test-workspace")
-	t.Setenv("BOOMPI_DEVICE_TOKEN", "0123456789abcdef0123456789abcdef")
-	cfg, err := config.Load("", nil)
+	cfg, err := config.Load("")
 	if err != nil {
 		t.Fatalf("config.Load() error = %v", err)
 	}

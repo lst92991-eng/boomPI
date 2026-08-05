@@ -7,6 +7,8 @@
 *.cmake text eol=lf
 CMakeLists.txt text eol=lf
 *.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
 *.py text eol=lf
 *.sh text eol=lf
 *.json text eol=lf

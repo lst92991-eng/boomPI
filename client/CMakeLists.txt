@@ -1,12 +1,5 @@
 include(GNUInstallDirs)
 
-set(_boompi_alsa_default OFF)
-if(BOOMPI_TARGET_RV1106)
-  set(_boompi_alsa_default ON)
-endif()
-option(BOOMPI_ENABLE_ALSA_PLAYBACK "Build the RV1106 ALSA voice path" ${_boompi_alsa_default})
-option(BOOMPI_ENABLE_WSS_CLIENT "Build the persistent WSS voice transport" OFF)
-option(BOOMPI_ENABLE_WEBRTC_VAD "Build the 16 kHz WebRTC VAD" OFF)
 set(_boompi_ui_simulator_default ON)
 if(BOOMPI_TARGET_RV1106)
   set(_boompi_ui_simulator_default OFF)
@@ -19,8 +12,6 @@ option(BOOMPI_AEC_LOOP_ENABLE_STDT
   "Enable vendor STDT in the opt-in AEC regression probe" ON)
 option(BOOMPI_AEC_LOOP_ACTIVE_PROBE
   "Exercise the application mute-and-recheck barge-in guard in the AEC probe" OFF)
-set(BOOMPI_AEC_LOOP_REFERENCE_CHANNELS "2" CACHE STRING
-  "Reference channels passed to Rockchip 3A by the opt-in AEC probe (1 or 2)")
 set(BOOMPI_AEC_LOOP_DELAY_SAMPLES "0" CACHE STRING
   "Fixed Rockchip AEC reference delay used by the opt-in probe (0 or 256)")
 set(BOOMPI_OPENSSL_ROOT "" CACHE PATH "Pinned OpenSSL 3.5.7 package root")
@@ -38,27 +29,19 @@ if(BOOMPI_TARGET_RV1106 OR BOOMPI_BUILD_UI_SIMULATOR)
   include(cmake/BoompiLvgl.cmake)
   boompi_configure_lvgl()
 
-  set(_boompi_voice_orb_asset "${CMAKE_CURRENT_SOURCE_DIR}/assets/ui/voice-orb-v2.rgb565")
-  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${_boompi_voice_orb_asset}")
-  file(READ "${_boompi_voice_orb_asset}" _boompi_voice_orb_hex HEX)
-  string(REGEX REPLACE "(..)" "0x\\1," BOOMPI_VOICE_ORB_BYTES
-    "${_boompi_voice_orb_hex}")
-  file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
-  configure_file(cmake/lvgl/voice_orb_rgb565.inc.in
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/voice_orb_rgb565.inc" @ONLY)
-  unset(_boompi_voice_orb_hex)
-  unset(BOOMPI_VOICE_ORB_BYTES)
-
   add_library(boompi_lvgl_ui STATIC
     src/ui/lvgl_screen.cpp
-    src/ui/voice_orb_asset.cpp)
+    assets/xiaozhi/emoji_1f606_64.c
+    assets/xiaozhi/emoji_1f614_64.c
+    assets/xiaozhi/emoji_1f62f_64.c
+    assets/xiaozhi/emoji_1f642_64.c
+    assets/xiaozhi/emoji_1f914_64.c)
   target_compile_features(boompi_lvgl_ui PRIVATE cxx_std_17)
   target_compile_options(boompi_lvgl_ui PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>
     $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<BOOL:${BOOMPI_STRICT_WARNINGS}>>:-Werror>)
   target_include_directories(boompi_lvgl_ui PUBLIC include PRIVATE
-    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    assets/xiaozhi)
   target_link_libraries(boompi_lvgl_ui PUBLIC lvgl::lvgl Freetype::Freetype)
 endif()
 
@@ -128,7 +111,8 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
       stop-stalled-capture
       backpressure reconnect connection-subtitle abnormal-subtitle barge
       barge-short-before-ack barge-long-across-ack
-      cancel-done max-input)
+      cancel-done stale-epoch session-error-after-turn
+      downlink-sequence-gap max-input)
     add_test(NAME voice-client-${_scenario}
       COMMAND boompi_voice_client_harness ${_scenario})
   endforeach()
@@ -160,12 +144,6 @@ if(NOT BOOMPI_TARGET_RV1106)
   return()
 endif()
 
-foreach(_required IN ITEMS BOOMPI_ENABLE_ALSA_PLAYBACK BOOMPI_ENABLE_WSS_CLIENT
-    BOOMPI_ENABLE_ROCKCHIP_3A BOOMPI_ENABLE_SNOWBOY BOOMPI_ENABLE_WEBRTC_VAD)
-  if(NOT ${_required})
-    message(FATAL_ERROR "The production voice client requires ${_required}=ON")
-  endif()
-endforeach()
 foreach(_target IN ITEMS boompi_vendor::rockchip_3a_aec boompi_vendor::snowboy)
   if(NOT TARGET ${_target})
     message(FATAL_ERROR "Missing validated vendor target ${_target}")
@@ -199,19 +177,6 @@ if(NOT IS_ABSOLUTE "${BOOMPI_OPENSSL_ROOT}" OR NOT IS_DIRECTORY "${BOOMPI_OPENSS
   message(FATAL_ERROR "BOOMPI_OPENSSL_ROOT must be an explicit absolute package root")
 endif()
 file(REAL_PATH "${BOOMPI_OPENSSL_ROOT}" BOOMPI_OPENSSL_ROOT)
-function(boompi_require_sha256 relative expected)
-  if(NOT EXISTS "${BOOMPI_OPENSSL_ROOT}/${relative}")
-    message(FATAL_ERROR "Pinned OpenSSL file is missing: ${relative}")
-  endif()
-  file(SHA256 "${BOOMPI_OPENSSL_ROOT}/${relative}" actual)
-  if(NOT actual STREQUAL expected)
-    message(FATAL_ERROR "Pinned OpenSSL SHA-256 mismatch: ${relative}")
-  endif()
-endfunction()
-boompi_require_sha256(libssl.a 9d40ee1a49721f880f2b47da71908b231411f713c0db1bd9b64a0713ded864ec)
-boompi_require_sha256(libcrypto.a 26d1122294bac0ef8963708e5956bedf62df169360b9e9fe9cb7c682bb326aea)
-boompi_require_sha256(include/openssl/opensslv.h 256985d6271826835673eb59dec8369dbbead0b5055864b8b7e69effac426e52)
-boompi_require_sha256(include/openssl/configuration.h 25cc4d05c4a6ccd42e1441b40c5804392e588e0d0ff31087f47a926de0ccec96)
 set(OPENSSL_USE_STATIC_LIBS TRUE)
 set(OpenSSL_DIR "${BOOMPI_OPENSSL_ROOT}" CACHE PATH "Pinned OpenSSL package" FORCE)
 find_package(OpenSSL 3.5.7 EXACT CONFIG REQUIRED PATHS "${BOOMPI_OPENSSL_ROOT}"
@@ -263,6 +228,8 @@ target_link_libraries(boompi_client PRIVATE
   Freetype::Freetype
   OpenSSL::SSL OpenSSL::Crypto
   Threads::Threads ${CMAKE_DL_LIBS} atomic)
+target_link_options(boompi_client PRIVATE
+  $<$<CONFIG:Release>:-Wl,--strip-all>)
 set_target_properties(boompi_client PROPERTIES OUTPUT_NAME boompi-client
   SKIP_BUILD_RPATH TRUE BUILD_RPATH "" INSTALL_RPATH ""
   BUILD_WITH_INSTALL_RPATH FALSE INSTALL_RPATH_USE_LINK_PATH FALSE)
@@ -294,9 +261,6 @@ install(PROGRAMS scripts/boompi-provision.py DESTINATION /usr/lib/boompi)
 install(PROGRAMS scripts/S99boompi-client DESTINATION /etc/init.d)
 
 if(BOOMPI_BUILD_AEC_LOOP_HIL)
-  if(NOT BOOMPI_AEC_LOOP_REFERENCE_CHANNELS MATCHES "^[12]$")
-    message(FATAL_ERROR "BOOMPI_AEC_LOOP_REFERENCE_CHANNELS must be 1 or 2")
-  endif()
   if(NOT BOOMPI_AEC_LOOP_DELAY_SAMPLES MATCHES "^(0|256)$")
     message(FATAL_ERROR "BOOMPI_AEC_LOOP_DELAY_SAMPLES must be 0 or 256")
   endif()
@@ -312,8 +276,7 @@ if(BOOMPI_BUILD_AEC_LOOP_HIL)
     BOOMPI_AEC_LOOP_DIAGNOSTICS=1
     BOOMPI_AEC_LOOP_ACTIVE_PROBE=$<BOOL:${BOOMPI_AEC_LOOP_ACTIVE_PROBE}>
     BOOMPI_ROCKCHIP_ENABLE_STDT=$<BOOL:${BOOMPI_AEC_LOOP_ENABLE_STDT}>
-    BOOMPI_ROCKCHIP_DELAY_SAMPLES=${BOOMPI_AEC_LOOP_DELAY_SAMPLES}
-    BOOMPI_ROCKCHIP_REFERENCE_CHANNELS=${BOOMPI_AEC_LOOP_REFERENCE_CHANNELS})
+    BOOMPI_ROCKCHIP_DELAY_SAMPLES=${BOOMPI_AEC_LOOP_DELAY_SAMPLES})
   target_compile_options(boompi_aec_loop_hil PRIVATE -Wall -Wextra -Wpedantic
     $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:-Werror>)
   target_include_directories(boompi_aec_loop_hil PRIVATE
@@ -330,7 +293,7 @@ if(BOOMPI_BUILD_AEC_LOOP_HIL)
     "${BOOMPI_AVUTIL_LIBRARY}"
     Threads::Threads ${CMAKE_DL_LIBS} atomic)
   set_target_properties(boompi_aec_loop_hil PROPERTIES
-    OUTPUT_NAME boompi-aec-loop-hil-ref${BOOMPI_AEC_LOOP_REFERENCE_CHANNELS}
+    OUTPUT_NAME boompi-aec-loop-hil
     SKIP_BUILD_RPATH TRUE BUILD_RPATH "" INSTALL_RPATH ""
     BUILD_WITH_INSTALL_RPATH FALSE INSTALL_RPATH_USE_LINK_PATH FALSE)
 endif()

@@ -23,25 +23,6 @@ const (
 	pcmFrameBytes16kMono = 320 * 2
 )
 
-type Limits struct {
-	IdleTimeout      time.Duration
-	MaxTurns         int
-	MaxContextTokens int
-}
-
-func (l Limits) Validate() error {
-	if l.IdleTimeout < time.Minute || l.IdleTimeout > 24*time.Hour {
-		return errors.New("session idle timeout must be between 1m and 24h")
-	}
-	if l.MaxTurns < 1 || l.MaxTurns > 100 {
-		return errors.New("session max turns must be between 1 and 100")
-	}
-	if l.MaxContextTokens < 1024 || l.MaxContextTokens > 1_000_000 {
-		return errors.New("session max context tokens must be between 1024 and 1000000")
-	}
-	return nil
-}
-
 // Event adds the device epoch to a provider-neutral response event. Consumers
 // use Epoch to reject data that was already delivered when a turn was cancelled.
 type Event struct {
@@ -71,8 +52,7 @@ type phase uint8
 const (
 	idle phase = iota
 	listening
-	thinking
-	speaking
+	responding
 )
 
 // actorState is owned exclusively by Actor.run.
@@ -81,7 +61,6 @@ type actorState struct {
 	latest     uint64
 	epoch      uint64
 	responseID string
-	frames     int
 	pending    *Event
 }
 
@@ -238,7 +217,7 @@ func (a *Actor) apply(cmd command, state *actorState) error {
 			return ErrStaleEpoch
 		}
 		state.phase, state.latest, state.epoch = listening, cmd.epoch, cmd.epoch
-		state.responseID, state.frames = "", 0
+		state.responseID = ""
 		return nil
 
 	case appendPCM:
@@ -251,20 +230,19 @@ func (a *Actor) apply(cmd command, state *actorState) error {
 		if err := a.provider.SendAudio(cmd.ctx, cmd.pcm); err != nil {
 			return fmt.Errorf("send audio: %w", err)
 		}
-		state.frames++
 		return nil
 
 	case commit:
 		if stale(cmd.epoch, state) {
 			return ErrStaleEpoch
 		}
-		if state.phase != listening || cmd.epoch != state.epoch || state.frames == 0 {
+		if state.phase != listening || cmd.epoch != state.epoch {
 			return ErrInvalidTransition
 		}
 		if err := a.provider.Commit(cmd.ctx); err != nil {
 			return fmt.Errorf("commit audio: %w", err)
 		}
-		state.phase = thinking
+		state.phase = responding
 		return nil
 
 	case cancelTurn:
@@ -288,7 +266,7 @@ func (a *Actor) apply(cmd command, state *actorState) error {
 		if cmd.epoch != state.epoch {
 			return ErrInvalidTransition
 		}
-		responseWasActive := state.phase == thinking || state.phase == speaking
+		responseWasActive := state.phase == responding
 		if err := a.provider.Cancel(cmd.ctx); err != nil {
 			return fmt.Errorf("cancel response: %w", err)
 		}
@@ -303,7 +281,7 @@ func (a *Actor) apply(cmd command, state *actorState) error {
 		if state.pending != nil && state.pending.Epoch == state.epoch {
 			state.pending = nil
 		}
-		state.phase, state.epoch, state.responseID, state.frames = idle, 0, "", 0
+		state.phase, state.epoch, state.responseID = idle, 0, ""
 		return nil
 	}
 	return errors.New("unknown session operation")
@@ -329,7 +307,7 @@ func stale(epoch uint64, state *actorState) bool {
 }
 
 func accept(raw backend.ConversationEvent, state *actorState) *Event {
-	if state.phase != thinking && state.phase != speaking {
+	if state.phase != responding {
 		return nil
 	}
 	if err := validProviderEvent(raw); err != nil {
@@ -344,9 +322,6 @@ func accept(raw backend.ConversationEvent, state *actorState) *Event {
 	}
 	raw.PCM = append([]byte(nil), raw.PCM...)
 	event := &Event{Epoch: state.epoch, ConversationEvent: raw}
-	if raw.Type == backend.EventAudio {
-		state.phase = speaking
-	}
 	if raw.Type == backend.EventDone || raw.Type == backend.EventError {
 		state.phase, state.responseID = idle, ""
 	}

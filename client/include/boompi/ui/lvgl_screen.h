@@ -61,10 +61,6 @@ class LvglScreen final {
   void ShowApp(std::size_t index) noexcept;
   void UpdateClock() noexcept;
   void UpdateVoice() noexcept;
-  void StartHomeOrbMotion() noexcept;
-  void StopHomeOrbMotion() noexcept;
-  void StartOrbMotion() noexcept;
-  void StopOrbMotion() noexcept;
 
   static void AppClicked(lv_event_t* event);
   static void BackClicked(lv_event_t* event);
@@ -73,10 +69,6 @@ class LvglScreen final {
   static void VoiceClicked(lv_event_t* event);
   static void AppActionClicked(lv_event_t* event);
   static void ClockTick(lv_timer_t* timer);
-  static void MoveX(void* object, std::int32_t value);
-  static void MoveY(void* object, std::int32_t value);
-  static void Zoom(void* object, std::int32_t value);
-  static void Rotate(void* object, std::int32_t value);
 
   lv_obj_t* home_{nullptr};
   lv_obj_t* voice_{nullptr};
@@ -86,9 +78,9 @@ class LvglScreen final {
   lv_obj_t* home_clock_{nullptr};
   lv_obj_t* home_date_{nullptr};
   lv_obj_t* home_year_{nullptr};
-  lv_obj_t* home_orb_image_{nullptr};
+  lv_obj_t* home_face_image_{nullptr};
   lv_obj_t* app_buttons_[kAppCount]{};
-  lv_obj_t* voice_orb_image_{nullptr};
+  lv_obj_t* voice_face_image_{nullptr};
   lv_obj_t* voice_status_{nullptr};
   lv_obj_t* voice_text_{nullptr};
   lv_obj_t* voice_volume_slider_{nullptr};
@@ -96,7 +88,6 @@ class LvglScreen final {
   lv_obj_t* camera_image_{nullptr};
   lv_obj_t* camera_status_{nullptr};
   lv_obj_t* voice_mute_icon_{nullptr};
-  lv_obj_t* voice_orbits_[2]{};
   lv_obj_t* generic_title_{nullptr};
   lv_obj_t* generic_hero_{nullptr};
   lv_obj_t* generic_badge_{nullptr};

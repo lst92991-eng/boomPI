@@ -6,8 +6,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
-#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -78,7 +76,6 @@ constexpr auto kFollowUpWait = TestableDuration(3000, 30);
 constexpr unsigned kFollowUpNearFrames = 20U;
 constexpr unsigned kEventsPerCaptureFrame = 8U;
 constexpr auto kActorPollInterval = std::chrono::milliseconds(100);
-constexpr char kUiSettings[] = "/userdata/boompi/config/ui.settings";
 
 /** WSS 线程单生产、主 actor 单消费；固定 64 项，溢出时主动断线而不是覆盖事件。 */
 class EventQueue final {
@@ -164,24 +161,17 @@ class VoiceClient final {
     audio_config.snowboy_model = config_.snowboy_model_path;
     audio_config.snowboy_sensitivity = config_.snowboy_sensitivity;
     audio_config.vad_min_dbfs = config_.vad_min_dbfs;
-    volume_ = config_.volume_percent;
-    unsigned saved_volume = volume_, saved_brightness = 100U;
-    std::ifstream settings(kUiSettings);
-    if (settings >> saved_volume >> saved_brightness && saved_volume <= 100U)
-      volume_ = static_cast<std::uint8_t>(saved_volume);
+    volume_ = ui::DeviceUi::LoadVolume(config_.volume_percent);
     audio_config.playback_gain = static_cast<float>(volume_) *
                                  config_.speaker_gain_percent / 10000.0F;
     audio_config.left_polarity = config_.capture_left_polarity;
     audio_config.right_polarity = config_.capture_right_polarity;
     if (!ui_.Open()) std::cerr << "boompi-client: display unavailable; continuing voice-only\n";
-    brightness_ = saved_brightness != 0U;
     ui_.SetVolume(volume_);
-    ui_.SetBrightness(brightness_ ? 100U : 0U);
     ui_.SetState(DeviceUiState::kOffline);
     if (!audio_.Open(audio_config)) return Fail(audio_.last_error());
     try { network_thread_ = std::thread(&VoiceClient::NetworkLoop, this); }
     catch (...) { return Fail("network thread creation failed"); }
-    audio_origin_us_ = NowUs();
     next_connect_ = Clock::now();
     std::cout << "boompi-client: voice loop ready; wake_word=snowboy"
               << "; wake_sensitivity=" << config_.snowboy_sensitivity
@@ -223,19 +213,38 @@ class VoiceClient final {
     if (error_ != nullptr) *error_ = std::move(why);
     return false;
   }
-  static std::uint64_t NowUs() {
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            Clock::now().time_since_epoch()).count());
-  }
   bool SendControl(ControlKind kind, WireIds ids) {
     Control control{};
     control.kind = kind;
     control.message_id = "client-" + std::to_string(message_++);
     control.ids = ids;
-    if (kind == ControlKind::kHello)
-      control.device_token = config_.device_token;
     return transport_ && transport_->SendControl(control);
+  }
+  static bool SameTurn(const WireIds& left, const WireIds& right) {
+    return left.session == right.session && left.turn == right.turn &&
+           left.epoch == right.epoch;
+  }
+  static bool SameIds(const WireIds& left, const WireIds& right) {
+    return SameTurn(left, right) && left.stream == right.stream;
+  }
+  bool IsStale(const WireIds& ids) const {
+    return turn_ids_.session != 0U && ids.turn != 0U &&
+           ids.session == turn_ids_.session &&
+           ids.epoch != 0U && ids.epoch < turn_ids_.epoch;
+  }
+  bool IsCurrentResponse(const Inbound& event) const {
+    return response_ids_.session != 0U && SameIds(event.ids, response_ids_);
+  }
+  void ProtocolViolation(const char* reason) {
+    std::cerr << "boompi-client: protocol error; reason=" << reason << std::endl;
+    LoseConnection(reason);
+  }
+  void ResetResponse() {
+    response_ids_ = {};
+    response_id_.clear();
+    downlink_sequence_ = 0U;
+    response_audio_started_ = false;
+    response_audio_ended_ = false;
   }
   void ResetListener() {
     if (!audio_.ResetListener())
@@ -272,28 +281,17 @@ class VoiceClient final {
     await_hint_visible_ = false;
     ClearSubtitle();
   }
-  void SaveUiSettings() {
-    constexpr char temporary[] = "/userdata/boompi/config/ui.settings.tmp";
-    std::ofstream output(temporary, std::ios::trunc);
-    output << static_cast<unsigned>(volume_) << ' ' << (brightness_ ? 100 : 0) << '\n';
-    output.close();
-    if (output)
-      std::rename(temporary, kUiSettings);
-  }
-
-  void ApplyVolume(const std::uint8_t percent, const bool persist) {
+  void ApplyVolume(const std::uint8_t percent) {
     volume_ = std::min<std::uint8_t>(percent, 100U);
     audio_.SetPlaybackGain(static_cast<float>(volume_) *
                            config_.speaker_gain_percent / 10000.0F);
     ui_.SetVolume(volume_);
-    if (persist) SaveUiSettings();
   }
 
   void PollUi() {
     std::uint8_t selected_volume = volume_;
-    bool volume_committed = false;
-    if (ui_.PollVolumeChange(&selected_volume, &volume_committed))
-      ApplyVolume(selected_volume, volume_committed);
+    if (ui_.PollVolumeChange(&selected_volume))
+      ApplyVolume(selected_volume);
 
     DeviceUiAction action{};
     if (!ui_.PollAction(&action)) return;
@@ -311,21 +309,6 @@ class VoiceClient final {
       // response.done 只表示服务端已发完；ALSA 尾音未播完时仍需通知服务端
       // 丢弃完整 assistant turn，避免把用户没有听到的内容留进上下文。
       AbortCurrent("touch interrupt cancel failed");
-      return;
-    }
-    if (action == DeviceUiAction::kVolumeUp || action == DeviceUiAction::kVolumeDown) {
-      const int step = action == DeviceUiAction::kVolumeUp ? 5 : -5;
-      ApplyVolume(static_cast<std::uint8_t>(std::clamp(
-                      static_cast<int>(volume_) + step, 0, 100)),
-                  true);
-    } else if (action == DeviceUiAction::kBrightnessUp) {
-      brightness_ = true;
-      ui_.SetBrightness(100U);
-      SaveUiSettings();
-    } else if (action == DeviceUiAction::kBrightnessDown) {
-      brightness_ = false;
-      ui_.SetBrightness(0U);
-      SaveUiSettings();
     }
   }
 
@@ -467,7 +450,9 @@ class VoiceClient final {
     await_hint_pending_ = await_hint_visible_ = false;
     ui_.SetState(DeviceUiState::kOffline);
     state_ = State::kWaitingForWake;
-    turn_ids_ = response_ids_ = {};
+    turn_ids_ = {};
+    session_epoch_ = 0U;
+    ResetResponse();
     pre_head_ = pre_count_ = 0U;
     ResetBargeProbe();
     ResetBargeTurn();
@@ -508,67 +493,166 @@ class VoiceClient final {
     state_deadline_ = Clock::now() + kCancelAckWait;
   }
 
-  // WSS 回调只生产 Inbound；所有协议事件都在 actor 线程内改变 conversation state。
+  // WSS 回调只生产“已解码的单帧”。turn/epoch/response/sequence 都由
+  // 这个 application actor 唯一判定，因此不需要跨线程的协议状态锁。
   void HandleEvent(Inbound event) {
-    if (event.kind == InboundKind::kError) {
+    if (event.kind == InboundKind::kError && event.error_code == "transport") {
       MarkFirstResponseProgress();
-      std::cerr << "boompi-client: server error code=" << event.error_code << std::endl;
-      if (event.error_code == "transport" || turn_ids_.session == 0U)
-        LoseConnection("transport or hello error");
-      else if (event.ids.turn == 0U) LoseConnection("session error");
-      else if (event.error_code == "downlink_discontinuity") {
-        if (state_ != State::kCancelPending)
-          AbortCurrent("discontinuous response cancel failed");
-      }
-      else if (state_ == State::kCancelPending) CompleteCancel();
-      else FinishTurn(false);
+      LoseConnection("transport error");
       return;
     }
     if (event.kind == InboundKind::kHeartbeat) {
       heartbeat_deadline_ = Clock::now() + kHeartbeatWait;
       return;
     }
-    // response.done 可能和 response.cancelled 交叉；取消已经发出时只等明确
-    // cancelled，避免提前启动新 turn 后再收到旧 epoch 的确认。
-    if (state_ == State::kCancelPending && event.kind == InboundKind::kDone)
+    if (event.kind == InboundKind::kHelloAck) {
+      if (!hello_sent_ || turn_ids_.session != 0U || event.ids.session == 0U ||
+          event.ids.turn != 0U || event.ids.stream != 0U || event.ids.epoch == 0U) {
+        ProtocolViolation("invalid hello.ack identity");
+        return;
+      }
+      session_epoch_ = event.ids.epoch;
+      turn_ids_ = {event.ids.session, 1U, 1U, event.ids.epoch};
+      reconnect_attempt_ = 0U;
+      heartbeat_deadline_ = Clock::now() + kHeartbeatWait;
+      pre_head_ = pre_count_ = 0U;
+      ResetResponse();
+      ResetListener();
+      ui_.SetState(DeviceUiState::kIdle);
+      std::cout << "boompi-client: secure session ready" << std::endl;
       return;
-    if (state_ == State::kCancelPending &&
-        event.kind != InboundKind::kCancelled) return;
+    }
+    if (turn_ids_.session == 0U) {
+      ProtocolViolation("event received before hello.ack");
+      return;
+    }
+    // 正常结束会推进 epoch。旧 epoch 的延迟帧只能丢弃，不得影响新 turn。
+    if (IsStale(event.ids)) return;
+
+    if (event.kind == InboundKind::kError) {
+      MarkFirstResponseProgress();
+      std::cerr << "boompi-client: server error code=" << event.error_code << std::endl;
+      const bool session_error = event.ids.session == turn_ids_.session &&
+          event.ids.turn == 0U && event.ids.stream == 0U &&
+          event.ids.epoch == session_epoch_;
+      const bool turn_error = SameTurn(event.ids, turn_ids_) &&
+          event.ids.stream != 0U;
+      if (!session_error && !turn_error) {
+        ProtocolViolation("wrong error identity");
+      } else if (session_error) {
+        LoseConnection("session error");
+      } else if (state_ == State::kCancelPending) {
+        CompleteCancel();
+      } else {
+        FinishTurn(false);
+      }
+      return;
+    }
+
+    if (state_ == State::kCancelPending) {
+      // cancel 发出后可能与 response.start/done 交叉。仍记住新出现的
+      // response 身份，但不再向 UI/播放器发布它的内容。
+      if (event.kind == InboundKind::kResponseStart &&
+          response_ids_.session == 0U && SameTurn(event.ids, turn_ids_) &&
+          event.ids.stream != 0U) {
+        response_ids_ = event.ids;
+        response_id_ = std::move(event.response_id);
+        return;
+      }
+      if (event.kind == InboundKind::kCancelled) {
+        const bool stream_matches = response_ids_.session == 0U
+            ? event.ids.stream != 0U
+            : event.ids.stream == response_ids_.stream;
+        if (!SameTurn(event.ids, turn_ids_) || !stream_matches) {
+          ProtocolViolation("wrong cancellation identity");
+          return;
+        }
+        MarkFirstResponseProgress();
+        CompleteCancel();
+        return;
+      }
+      if (event.kind == InboundKind::kDone && IsCurrentResponse(event) &&
+          event.response_id == response_id_) return;
+      if (response_ids_.session != 0U && IsCurrentResponse(event)) return;
+      ProtocolViolation("wrong event while cancellation is pending");
+      return;
+    }
+
+    if (event.kind == InboundKind::kCancelled) {
+      ProtocolViolation("unexpected response.cancelled");
+      return;
+    }
+    if (state_ == State::kDrainingPlayback) {
+      if (IsCurrentResponse(event)) return;
+      ProtocolViolation("wrong event after response.done");
+      return;
+    }
+
     state_deadline_ = Clock::now() + kResponseWait;
     switch (event.kind) {
-      case InboundKind::kHelloAck:
-        turn_ids_ = {event.ids.session, 1U, 1U, event.ids.epoch};
-        reconnect_attempt_ = 0U;
-        heartbeat_deadline_ = Clock::now() + kHeartbeatWait;
-        pre_head_ = pre_count_ = 0U;
-        ResetListener();
-        ui_.SetState(DeviceUiState::kIdle);
-        std::cout << "boompi-client: secure session ready" << std::endl;
-        break;
       case InboundKind::kResponseStart:
+        if (state_ != State::kWaitingForResponse ||
+            response_ids_.session != 0U || !SameTurn(event.ids, turn_ids_) ||
+            event.ids.stream == 0U) {
+          ProtocolViolation("wrong response.start identity or order");
+          return;
+        }
         response_ids_ = event.ids;
+        response_id_ = std::move(event.response_id);
+        downlink_sequence_ = 0U;
+        response_audio_started_ = false;
+        response_audio_ended_ = false;
         if (!await_hint_visible_) ClearSubtitle();
         break;
       case InboundKind::kTextDelta:
+        if (!IsCurrentResponse(event) || event.response_id != response_id_) {
+          ProtocolViolation("wrong response.text_delta identity");
+          return;
+        }
         MarkFirstResponseProgress();
         ShowText(event.text);
         break;
       case InboundKind::kAudioStart:
+        if (!IsCurrentResponse(event) || event.response_id != response_id_ ||
+            response_audio_started_) {
+          ProtocolViolation("invalid response.audio_start");
+          return;
+        }
         MarkFirstResponseProgress();
         if (!audio_.BeginPlayback()) {
           LoseConnection("playback start failed");
           break;
         }
+        response_audio_started_ = true;
         state_ = State::kPlayingResponse;
         ui_.SetState(DeviceUiState::kSpeaking);
         ResetBargeProbe();
         break;
       case InboundKind::kPcm:
+        if (!IsCurrentResponse(event) || !response_audio_started_ ||
+            response_audio_ended_ || event.pcm.sequence != downlink_sequence_ ||
+            ((event.pcm.sequence == 0U) != ((event.pcm.flags & 1U) != 0U))) {
+          ProtocolViolation("PCM identity or sequence mismatch");
+          return;
+        }
+        if ((event.pcm.flags & 4U) != 0U) {
+          AbortCurrent("discontinuous response cancel failed");
+          return;
+        }
         MarkFirstResponseProgress();
-        if (!audio_.QueueTts24k(event.audio.data(), event.audio_size, event.pcm.sequence))
+        if (!audio_.QueueTts24k(event.audio.data(), event.audio_size, event.pcm.sequence)) {
           AbortCurrent("TTS response cancel failed");
+          return;
+        }
+        ++downlink_sequence_;
+        response_audio_ended_ = (event.pcm.flags & 2U) != 0U;
         break;
       case InboundKind::kDone:
+        if (!IsCurrentResponse(event) || event.response_id != response_id_ ||
+            (response_audio_started_ && !response_audio_ended_)) {
+          ProtocolViolation("invalid response.done");
+          return;
+        }
         MarkFirstResponseProgress();
         if (audio_.playback_active() && !audio_.EndPlayback())
           LoseConnection("playback finish failed");
@@ -579,11 +663,6 @@ class VoiceClient final {
           ui_.SetState(DeviceUiState::kSpeakingTail);
         }
         break;
-      case InboundKind::kCancelled:
-        MarkFirstResponseProgress();
-        if (state_ == State::kCancelPending) CompleteCancel();
-        else FinishTurn(false);
-        break;
       default: break;
     }
   }
@@ -592,7 +671,7 @@ class VoiceClient final {
     ++turn_ids_.turn;
     ++turn_ids_.stream;
     ++turn_ids_.epoch;
-    response_ids_ = {};
+    ResetResponse();
   }
 
   // 正常结束和异常取消都推进 epoch 并进入 follow-up；异常路径还会立即丢弃残余播放。
@@ -684,7 +763,7 @@ class VoiceClient final {
     h.flags = static_cast<std::uint16_t>(
         (uplink_sequence_ == 0U ? 1U : 0U) | (end ? 2U : 0U));
     h.sequence = uplink_sequence_;
-    h.timestamp_us = audio_origin_us_ + frame.sequence * 20000U;
+    h.timestamp_us = frame.timestamp_us;
     h.ids = turn_ids_;
     const SendOutcome outcome = transport_->SendPcm64(
         h, reinterpret_cast<const std::uint8_t*>(frame.pcm.data()),
@@ -952,12 +1031,14 @@ class VoiceClient final {
   std::size_t pre_count_{0U};
   WireIds turn_ids_{};
   WireIds response_ids_{};
+  std::uint32_t session_epoch_{0U};
+  std::uint32_t downlink_sequence_{0U};
+  std::string response_id_;
   State state_{State::kWaitingForWake};
   Clock::time_point state_deadline_{};
   Clock::time_point next_connect_{};
   Clock::time_point heartbeat_deadline_{};
   Clock::time_point await_hint_at_{};
-  std::uint64_t audio_origin_us_{0U};
   std::uint64_t next_capture_sequence_{0U};
   std::uint32_t message_{1U};
   std::uint32_t uplink_sequence_{0U};
@@ -971,9 +1052,10 @@ class VoiceClient final {
   unsigned barge_quiet_frames_{0U};
   unsigned barge_silence_frames_{0U};
   std::uint8_t volume_{60U};
-  bool brightness_{true};
   bool await_hint_pending_{false};
   bool await_hint_visible_{false};
+  bool response_audio_started_{false};
+  bool response_audio_ended_{false};
   BargeProbe barge_probe_{BargeProbe::kIdle};
   bool hello_sent_{false};
   bool barge_ended_{false};

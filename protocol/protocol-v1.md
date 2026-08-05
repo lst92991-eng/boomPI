@@ -2,18 +2,18 @@
 
 ## 1. Status and scope
 
-This document is the P1 wire-contract baseline shared by the RV1106 C++ client and the Go server. It defines framing, identifiers, bounds and cancellation semantics. The Go MVP implements the WSS and streaming subset listed in section 4.2, the fixed discovery exchange in section 8, and shared development-token authentication. Pairing, per-device token provisioning and flow credit are still pending. The teaching client already performs bounded automatic reconnect: it discards the old turn and media, opens a new session/epoch and never retransmits real-time audio.
+This document is the v1 wire contract shared by the RV1106 C++ client and the Go server. It defines framing, identifiers, bounds, cancellation, discovery and the classroom hello guard. Pairing, per-device credentials and flow credit are outside protocol v1. The client performs bounded automatic reconnect: it discards the old turn and media, opens a new session/epoch and never retransmits real-time audio.
 
 Normative words `MUST`, `MUST NOT`, `SHOULD` and `MAY` are used deliberately. Protocol implementations must reject malformed lengths before allocation or state mutation.
 
 ## 2. Transports
 
 - UDP port `17807`: unauthenticated LAN discovery only.
-- TCP/WSS port `17806`: one persistent TLS connection carrying UTF-8 JSON text frames and binary PCM frames. The current server limits this to one device and authenticates it with a shared development token; pairing and per-device token provisioning are not yet implemented.
-- WebSocket ping/pong: the server sends a periodic Ping every 1–10 seconds (10 seconds by default), and requires the Pong timeout to cover at least three Ping intervals without exceeding 30 seconds. The teaching client automatically replies with Pong and declares the server unavailable after 30 seconds without an inbound Ping. Receiving a Pong refreshes the server deadline but never suppresses its next periodic Ping.
+- TCP/WSS port `17806`: one persistent TLS connection carrying UTF-8 JSON text frames and binary PCM frames. The current teaching deployment uses one server process and one board.
+- WebSocket ping/pong: the server sends a periodic Ping every 1–10 seconds (10 seconds by default), and requires the Pong timeout to cover at least three Ping intervals without exceeding 30 seconds. The client automatically replies with Pong and declares the server unavailable after 30 seconds without an inbound Ping. Receiving a Pong refreshes the server deadline but never suppresses its next periodic Ping.
 - Application audio is real-time and is never retransmitted after reconnect.
 
-UDP discovery is not a trust mechanism. A response supplies only a candidate endpoint and its TLS SPKI digest. The current teaching build checks the configured shared token and SPKI pin; production pairing and per-device provisioning remain future work.
+UDP discovery is not a trust mechanism. A response supplies only an endpoint hint and its TLS SPKI digest. The client saves and checks the server SPKI pin. Both ends also send the same built-in classroom hello value so unrelated WebSocket clients fail closed; this value is not a user credential. Pairing and per-device provisioning are not defined by v1.
 
 ## 3. Identifier model
 
@@ -54,7 +54,7 @@ Rules:
 - Maximum text-frame size is 65,536 bytes after UTF-8 encoding.
 - `type` is 1–64 visible ASCII bytes (`0x21`–`0x7e`). Receivers must not change state for an unknown type.
 - `payload` is always an object. Individual message schemas must define their own required fields and bounds.
-- Duplicate JSON object keys, invalid UTF-8, fractional/negative IDs and values outside unsigned 32-bit range are invalid.
+- Senders do not emit duplicate JSON object keys. The teaching receiver validates the required value it reads instead of performing a second lexical duplicate-key scan. Invalid UTF-8, fractional/negative IDs and values outside unsigned 32-bit range remain invalid.
 - JSON member order and whitespace have no semantic meaning.
 
 ### 4.1 Initial message set
@@ -74,17 +74,17 @@ Rules:
 | `response.done` | server → device | `{"response_id":"<1..128 bytes>"}` |
 | `error` | server → device | `{"code":"<1..64 bytes>","message":"<1..512 bytes>"}` |
 
-`playback.progress`, `flow.credit` and `state.update` are reserved future message types. The current teaching v1 does not send, accept or negotiate them.
+`playback.progress`, `flow.credit` and `state.update` are reserved message types. v1 does not send, accept or negotiate them.
 
-Pairing, update and tool payload schemas will be added before those features are implemented. Implementations must not invent ad-hoc production payloads outside this document.
+Pairing, update and tool payload schemas are not defined. Implementations must not invent ad-hoc payloads outside this document.
 
-### 4.2 Implemented server MVP subset
+### 4.2 Implemented v1 subset
 
-The current Go server accepts one device on `wss://<host>:17806/ws`. Its first message must arrive within five seconds and must be `hello`, with a canonical persistent `device_id`, all numeric identifiers set to zero, and the exact development payload `{"device_token":"<environment-provisioned token>"}`. Unknown or missing hello payload fields are rejected. The server authenticates this token before opening a provider session. `hello.ack` assigns a nonzero `session_id`, starts at epoch 1, and advertises 16 kHz input, 24 kHz output and 20 ms input frames.
+The current Go server accepts one device on `wss://<host>:17806/ws`. Its first message must arrive within five seconds and must be `hello`, with a canonical persistent `device_id`, all numeric identifiers set to zero, and the exact payload `{"device_token":"<built-in classroom value>"}`. Unknown or missing hello payload fields are rejected. The server checks this value before opening a provider session. `hello.ack` assigns a nonzero `session_id`, starts at epoch 1, and advertises 16 kHz input, 24 kHz output and 20 ms input frames.
 
 For each manual-VAD turn, the device sends `turn.start` with nonzero `session_id`, `turn_id`, `stream_id` and monotonic `epoch`; its payload is `{"sample_rate_hz":16000}`. Binary uplink frames then use those identifiers and consecutive sequence numbers starting at zero. `turn.commit`, `turn.cancel` and `response.cancel` each use the exact payload `{}`; the binary END flag and sequence identify the final uploaded sample boundary. `turn.commit` ends the input. The server may return `response.start`, `response.text_delta`, `response.audio_start`, binary 24 kHz PCM, and `response.done`. `turn.cancel` and `response.cancel` retire the active epoch and return `response.cancelled`.
 
-This subset deliberately omits pairing, per-device token provisioning, conversation persistence, tools and flow credit. Discovery uses the fixed teaching exchange in section 8. The shared development token is only a fail-closed guard against unauthenticated LAN clients triggering provider calls; it is not a replacement for pairing. Until pairing lands, the generated stable SPKI digest and manually provisioned token must be treated as development information rather than a complete production trust flow.
+Protocol v1 omits pairing, per-device credentials, conversation persistence, tools and flow credit. Discovery uses the fixed exchange in section 8. The built-in hello value is only a fail-closed protocol guard; TLS plus the saved SPKI identifies the server. Use this teaching profile only on a trusted classroom LAN and never expose its WSS port to the Internet.
 
 ## 5. Binary audio frame
 
@@ -185,15 +185,15 @@ The response payload is exactly one space-delimited UTF-8 line, also without a t
 BOOMPI_SERVER_V1 <wss_port> <spki_sha256_base64>
 ```
 
-`wss_port` is a decimal integer from 1 through 65535. `spki_sha256_base64` is standard Base64 encoding of the 32-byte SHA-256 digest of the server certificate's SubjectPublicKeyInfo. The device uses the UDP source address as the candidate WSS host. Neither request nor response contains a device token, certificate private material, Wi-Fi credentials or provider credentials.
+`wss_port` is a decimal integer from 1 through 65535. `spki_sha256_base64` is standard Base64 encoding of the 32-byte SHA-256 digest of the server certificate's SubjectPublicKeyInfo. The device uses the UDP source address as the WSS host hint. Neither request nor response contains a device token, certificate private material, Wi-Fi credentials or provider credentials.
 
 Because discovery is unauthenticated, the device treats every response as a hint. It must validate the advertised SPKI digest during TLS setup; a changed server key requires explicit user approval or a future re-pairing flow.
 
 ## 9. Compatibility
 
 - A v1 parser accepts only major version `1` unless capability negotiation explicitly adds another version.
-- The v1 envelope and every v1 payload object use exact documented schemas. Receivers reject unknown or duplicate fields.
-- Adding an optional payload field requires a negotiated later version or capability; existing v1 meanings cannot change.
+- V1 senders emit the documented fields. Receivers validate every required field, type and bound, and may ignore unknown fields; duplicate fields have no compatibility meaning and senders must not emit them.
+- An added optional field cannot change existing v1 meanings. A peer must negotiate a later version or capability before relying on that field.
 - New message types require documentation and capability negotiation before use.
 - New binary-header fields require a later negotiated header/version; v1 header length remains exactly 64.
 - Provider-specific Qwen events never cross this protocol boundary.

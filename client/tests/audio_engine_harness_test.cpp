@@ -190,6 +190,7 @@ bool TestResetPreservesQueuedPcm() {
   for (std::size_t index = 0U; index < 3U; ++index) {
     CaptureFrame frame{};
     frame.pcm[0] = static_cast<std::int16_t>(101U + index);
+    frame.timestamp_us = 1000000U + index * 20000U;
     frame.input_dbfs = -20.0F - static_cast<float>(index);
     frame.wake = frame.vad_now = frame.vad_started = frame.vad_ended = true;
     frame.near_voice = frame.reference_active = true;
@@ -207,6 +208,7 @@ bool TestResetPreservesQueuedPcm() {
   std::this_thread::sleep_for(10ms);
   CaptureFrame fourth{};
   fourth.pcm[0] = 104;
+  fourth.timestamp_us = 1060000U;
   fourth.input_dbfs = -23.0F;
   fourth.wake = fourth.vad_now = fourth.vad_started = fourth.vad_ended = true;
   fourth.near_voice = fourth.reference_active = true;
@@ -223,6 +225,8 @@ bool TestResetPreservesQueuedPcm() {
         !Check(actual.sequence == index, "capture sequence changed at reset") ||
         !Check(actual.pcm[0] == static_cast<std::int16_t>(101U + index),
                "queued PCM changed at reset") ||
+        !Check(actual.timestamp_us == 1000000U + index * 20000U,
+               "capture timestamp changed at reset") ||
         !Check(actual.input_dbfs == -20.0F - static_cast<float>(index),
                "dBFS evidence changed at reset") ||
         !Check(actual.reference_active, "reference evidence changed at reset") ||

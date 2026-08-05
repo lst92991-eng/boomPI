@@ -348,6 +348,10 @@ namespace boompi::ui {
 
 DeviceUi::~DeviceUi() noexcept { Close(); }
 
+std::uint8_t DeviceUi::LoadVolume(const std::uint8_t fallback) noexcept {
+  return fallback;
+}
+
 bool DeviceUi::Open() noexcept { return true; }
 
 void DeviceUi::SetState(const DeviceUiState state_value) noexcept {
@@ -373,12 +377,11 @@ bool DeviceUi::PollAction(DeviceUiAction* const action) noexcept {
   return true;
 }
 
-bool DeviceUi::PollVolumeChange(std::uint8_t*, bool*) noexcept {
+bool DeviceUi::PollVolumeChange(std::uint8_t*) noexcept {
   return false;
 }
 
 void DeviceUi::SetVolume(std::uint8_t) noexcept {}
-void DeviceUi::SetBrightness(std::uint8_t) noexcept {}
 void DeviceUi::Close() noexcept {}
 
 }  // namespace boompi::ui

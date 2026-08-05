@@ -1,7 +1,0 @@
-runs/*
-!runs/.gitkeep
-*.wav
-*.raw
-*.log
-*.jsonl
-*.csv

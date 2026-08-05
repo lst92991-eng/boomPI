@@ -1,7 +1,6 @@
-/// @file 环境配置解析、边界校验和设备令牌生命周期。
+/// @file 板端环境配置解析与边界校验。
 #include "boompi/config/voice_client_config.h"
 
-#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstddef>
@@ -10,8 +9,6 @@
 
 namespace boompi::config {
 namespace {
-
-constexpr std::uint32_t kMaximumSpeakerGainPercent = 400U;
 
 bool Bad(const char* const variable_name, std::string* const error) {
   if (error != nullptr)
@@ -112,47 +109,37 @@ bool IsValidSpkiSha256(const std::string& value) noexcept {
   return (static_cast<unsigned>(Base64Value(value[42])) & 0x03U) == 0U;
 }
 
-bool IsValidDeviceToken(const std::string& value) noexcept {
-  return value.size() >= 32U && value.size() <= 256U &&
-         std::all_of(value.begin(), value.end(), [](const unsigned char byte) {
-           return byte >= 0x21U && byte <= 0x7eU;
-         });
-}
-
 bool LoadVoiceClientConfigFromEnvironment(VoiceClientConfig* const output,
                                           std::string* const error) {
   if (output == nullptr) {
     if (error != nullptr) *error = "voice client config output is null";
     return false;
   }
+  *output = VoiceClientConfig{};
   if (!ReadString("BOOMPI_SERVER_IP", false, 64U, &output->server_ip, error) ||
       !ReadString("BOOMPI_SERVER_SPKI_SHA256", false, 64U, &output->server_spki_sha256, error) ||
-      !ReadString("BOOMPI_DEVICE_ID", true, 36U, &output->device_id, error) ||
-      !ReadString("BOOMPI_DEVICE_TOKEN", false, 256U, &output->device_token, error) ||
-      !ReadString("BOOMPI_CAPTURE_PCM", true, 31U, &output->capture_pcm, error) ||
-      !ReadString("BOOMPI_PLAYBACK_PCM", true, 31U, &output->playback_pcm, error)) return false;
+      !ReadString("BOOMPI_DEVICE_ID", true, 36U, &output->device_id, error)) {
+    return false;
+  }
   if (!IsValidDeviceId(output->device_id)) return Bad("BOOMPI_DEVICE_ID", error);
   if ((output->server_ip.empty() != output->server_spki_sha256.empty()) ||
       (!output->server_spki_sha256.empty() &&
        !IsValidSpkiSha256(output->server_spki_sha256))) {
     return Bad("BOOMPI_SERVER_SPKI_SHA256", error);
   }
-  if (output->device_token.empty()) output->device_token = "boompi-teaching-shared-token-v1-2026";
-  if (!IsValidDeviceToken(output->device_token)) return Bad("BOOMPI_DEVICE_TOKEN", error);
   std::uint32_t parsed = 0U;
   if (!ReadUint("BOOMPI_SERVER_PORT", 17806U, 1U, 65535U, &parsed, error)) return false;
   output->server_port = static_cast<std::uint16_t>(parsed);
   if (!ReadPolarity("BOOMPI_CAPTURE_LEFT_POLARITY", &output->capture_left_polarity, error) ||
       !ReadPolarity("BOOMPI_CAPTURE_RIGHT_POLARITY", &output->capture_right_polarity, error) ||
-      !ReadUint("BOOMPI_VOLUME_PERCENT", 60U, 0U, 100U, &parsed, error)) return false;
+      !ReadUint("BOOMPI_VOLUME_PERCENT", 60U, 0U, 100U, &parsed, error)) {
+    return false;
+  }
   output->volume_percent = static_cast<std::uint8_t>(parsed);
-  if (!ReadUint("BOOMPI_SPEAKER_GAIN_PERCENT", 100U, 1U, kMaximumSpeakerGainPercent, &parsed, error)) return false;
-  output->speaker_gain_percent = static_cast<std::uint16_t>(parsed);
-  if (!ReadUint("BOOMPI_BARGE_IN_ENABLED", 1U, 0U, 1U, &parsed, error)) return false;
-  output->barge_in_enabled = parsed != 0U;
-  if (!ReadString("BOOMPI_SNOWBOY_RESOURCE_FILE", true, 1024U, &output->snowboy_resource_path, error) ||
-      !ReadString("BOOMPI_SNOWBOY_MODEL_FILE", true, 1024U, &output->snowboy_model_path, error) ||
-      !ReadString("BOOMPI_SNOWBOY_SENSITIVITY", false, 32U, &output->snowboy_sensitivity, error)) return false;
+  if (!ReadString("BOOMPI_SNOWBOY_SENSITIVITY", false, 32U,
+                  &output->snowboy_sensitivity, error)) {
+    return false;
+  }
   if (output->snowboy_sensitivity.empty()) output->snowboy_sensitivity = "0.7";
   if (!IsSnowboySensitivity(output->snowboy_sensitivity)) return Bad("BOOMPI_SNOWBOY_SENSITIVITY", error);
   if (!ReadFloat("BOOMPI_VAD_MIN_DBFS", -35.0F, -90.0F, 0.0F,

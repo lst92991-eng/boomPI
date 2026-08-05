@@ -445,7 +445,7 @@ int main(int argc, char* argv[]) {
   const Correlation reference_right =
       BestCorrelation(metrics.signals[2U], metrics.signals[3U], 32);
   std::cout << "AEC_LOOP_RESULT {\"reference_channels\":"
-            << BOOMPI_ROCKCHIP_REFERENCE_CHANNELS
+            << 1
             << ",\"active_probe\":" << BOOMPI_AEC_LOOP_ACTIVE_PROBE
             << ",\"aec_metrics_valid\":"
             << (BOOMPI_AEC_LOOP_ACTIVE_PROBE == 0 ? "true" : "false")

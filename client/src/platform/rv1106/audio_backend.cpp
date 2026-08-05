@@ -12,6 +12,7 @@ extern "C" {
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -26,6 +27,7 @@ namespace boompi::platform::rv1106 {
 using audio::VoiceFrame16k;
 using audio::kVoiceFrameSamples16k;
 namespace {
+using SteadyClock = std::chrono::steady_clock;
 constexpr std::size_t kCaptureChannels = 4U, kPlaybackChannels = 2U;
 constexpr std::size_t kCapture48Frames = 960U, kTts24Frames = 480U;
 constexpr std::size_t kMaximumPlayback48Frames = 2U * kCapture48Frames;
@@ -170,6 +172,13 @@ float AcRmsDbfs(const VoiceFrame16k& samples) noexcept {
   return static_cast<float>(20.0 * std::log10(rms / 32768.0));
 }
 
+std::uint64_t MonotonicUs() noexcept {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          SteadyClock::now().time_since_epoch())
+          .count());
+}
+
 }
 
 struct AudioBackend::Impl final {
@@ -183,11 +192,13 @@ struct AudioBackend::Impl final {
   std::array<std::int16_t, kTts24Frames> playback24{};
   std::array<std::int16_t, kMaximumPlayback48Frames> playback48{};
   std::array<std::int16_t, kMaximumPlayback48Frames * kPlaybackChannels> playback_stereo{};
-  VoiceFrame16k mic_left{}, mic_right{}, reference_left{}, reference_right{}, processed{};
+  VoiceFrame16k mic_left{}, mic_right{}, reference_left{}, processed{};
   std::uint32_t vad_speech_ms{0U}, vad_silence_ms{0U};
   unsigned aec_warmup_remaining{0U}, aec_tail_remaining{0U};
   unsigned reference_wait_frames{0U};
   float delayed_input_dbfs{-120.0F};
+  std::uint64_t capture_timestamp_us{0U};
+  std::uint64_t delayed_timestamp_us{0U};
   bool open{false}, vad_in_speech{false};
   bool playback_session_active{false}, aec_warmup_armed{false};
   bool delayed_reference_active{false};
@@ -222,6 +233,7 @@ struct AudioBackend::Impl final {
                   kVoiceFrameSamples16k, capture16.data())) return false;
     delayed_input_dbfs = -120.0F;
     delayed_reference_active = false;
+    delayed_timestamp_us = 0U;
     dsp.Close(); return dsp.Open() && ResetListener();
   }
   bool WritePlayback(const std::int16_t* mono, std::size_t frames) noexcept {
@@ -393,6 +405,9 @@ bool AudioBackend::ReadCapture20ms(bool* const discontinuity) noexcept {
     }
     impl_->SetError("ALSA capture read", static_cast<int>(rc)); return false;
   }
+  // 记录真实采集时序，而不是让 application 用 sequence 推算。发生调度抖动或
+  // ALSA recover 时，上传时间戳因此仍会反映真实 period 间隔。
+  impl_->capture_timestamp_us = MonotonicUs();
   return true;
 }
 
@@ -429,7 +444,9 @@ bool AudioBackend::ProcessCapture20ms(bool discontinuity, CaptureFrame* const fr
     impl_->mic_left[i] = impl_->capture16[base];
     impl_->mic_right[i] = impl_->capture16[base + 1U];
     impl_->reference_left[i] = impl_->capture16[base + 2U];
-    impl_->reference_right[i] = impl_->capture16[base + 3U];
+#ifdef BOOMPI_AEC_LOOP_DIAGNOSTICS
+    frame->aec_input[3][i] = impl_->capture16[base + 3U];
+#endif
   }
   // 生产 AEC 固定为双麦单参考。Mode1 仍保留 REF-R 原始/HIL 数据，
   // 但打断门控必须和送入 Rockchip 3A 的 REF-L 使用同一证据。
@@ -440,11 +457,10 @@ bool AudioBackend::ProcessCapture20ms(bool discontinuity, CaptureFrame* const fr
   frame->aec_input[0] = impl_->mic_left;
   frame->aec_input[1] = impl_->mic_right;
   frame->aec_input[2] = impl_->reference_left;
-  frame->aec_input[3] = impl_->reference_right;
 #endif
   // 每个 sample 只进入这一条 Rockchip 3A 路径；STDT 在 vendor 内部保护双讲。
-  if (!impl_->dsp.Process(impl_->mic_left, impl_->mic_right, impl_->reference_left,
-                          impl_->reference_right, &impl_->processed)) {
+  if (!impl_->dsp.Process(impl_->mic_left, impl_->mic_right,
+                          impl_->reference_left, &impl_->processed)) {
     impl_->SetError("Rockchip 3A rejected a frame");
     return false;
   }
@@ -454,6 +470,10 @@ bool AudioBackend::ProcessCapture20ms(bool discontinuity, CaptureFrame* const fr
   // 不能把上一帧的 VAD 结果和当前帧的 dBFS/reference 拼在一起。
   frame->reference_active = impl_->delayed_reference_active;
   impl_->delayed_reference_active = current_reference_active;
+  frame->timestamp_us = impl_->delayed_timestamp_us != 0U
+                            ? impl_->delayed_timestamp_us
+                            : impl_->capture_timestamp_us;
+  impl_->delayed_timestamp_us = impl_->capture_timestamp_us;
   std::int32_t detection = 0;
   if (!boompi_snowboy_legacy_process_s16(impl_->snowboy, impl_->processed.data(),
                                          impl_->processed.size(), &detection)) {
@@ -583,7 +603,7 @@ void AudioBackend::Close() noexcept {
   impl_->playback_render_started.store(false, std::memory_order_release);
   impl_->playback_ended.store(false, std::memory_order_release);
   impl_->capture48.fill(0); impl_->capture16.fill(0); impl_->mic_left.fill(0); impl_->mic_right.fill(0);
-  impl_->reference_left.fill(0); impl_->reference_right.fill(0); impl_->processed.fill(0);
+  impl_->reference_left.fill(0); impl_->processed.fill(0);
 }
 
 }  // namespace boompi::platform::rv1106

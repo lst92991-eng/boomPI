@@ -176,13 +176,6 @@ func (connection *Connection) enqueue(ctx context.Context, message outboundMessa
 		return errors.New("send context is required")
 	}
 	select {
-	case <-ctx.Done():
-		return context.Cause(ctx)
-	case <-connection.ctx.Done():
-		return context.Cause(connection.ctx)
-	default:
-	}
-	select {
 	case connection.sendQueue <- message:
 		return nil
 	case <-ctx.Done():

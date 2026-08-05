@@ -39,8 +39,7 @@ func TestCppWSSHappyPath(t *testing.T) {
 	// the deterministic in-process fake and therefore never opens Qwen.
 	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
-	t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
-	cfg, err := config.Load("", nil)
+	cfg, err := config.Load("")
 	if err != nil {
 		t.Fatalf("config.Load() error = %v", err)
 	}
@@ -85,7 +84,7 @@ func TestCppWSSHappyPath(t *testing.T) {
 	wrongPinCtx, cancelWrongPin := context.WithTimeout(context.Background(), 5*time.Second)
 	wrongPinCommand := exec.CommandContext(wrongPinCtx, smokeExecutable,
 		cfg.ListenAddress, strconv.Itoa(cfg.WSSPort), wrongPin)
-	wrongPinCommand.Env = smokeChildEnvironment(testDeviceToken)
+	wrongPinCommand.Env = smokeChildEnvironment()
 	wrongPinOutput, wrongPinErr := wrongPinCommand.CombinedOutput()
 	wrongPinContextErr := wrongPinCtx.Err()
 	cancelWrongPin()
@@ -106,7 +105,7 @@ func TestCppWSSHappyPath(t *testing.T) {
 	defer cancelCommand()
 	command := exec.CommandContext(commandCtx, smokeExecutable,
 		cfg.ListenAddress, strconv.Itoa(cfg.WSSPort), application.spkiPin)
-	command.Env = smokeChildEnvironment(testDeviceToken)
+	command.Env = smokeChildEnvironment()
 	output, err := command.CombinedOutput()
 	if commandCtx.Err() != nil {
 		t.Fatalf("C++ WSS smoke timed out: %v", commandCtx.Err())
@@ -136,8 +135,7 @@ func TestCppWSSExternalHILServer(t *testing.T) {
 	}
 	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
-	t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
-	cfg, err := config.Load("", nil)
+	cfg, err := config.Load("")
 	if err != nil {
 		t.Fatalf("config.Load() error = %v", err)
 	}
@@ -262,18 +260,17 @@ func waitForTCPListener(address string, timeout time.Duration) error {
 	}
 }
 
-func smokeChildEnvironment(deviceToken string) []string {
-	environment := make([]string, 0, len(os.Environ())+1)
+func smokeChildEnvironment() []string {
+	environment := make([]string, 0, len(os.Environ()))
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
-		if strings.EqualFold(key, "BOOMPI_DEVICE_TOKEN") ||
-			strings.EqualFold(key, "DASHSCOPE_API_KEY") ||
+		if strings.EqualFold(key, "DASHSCOPE_API_KEY") ||
 			strings.EqualFold(key, "DASHSCOPE_WORKSPACE_ID") {
 			continue
 		}
 		environment = append(environment, entry)
 	}
-	return append(environment, "BOOMPI_DEVICE_TOKEN="+deviceToken)
+	return environment
 }
 
 func minInt(left, right int) int {

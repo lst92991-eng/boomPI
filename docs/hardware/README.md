@@ -1,33 +1,55 @@
-# 硬件资料与验证记录
+# boomPI 硬件基线
 
-本目录保存 boomPI 产品代码所依赖的硬件事实。开发机下载目录中的原始网表、BSP
-临时脚本和板端探测结果不是产品代码的运行时依赖；需要用于实现的结论必须先在这里
-留下可审查记录。
+本页只保留产品代码依赖的当前硬件事实。原始网表、BSP 工作树、器件手册和探测输出可以作为
+证据输入，但不是仓库运行时依赖；任何新结论都必须先与当前板卡和镜像对应。
 
-## 事实来源优先级
+## 事实来源
 
-1. 当前主板的 `netlist.json`、对应器件数据手册和实际 PCB。
-2. 当前 BSP 的 DTS、驱动源码和编译配置。
-3. 目标板 SSH 只读探测与仪器实测结果。
-4. 历史网表或其他 RV1106 示例板仅作线索，不可直接形成引脚结论。
+按以下顺序判断硬件结论：
 
-`netlist (3).json` 只用于双 16P 屏幕/转接板子系统；它不能覆盖主板
-`netlist.json` 的结论。
+1. 当前主板的 `netlist.json`、PCB 和器件数据手册；
+2. 当前烧录镜像对应的 DTS、驱动和构建配置；
+3. 目标板 SSH 只读探测、逻辑分析仪、示波器或万用表实测；
+4. 其他 RV1106 板、旧网表和 vendor 示例只能提供线索，不能直接确定引脚或通道布局。
 
-## 当前记录
+屏幕转接板网表只约束显示/触摸子系统，不能覆盖主板网表。更换主控、板卡或镜像后，旧板
+指纹和旧测量值不得直接沿用。
 
-- [2026-07-29 BSP 候选镜像不可变清单](bsp-candidate-manifest-20260729.md)：固定最新网表、
-  候选 DTS/overlay 和现有镜像哈希；当前因 MIS5001 残留和不可复现工作树被标记为拒绝烧录。
-- [2026-07-25 基础硬件测试记录](hardware-test-record-20260725-154016.md)：板卡/镜像版本缺失的
-  历史单项 bring-up，只能作为线索，不能替代当前镜像验收。
+## 当前接口
 
-相关音频和板端证据：
+| 子系统 | 当前契约 |
+| --- | --- |
+| 音频 capture | Codec Mode1，48 kHz、S16_LE、4ch `[mic0,mic1,refL,refR]` |
+| 音频 playback | 48 kHz、S16_LE、stereo；TTS mono 复制到 L/R |
+| ALSA timing | capture `960/1920`、playback `960/3840` frame period/buffer |
+| 3A 输入 | 双麦 + 单参考 `[mic0,mic1,refL]`；保留采集但丢弃高度相关 `refR` |
+| 显示 | 320×240 ST7789P3，LVGL，SPI 实际配置 80 MHz |
+| 触摸 | GT911；触摸事件由 UI 线程提交给 application actor |
+| 摄像头 | SC3336，本地预览；当前 UI 标注 4 FPS |
+| 网络 | 以太网优先，2.4 GHz Wi-Fi 备用并支持屏幕配网 |
 
-- [P0 vendor 音频证据基线](../test/p0-vendor-audio-inventory-20260727.md)
-- [P0 直接 ALSA 全双工验证](../test/p0-alsa-full-duplex-validation-20260728.md)
-- [P0 Rockchip MPI preflight](../test/p0-rockchip-mpi-audio-preflight-20260728.md)
-- [P0 Rockchip 3A HIL 构建验证](../test/p0-rockchip-3a-hil-build-validation-20260729.md)
-- [RV1106 验证闸门](../test/rv1106-validation-gates.md)
+`TRCM clk-trcm=1` 只能表明共享 TX 时钟，不能单独证明四通道顺序。`Mode1` 的布局和两个参考
+高度相关必须通过当前板的正交信号或等价 HIL 重新确认；该结果不能外推到不同 DTS/BSP。
 
-新增记录必须写明北京时间、板卡版本、镜像或内核版本、接线与测试条件、原始命令或
-仪器、结果和未覆盖范围。无法确认的信息写“未记录”或“未验证”，不得根据预期补齐。
+## 音频装配边界
+
+- 麦克风左右、极性和间距属于整机声学配置；源码只允许分别设置 `+1/-1` 极性，不猜测焊接。
+- `refL/refR` 是 Codec 数字回采，不能套用麦克风极性修正。
+- 生产 AEC 固定为双麦单参考。恢复双参考必须重新证明参考独立性和声学收益，不能只修改通道数。
+- Snowboy `0.7`、VAD `-35 dBFS`、barge-in `-25 dBFS` 是当前软件默认值，不代表麦克风灵敏度、
+  SPL、SNR 或远场规格。
+- 最终壳体、扬声器音量或麦克风安装变化后，必须重新测试残余回声、自激和 double-talk。
+
+## 复测记录要求
+
+新的硬件/HIL 记录至少包含：
+
+- 板卡标识和 SSH host key 指纹；
+- 镜像、内核、DTB 和客户端 ELF 的版本或 SHA-256；
+- 接线、供电、外设和 mixer/音量条件；
+- 原始命令、仪器设置、关键计数和退出状态；
+- `XRUN`、capture discontinuity、queue overrun、core 和资源占用；
+- 已覆盖与未覆盖范围。
+
+无法确认的信息写“未验证”，不得根据旧报告或预期补齐。当前构建、只读探测和真板 HIL 的
+统一入口见 [Host 与板端验证](../test/host-validation.md)。

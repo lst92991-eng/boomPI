@@ -8,7 +8,6 @@ import (
 	"net"
 
 	"github.com/lst92991-eng/boomPI/server/internal/backend"
-	"github.com/lst92991-eng/boomPI/server/internal/backend/qwen"
 	"github.com/lst92991-eng/boomPI/server/internal/backend/qwenpipeline"
 	"github.com/lst92991-eng/boomPI/server/internal/config"
 	"github.com/lst92991-eng/boomPI/server/internal/discovery"
@@ -18,7 +17,7 @@ import (
 
 const providerEventQueueCapacity = 8
 
-// App is the deliberately small server MVP: one WSS listener, one device and
+// App is the deliberately small server: one WSS listener, one device and
 // one pluggable conversation backend.
 type App struct {
 	cfg       config.Config
@@ -43,32 +42,21 @@ func New(cfg config.Config, logger *slog.Logger, identityDirectory string) (*App
 }
 
 func newQwenBackend(cfg config.Config, logger *slog.Logger) (backend.ConversationBackend, error) {
-	if cfg.ConversationMode == "intelligence" {
-		return qwenpipeline.New(qwenpipeline.Config{
-			APIKey:           cfg.Credentials.APIKey(),
-			WorkspaceID:      cfg.Credentials.WorkspaceID(),
-			Region:           cfg.Region,
-			ASRModel:         cfg.ASRModel,
-			ReasoningModel:   cfg.ReasoningModel,
-			ReasoningEffort:  cfg.ReasoningEffort,
-			TTSModel:         cfg.TTSModel,
-			TTSVoice:         cfg.TTSVoice,
-			SearchMode:       cfg.SearchMode,
-			Timeout:          cfg.FirstResponseTimeout,
-			QueueSize:        providerEventQueueCapacity,
-			MaxTurns:         cfg.MaxTurns,
-			MaxContextTokens: cfg.MaxContextTokens,
-			Logger:           logger,
-		})
-	}
-	return qwen.New(qwen.Config{
-		APIKey:      cfg.Credentials.APIKey(),
-		WorkspaceID: cfg.Credentials.WorkspaceID(),
-		Region:      cfg.Region,
-		Model:       cfg.Model,
-		Voice:       cfg.Voice,
-		Timeout:     cfg.ConnectionTimeout,
-		QueueSize:   providerEventQueueCapacity,
+	return qwenpipeline.New(qwenpipeline.Config{
+		APIKey:           cfg.Credentials.APIKey(),
+		WorkspaceID:      cfg.Credentials.WorkspaceID(),
+		Region:           qwenpipeline.RegionChinaBeijing,
+		ASRModel:         cfg.ASRModel,
+		ReasoningModel:   cfg.ReasoningModel,
+		ReasoningEffort:  cfg.ReasoningEffort,
+		TTSModel:         cfg.TTSModel,
+		TTSVoice:         cfg.TTSVoice,
+		SearchMode:       cfg.SearchMode,
+		Timeout:          cfg.FirstResponseTimeout,
+		QueueSize:        providerEventQueueCapacity,
+		MaxTurns:         cfg.MaxTurns,
+		MaxContextTokens: cfg.MaxContextTokens,
+		Logger:           logger,
 	})
 }
 
@@ -114,14 +102,13 @@ func (a *App) Run(ctx context.Context) error {
 	a.logger.Info("boomPI server starting",
 		"wss_address", net.JoinHostPort(a.cfg.ListenAddress, fmt.Sprint(a.cfg.WSSPort)),
 		"discovery_address", net.JoinHostPort(a.cfg.ListenAddress, fmt.Sprint(a.cfg.DiscoveryPort)),
-		"provider", a.cfg.Provider,
-		"region", a.cfg.Region,
-		"conversation_mode", a.cfg.ConversationMode,
-		"model", a.cfg.Model,
+		"region", qwenpipeline.RegionChinaBeijing,
+		"asr_model", a.cfg.ASRModel,
 		"reasoning_model", a.cfg.ReasoningModel,
 		"reasoning_effort", a.cfg.ReasoningEffort,
 		"search_mode", a.cfg.SearchMode,
-		"voice", a.cfg.Voice,
+		"tts_model", a.cfg.TTSModel,
+		"tts_voice", a.cfg.TTSVoice,
 		"credential_source", a.cfg.Credentials.Source(),
 		"tls_spki_sha256", a.spkiPin,
 	)

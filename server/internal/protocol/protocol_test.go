@@ -63,22 +63,15 @@ func TestControlEnvelopeRejectsUnknownField(t *testing.T) {
 	}
 }
 
-func TestControlEnvelopeRejectsDuplicateKeysAndNonObjectPayload(t *testing.T) {
+func TestControlEnvelopeUsesDecodedDuplicateValueAndRejectsNonObjectPayload(t *testing.T) {
 	duplicate := []byte(`{"version":1,"type":"hello","type":"turn.start","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}}`)
-	if _, err := DecodeControl(duplicate); err == nil {
-		t.Fatal("DecodeControl() unexpectedly accepted a duplicate key")
+	decoded, err := DecodeControl(duplicate)
+	if err != nil || decoded.Type != "turn.start" {
+		t.Fatalf("DecodeControl() duplicate value = %q, error = %v", decoded.Type, err)
 	}
 	nonObject := ControlEnvelope{Version: 1, Type: "hello", MessageID: "1", DeviceID: "00112233-4455-6677-8899-aabbccddeeff", Payload: json.RawMessage(`[]`)}
 	if _, err := EncodeControl(nonObject); err == nil {
 		t.Fatal("EncodeControl() unexpectedly accepted an array payload")
-	}
-	duplicatePayload := ControlEnvelope{
-		Version: 1, Type: "turn.start", MessageID: "1", DeviceID: "00112233-4455-6677-8899-aabbccddeeff",
-		SessionID: 1, TurnID: 1, StreamID: 1, Epoch: 1,
-		Payload: json.RawMessage(`{"nested":{"value":1,"value":2}}`),
-	}
-	if _, err := EncodeControl(duplicatePayload); err == nil {
-		t.Fatal("EncodeControl() unexpectedly accepted duplicate payload keys")
 	}
 }
 
@@ -131,42 +124,6 @@ func TestPCMFrameRejectsLengthMismatch(t *testing.T) {
 	}
 	if _, _, err := ParsePCMFrame(encoded); err == nil {
 		t.Fatal("ParsePCMFrame() unexpectedly accepted a missing payload")
-	}
-}
-
-func TestPCMStreamContextRejectsStreamMismatches(t *testing.T) {
-	device, err := ParseDeviceUUID("00112233-4455-6677-8899-aabbccddeeff")
-	if err != nil {
-		t.Fatalf("ParseDeviceUUID() error = %v", err)
-	}
-	header := PCMHeader{
-		Version: 1, Kind: AudioKindUplink, AudioFormat: AudioFormatPCM16LE, Channels: 1,
-		SampleRateHz: 16000, PayloadLen: 640, Sequence: 42, Epoch: 7, DeviceUUID: device,
-		SessionID: 8, TurnID: 9, StreamID: 10,
-	}
-	stream := PCMStreamContext{
-		Kind: AudioKindUplink, SampleRateHz: 16000, DeviceUUID: device, Epoch: 7,
-		SessionID: 8, TurnID: 9, StreamID: 10, ExpectedSequence: 42,
-	}
-	if err := stream.ValidateHeader(header); err != nil {
-		t.Fatalf("ValidateHeader() valid header error = %v", err)
-	}
-	tests := []struct {
-		name   string
-		mutate func(*PCMHeader)
-	}{
-		{name: "epoch", mutate: func(value *PCMHeader) { value.Epoch++ }},
-		{name: "sample_rate", mutate: func(value *PCMHeader) { value.SampleRateHz = 24000 }},
-		{name: "sequence", mutate: func(value *PCMHeader) { value.Sequence++ }},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			candidate := header
-			test.mutate(&candidate)
-			if err := stream.ValidateHeader(candidate); err == nil {
-				t.Fatal("ValidateHeader() unexpectedly accepted a stream mismatch")
-			}
-		})
 	}
 }
 

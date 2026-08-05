@@ -1,54 +1,30 @@
 package config
 
 import (
-	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
+
+	"gopkg.in/yaml.v3"
 )
 
-const maxConfigBytes = 64 * 1024
+const (
+	maxConfigBytes = 64 * 1024
 
-const APIKeyPlaceholder = "replace-with-your-qwen-api-key"
+	APIKeyPlaceholder = "replace-with-your-qwen-api-key"
 
-const maxHeartbeatInterval = 10 * time.Second
+	DefaultDiscoveryPort = 17807
+	defaultDeviceToken   = "boompi-teaching-shared-token-v1-2026"
+	maxHeartbeatInterval = 10 * time.Second
+)
 
-var configKeys = []string{
-	"listen_address",
-	"wss_port",
-	"discovery_port",
-	"log_level",
-	"provider",
-	"region",
-	"conversation_mode",
-	"model",
-	"asr_model",
-	"reasoning_model",
-	"reasoning_effort",
-	"tts_model",
-	"tts_voice",
-	"voice",
-	"search_mode",
-	"system_prompt",
-	"persona",
-	"heartbeat_interval",
-	"connection_timeout",
-	"first_response_timeout",
-	"session_idle_timeout",
-	"max_turns",
-	"max_context_tokens",
-	"qwen_api_key",
-	"device_token",
-}
-
-type Overrides map[string]string
-
+// Credentials 的字段不导出，避免格式化 Config 或日志时泄露密钥。
 type Credentials struct {
 	apiKey      string
 	source      string
@@ -58,38 +34,30 @@ type Credentials struct {
 func (c Credentials) APIKey() string      { return c.apiKey }
 func (c Credentials) Source() string      { return c.source }
 func (c Credentials) WorkspaceID() string { return c.workspaceID }
-
 func (c Credentials) String() string {
 	return fmt.Sprintf("{api_key:<redacted> source:%s workspace_id_set:%t}", c.source, c.workspaceID != "")
 }
-
 func (c Credentials) GoString() string { return c.String() }
 
-type DeviceToken struct {
-	value string
-}
+// DeviceToken 是教学客户端和服务端共用的固定课堂口令。
+type DeviceToken struct{ value string }
 
-func (t DeviceToken) Value() string { return t.value }
-
-func (DeviceToken) String() string { return "<redacted>" }
-
+func (t DeviceToken) Value() string    { return t.value }
+func (DeviceToken) String() string     { return "<redacted>" }
 func (t DeviceToken) GoString() string { return t.String() }
 
+// Config 是校验后的运行参数。配置文件不开放 discovery_port，
+// 正式运行固定使用客户端约定的 IPv4 UDP 17807。
 type Config struct {
 	ListenAddress        string
 	WSSPort              int
 	DiscoveryPort        int
 	LogLevel             string
-	Provider             string
-	Region               string
-	ConversationMode     string
-	Model                string
 	ASRModel             string
 	ReasoningModel       string
 	ReasoningEffort      string
 	TTSModel             string
 	TTSVoice             string
-	Voice                string
 	SearchMode           string
 	SystemPrompt         string
 	Persona              string
@@ -107,18 +75,13 @@ func Defaults() Config {
 	return Config{
 		ListenAddress:        "0.0.0.0",
 		WSSPort:              17806,
-		DiscoveryPort:        17807,
+		DiscoveryPort:        DefaultDiscoveryPort,
 		LogLevel:             "info",
-		Provider:             "qwen",
-		Region:               "china-beijing",
-		ConversationMode:     "intelligence",
-		Model:                "qwen3.5-omni-plus-realtime",
 		ASRModel:             "qwen3-asr-flash",
 		ReasoningModel:       "qwen3.6-flash",
 		ReasoningEffort:      "none",
 		TTSModel:             "qwen3-tts-flash-realtime",
 		TTSVoice:             "Cherry",
-		Voice:                "Ethan",
 		SearchMode:           "off",
 		SystemPrompt:         "You are boomPI, a concise and helpful voice assistant. Reply in Simplified Chinese unless the user asks for another language.",
 		Persona:              "Natural, young, friendly, and not overly cute.",
@@ -128,89 +91,139 @@ func Defaults() Config {
 		SessionIdleTimeout:   30 * time.Minute,
 		MaxTurns:             20,
 		MaxContextTokens:     24_000,
+		DeviceToken:          DeviceToken{value: defaultDeviceToken},
 	}
 }
 
-func Load(path string, cli Overrides) (Config, error) {
+// fileConfig 只保留课堂上真正需要调整的参数；provider、区域、链路模式和
+// discovery 端口都是本版本的固定事实，不再伪装成可配置项。
+type fileConfig struct {
+	QwenAPIKey           string       `yaml:"qwen_api_key"`
+	ListenAddress        string       `yaml:"listen_address"`
+	WSSPort              int          `yaml:"wss_port"`
+	LogLevel             string       `yaml:"log_level"`
+	ASRModel             string       `yaml:"asr_model"`
+	ReasoningModel       string       `yaml:"reasoning_model"`
+	ReasoningEffort      string       `yaml:"reasoning_effort"`
+	TTSModel             string       `yaml:"tts_model"`
+	TTSVoice             string       `yaml:"tts_voice"`
+	SearchMode           string       `yaml:"search_mode"`
+	SystemPrompt         string       `yaml:"system_prompt"`
+	Persona              string       `yaml:"persona"`
+	HeartbeatInterval    yamlDuration `yaml:"heartbeat_interval"`
+	ConnectionTimeout    yamlDuration `yaml:"connection_timeout"`
+	FirstResponseTimeout yamlDuration `yaml:"first_response_timeout"`
+	SessionIdleTimeout   yamlDuration `yaml:"session_idle_timeout"`
+	MaxTurns             int          `yaml:"max_turns"`
+	MaxContextTokens     int          `yaml:"max_context_tokens"`
+}
+
+type yamlDuration time.Duration
+
+func (d *yamlDuration) UnmarshalYAML(node *yaml.Node) error {
+	var value string
+	if err := node.Decode(&value); err != nil {
+		return errors.New("must be a duration such as 10s or 30m")
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return errors.New("must be a duration such as 10s or 30m")
+	}
+	*d = yamlDuration(parsed)
+	return nil
+}
+
+func Load(path string) (Config, error) {
 	cfg := Defaults()
 	if path != "" {
-		file, err := os.Open(path)
+		loaded, err := loadFile(path, cfg)
 		if err != nil {
-			return Config{}, fmt.Errorf("open config %q: %w", path, err)
+			return Config{}, err
 		}
-		defer file.Close()
-
-		if err := parseYAMLSubset(io.LimitReader(file, maxConfigBytes+1), &cfg); err != nil {
-			return Config{}, fmt.Errorf("parse config %q: %w", path, err)
-		}
-	}
-	if err := applyEnvironment(&cfg, os.LookupEnv); err != nil {
-		return Config{}, err
-	}
-	if err := applyOverrides(&cfg, cli); err != nil {
-		return Config{}, err
+		cfg = loaded
 	}
 
-	apiKey, source := lookupAPIKey(os.LookupEnv, cfg.Credentials.apiKey, cfg.Credentials.source)
-	if apiKey == "" {
-		return Config{}, errors.New("missing Qwen API key: edit qwen_api_key in config.yaml or set DASHSCOPE_API_KEY")
+	if key := strings.TrimSpace(os.Getenv("DASHSCOPE_API_KEY")); key != "" {
+		cfg.Credentials.apiKey = key
+		cfg.Credentials.source = "DASHSCOPE_API_KEY"
 	}
-	workspaceID, _ := os.LookupEnv("DASHSCOPE_WORKSPACE_ID")
-	cfg.Credentials = Credentials{
-		apiKey:      apiKey,
-		source:      source,
-		workspaceID: strings.TrimSpace(workspaceID),
-	}
-	if deviceToken, ok := os.LookupEnv("BOOMPI_DEVICE_TOKEN"); ok && strings.TrimSpace(deviceToken) != "" {
-		cfg.DeviceToken = DeviceToken{value: deviceToken}
-	}
-
+	cfg.Credentials.workspaceID = strings.TrimSpace(os.Getenv("DASHSCOPE_WORKSPACE_ID"))
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
 }
 
-func applyEnvironment(cfg *Config, lookup func(string) (string, bool)) error {
-	for _, key := range configKeys {
-		if isSecretConfigKey(key) {
-			continue
-		}
-		environmentKey := "BOOMPI_" + strings.ToUpper(key)
-		if value, ok := lookup(environmentKey); ok {
-			if err := applyValue(cfg, key, value); err != nil {
-				return fmt.Errorf("environment variable %s: %w", environmentKey, err)
-			}
-		}
+func loadFile(path string, defaults Config) (Config, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("open config %q: %w", path, err)
 	}
-	return nil
-}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxConfigBytes+1))
+	if err != nil {
+		return Config{}, fmt.Errorf("read config %q: %w", path, err)
+	}
+	if len(data) > maxConfigBytes {
+		return Config{}, fmt.Errorf("config %q exceeds %d bytes", path, maxConfigBytes)
+	}
 
-func applyOverrides(cfg *Config, overrides Overrides) error {
-	for key, value := range overrides {
-		if isSecretConfigKey(key) {
-			return fmt.Errorf("CLI override %q is not supported", key)
-		}
-		if !isKnownConfigKey(key) {
-			return fmt.Errorf("CLI override %q is not supported", key)
-		}
-		if err := applyValue(cfg, key, value); err != nil {
-			return fmt.Errorf("CLI override %q: %w", key, err)
-		}
+	raw := fileConfig{
+		ListenAddress:        defaults.ListenAddress,
+		WSSPort:              defaults.WSSPort,
+		LogLevel:             defaults.LogLevel,
+		ASRModel:             defaults.ASRModel,
+		ReasoningModel:       defaults.ReasoningModel,
+		ReasoningEffort:      defaults.ReasoningEffort,
+		TTSModel:             defaults.TTSModel,
+		TTSVoice:             defaults.TTSVoice,
+		SearchMode:           defaults.SearchMode,
+		SystemPrompt:         defaults.SystemPrompt,
+		Persona:              defaults.Persona,
+		HeartbeatInterval:    yamlDuration(defaults.HeartbeatInterval),
+		ConnectionTimeout:    yamlDuration(defaults.ConnectionTimeout),
+		FirstResponseTimeout: yamlDuration(defaults.FirstResponseTimeout),
+		SessionIdleTimeout:   yamlDuration(defaults.SessionIdleTimeout),
+		MaxTurns:             defaults.MaxTurns,
+		MaxContextTokens:     defaults.MaxContextTokens,
 	}
-	return nil
-}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&raw); err != nil {
+		return Config{}, fmt.Errorf("parse config %q: %w", path, err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return Config{}, fmt.Errorf("parse config %q: multiple YAML documents are not supported", path)
+		}
+		return Config{}, fmt.Errorf("parse config %q: %w", path, err)
+	}
 
-func lookupAPIKey(lookup func(string) (string, bool), fallback, fallbackSource string) (string, string) {
-	if value, ok := lookup("DASHSCOPE_API_KEY"); ok && strings.TrimSpace(value) != "" {
-		return strings.TrimSpace(value), "DASHSCOPE_API_KEY"
-	}
-	return strings.TrimSpace(fallback), fallbackSource
+	defaults.ListenAddress = strings.TrimSpace(raw.ListenAddress)
+	defaults.WSSPort = raw.WSSPort
+	defaults.LogLevel = strings.ToLower(strings.TrimSpace(raw.LogLevel))
+	defaults.ASRModel = strings.TrimSpace(raw.ASRModel)
+	defaults.ReasoningModel = strings.TrimSpace(raw.ReasoningModel)
+	defaults.ReasoningEffort = strings.ToLower(strings.TrimSpace(raw.ReasoningEffort))
+	defaults.TTSModel = strings.TrimSpace(raw.TTSModel)
+	defaults.TTSVoice = strings.TrimSpace(raw.TTSVoice)
+	defaults.SearchMode = strings.ToLower(strings.TrimSpace(raw.SearchMode))
+	defaults.SystemPrompt = strings.TrimSpace(raw.SystemPrompt)
+	defaults.Persona = strings.TrimSpace(raw.Persona)
+	defaults.HeartbeatInterval = time.Duration(raw.HeartbeatInterval)
+	defaults.ConnectionTimeout = time.Duration(raw.ConnectionTimeout)
+	defaults.FirstResponseTimeout = time.Duration(raw.FirstResponseTimeout)
+	defaults.SessionIdleTimeout = time.Duration(raw.SessionIdleTimeout)
+	defaults.MaxTurns = raw.MaxTurns
+	defaults.MaxContextTokens = raw.MaxContextTokens
+	defaults.Credentials = Credentials{apiKey: strings.TrimSpace(raw.QwenAPIKey), source: "config.yaml"}
+	return defaults, nil
 }
 
 func (c Config) Validate() error {
-	if !validListenAddress(c.ListenAddress) {
-		return errors.New("listen_address must be an IPv4 or IPv6 address")
+	if ip := net.ParseIP(c.ListenAddress); ip == nil || ip.To4() == nil {
+		return errors.New("listen_address must be an IPv4 address")
 	}
 	if err := validatePort("wss_port", c.WSSPort); err != nil {
 		return err
@@ -224,37 +237,16 @@ func (c Config) Validate() error {
 	if !oneOf(c.LogLevel, "debug", "info", "warn", "error") {
 		return errors.New("log_level must be debug, info, warn, or error")
 	}
-	if c.Provider != "qwen" {
-		return errors.New("provider must be qwen in P1")
-	}
-	if !oneOf(c.Region, "china-beijing", "singapore") {
-		return errors.New("region must be china-beijing or singapore")
-	}
-	if !oneOf(c.ConversationMode, "realtime", "intelligence") {
-		return errors.New("conversation_mode must be realtime or intelligence")
-	}
-	if strings.TrimSpace(c.Model) == "" || len(c.Model) > 128 {
-		return errors.New("model must contain 1..128 characters")
-	}
-	if strings.IndexFunc(c.Model, unicode.IsControl) >= 0 {
-		return errors.New("model must not contain control characters")
-	}
 	for name, value := range map[string]string{
-		"asr_model":       c.ASRModel,
-		"reasoning_model": c.ReasoningModel,
-		"tts_model":       c.TTSModel,
-		"tts_voice":       c.TTSVoice,
+		"asr_model": c.ASRModel, "reasoning_model": c.ReasoningModel,
+		"tts_model": c.TTSModel, "tts_voice": c.TTSVoice,
 	} {
-		if strings.TrimSpace(value) == "" || len(value) > 128 ||
-			strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		if strings.TrimSpace(value) == "" || len(value) > 128 || strings.IndexFunc(value, unicode.IsControl) >= 0 {
 			return fmt.Errorf("%s must contain 1..128 characters without control characters", name)
 		}
 	}
 	if !oneOf(c.ReasoningEffort, "none", "minimal", "low", "medium", "high") {
 		return errors.New("reasoning_effort must be none, minimal, low, medium, or high")
-	}
-	if strings.TrimSpace(c.Voice) == "" || len(c.Voice) > 64 || strings.IndexFunc(c.Voice, unicode.IsControl) >= 0 {
-		return errors.New("voice must contain 1..64 characters without control characters")
 	}
 	if !oneOf(c.SearchMode, "auto", "off") {
 		return errors.New("search_mode must be auto or off")
@@ -265,15 +257,11 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.Persona) == "" || len(c.Persona) > 2048 {
 		return errors.New("persona must contain 1..2048 characters")
 	}
-	// The teaching client declares the server unavailable after 30 seconds
-	// without an inbound heartbeat. Keep at least three heartbeat opportunities
-	// in that window, and retire a half-open server connection no later than the
-	// client so its single-device slot is available to the reconnect.
 	if c.HeartbeatInterval < time.Second || c.HeartbeatInterval > maxHeartbeatInterval {
 		return errors.New("heartbeat_interval must be between 1s and 10s")
 	}
 	if c.ConnectionTimeout < 3*c.HeartbeatInterval || c.ConnectionTimeout > 30*time.Second {
-		return errors.New("connection_timeout must cover at least three heartbeat intervals and be at most 30s")
+		return errors.New("connection_timeout must cover three heartbeats and be at most 30s")
 	}
 	if c.FirstResponseTimeout < time.Second || c.FirstResponseTimeout > 5*time.Minute {
 		return errors.New("first_response_timeout must be between 1s and 5m")
@@ -287,261 +275,18 @@ func (c Config) Validate() error {
 	if c.MaxContextTokens < 1024 || c.MaxContextTokens > 1_000_000 {
 		return errors.New("max_context_tokens must be between 1024 and 1000000")
 	}
-	apiKey := strings.TrimSpace(c.Credentials.apiKey)
-	if apiKey == "" || apiKey == APIKeyPlaceholder {
-		return errors.New("Qwen API key is missing: edit qwen_api_key in config.yaml or set DASHSCOPE_API_KEY")
+	if key := strings.TrimSpace(c.Credentials.apiKey); key == "" || key == APIKeyPlaceholder {
+		return errors.New("Qwen API key is missing: edit config.yaml or set DASHSCOPE_API_KEY")
 	}
-	if workspaceID := strings.TrimSpace(c.Credentials.workspaceID); strings.ContainsAny(workspaceID, "/?#@") {
+	if strings.ContainsAny(c.Credentials.workspaceID, "/?#@") {
 		return errors.New("DASHSCOPE_WORKSPACE_ID contains invalid characters")
 	}
-	trimmedDeviceToken := strings.TrimSpace(c.DeviceToken.value)
-	if len([]byte(trimmedDeviceToken)) < 32 || len([]byte(trimmedDeviceToken)) > 256 {
-		return errors.New("BOOMPI_DEVICE_TOKEN must contain 32..256 bytes")
-	}
-	if trimmedDeviceToken != c.DeviceToken.value || strings.IndexFunc(c.DeviceToken.value, func(current rune) bool {
-		return unicode.IsSpace(current) || unicode.IsControl(current)
-	}) >= 0 {
-		return errors.New("BOOMPI_DEVICE_TOKEN must not contain whitespace or control characters")
+	token := c.DeviceToken.value
+	if len([]byte(token)) < 32 || len([]byte(token)) > 256 || token != strings.TrimSpace(token) ||
+		strings.IndexFunc(token, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return errors.New("device_token must contain 32..256 bytes without whitespace")
 	}
 	return nil
-}
-
-func parseYAMLSubset(reader io.Reader, cfg *Config) error {
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		return fmt.Errorf("read: %w", err)
-	}
-	if len(data) > maxConfigBytes {
-		return fmt.Errorf("file exceeds %d bytes", maxConfigBytes)
-	}
-
-	seen := make(map[string]struct{})
-	scanner := bufio.NewScanner(strings.NewReader(string(data)))
-	for lineNumber := 1; scanner.Scan(); lineNumber++ {
-		raw := strings.TrimSuffix(scanner.Text(), "\r")
-		trimmed := strings.TrimSpace(raw)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		if raw[0] == ' ' || raw[0] == '\t' {
-			return fmt.Errorf("line %d: nested or indented YAML is not supported", lineNumber)
-		}
-		key, rawValue, ok := strings.Cut(raw, ":")
-		if !ok {
-			return fmt.Errorf("line %d: expected key: value", lineNumber)
-		}
-		key = strings.TrimSpace(key)
-		if !validConfigKey(key) {
-			return fmt.Errorf("line %d: invalid key", lineNumber)
-		}
-		if _, exists := seen[key]; exists {
-			return fmt.Errorf("line %d: duplicate key %q", lineNumber, key)
-		}
-		seen[key] = struct{}{}
-
-		value, err := parseScalar(rawValue)
-		if err != nil {
-			return fmt.Errorf("line %d key %q: %w", lineNumber, key, err)
-		}
-		if err := applyValue(cfg, key, value); err != nil {
-			return fmt.Errorf("line %d key %q: %w", lineNumber, key, err)
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan: %w", err)
-	}
-	return nil
-}
-
-func parseScalar(raw string) (string, error) {
-	value, err := stripInlineComment(strings.TrimSpace(raw))
-	if err != nil {
-		return "", err
-	}
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "", errors.New("value is empty")
-	}
-	if strings.HasPrefix(value, "\"") {
-		parsed, err := strconv.Unquote(value)
-		if err != nil {
-			return "", errors.New("invalid double-quoted scalar")
-		}
-		return parsed, nil
-	}
-	if strings.HasPrefix(value, "'") {
-		if len(value) < 2 || !strings.HasSuffix(value, "'") {
-			return "", errors.New("invalid single-quoted scalar")
-		}
-		return strings.ReplaceAll(value[1:len(value)-1], "''", "'"), nil
-	}
-	if strings.ContainsAny(value, "[]{}&*!|>") {
-		return "", errors.New("only plain or quoted scalar values are supported")
-	}
-	return value, nil
-}
-
-func stripInlineComment(value string) (string, error) {
-	var quote rune
-	var previous rune
-	hasPrevious := false
-	escaped := false
-	for index, current := range value {
-		if quote == '"' {
-			if escaped {
-				escaped = false
-				previous = current
-				hasPrevious = true
-				continue
-			}
-			if current == '\\' {
-				escaped = true
-				previous = current
-				hasPrevious = true
-				continue
-			}
-			if current == quote {
-				quote = 0
-			}
-			previous = current
-			hasPrevious = true
-			continue
-		}
-		if quote == '\'' {
-			if current == quote {
-				quote = 0
-			}
-			previous = current
-			hasPrevious = true
-			continue
-		}
-		switch current {
-		case '\'', '"':
-			quote = current
-		case '#':
-			if !hasPrevious || unicode.IsSpace(previous) {
-				return value[:index], nil
-			}
-		}
-		previous = current
-		hasPrevious = true
-	}
-	if quote != 0 {
-		return "", errors.New("unterminated quoted scalar")
-	}
-	return value, nil
-}
-
-func applyValue(cfg *Config, key, value string) error {
-	parseInt := func() (int, error) {
-		parsed, err := strconv.Atoi(value)
-		if err != nil {
-			return 0, errors.New("must be an integer")
-		}
-		return parsed, nil
-	}
-	parseDuration := func() (time.Duration, error) {
-		parsed, err := time.ParseDuration(value)
-		if err != nil {
-			return 0, errors.New("must be a Go duration such as 10s or 30m")
-		}
-		return parsed, nil
-	}
-
-	switch key {
-	case "listen_address":
-		cfg.ListenAddress = value
-	case "wss_port":
-		parsed, err := parseInt()
-		if err != nil {
-			return err
-		}
-		cfg.WSSPort = parsed
-	case "discovery_port":
-		parsed, err := parseInt()
-		if err != nil {
-			return err
-		}
-		cfg.DiscoveryPort = parsed
-	case "log_level":
-		cfg.LogLevel = strings.ToLower(value)
-	case "provider":
-		cfg.Provider = strings.ToLower(value)
-	case "region":
-		cfg.Region = strings.ToLower(value)
-	case "conversation_mode":
-		cfg.ConversationMode = strings.ToLower(value)
-	case "model":
-		cfg.Model = value
-	case "asr_model":
-		cfg.ASRModel = value
-	case "reasoning_model":
-		cfg.ReasoningModel = value
-	case "reasoning_effort":
-		cfg.ReasoningEffort = strings.ToLower(value)
-	case "tts_model":
-		cfg.TTSModel = value
-	case "tts_voice":
-		cfg.TTSVoice = value
-	case "voice":
-		cfg.Voice = value
-	case "search_mode":
-		cfg.SearchMode = strings.ToLower(value)
-	case "system_prompt":
-		cfg.SystemPrompt = value
-	case "persona":
-		cfg.Persona = value
-	case "heartbeat_interval":
-		parsed, err := parseDuration()
-		if err != nil {
-			return err
-		}
-		cfg.HeartbeatInterval = parsed
-	case "connection_timeout":
-		parsed, err := parseDuration()
-		if err != nil {
-			return err
-		}
-		cfg.ConnectionTimeout = parsed
-	case "first_response_timeout":
-		parsed, err := parseDuration()
-		if err != nil {
-			return err
-		}
-		cfg.FirstResponseTimeout = parsed
-	case "session_idle_timeout":
-		parsed, err := parseDuration()
-		if err != nil {
-			return err
-		}
-		cfg.SessionIdleTimeout = parsed
-	case "max_turns":
-		parsed, err := parseInt()
-		if err != nil {
-			return err
-		}
-		cfg.MaxTurns = parsed
-	case "max_context_tokens":
-		parsed, err := parseInt()
-		if err != nil {
-			return err
-		}
-		cfg.MaxContextTokens = parsed
-	case "qwen_api_key":
-		cfg.Credentials.apiKey = value
-		cfg.Credentials.source = "config.yaml"
-	case "device_token":
-		cfg.DeviceToken.value = value
-	case "api_key", "dashscope_api_key", "workspace_id":
-		return errors.New("use qwen_api_key or the documented environment variable")
-	default:
-		return errors.New("unknown configuration key")
-	}
-	return nil
-}
-
-func isSecretConfigKey(key string) bool {
-	return key == "qwen_api_key" || key == "device_token"
 }
 
 func validatePort(name string, value int) error {
@@ -549,31 +294,6 @@ func validatePort(name string, value int) error {
 		return fmt.Errorf("%s must be between 1 and 65535", name)
 	}
 	return nil
-}
-
-func validListenAddress(value string) bool {
-	return net.ParseIP(value) != nil
-}
-
-func validConfigKey(value string) bool {
-	if value == "" {
-		return false
-	}
-	for _, current := range value {
-		if !((current >= 'a' && current <= 'z') || (current >= '0' && current <= '9') || current == '_') {
-			return false
-		}
-	}
-	return true
-}
-
-func isKnownConfigKey(value string) bool {
-	for _, key := range configKeys {
-		if value == key {
-			return true
-		}
-	}
-	return false
 }
 
 func oneOf(value string, allowed ...string) bool {

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -35,9 +34,6 @@ func DecodeControl(data []byte) (ControlEnvelope, error) {
 	if !utf8.Valid(data) {
 		return ControlEnvelope{}, errors.New("control message is not valid UTF-8")
 	}
-	if err := rejectDuplicateJSONKeys(data); err != nil {
-		return ControlEnvelope{}, err
-	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return ControlEnvelope{}, fmt.Errorf("decode control fields: %w", err)
@@ -47,13 +43,10 @@ func DecodeControl(data []byte) (ControlEnvelope, error) {
 			return ControlEnvelope{}, fmt.Errorf("control envelope is missing field %q", required)
 		}
 	}
-	numericFields := make(map[string]uint32, 5)
-	for _, name := range []string{"version", "session_id", "turn_id", "stream_id", "epoch"} {
-		value, err := decodeJSONUint32(fields[name])
-		if err != nil {
-			return ControlEnvelope{}, fmt.Errorf("control field %q: %w", name, err)
+	for _, numeric := range []string{"version", "session_id", "turn_id", "stream_id", "epoch"} {
+		if bytes.Equal(bytes.TrimSpace(fields[numeric]), []byte("null")) {
+			return ControlEnvelope{}, fmt.Errorf("control field %q must be an unsigned integer", numeric)
 		}
-		numericFields[name] = value
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -63,13 +56,6 @@ func DecodeControl(data []byte) (ControlEnvelope, error) {
 	}
 	if err := ensureJSONEOF(decoder); err != nil {
 		return ControlEnvelope{}, err
-	}
-	if numericFields["version"] != uint32(envelope.Version) ||
-		numericFields["session_id"] != envelope.SessionID ||
-		numericFields["turn_id"] != envelope.TurnID ||
-		numericFields["stream_id"] != envelope.StreamID ||
-		numericFields["epoch"] != envelope.Epoch {
-		return ControlEnvelope{}, errors.New("decoded control numeric fields are inconsistent")
 	}
 	if err := envelope.Validate(); err != nil {
 		return ControlEnvelope{}, err
@@ -108,27 +94,7 @@ func (e ControlEnvelope) Validate() error {
 	if len(payload) < 2 || payload[0] != '{' || payload[len(payload)-1] != '}' || !json.Valid(payload) {
 		return errors.New("payload must be a valid JSON object")
 	}
-	if err := rejectDuplicateJSONKeys(payload); err != nil {
-		return fmt.Errorf("payload: %w", err)
-	}
 	return nil
-}
-
-func decodeJSONUint32(raw json.RawMessage) (uint32, error) {
-	value := strings.TrimSpace(string(raw))
-	if value == "" {
-		return 0, errors.New("must be a JSON unsigned integer")
-	}
-	for index := 0; index < len(value); index++ {
-		if value[index] < '0' || value[index] > '9' {
-			return 0, errors.New("must be a JSON unsigned integer")
-		}
-	}
-	parsed, err := strconv.ParseUint(value, 10, 32)
-	if err != nil {
-		return 0, errors.New("must be within the uint32 range")
-	}
-	return uint32(parsed), nil
 }
 
 func validASCIIField(value string, maxBytes int) bool {
@@ -141,70 +107,6 @@ func validASCIIField(value string, maxBytes int) bool {
 		}
 	}
 	return true
-}
-
-func rejectDuplicateJSONKeys(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	if err := walkJSONValue(decoder); err != nil {
-		return fmt.Errorf("validate JSON object keys: %w", err)
-	}
-	return ensureJSONEOF(decoder)
-}
-
-func walkJSONValue(decoder *json.Decoder) error {
-	token, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	delimiter, isDelimiter := token.(json.Delim)
-	if !isDelimiter {
-		return nil
-	}
-	switch delimiter {
-	case '{':
-		seen := make(map[string]struct{})
-		for decoder.More() {
-			keyToken, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			key, ok := keyToken.(string)
-			if !ok {
-				return errors.New("object key is not a string")
-			}
-			if _, duplicate := seen[key]; duplicate {
-				return fmt.Errorf("duplicate object key %q", key)
-			}
-			seen[key] = struct{}{}
-			if err := walkJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-		closing, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		if closing != json.Delim('}') {
-			return errors.New("object is not terminated")
-		}
-	case '[':
-		for decoder.More() {
-			if err := walkJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-		closing, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		if closing != json.Delim(']') {
-			return errors.New("array is not terminated")
-		}
-	default:
-		return errors.New("unexpected JSON delimiter")
-	}
-	return nil
 }
 
 func ensureJSONEOF(decoder *json.Decoder) error {

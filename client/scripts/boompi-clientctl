@@ -19,21 +19,14 @@ prepare() {
   chmod 700 "$BASE" "$BASE/config" "$BASE/log"
   if [ ! -e "$CONF" ]; then
     device_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null) || fail 'cannot create device id'
-    resource=$BASE/models/common.res; model=$BASE/models/snowboy.umdl
-    [ ! -r "$BASE/qwen-test/common.res" ] || resource=$BASE/qwen-test/common.res
-    [ ! -r "$BASE/qwen-test/snowboy.umdl" ] || model=$BASE/qwen-test/snowboy.umdl
     cat > "$CONF" <<EOF
 BOOMPI_DEVICE_ID=$device_id
-BOOMPI_CAPTURE_PCM=hw:0,0
-BOOMPI_PLAYBACK_PCM=hw:0,0
 BOOMPI_VOLUME_PERCENT=60
-BOOMPI_SPEAKER_GAIN_PERCENT=100
-BOOMPI_BARGE_IN_ENABLED=1
-BOOMPI_SNOWBOY_RESOURCE_FILE=$resource
-BOOMPI_SNOWBOY_MODEL_FILE=$model
 BOOMPI_SNOWBOY_SENSITIVITY=0.7
 BOOMPI_VAD_MIN_DBFS=-35
 BOOMPI_BARGE_MIN_DBFS=-25
+BOOMPI_CAPTURE_LEFT_POLARITY=1
+BOOMPI_CAPTURE_RIGHT_POLARITY=1
 EOF
     echo "boompi-clientctl: created $CONF"
   fi

@@ -142,19 +142,11 @@ func openRealtimeASRAt(ctx context.Context, config Config, endpoint string) (*as
 
 func (c Config) asrRealtimeURL() string {
 	if strings.TrimSpace(c.WorkspaceID) == "" {
-		domain := "dashscope.aliyuncs.com"
-		if c.Region == RegionSingapore {
-			domain = "dashscope-intl.aliyuncs.com"
-		}
-		return fmt.Sprintf("wss://%s/api-ws/v1/realtime?model=%s",
-			domain, url.QueryEscape(realtimeASRModelName))
+		return fmt.Sprintf("wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=%s",
+			url.QueryEscape(realtimeASRModelName))
 	}
-	domain := "cn-beijing.maas.aliyuncs.com"
-	if c.Region == RegionSingapore {
-		domain = "ap-southeast-1.maas.aliyuncs.com"
-	}
-	return fmt.Sprintf("wss://%s.%s/api-ws/v1/realtime?model=%s",
-		c.WorkspaceID, domain, url.QueryEscape(realtimeASRModelName))
+	return fmt.Sprintf("wss://%s.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime?model=%s",
+		c.WorkspaceID, url.QueryEscape(realtimeASRModelName))
 }
 
 func (s *asrRealtimeStream) Append(pcm []byte) error {

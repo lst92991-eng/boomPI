@@ -7,7 +7,7 @@
 #include <ctime>
 #include <string>
 
-#include "voice_orb_asset.h"
+#include "twemoji_64.h"
 
 namespace boompi::ui {
 namespace {
@@ -59,21 +59,20 @@ const std::array<AppInfo, 7>& Apps() {
 struct VoiceView final {
   const char* status;
   const char* hint;
-  int amplitude;
-  std::uint32_t period_ms;
+  const lv_img_dsc_t* face;
 };
 
 const VoiceView& Voice(DeviceUiState state) {
   // 条目顺序必须与 DeviceUiState 一致；新状态追加在枚举末尾。
   static const std::array<VoiceView, 8> views{{
-      {"随时可以说话", "说出唤醒词开始对话", 2, 2200},
-      {"正在聆听", "我在听，请继续", 8, 760},
-      {"正在思考", "正在组织回答", 5, 1200},
-      {"正在回答", "轻触屏幕即可打断", 10, 620},
-      {"回答完成", "随时可以继续问我", 3, 1800},
-      {"暂时离线", "等待网络恢复", 0, 2400},
-      {"发生错误", "请检查网络后重试", 1, 2000},
-      {"即将说完", "轻触屏幕仍可打断", 4, 1500},
+      {"随时可以说话", "说出唤醒词开始对话", &emoji_1f642_64},
+      {"正在聆听", "我在听，请继续", &emoji_1f62f_64},
+      {"正在思考", "正在组织回答", &emoji_1f914_64},
+      {"正在回答", "轻触屏幕即可打断", &emoji_1f606_64},
+      {"回答完成", "随时可以继续问我", &emoji_1f642_64},
+      {"暂时离线", "等待网络恢复", &emoji_1f614_64},
+      {"发生错误", "请检查网络后重试", &emoji_1f614_64},
+      {"即将说完", "轻触屏幕仍可打断", &emoji_1f606_64},
   }};
   return views[static_cast<std::size_t>(state)];
 }
@@ -350,21 +349,20 @@ void LvglScreen::BuildHome(lv_obj_t* root) noexcept {
   app_buttons_[0] = voice_cell;
   lv_obj_add_event_cb(voice_cell, AppClicked, LV_EVENT_CLICKED, this);
 
-  lv_obj_t* mini_orb = lv_obj_create(voice_cell);
-  lv_obj_clear_flag(mini_orb, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(mini_orb, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_size(mini_orb, 58, 58);
-  lv_obj_set_pos(mini_orb, 13, 3);
-  lv_obj_set_style_border_width(mini_orb, 0, 0);
-  lv_obj_set_style_bg_opa(mini_orb, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_pad_all(mini_orb, 0, 0);
-  home_orb_image_ = lv_img_create(mini_orb);
-  lv_img_set_src(home_orb_image_, assets::VoiceOrb());
-  lv_img_set_pivot(home_orb_image_, 56, 56);
-  lv_img_set_antialias(home_orb_image_, true);
-  lv_img_set_zoom(home_orb_image_, 116);
-  lv_obj_clear_flag(home_orb_image_, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_center(home_orb_image_);
+  lv_obj_t* face = lv_obj_create(voice_cell);
+  lv_obj_clear_flag(face, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(face, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_size(face, 58, 58);
+  lv_obj_set_pos(face, 13, 3);
+  lv_obj_set_style_border_width(face, 0, 0);
+  lv_obj_set_style_bg_opa(face, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_pad_all(face, 0, 0);
+  home_face_image_ = lv_img_create(face);
+  lv_img_set_src(home_face_image_, &emoji_1f642_64);
+  lv_img_set_antialias(home_face_image_, true);
+  lv_img_set_zoom(home_face_image_, 192);
+  lv_obj_clear_flag(home_face_image_, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_center(home_face_image_);
 
   lv_obj_t* voice_name = lv_label_create(voice_cell);
   lv_label_set_text(voice_name, "小智");
@@ -466,40 +464,22 @@ void LvglScreen::BuildVoice(lv_obj_t* root) noexcept {
   StyleLabel(voice_mute_icon_, icon_small_font_, 0xF3EEE6);
   lv_obj_center(voice_mute_icon_);
 
-  for (int i = 0; i < 2; ++i) {
-    voice_orbits_[i] = lv_obj_create(voice_);
-    lv_obj_clear_flag(voice_orbits_[i], LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(voice_orbits_[i], LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(voice_orbits_[i], 142 + i * 28, 142 + i * 28);
-    lv_obj_align(voice_orbits_[i], LV_ALIGN_TOP_MID, 0, 27 - i * 14);
-    lv_obj_set_style_radius(voice_orbits_[i], LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(voice_orbits_[i], 1, 0);
-    lv_obj_set_style_border_color(voice_orbits_[i],
-                                  lv_color_hex(i == 0 ? 0x315F9D : 0x34445E), 0);
-    lv_obj_set_style_border_opa(voice_orbits_[i], i == 0 ? LV_OPA_40 : LV_OPA_20, 0);
-    lv_obj_set_style_bg_color(voice_orbits_[i], lv_color_hex(0x17243A), 0);
-    lv_obj_set_style_bg_opa(voice_orbits_[i], i == 0 ? LV_OPA_10 : LV_OPA_TRANSP, 0);
-    lv_obj_set_style_pad_all(voice_orbits_[i], 0, 0);
-  }
+  lv_obj_t* face_button = lv_obj_create(voice_);
+  lv_obj_clear_flag(face_button, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(face_button, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(face_button, VoiceClicked, LV_EVENT_CLICKED, this);
+  lv_obj_set_size(face_button, 112, 112);
+  lv_obj_align(face_button, LV_ALIGN_TOP_MID, 0, 38);
+  lv_obj_set_style_border_width(face_button, 0, 0);
+  lv_obj_set_style_bg_opa(face_button, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_pad_all(face_button, 0, 0);
 
-  lv_obj_t* orb = lv_obj_create(voice_);
-  lv_obj_clear_flag(orb, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_add_flag(orb, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
-  lv_obj_add_flag(orb, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(orb, VoiceClicked, LV_EVENT_CLICKED, this);
-  lv_obj_set_size(orb, 138, 124);
-  lv_obj_align(orb, LV_ALIGN_TOP_MID, 0, 35);
-  lv_obj_set_style_border_width(orb, 0, 0);
-  lv_obj_set_style_bg_opa(orb, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_pad_all(orb, 0, 0);
-
-  voice_orb_image_ = lv_img_create(orb);
-  lv_img_set_src(voice_orb_image_, assets::VoiceOrb());
-  lv_img_set_pivot(voice_orb_image_, 56, 56);
-  lv_img_set_antialias(voice_orb_image_, true);
-  lv_img_set_zoom(voice_orb_image_, LV_IMG_ZOOM_NONE);
-  lv_obj_clear_flag(voice_orb_image_, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_center(voice_orb_image_);
+  voice_face_image_ = lv_img_create(face_button);
+  lv_img_set_src(voice_face_image_, Voice(state_).face);
+  lv_img_set_antialias(voice_face_image_, true);
+  lv_img_set_zoom(voice_face_image_, 384);
+  lv_obj_clear_flag(voice_face_image_, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_center(voice_face_image_);
 
   voice_status_ = lv_label_create(voice_);
   StyleLabel(voice_status_, body_font_, 0xF3EEE6);
@@ -784,14 +764,12 @@ void LvglScreen::BuildGeneric(lv_obj_t* root) noexcept {
 
 void LvglScreen::ShowHome() noexcept {
   const bool camera_was_active = page_ == Page::kCamera;
-  StopOrbMotion();
   lv_obj_clear_flag(home_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(voice_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(camera_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(wifi_provision_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(generic_, LV_OBJ_FLAG_HIDDEN);
   page_ = Page::kHome;
-  StartHomeOrbMotion();
   if (camera_was_active && camera_activity_handler_ != nullptr)
     camera_activity_handler_(false, camera_activity_user_data_);
 }
@@ -799,7 +777,6 @@ void LvglScreen::ShowHome() noexcept {
 void LvglScreen::ShowApp(std::size_t index) noexcept {
   if (index >= kAppCount) return;
   const bool camera_was_active = page_ == Page::kCamera;
-  StopHomeOrbMotion();
   current_app_ = index;
   lv_obj_add_flag(home_, LV_OBJ_FLAG_HIDDEN);
   if (index == 0U) {
@@ -813,7 +790,6 @@ void LvglScreen::ShowApp(std::size_t index) noexcept {
     UpdateVoice();
     return;
   }
-  StopOrbMotion();
   lv_obj_add_flag(voice_, LV_OBJ_FLAG_HIDDEN);
   if (index == 1U) {
     lv_obj_clear_flag(camera_, LV_OBJ_FLAG_HIDDEN);
@@ -928,43 +904,10 @@ void LvglScreen::UpdateVoice() noexcept {
   const VoiceView& view = Voice(state_);
   lv_label_set_text(voice_status_, view.status);
   if (!has_text_) lv_label_set_text(voice_text_, view.hint);
-  std::uint32_t accent = 0x315F9D;
-  lv_opa_t recolor_opacity = LV_OPA_TRANSP;
-  if (state_ == DeviceUiState::kListening) {
-    accent = 0x35C9FF;
-    recolor_opacity = LV_OPA_10;
-  } else if (state_ == DeviceUiState::kThinking) {
-    accent = 0x8B6CFF;
-    recolor_opacity = LV_OPA_20;
-  } else if (state_ == DeviceUiState::kSpeaking) {
-    accent = 0x36D9C0;
-    recolor_opacity = LV_OPA_10;
-  } else if (state_ == DeviceUiState::kHappy) {
-    accent = 0x48CFA4;
-    recolor_opacity = LV_OPA_10;
-  } else if (state_ == DeviceUiState::kSpeakingTail) {
-    accent = 0x48CFA4;
-    recolor_opacity = LV_OPA_10;
-  } else if (state_ == DeviceUiState::kOffline) {
-    accent = 0x56657A;
-    recolor_opacity = LV_OPA_50;
-  } else if (state_ == DeviceUiState::kError) {
-    accent = 0xE9576C;
-    recolor_opacity = LV_OPA_30;
+  if (voice_face_image_ != nullptr) {
+    // 表情由业务状态直接选择，学生无需理解动画定时器即可读懂 UI 数据流。
+    lv_img_set_src(voice_face_image_, view.face);
   }
-  if (voice_orb_image_ != nullptr) {
-    lv_obj_set_style_img_recolor(voice_orb_image_, lv_color_hex(accent), 0);
-    lv_obj_set_style_img_recolor_opa(voice_orb_image_, recolor_opacity, 0);
-  }
-  if (voice_orbits_[0] != nullptr) {
-    lv_obj_set_style_border_color(voice_orbits_[0], lv_color_hex(accent), 0);
-    lv_obj_set_style_border_opa(voice_orbits_[0], LV_OPA_50, 0);
-  }
-  if (voice_orbits_[1] != nullptr) {
-    lv_obj_set_style_border_color(voice_orbits_[1], lv_color_hex(accent), 0);
-    lv_obj_set_style_border_opa(voice_orbits_[1], LV_OPA_20, 0);
-  }
-  if (page_ == Page::kVoice) StartOrbMotion();
 }
 
 void LvglScreen::SetText(std::string_view first, std::string_view second) noexcept {
@@ -981,122 +924,6 @@ void LvglScreen::SetText(std::string_view first, std::string_view second) noexce
   text = SupportedText(small_font_, text);
   has_text_ = !text.empty();
   lv_label_set_text(voice_text_, has_text_ ? text.c_str() : Voice(state_).hint);
-}
-
-void LvglScreen::StartHomeOrbMotion() noexcept {
-  StopHomeOrbMotion();
-  if (home_orb_image_ == nullptr) return;
-
-  lv_anim_t breathe{};
-  lv_anim_init(&breathe);
-  lv_anim_set_var(&breathe, home_orb_image_);
-  lv_anim_set_exec_cb(&breathe, Zoom);
-  lv_anim_set_values(&breathe, 112, 121);
-  lv_anim_set_time(&breathe, 1900);
-  lv_anim_set_playback_time(&breathe, 1900);
-  lv_anim_set_repeat_count(&breathe, LV_ANIM_REPEAT_INFINITE);
-  lv_anim_set_path_cb(&breathe, lv_anim_path_ease_in_out);
-  lv_anim_start(&breathe);
-
-  lv_anim_t drift = breathe;
-  lv_anim_set_exec_cb(&drift, MoveX);
-  lv_anim_set_values(&drift, -1, 1);
-  lv_anim_set_time(&drift, 2300);
-  lv_anim_set_playback_time(&drift, 2100);
-  lv_anim_start(&drift);
-
-  lv_anim_t rotate = breathe;
-  lv_anim_set_exec_cb(&rotate, Rotate);
-  lv_anim_set_values(&rotate, -45, 45);
-  lv_anim_set_time(&rotate, 2900);
-  lv_anim_set_playback_time(&rotate, 2700);
-  lv_anim_start(&rotate);
-}
-
-void LvglScreen::StopHomeOrbMotion() noexcept {
-  if (home_orb_image_ == nullptr) return;
-  lv_anim_del(home_orb_image_, Zoom);
-  lv_anim_del(home_orb_image_, MoveX);
-  lv_anim_del(home_orb_image_, Rotate);
-  lv_obj_set_style_translate_x(home_orb_image_, 0, 0);
-  lv_img_set_zoom(home_orb_image_, 116);
-  lv_img_set_angle(home_orb_image_, 0);
-}
-
-void LvglScreen::StartOrbMotion() noexcept {
-  StopOrbMotion();
-  if (voice_orb_image_ == nullptr) return;
-  const VoiceView& view = Voice(state_);
-  if (view.amplitude == 0) {
-    lv_img_set_zoom(voice_orb_image_, 250);
-    lv_obj_set_style_img_opa(voice_orb_image_, LV_OPA_60, 0);
-    return;
-  }
-
-  const int drift = view.amplitude >= 8 ? 3 : (view.amplitude >= 4 ? 2 : 1);
-  const int zoom = view.amplitude >= 8 ? 10 : (view.amplitude >= 4 ? 7 : 4);
-
-  lv_anim_t breathe{};
-  lv_anim_init(&breathe);
-  lv_anim_set_var(&breathe, voice_orb_image_);
-  lv_anim_set_exec_cb(&breathe, Zoom);
-  lv_anim_set_values(&breathe, 256 - zoom, 256 + zoom);
-  lv_anim_set_time(&breathe, view.period_ms);
-  lv_anim_set_playback_time(&breathe, view.period_ms);
-  lv_anim_set_repeat_count(&breathe, LV_ANIM_REPEAT_INFINITE);
-  lv_anim_set_path_cb(&breathe, lv_anim_path_ease_in_out);
-  lv_anim_start(&breathe);
-
-  lv_anim_t x = breathe;
-  lv_anim_set_exec_cb(&x, MoveX);
-  lv_anim_set_values(&x, -drift, drift);
-  lv_anim_set_time(&x, view.period_ms + 230U);
-  lv_anim_set_playback_time(&x, view.period_ms + 170U);
-  lv_anim_start(&x);
-
-  lv_anim_t y = breathe;
-  lv_anim_set_exec_cb(&y, MoveY);
-  lv_anim_set_values(&y, drift, -drift);
-  lv_anim_set_time(&y, view.period_ms + 410U);
-  lv_anim_set_playback_time(&y, view.period_ms + 290U);
-  lv_anim_start(&y);
-
-  lv_anim_t rotate = breathe;
-  lv_anim_set_exec_cb(&rotate, Rotate);
-  const int angle = 18 + view.amplitude * 5;
-  lv_anim_set_values(&rotate, -angle, angle);
-  lv_anim_set_time(&rotate, view.period_ms + 530U);
-  lv_anim_set_playback_time(&rotate, view.period_ms + 430U);
-  lv_anim_start(&rotate);
-}
-
-void LvglScreen::StopOrbMotion() noexcept {
-  if (voice_orb_image_ == nullptr) return;
-  lv_anim_del(voice_orb_image_, Zoom);
-  lv_anim_del(voice_orb_image_, MoveX);
-  lv_anim_del(voice_orb_image_, MoveY);
-  lv_anim_del(voice_orb_image_, Rotate);
-  lv_obj_set_style_translate_x(voice_orb_image_, 0, 0);
-  lv_obj_set_style_translate_y(voice_orb_image_, 0, 0);
-  lv_img_set_zoom(voice_orb_image_, LV_IMG_ZOOM_NONE);
-  lv_img_set_angle(voice_orb_image_, 0);
-  lv_obj_set_style_img_opa(voice_orb_image_, LV_OPA_COVER, 0);
-}
-
-void LvglScreen::MoveX(void* object, std::int32_t value) {
-  lv_obj_set_style_translate_x(static_cast<lv_obj_t*>(object), value, 0);
-}
-
-void LvglScreen::MoveY(void* object, std::int32_t value) {
-  lv_obj_set_style_translate_y(static_cast<lv_obj_t*>(object), value, 0);
-}
-
-void LvglScreen::Zoom(void* object, std::int32_t value) {
-  lv_img_set_zoom(static_cast<lv_obj_t*>(object), static_cast<std::uint16_t>(value));
-}
-
-void LvglScreen::Rotate(void* object, std::int32_t value) {
-  lv_img_set_angle(static_cast<lv_obj_t*>(object), static_cast<std::int16_t>(value));
 }
 
 void LvglScreen::AppClicked(lv_event_t* event) {
@@ -1195,8 +1022,6 @@ void LvglScreen::UpdateClock() noexcept {
 }
 
 void LvglScreen::Destroy() noexcept {
-  StopHomeOrbMotion();
-  StopOrbMotion();
   if (clock_timer_ != nullptr) {
     lv_timer_del(clock_timer_);
     clock_timer_ = nullptr;
@@ -1219,10 +1044,9 @@ void LvglScreen::Destroy() noexcept {
   }
   home_ = voice_ = camera_ = wifi_provision_ = generic_ = nullptr;
   home_clock_ = home_date_ = home_year_ = nullptr;
-  home_orb_image_ = nullptr;
+  home_face_image_ = nullptr;
   for (auto*& button : app_buttons_) button = nullptr;
-  voice_orb_image_ = nullptr;
-  for (auto*& orbit : voice_orbits_) orbit = nullptr;
+  voice_face_image_ = nullptr;
   voice_status_ = voice_text_ = voice_mute_icon_ = nullptr;
   voice_volume_slider_ = voice_volume_value_ = nullptr;
   camera_image_ = camera_status_ = nullptr;

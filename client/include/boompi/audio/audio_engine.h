@@ -26,6 +26,8 @@ struct CaptureFrame final {
   std::array<VoiceFrame16k, 4U> aec_input{};
 #endif
   std::uint64_t sequence{0U};
+  /// 该 PCM 对应采集 period 结束时的 steady-clock 时间；随 3A 固定一帧延迟一起延后。
+  std::uint64_t timestamp_us{0U};
   float input_dbfs{-120.0F}, voice_dbfs{-120.0F};
   bool wake{false}, vad_now{false}, vad_started{false}, vad_ended{false};
   bool discontinuity{false}, actor_overrun{false};

@@ -22,11 +22,19 @@ bool SetValidEnvironment() {
       {"BOOMPI_SERVER_SPKI_SHA256",
        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
       {"BOOMPI_DEVICE_ID", "00000000-0000-4000-8000-000000000001"},
-      {"BOOMPI_DEVICE_TOKEN", "boompi-valid-token-0123456789abcdef"},
-      {"BOOMPI_CAPTURE_PCM", "hw:0,0"},
-      {"BOOMPI_PLAYBACK_PCM", "hw:0,0"},
-      {"BOOMPI_SNOWBOY_RESOURCE_FILE", "common.res"},
-      {"BOOMPI_SNOWBOY_MODEL_FILE", "model.pmdl"},
+      {"BOOMPI_VOLUME_PERCENT", "37"},
+      {"BOOMPI_SNOWBOY_SENSITIVITY", "0.65"},
+      {"BOOMPI_VAD_MIN_DBFS", "-40"},
+      {"BOOMPI_BARGE_MIN_DBFS", "-30"},
+      {"BOOMPI_CAPTURE_LEFT_POLARITY", "-1"},
+      {"BOOMPI_CAPTURE_RIGHT_POLARITY", "1"},
+      // 旧镜像中的这些变量会被忽略，不能覆盖当前 BSP 的固定事实。
+      {"BOOMPI_CAPTURE_PCM", "ignored"},
+      {"BOOMPI_PLAYBACK_PCM", "ignored"},
+      {"BOOMPI_SPEAKER_GAIN_PERCENT", "999"},
+      {"BOOMPI_BARGE_IN_ENABLED", "0"},
+      {"BOOMPI_SNOWBOY_RESOURCE_FILE", "ignored"},
+      {"BOOMPI_SNOWBOY_MODEL_FILE", "ignored"},
   };
   for (const auto& value : values) {
     if (!SetEnvironment(value.first, value.second)) return false;
@@ -34,10 +42,19 @@ bool SetValidEnvironment() {
   return true;
 }
 
-bool LoadSucceeds() {
+bool FixedBoardValuesAreKept() {
   boompi::config::VoiceClientConfig config;
   std::string error;
-  return boompi::config::LoadVoiceClientConfigFromEnvironment(&config, &error);
+  return boompi::config::LoadVoiceClientConfigFromEnvironment(&config, &error) &&
+         config.server_ip == "127.0.0.1" && config.server_port == 17806U &&
+         config.device_id == "00000000-0000-4000-8000-000000000001" &&
+         config.volume_percent == 37U && config.snowboy_sensitivity == "0.65" &&
+         config.vad_min_dbfs == -40.0F && config.barge_min_dbfs == -30.0F &&
+         config.capture_left_polarity == -1 && config.capture_right_polarity == 1 &&
+         config.capture_pcm == "hw:0,0" && config.playback_pcm == "hw:0,0" &&
+         config.snowboy_resource_path == "/userdata/boompi/models/common.res" &&
+         config.snowboy_model_path == "/userdata/boompi/models/snowboy.umdl" &&
+         config.speaker_gain_percent == 100U && config.barge_in_enabled;
 }
 
 bool Rejects(const char* name, const std::string& value) {
@@ -52,7 +69,7 @@ bool Rejects(const char* name, const std::string& value) {
 
 int main() {
   int failures = 0;
-  if (!SetValidEnvironment() || !LoadSucceeds()) {
+  if (!SetValidEnvironment() || !FixedBoardValuesAreKept()) {
     std::cerr << "valid configuration was rejected\n";
     ++failures;
   }
@@ -63,8 +80,6 @@ int main() {
        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA?="},
       {"BOOMPI_SERVER_SPKI_SHA256",
        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB="},
-      {"BOOMPI_DEVICE_TOKEN", std::string(31U, 'x') + " "},
-      {"BOOMPI_DEVICE_TOKEN", std::string(31U, 'x') + '\x7f'},
       {"BOOMPI_BARGE_MIN_DBFS", "1"},
   };
   for (std::size_t index = 0; index < invalid.size(); ++index) {

@@ -1,5 +1,7 @@
 #include "boompi/network/network_bootstrap.h"
 
+#include "boompi/config/voice_client_config.h"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <net/if.h>
@@ -29,16 +31,11 @@ bool IsText(const std::string& text, std::size_t minimum, std::size_t maximum) {
   return true;
 }
 
-bool IsSpki(const std::string& text) {
-  if (text.size() != 44U || text.back() != '=') return false;
-  for (std::size_t i = 0; i < 43U; ++i) { const char c = text[i];
-    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/')) return false; }
-  return true;
-}
-
 bool IsEndpoint(const NetworkBootstrapResult& server) {
-  in_addr address{}; return server.port != 0U && IsSpki(server.spki_sha256_base64) &&
-                           inet_pton(AF_INET, server.host.c_str(), &address) == 1;
+  in_addr address{};
+  return server.port != 0U &&
+         config::IsValidSpkiSha256(server.spki_sha256_base64) &&
+         inet_pton(AF_INET, server.host.c_str(), &address) == 1;
 }
 
 bool AtomicWrite(const char* path, const std::string& text) {

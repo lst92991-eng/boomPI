@@ -39,7 +39,7 @@ func (r *Responder) Serve(ctx context.Context) error {
 		return errors.New("discovery context is required")
 	}
 	address := &net.UDPAddr{IP: net.ParseIP(r.config.BindAddress), Port: r.config.UDPPort}
-	connection, err := net.ListenUDP("udp", address)
+	connection, err := net.ListenUDP("udp4", address)
 	if err != nil {
 		return fmt.Errorf("listen for UDP discovery: %w", err)
 	}

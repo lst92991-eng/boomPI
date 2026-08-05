@@ -43,6 +43,7 @@ CMakeUserPresets.json
 .env.*
 !.env.example
 /server/config.yaml
+/server/**/state/
 /server/configs/config.yaml
 /server/configs/*.local.yaml
 /server/data/

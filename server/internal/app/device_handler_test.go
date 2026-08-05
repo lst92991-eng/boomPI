@@ -25,14 +25,13 @@ import (
 
 const (
 	testDeviceID    = "00112233-4455-6677-8899-aabbccddeeff"
-	testDeviceToken = "0123456789abcdef0123456789abcdef"
+	testDeviceToken = "boompi-teaching-shared-token-v1-2026"
 )
 
 func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
-	t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
-	cfg, err := config.Load("", nil)
+	cfg, err := config.Load("")
 	if err != nil {
 		t.Fatalf("config.Load() error = %v", err)
 	}
@@ -182,8 +181,7 @@ func TestDeviceStreamingRoundTripWithFakeProvider(t *testing.T) {
 func TestInvalidTurnSequencesDoNotClosePersistentSession(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
-	t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
-	cfg, err := config.Load("", nil)
+	cfg, err := config.Load("")
 	if err != nil {
 		t.Fatalf("config.Load() error = %v", err)
 	}
@@ -449,8 +447,7 @@ func TestDeviceHelloRejectsInvalidTokenBeforeProviderOpen(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
 			t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
-			t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
-			cfg, err := config.Load("", nil)
+			cfg, err := config.Load("")
 			if err != nil {
 				t.Fatalf("config.Load() error = %v", err)
 			}
@@ -495,8 +492,7 @@ func TestDeviceHelloRejectsInvalidTokenBeforeProviderOpen(t *testing.T) {
 func TestDeviceHelloTimesOutBeforeProviderOpen(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
-	t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
-	cfg, err := config.Load("", nil)
+	cfg, err := config.Load("")
 	if err != nil {
 		t.Fatalf("config.Load() error = %v", err)
 	}
@@ -543,8 +539,7 @@ func TestDeviceHelloTimesOutBeforeProviderOpen(t *testing.T) {
 func TestDeviceSessionIdleTimeoutUsesBusinessActivityAndReleasesDevice(t *testing.T) {
 	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
 	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
-	t.Setenv("BOOMPI_DEVICE_TOKEN", testDeviceToken)
-	cfg, err := config.Load("", nil)
+	cfg, err := config.Load("")
 	if err != nil {
 		t.Fatalf("config.Load() error = %v", err)
 	}
@@ -631,7 +626,7 @@ func TestDeviceSessionIdleTimeoutUsesBusinessActivityAndReleasesDevice(t *testin
 	}
 }
 
-func TestDeviceSessionErrorCode(t *testing.T) {
+func TestReportableSessionError(t *testing.T) {
 	abnormalClose := &websocket.CloseError{
 		Code: websocket.CloseAbnormalClosure,
 		Text: "private peer details",
@@ -644,11 +639,10 @@ func TestDeviceSessionErrorCode(t *testing.T) {
 	cancelCleanup(context.Canceled)
 
 	testCases := []struct {
-		name       string
-		ctx        context.Context
-		err        error
-		wantCode   string
-		wantReport bool
+		name string
+		ctx  context.Context
+		err  error
+		want error
 	}{
 		{name: "nil result", ctx: context.Background()},
 		{name: "normal cancellation", ctx: cleanupCtx, err: context.Canceled},
@@ -663,33 +657,32 @@ func TestDeviceSessionErrorCode(t *testing.T) {
 		},
 		{
 			name: "worker cause recovered from canceled receive", ctx: workerFailureCtx,
-			err:      fmt.Errorf("receive: %w", context.Canceled),
-			wantCode: "peer_disconnected", wantReport: true,
+			err: fmt.Errorf("receive: %w", context.Canceled), want: abnormalClose,
 		},
 		{
 			name: "actual close is not masked by cleanup cancellation", ctx: cleanupCtx,
-			err: abnormalClose, wantCode: "peer_disconnected", wantReport: true,
+			err: abnormalClose, want: abnormalClose,
 		},
 		{
 			name: "session idle timeout", ctx: idleCtx,
-			err: context.Canceled, wantCode: "session_idle_timeout", wantReport: true,
+			err: context.Canceled, want: errDeviceSessionIdleTimeout,
 		},
 		{
 			name: "deadline", ctx: context.Background(), err: context.DeadlineExceeded,
-			wantCode: "timeout", wantReport: true,
+			want: context.DeadlineExceeded,
 		},
 		{
 			name: "generic failure", ctx: context.Background(), err: errors.New("private internal details"),
-			wantCode: "session_error", wantReport: true,
+			want: errors.New("private internal details"),
 		},
 	}
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			gotCode, gotReport := deviceSessionErrorCode(testCase.ctx, testCase.err)
-			if gotCode != testCase.wantCode || gotReport != testCase.wantReport {
-				t.Fatalf("deviceSessionErrorCode() = (%q, %t), want (%q, %t)",
-					gotCode, gotReport, testCase.wantCode, testCase.wantReport)
+			got := reportableSessionError(testCase.ctx, testCase.err)
+			if (got == nil) != (testCase.want == nil) ||
+				(got != nil && got.Error() != testCase.want.Error()) {
+				t.Fatalf("reportableSessionError() = %v, want %v", got, testCase.want)
 			}
 		})
 	}

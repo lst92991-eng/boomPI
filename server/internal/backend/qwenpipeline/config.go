@@ -9,10 +9,7 @@ import (
 	"time"
 )
 
-const (
-	RegionChinaBeijing = "china-beijing"
-	RegionSingapore    = "singapore"
-)
+const RegionChinaBeijing = "china-beijing"
 
 type Config struct {
 	APIKey           string
@@ -35,8 +32,8 @@ func (c Config) validate() error {
 	if strings.TrimSpace(c.APIKey) == "" {
 		return errors.New("Qwen API key is required")
 	}
-	if c.Region != RegionChinaBeijing && c.Region != RegionSingapore {
-		return errors.New("Qwen region must be china-beijing or singapore")
+	if c.Region != RegionChinaBeijing {
+		return errors.New("Qwen region must be china-beijing")
 	}
 	if strings.ContainsAny(c.WorkspaceID, "/?#@") {
 		return errors.New("Qwen workspace ID contains invalid characters")
@@ -74,22 +71,11 @@ func (c Config) validate() error {
 
 func (c Config) compatibleBaseURL() string {
 	if strings.TrimSpace(c.WorkspaceID) == "" {
-		if c.Region == RegionSingapore {
-			return "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-		}
 		return "https://dashscope.aliyuncs.com/compatible-mode/v1"
 	}
-	domain := "cn-beijing.maas.aliyuncs.com"
-	if c.Region == RegionSingapore {
-		domain = "ap-southeast-1.maas.aliyuncs.com"
-	}
-	return fmt.Sprintf("https://%s.%s/compatible-mode/v1", c.WorkspaceID, domain)
+	return fmt.Sprintf("https://%s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", c.WorkspaceID)
 }
 
 func (c Config) ttsURL() string {
-	domain := "dashscope.aliyuncs.com"
-	if c.Region == RegionSingapore {
-		domain = "dashscope-intl.aliyuncs.com"
-	}
-	return "wss://" + domain + "/api-ws/v1/realtime?model=" + url.QueryEscape(c.TTSModel)
+	return "wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=" + url.QueryEscape(c.TTSModel)
 }

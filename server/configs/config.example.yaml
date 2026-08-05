@@ -1,34 +1,23 @@
-# boomPI 教学版服务端完整配置示例。
-# 正常使用无需复制本文件：直接运行 boompi-server 会生成最小 config.yaml。
-# 最小配置只需替换 qwen_api_key；环境变量 DASHSCOPE_API_KEY 的优先级更高。
-# DASHSCOPE_WORKSPACE_ID 和 BOOMPI_DEVICE_TOKEN 都是可选环境覆盖。
-
+# boomPI 教学版服务端完整示例。
+# 正常使用无需复制：首次运行 EXE 时粘贴中国内地 DashScope Key 即可。
 qwen_api_key: "replace-with-your-qwen-api-key"
-# 教学局域网默认令牌与客户端默认值一致；复制本文件时只填 key 即可运行。
-device_token: "boompi-teaching-shared-token-v1-2026"
-# 正式部署时应同时替换服务端与客户端令牌。
 
+# 以下均可省略；默认值就是当前真板联调参数。
 listen_address: "0.0.0.0"
 wss_port: 17806
-discovery_port: 17807
 log_level: "info"
 
-provider: "qwen"
-region: "china-beijing"
-conversation_mode: "intelligence"
-model: "qwen3.5-omni-plus-realtime"
 asr_model: "qwen3-asr-flash"
 reasoning_model: "qwen3.6-flash"
 reasoning_effort: "none"
 tts_model: "qwen3-tts-flash-realtime"
 tts_voice: "Cherry"
-voice: "Ethan"
 search_mode: "off"
 system_prompt: "You are boomPI, a concise and helpful voice assistant. Reply in Simplified Chinese unless the user asks for another language."
 persona: "Natural, young, friendly, and not overly cute."
 
-heartbeat_interval: "10s" # 板端 30s 心跳超时；服务端只接受 1s..10s。
-connection_timeout: "30s" # 至少覆盖三个心跳周期，且不超过 30s。
+heartbeat_interval: "10s"
+connection_timeout: "30s"
 first_response_timeout: "30s"
 session_idle_timeout: "30m"
 max_turns: 20

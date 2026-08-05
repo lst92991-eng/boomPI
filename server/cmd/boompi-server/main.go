@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/lst92991-eng/boomPI/server/internal/app"
@@ -19,35 +21,24 @@ import (
 type options struct {
 	configPath  string
 	checkConfig bool
-	overrides   config.Overrides
 }
 
 func main() {
-	os.Exit(realMain(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(realMain(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
-func realMain(args []string, stdout, stderr io.Writer) int {
+func realMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return run(ctx, args, stdout, stderr)
+	return run(ctx, args, stdin, stdout, stderr)
 }
 
-func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("boompi-server", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var opts options
-	opts.overrides = make(config.Overrides)
-	flags.StringVar(&opts.configPath, "config", "config.yaml", "path to the YAML configuration")
+	flags.StringVar(&opts.configPath, "config", defaultConfigPath(), "path to config.yaml")
 	flags.BoolVar(&opts.checkConfig, "check-config", false, "validate configuration and exit")
-	addOverrideFlag(flags, opts.overrides, "listen-address", "listen_address", "override the server listen address")
-	addOverrideFlag(flags, opts.overrides, "wss-port", "wss_port", "override the WSS port")
-	addOverrideFlag(flags, opts.overrides, "discovery-port", "discovery_port", "override the UDP discovery port")
-	addOverrideFlag(flags, opts.overrides, "log-level", "log_level", "override the log level")
-	addOverrideFlag(flags, opts.overrides, "provider", "provider", "override the provider name")
-	addOverrideFlag(flags, opts.overrides, "region", "region", "override the provider region")
-	addOverrideFlag(flags, opts.overrides, "model", "model", "override the provider model")
-	addOverrideFlag(flags, opts.overrides, "voice", "voice", "override the provider voice")
-	addOverrideFlag(flags, opts.overrides, "search-mode", "search_mode", "override search mode (auto or off)")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -59,29 +50,20 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	created, err := config.CreateStarter(opts.configPath)
-	if err != nil {
+	if err := ensureConfiguration(opts.configPath, stdin, stdout); err != nil {
 		fmt.Fprintf(stderr, "configuration setup error: %v\n", err)
 		return 1
 	}
-	if created {
-		absolutePath, pathErr := filepath.Abs(opts.configPath)
-		if pathErr != nil {
-			absolutePath = opts.configPath
-		}
-		fmt.Fprintf(stdout, "Created starter configuration: %s\n", absolutePath)
-		fmt.Fprintln(stdout, "Edit qwen_api_key, save the file, then run boompi-server again.")
-		return 0
-	}
 
-	cfg, err := config.Load(opts.configPath, opts.overrides)
+	cfg, err := config.Load(opts.configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "configuration error: %v\n", err)
 		return 1
 	}
 	if opts.checkConfig {
-		fmt.Fprintf(stdout, "configuration valid (listen_address=%s wss_port=%d discovery_port=%d provider=%s region=%s model=%s credential_source=%s)\n",
-			cfg.ListenAddress, cfg.WSSPort, cfg.DiscoveryPort, cfg.Provider, cfg.Region, cfg.Model, cfg.Credentials.Source())
+		fmt.Fprintf(stdout, "configuration valid (wss=%s:%d discovery_udp=%d asr=%s llm=%s tts=%s credential_source=%s)\n",
+			cfg.ListenAddress, cfg.WSSPort, cfg.DiscoveryPort, cfg.ASRModel,
+			cfg.ReasoningModel, cfg.TTSModel, cfg.Credentials.Source())
 		return 0
 	}
 
@@ -108,18 +90,47 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-type overrideValue struct {
-	key       string
-	overrides config.Overrides
+func defaultConfigPath() string {
+	executable, err := os.Executable()
+	if err != nil {
+		return "config.yaml"
+	}
+	return filepath.Join(filepath.Dir(executable), "config.yaml")
 }
 
-func (v overrideValue) String() string { return "" }
+func ensureConfiguration(path string, stdin io.Reader, stdout io.Writer) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect config: %w", err)
+	}
 
-func (v overrideValue) Set(value string) error {
-	v.overrides[v.key] = value
+	apiKey := strings.TrimSpace(os.Getenv("DASHSCOPE_API_KEY"))
+	if apiKey == "" {
+		fmt.Fprintln(stdout, "首次运行：请粘贴中国内地 DashScope API Key。")
+		fmt.Fprintln(stdout, "Key 只会保存到 EXE 同目录的 config.yaml，不会写入日志。")
+		fmt.Fprint(stdout, "Qwen API Key: ")
+		reader := bufio.NewReader(io.LimitReader(stdin, 4097))
+		line, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("read Qwen API key: %w", err)
+		}
+		apiKey = strings.TrimSpace(line)
+		if len(apiKey) > 4096 {
+			return errors.New("Qwen API key is too long")
+		}
+	}
+	created, err := config.CreateStarter(path, apiKey)
+	if err != nil {
+		return err
+	}
+	if created {
+		absolutePath, pathErr := filepath.Abs(path)
+		if pathErr != nil {
+			absolutePath = path
+		}
+		fmt.Fprintf(stdout, "配置已保存：%s\n", absolutePath)
+		fmt.Fprintln(stdout, "正在启动 boomPI 服务端……")
+	}
 	return nil
-}
-
-func addOverrideFlag(flags *flag.FlagSet, overrides config.Overrides, flagName, configKey, usage string) {
-	flags.Var(overrideValue{key: configKey, overrides: overrides}, flagName, usage)
 }

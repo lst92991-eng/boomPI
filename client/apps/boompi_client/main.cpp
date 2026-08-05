@@ -37,14 +37,6 @@ int main(int argc, char* argv[]) {
     std::cout << "boompi-client: configuration is valid\n";
     return EXIT_SUCCESS;
   }
-  if (!config.server_ip.empty()) {
-    boompi::network::NetworkBootstrapResult network;
-    network.host = config.server_ip; network.port = config.server_port;
-    network.spki_sha256_base64 = config.server_spki_sha256;
-    if (!boompi::network::NetworkBootstrap::SaveServer(network)) {
-      std::cerr << "boompi-client: cannot save configured server\n"; return EXIT_FAILURE;
-    }
-  }
   std::signal(SIGINT, Stop); std::signal(SIGTERM, Stop);
   if (!boompi::application::RunVoiceClient(config, &g_stop, &error)) {
     std::cerr << "boompi-client: voice loop failed: " << error << '\n';

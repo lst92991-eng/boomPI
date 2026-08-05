@@ -82,6 +82,10 @@ Inbound Event(const InboundKind kind) {
   Inbound event{};
   event.kind = kind;
   event.ids = {101U, 1U, 1U, 1U};
+  if (kind == InboundKind::kResponseStart ||
+      kind == InboundKind::kTextDelta ||
+      kind == InboundKind::kAudioStart || kind == InboundKind::kDone)
+    event.response_id = "response-1";
   return event;
 }
 
@@ -95,6 +99,11 @@ CaptureStep StartResponse() {
   CaptureStep step{};
   step.inbound.push_back(Event(InboundKind::kResponseStart));
   step.inbound.push_back(Event(InboundKind::kAudioStart));
+  Inbound pcm = Event(InboundKind::kPcm);
+  pcm.pcm.ids = pcm.ids;
+  pcm.pcm.flags = 3U;  // 单帧测试音频：START + END。
+  pcm.audio_size = 2U;
+  step.inbound.push_back(std::move(pcm));
   return step;
 }
 
@@ -183,7 +192,6 @@ HarnessSnapshot Run(HarnessPlan plan) {
   config.server_port = 17806U;
   config.server_spki_sha256 = kExplicitSpki;
   config.device_id = "00000000-0000-4000-8000-000000000001";
-  config.device_token = "test-token";
   config.capture_pcm = "test-capture";
   config.playback_pcm = "test-playback";
   config.snowboy_resource_path = "test-common.res";
@@ -864,6 +872,70 @@ void CancelDoneReorderingIsIdempotent() {
         "done/cancel reordering rebuilt WSS");
 }
 
+void StaleEpochCannotMutateNextTurn() {
+  HarnessPlan plan{};
+  plan.capture = {Wake(), SpeechStart(), SpeechEnd(), StartResponse()};
+  CaptureStep done = Quiet();
+  done.inbound.push_back(Event(InboundKind::kDone));
+  plan.capture.push_back(std::move(done));
+  CaptureStep drained = Quiet();
+  drained.playback_done = true;
+  plan.capture.push_back(std::move(drained));
+  CaptureStep stale = Quiet();
+  stale.inbound.push_back(TextDelta("late stale text"));
+  stale.stop_after = true;
+  plan.capture.push_back(std::move(stale));
+
+  const auto result = Run(std::move(plan));
+  Check(result.connections == 1U, "stale epoch rebuilt healthy WSS");
+  Check(!ContainsText(result, "late stale text"),
+        "stale epoch changed the next-turn subtitle");
+  Check(CountControl(result, ControlKind::kTurnStart) == 1U,
+        "stale epoch started a duplicate turn");
+}
+
+void SessionErrorSurvivesTurnEpochAdvance() {
+  HarnessPlan plan{};
+  plan.capture = {Wake(), SpeechStart(), SpeechEnd(), StartResponse()};
+  CaptureStep done = Quiet();
+  done.inbound.push_back(Event(InboundKind::kDone));
+  plan.capture.push_back(std::move(done));
+  CaptureStep drained = Quiet();
+  drained.playback_done = true;
+  plan.capture.push_back(std::move(drained));
+  CaptureStep failed = Quiet();
+  Inbound session_error = Event(InboundKind::kError);
+  session_error.ids = {101U, 0U, 0U, 1U};
+  session_error.error_code = "session_error";
+  session_error.text = "session closed";
+  failed.inbound.push_back(std::move(session_error));
+  failed.stop_after = true;
+  plan.capture.push_back(std::move(failed));
+
+  const auto result = Run(std::move(plan));
+  Check(result.transport_closes >= 1U,
+        "session error was mistaken for a stale turn event");
+}
+
+void DownlinkSequenceGapRejectsConnection() {
+  HarnessPlan plan{};
+  plan.capture = {Wake(), SpeechStart(), SpeechEnd()};
+  CaptureStep response = Quiet();
+  response.inbound.push_back(Event(InboundKind::kResponseStart));
+  response.inbound.push_back(Event(InboundKind::kAudioStart));
+  Inbound gap = Event(InboundKind::kPcm);
+  gap.pcm.ids = gap.ids;
+  gap.pcm.sequence = 1U;
+  gap.audio_size = 2U;
+  response.inbound.push_back(std::move(gap));
+  response.stop_after = true;
+  plan.capture.push_back(std::move(response));
+
+  const auto result = Run(std::move(plan));
+  Check(result.transport_closes >= 1U,
+        "downlink sequence gap did not retire ambiguous WSS");
+}
+
 void MaximumInputCommitsInsteadOfCancelling() {
   HarnessPlan plan{};
   plan.capture.reserve(3010U);
@@ -946,6 +1018,11 @@ int main(const int argc, char** const argv) {
     else if (scenario == "barge-long-across-ack")
       BargeLongUtteranceCrossesAck();
     else if (scenario == "cancel-done") CancelDoneReorderingIsIdempotent();
+    else if (scenario == "stale-epoch") StaleEpochCannotMutateNextTurn();
+    else if (scenario == "session-error-after-turn")
+      SessionErrorSurvivesTurnEpochAdvance();
+    else if (scenario == "downlink-sequence-gap")
+      DownlinkSequenceGapRejectsConnection();
     else if (scenario == "max-input") MaximumInputCommitsInsteadOfCancelling();
     else throw std::runtime_error("unknown scenario");
   } catch (const std::exception& error) {

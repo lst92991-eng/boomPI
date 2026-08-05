@@ -1,145 +1,100 @@
-# boomPI 系统架构摘要
+# boomPI 系统架构
 
-## 文档状态
+## 范围
 
-本页描述 `v1.0.0` 教学基线的职责和数据流，不给后续未冻结工作树继承本次验收结论。音频 ELOC 由
-`scripts/tests/test_client_source_contract.py` 按固定集合计算；LVGL UI、网络启动和测试代码单独
-统计。当前冻结源码为 15 个生产文件、3078 ELOC，其中 vendor 集成 280 ELOC、产品胶水
-2798 ELOC。2026-08-03 的 2929 ELOC 以及当日严格交叉构建、板端启动和真人语音结果，只属于
-对应历史候选。后续修改必须重新完成 Host、严格交叉构建和板端 HIL 后才能声明通过。
+本文只描述当前教学版实现。架构事实以源码、唯一交叉构建入口和本轮验证输出为准。
 
-真实 Wi-Fi 配网、屏幕/触摸、摄像头本地预览和完整语音闭环已完成人工验收。受控
-double-talk、量化延迟、最终壳体 ERLE 和有界稳定性窗口仍是后续上限测试。实现状态以当前
-测试输出和带日期的板端记录为准；根目录 `AGENTS.md` 是更高优先级的开发契约。
-
-## 部署边界
+boomPI 由 RV1106 板端客户端和局域网内的 Go 服务端组成：
 
 ```text
-RV1106 device                                      Local host
+RV1106                                                    本地服务端
 
-ALSA capture -> [private AudioBackend] -> AudioEngine -> VoiceClient
-        ^                  |                 |             |
-        |              3A/VAD/AEC       fixed queues   VoiceTransport
-ALSA playback -> Mode1 hard ref -> AudioBackend             |
-                                                      boompi-server -> Qwen China (Beijing)
+ALSA capture -> AudioBackend -> AudioEngine -> VoiceClient -> VoiceTransport
+      ^              |              |              |              |
+      |          3A / wake / VAD  有界队列      会话状态机       WSS/TLS
+ALSA playback <- 24->48 kHz <- TTS ring <-------------------------+
+      |
+      +---- Codec Mode1 数字回采 ----> refL/refR
 
-GT911 -> DeviceUi <- VoiceClient -> ST7789P3
-Ethernet/Wi-Fi -> NetworkBootstrap -> discovered WSS endpoint
+GT911 -> DeviceUi/LVGL <- VoiceClient -> ST7789P3
+Ethernet/Wi-Fi -> NetworkBootstrap -> UDP discovery / cached endpoint
+
+Go server -> 设备会话、当前对话、Qwen 中国区适配、TLS 身份
 ```
 
-- RV1106 当前客户端负责实时音频、唤醒、VAD、打断、本地语音状态机、显示、触摸和网络启动。
-- Go 服务端负责设备 session、Qwen adapter、当前会话上下文、TLS 身份和 UDP 发现。
-- 板端不保存 Qwen Key，也不直接连接 Qwen。
-- 企业配对、守护进程和签名更新属于后续产品阶段，不进入当前教学版 C++。
+板端不保存 Qwen API Key，也不直接访问 Qwen。服务端使用中国大陆区域配置；设备只连接
+局域网内的 `boompi-server`。
 
-## 客户端所有权
+## 代码职责
 
-源码按仓库既定职责放置：
-
-| 目录 | 当前职责 |
+| 目录 | 唯一职责 |
 | --- | --- |
-| `client/src/application/` | 唯一会话 actor、pre-roll、turn/epoch、超时和打断状态转换 |
-| `client/src/audio/` | 唯一公开音频门面、播放线程、TTS 固定环和播放结果 |
-| `client/src/network/` | WSS/TLS、v1 收发、以太网/Wi-Fi 优先级、UDP 发现与 endpoint 持久化 |
-| `client/src/platform/rv1106/` | `AudioEngine` 私有的 ALSA、重采样、Rockchip 3A、Snowboy C ABI、VAD 和近讲门控 |
-| `client/src/ui/` | ST7789P3 刷新、GT911 触摸、动态语音球、字幕、实时音量、配网与摄像头预览 |
+| `client/src/application/` | 会话状态机、turn/epoch、500 ms pre-roll、追问、取消和打断编排 |
+| `client/src/audio/` | application 可见的音频门面、capture handoff、TTS 有界队列和播放线程 |
+| `client/src/platform/rv1106/` | ALSA、重采样、Rockchip 3A、Snowboy C ABI、WebRTC VAD 和近讲判定 |
+| `client/src/network/` | WSS/TLS、协议 v1、以太网/Wi-Fi 启动、UDP 发现和 endpoint 缓存 |
+| `client/src/ui/` | LVGL、ST7789P3、GT911、状态页面、音量控制和 SC3336 本地预览 |
+| `server/internal/` | 配置、设备会话、Qwen provider、WSS transport、发现和 TLS 身份 |
+| `protocol/` | 客户端和服务端共同遵守的 wire contract 与 fixture |
 
-不存在另一套 `App/Driver/Inf` 平行目录，也没有恢复已删除的通用 worker 或 backend 工厂。
+`VoiceClient` 是唯一修改业务状态的 actor。音频线程、WebSocket 回调、UI 和网络启动代码只
+提交事件，不直接切换 turn，也不共享另一套业务状态机。
 
-正常语音与显示在线时，当前源码共有六个客户端自有长期执行上下文；打开摄像头后再增加一个。
-依赖库如果额外创建线程，不得拥有 boomPI 业务状态：
+## 执行上下文
 
-| 执行上下文 | 独占资源与职责 |
+正常语音和显示在线时，客户端有六个自有长期执行上下文；进入摄像头页面后增加一个：
+
+| 上下文 | 调度与所有权 |
 | --- | --- |
-| 主 application actor | 500 ms pre-roll、状态机、turn 和重连调度；唯一修改业务状态 |
-| capture/DSP 线程 | `SCHED_FIFO 40`；ALSA capture、3A、Snowboy/VAD，并提交到 4 帧固定队列 |
-| 播放线程 | `SCHED_FIFO 30`；固定 TTS 队列、重采样、gain/limiter 和 ALSA playback |
-| WebSocket service 线程 | TLS/WSS I/O；回调只向固定 64 项事件环提交结果 |
-| UI 线程 | 合并状态刷新、SPI 写屏和 GT911 触摸；只把用户动作交回主状态机 |
-| 网络线程 | DHCP/Wi-Fi 启动、UDP 发现与 endpoint 持久化；服务端晚启动时持续重试 |
+| application actor | 主线程；唯一拥有会话状态、turn、epoch 和重连编排 |
+| capture/DSP | `SCHED_FIFO 40`；独占 ALSA capture、3A、Snowboy、VAD 和采集队列生产端 |
+| playback | `SCHED_FIFO 30`；独占 TTS 渲染、增益/限幅和 ALSA playback |
+| WebSocket service | TLS/WSS I/O；回调只写入 64 项固定事件环 |
+| NetworkBootstrap | DHCP、Wi-Fi、UDP discovery 和 endpoint 持久化 |
+| UI | 普通调度、`nice +5`；触摸和合并刷新，不进入逐帧 PCM 路径 |
+| camera（按需） | 仅在摄像头页运行，退出页面即回收 |
 
-业务状态只能由主 application actor 修改。实时 PCM 使用对象内固定数组；采集 PCM、播放 PCM 与网络事件通过
-预分配有界环传递，不允许逐帧动态分配或无界等待。
+实时 PCM 使用固定数组和有界队列。代码不允许在逐帧路径中创建无界容器，也不允许 UI、
+网络或摄像头阻塞 capture/DSP 线程。
 
-有界队列、discontinuity barrier 和 consumer handoff 的具体 ownership 见
-[音频运行时边界](audio-runtime.md)；Rockchip 3A/Snowboy 与 vendor 依赖闸门见
-[音频后端契约与依赖闸门](audio-backends.md)。
+## 音频契约
 
-## 音频边界
+板端固定打开 Codec `Mode1`：
 
-`AudioEngine` 是 application 唯一可见的音频接口；其私有 `AudioBackend` 直接打开
-48 kHz/S16_LE Mode1 四通道 capture `[mic0,mic1,refL,refR]`
-和双通道 playback。20 ms capture 保持四通道相位完成 48→16 kHz；
-`RockchipVoiceDsp` 在 vendor 输入边界固定选择 `[mic0,mic1,refL]`，丢弃重复的 `refR`，
-其 mono 输出供 Snowboy、VAD 和 16 kHz 上行。
-24 kHz mono TTS 进入 75 帧/1.5 s 固定队列，经 24→48 kHz、gain/limiter 后播放；最终写入
-ALSA 的 PCM 由 Codec Mode1 数字回采到同帧 `refL/refR`，不再维护 software reference ring 或
-60 ms lead。高优先级采集线程在网络连接、云端等待和播放期间持续排空 ALSA，再通过
-4 × 20 ms 固定队列交给 application actor；actor 落后超过 80 ms 时清空旧帧并显式提交
-`discontinuity`，不会静默续接时间轴。xrun 或四通道重采样错位同样建立 discontinuity 并重置前端历史。
+- capture：48 kHz、S16_LE、4 通道、20 ms，布局为
+  `[mic0,mic1,refL,refR]`，ALSA period/buffer 为 `960/1920` frames；
+- playback：48 kHz、S16_LE、双通道，ALSA period/buffer 为 `960/3840` frames；
+- TTS：服务端下发 24 kHz、S16_LE、mono，板端重采样到 48 kHz 后复制到左右声道；
+- 3A：四通道保持同帧重采样到 16 kHz，只把 `[mic0,mic1,refL]` 送入 Rockchip 3A，
+  在 vendor 边界丢弃高度相关的 `refR`；
+- 上行：3A 输出的 16 kHz、S16_LE、mono 同时供 Snowboy、WebRTC VAD 和 WSS 使用。
 
-direct 3A 固定为 `init(16000,16,2,1)`、768-short 输入和 512-byte mono 输出；项目 profile
-使用 mask `1109`，启用 FastAEC、AES、ANR、Dereverberation 和 STDT，vendor AGC 关闭；
-STDT 为 `0.70/0.50`、`model_aec_en=0`。`ALC31/ref1/delay0` 是当前候选参数，不是最终声学
-定案。供应商公开 ABI 没有 DTD 事件，
-`wakeup_status` 不是 DTD；因此 `near_voice` 只使用 3A 后 VAD。首次有效硬参考后的
-600 ms warm-up 和自然结束后的 300 ms 尾音窗禁止触发；主动打断则保留近讲 VAD 历史。
+当前默认参数是 Snowboy `0.7`、VAD admission `-35 dBFS`、播放中近讲门限
+`-25 dBFS`。这些值是运行配置，不是声学指标；调整后必须重新完成真板测试。
 
-最新同类无人声/嘈杂环境 A/B 为：AGC ON `n=5`，`confirmed=4/5`、`follow=5/5`、
-`attempts=119`；AGC OFF 累计 `n=10`，`confirmed=2/10`、`follow=3/10`、`attempts=43`。
-关闭 AGC 明显降低误触发但仍不充分；当前环境噪声未受控，真人 double-talk 尚未验证。
+详细队列、故障和打断时序见 [音频运行时](audio-runtime.md)，vendor ABI 与依赖边界见
+[音频后端](audio-backends.md)。
 
-2026-07-31 已删除从未进入真实客户端 ELF 的通用 capture/DSP frontend、playback
-control/committer/worker、软件 ledger 和旧 ALSA adapter。当前取消直接由会话状态机执行：
-确认近端语音后 `DropPlayback`、清空固定 TTS 队列、发送云端 cancel，并把预卷作为下一轮
-utterance 开头。不得为了恢复历史测试结构重新引入这些抽象。
+## 状态、网络与 UI
 
-下列事项仍需目标板验收：
+应用状态包含待机、监听、思考、播放、drain、追问和离线。每个 turn 都带 generation；断线、
+取消或打断后递增 generation，旧响应、旧字幕和旧 PCM 不得进入新 turn。播放中确认近讲后，
+客户端停止剩余 TTS、发送 cancel，并把保留的 AEC 后 pre-roll 作为新一轮开头。
 
-- 两个 capture slot 的物理左右、极性和最终壳体下的双麦声学表现。
-- 最终壳体下硬件 reference 的残余回声、double-talk 与最大音量表现。
-- Rockchip 3A 的算法实时率和错误恢复；raw MPI 仍只是独立 HIL 候选。
-- 正常 TTS 结束后 3 s follow-up 在嘈杂环境中的残余误触发问题。
+显式 endpoint 优先，并只保留在 `client.env`，不再复制到 discovery 缓存。没有显式 endpoint
+时使用 UDP discovery；首次发现保存服务端 SPKI，之后地址可以变化，但 TLS 身份必须与已保存
+pin 一致。以太网优先，Wi-Fi 作为备用；Wi-Fi 页面提供配网入口。
 
-当前 DTB 的 `TRCM clk-trcm=1` 只表示共享 TX 时钟，不能独自证明四通道。第三块板的正交信号
-HIL 已确认 Mode1 顺序和 refL/refR 相关性；该结论不能外推到其他 BSP。详细证据见
-[P0 Mode1 硬件播放参考验证记录](../test/p0-mode1-hard-reference-validation-20260801.md)。
+LVGL 负责 320×240 桌面、静态小智状态表情、字幕、实时音量、网络和摄像头页面。UI 刷屏与
+触摸不拥有音频状态；点击小智只向 application actor 提交一次用户动作。
 
-## 状态与取消
+## 安全与证据边界
 
-会话状态和网络状态相互正交。application actor 创建 `turn_id` 和 `epoch`；网络重连、取消或打断后递增 generation，所有迟到帧必须被丢弃。
-
-播放期间先以原音量连续确认 6 帧（120 ms）近端候选，再一次性静音；不使用中间音量。
-随后最多等待 15 帧取得连续 3 帧低 reference，清尾 3 帧（60 ms）、重置 listener，并以
-连续 3 帧（60 ms）二次确认近端语音。成功后才清空本地 TTS 并请求服务端取消；新 turn
-另需有效 VAD start 和连续 20 帧（400 ms）低 reference，取消确认后的窗口上限为 500 ms。
-失败恢复播放并冷却 15 帧（300 ms）。自然播放结束时，backend 独立抑制 15 帧（300 ms）尾音，
-随后 follow-up 以连续 20 帧（400 ms）确认新一轮近讲。该主动硬参考探针是
-防自激的 containment 候选，不证明 AEC 已通过；其故意静音区间不得用于 AEC
-效果评分。新 utterance 携带当前连续可用、最多 500 ms 的 AEC 后 pre-roll；字幕按 response
-generation 删除。服务端若不能可靠把文本映射到实际播放位置，应删除整个
-被打断 assistant turn，不能把未播放全文留入上下文。
-
-## 网络与信任
-
-显式配置的 endpoint 不发起发现；未显式配置时广播固定 UDP 请求。响应主机只取 UDP 来源 IP；
-首次成功发现采用 TOFU 保存 SPKI，已有缓存时只接受相同 SPKI 的新地址，否则回退缓存地址。
-后续 TLS 握手仍必须匹配该 SPKI。客户端 `hello` 还携带教学版共享令牌，服务端在打开付费
-provider 会话前验证。此方案仅适合可信局域网，不声称提供企业级设备身份或抗恶意局域网攻击。
-
-WSS 承载 JSON 控制帧和二进制 PCM；心跳由服务端每 10 s 驱动，客户端自动回 pong。
-音频、Snowboy 和 UI 在网络工作线程之前打开；无缓存 endpoint 或服务端晚启动时，板端保持离线状态并继续发现，
-不再因三次失败停机。协议细节见 `protocol/protocol-v1.md`。断线后当前 turn 失败，实时语音不做应用层重传。
-
-## 守护与更新
-
-教学版使用 `/usr/sbin/boompi-clientctl` 启停前台客户端：异常退出后总计最多启动三次，手工更新只保留
-一个 `.bak`。它不是常驻 C++ supervisor，也不实现 A/B OTA、远程刷机或签名发布；BSP、内核
-和系统镜像仍由人工烧录。
-
-## 隐私边界
-
-- API Key 只存在于服务端私有 `config.yaml` 或进程环境，不下发到板端。
-- 默认不持久化 PCM、播放参考或完整会话文本。
-- 日志只记录脱敏状态、耗时、计数、错误码和 buffer 水位。
-- 诊断包不默认包含录音、完整对话、token、证书私钥或 Wi-Fi 凭据。
+- API Key、TLS 私钥和 Wi-Fi 凭据不得写入日志或提交到仓库。固定教学口令由两端代码内部
+  使用，学生不配置，也不能把它当成公网身份认证。
+- 默认不持久化 PCM、播放参考或完整对话文本。
+- Host 测试只能证明状态机、协议、ABI packing 和脚本控制流，不能证明真实 AEC、远场效果或
+  声学稳定性。
+- 交叉构建只能证明目标 ABI 和依赖闭包；Mode1 布局、AEC、自激、double-talk、触摸和摄像头
+  必须在目标板验证。
+- 当前可复现命令和验收边界统一记录在 [Host 与板端验证](../test/host-validation.md)。
