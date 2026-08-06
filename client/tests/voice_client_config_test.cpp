@@ -16,6 +16,14 @@ bool SetEnvironment(const char* name, const std::string& value) {
 #endif
 }
 
+bool UnsetEnvironment(const char* name) {
+#ifdef _WIN32
+  return _putenv_s(name, "") == 0;
+#else
+  return unsetenv(name) == 0;
+#endif
+}
+
 bool SetValidEnvironment() {
   const std::vector<std::pair<const char*, std::string>> values = {
       {"BOOMPI_SERVER_IP", "127.0.0.1"},
@@ -57,6 +65,16 @@ bool FixedBoardValuesAreKept() {
          config.speaker_gain_percent == 100U && config.barge_in_enabled;
 }
 
+bool DefaultVadAdmissionIsMinus30Dbfs() {
+  if (!SetValidEnvironment() || !UnsetEnvironment("BOOMPI_VAD_MIN_DBFS")) {
+    return false;
+  }
+  boompi::config::VoiceClientConfig config;
+  std::string error;
+  return boompi::config::LoadVoiceClientConfigFromEnvironment(&config, &error) &&
+         config.vad_min_dbfs == -30.0F;
+}
+
 bool Rejects(const char* name, const std::string& value) {
   if (!SetValidEnvironment() || !SetEnvironment(name, value)) return false;
   boompi::config::VoiceClientConfig config;
@@ -71,6 +89,10 @@ int main() {
   int failures = 0;
   if (!SetValidEnvironment() || !FixedBoardValuesAreKept()) {
     std::cerr << "valid configuration was rejected\n";
+    ++failures;
+  }
+  if (!DefaultVadAdmissionIsMinus30Dbfs()) {
+    std::cerr << "default VAD admission is not -30 dBFS\n";
     ++failures;
   }
   const std::vector<std::pair<const char*, std::string>> invalid = {

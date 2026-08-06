@@ -20,7 +20,7 @@ struct VoiceClientConfig final {
 
   std::uint8_t volume_percent{60U};           ///< 用户音量，闭区间 0..100。
   std::string snowboy_sensitivity{"0.7"};     ///< 当前人工验收的单关键词敏感度，闭区间 0..1。
-  float vad_min_dbfs{-35.0F};                 ///< 原始双麦较强一路的 VAD 能量门限，范围 -90..0 dBFS。
+  float vad_min_dbfs{-30.0F};                 ///< 原始双麦较强一路的 VAD 能量门限，范围 -90..0 dBFS。
   float barge_min_dbfs{-25.0F};               ///< AEC 后语音打断门限，范围 -90..0 dBFS。
   std::int8_t capture_left_polarity{1}, capture_right_polarity{1};  ///< 仅允许 +1/-1。
 };

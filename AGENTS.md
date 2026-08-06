@@ -57,7 +57,7 @@ TTS 左右声道相同，所以 `refR` 不进入 Rockchip 3A。四通道原始�
 
 ```text
 Snowboy sensitivity = 0.7
-VAD admission       = -35 dBFS
+VAD admission       = -30 dBFS
 barge-in            = -25 dBFS
 playback volume     = 60%
 pre-roll            = 500 ms

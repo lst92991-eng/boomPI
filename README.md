@@ -60,7 +60,7 @@ WSS 下发 24 kHz mono
 
 ```text
 Snowboy sensitivity = 0.7
-VAD admission       = -35 dBFS
+VAD admission       = -30 dBFS
 barge-in            = -25 dBFS
 playback volume     = 60%
 ```

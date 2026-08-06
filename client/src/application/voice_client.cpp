@@ -27,6 +27,7 @@ using audio::AudioEngine;
 using audio::AudioEngineConfig;
 using audio::CaptureFrame;
 using audio::CaptureResult;
+using audio::QueueTtsResult;
 using network::Control;
 using network::ControlKind;
 using network::Inbound;
@@ -41,8 +42,6 @@ using network::WireIds;
 using ui::DeviceUiAction;
 using ui::DeviceUiState;
 constexpr std::size_t kPreRollFrames = 25U;
-// 最慢探针路径可占 27 帧；再为 cancel ACK 保留完整 800 ms（40 帧）。
-constexpr std::size_t kBargeBufferFrames = 67U;
 constexpr unsigned kBargeCandidateFrames = 6U;
 constexpr unsigned kBargeReferenceLowFrames = 3U;
 constexpr unsigned kBargeReferenceWaitFrames = 15U;
@@ -50,6 +49,19 @@ constexpr unsigned kBargeEchoClearFrames = 3U;
 constexpr unsigned kBargeConfirmFrames = 3U;
 constexpr unsigned kBargeTailFreezeFrames = 10U;
 constexpr unsigned kBargeRetryCooldownFrames = 15U;
+constexpr std::size_t kAudioFrameMs = 20U;
+constexpr int kCancelAckWaitMs = 3000;
+constexpr std::size_t kMaximumBargeProbeFrames =
+    kBargeCandidateFrames + kBargeReferenceWaitFrames +
+    kBargeEchoClearFrames + kBargeConfirmFrames;
+constexpr std::size_t kCancelAckFrames =
+    (static_cast<std::size_t>(kCancelAckWaitMs) + kAudioFrameMs - 1U) /
+    kAudioFrameMs;
+// cancel 发出时 capture actor 还可能持有完整 4 槽队列；容量必须覆盖这些已采帧、
+// 最慢 27 帧探针和整个 3 s ACK 窗，不能在合法 deadline 前先丢掉打断语音。
+constexpr std::size_t kCaptureQueueSlackFrames = 4U;
+constexpr std::size_t kBargeBufferFrames =
+    kMaximumBargeProbeFrames + kCancelAckFrames + kCaptureQueueSlackFrames;
 constexpr std::uint32_t kMaximumTurnFrames = 3000U;  // 60 s：单次用户语音上限。
 /// Host harness 缩短等待但保留各 deadline 的相对顺序；板端始终采用 production_ms。
 constexpr auto TestableDuration([[maybe_unused]] const int production_ms,
@@ -67,7 +79,7 @@ constexpr auto kSpeechStartWait = TestableDuration(6000, 250);
 constexpr auto kMaximumTurnWait = TestableDuration(60000, 250);
 constexpr auto kFirstResponseHint = TestableDuration(15000, 15);
 constexpr auto kResponseWait = TestableDuration(30000, 300);
-constexpr auto kCancelAckWait = TestableDuration(3000, 250);
+constexpr auto kCancelAckWait = TestableDuration(kCancelAckWaitMs, 250);
 constexpr auto kDrainPlaybackWait = TestableDuration(30000, 20);
 constexpr auto kFollowUpWait = TestableDuration(3000, 30);
 // 追问不经过唤醒词，因此准入条件必须比播放期间的打断更严格。
@@ -76,6 +88,19 @@ constexpr auto kFollowUpWait = TestableDuration(3000, 30);
 constexpr unsigned kFollowUpNearFrames = 20U;
 constexpr unsigned kEventsPerCaptureFrame = 8U;
 constexpr auto kActorPollInterval = std::chrono::milliseconds(100);
+
+const char* QueueTtsResultName(const QueueTtsResult result) noexcept {
+  switch (result) {
+    case QueueTtsResult::kQueued: return "queued";
+    case QueueTtsResult::kNotOpen: return "not_open";
+    case QueueTtsResult::kInvalidArgument: return "invalid_argument";
+    case QueueTtsResult::kNotActive: return "not_active";
+    case QueueTtsResult::kEnding: return "ending";
+    case QueueTtsResult::kFull: return "full";
+    case QueueTtsResult::kDiscontinuous: return "discontinuous";
+  }
+  return "unknown";
+}
 
 /** WSS 线程单生产、主 actor 单消费；固定 64 项，溢出时主动断线而不是覆盖事件。 */
 class EventQueue final {
@@ -185,13 +210,15 @@ class VoiceClient final {
       const CaptureResult capture =
           audio_.Capture(&frame, kActorPollInterval);
       FinishConnect();
+      // 到期状态必须先封口；否则刚过 deadline 才入队的 ACK/响应会因本轮先消费
+      // 网络事件而重写 deadline，使同一时序随 Capture 返回时刻产生不同结果。
+      const bool frame_still_current = AdvanceDeadlines(Clock::now());
+      if (listener_failed_) return Fail(audio_.last_error());
       DrainEvents();
       PollUi();
       if (listener_failed_) return Fail(audio_.last_error());
       if (events_.overflowed()) LoseConnection("network event queue overflow");
       if (capture == CaptureResult::kFailed) return Fail(audio_.last_error());
-      const bool frame_still_current = AdvanceDeadlines(Clock::now());
-      if (listener_failed_) return Fail(audio_.last_error());
       if (capture == CaptureResult::kTimeout) continue;
       if (!frame_still_current) {
         // Deadline/drain transitions may intentionally reject the frame that
@@ -456,6 +483,7 @@ class VoiceClient final {
     pre_head_ = pre_count_ = 0U;
     ResetBargeProbe();
     ResetBargeTurn();
+    cancel_started_at_ = {};
     finish_after_cancel_ack_ = false;
     manual_wake_pending_ = false;
     ResetListener();
@@ -468,7 +496,7 @@ class VoiceClient final {
 
   void DrainEvents() {
     Inbound event{};
-    // capture PCM 只有 40 ms 缓冲；限制单帧事件消费量，避免持续下行饿死采集 actor。
+    // capture 环只有 4 × 20 ms（80 ms）缓冲；限制单帧事件消费量，避免持续下行饿死采集 actor。
     for (unsigned handled = 0U;
          handled < kEventsPerCaptureFrame && transport_ && !listener_failed_ &&
          events_.Pop(&event);
@@ -490,7 +518,8 @@ class VoiceClient final {
       return;
     }
     state_ = State::kCancelPending;
-    state_deadline_ = Clock::now() + kCancelAckWait;
+    cancel_started_at_ = Clock::now();
+    state_deadline_ = cancel_started_at_ + kCancelAckWait;
   }
 
   // WSS 回调只生产“已解码的单帧”。turn/epoch/response/sequence 都由
@@ -542,7 +571,7 @@ class VoiceClient final {
       } else if (session_error) {
         LoseConnection("session error");
       } else if (state_ == State::kCancelPending) {
-        CompleteCancel();
+        CompleteCancel(false);
       } else {
         FinishTurn(false);
       }
@@ -568,7 +597,7 @@ class VoiceClient final {
           return;
         }
         MarkFirstResponseProgress();
-        CompleteCancel();
+        CompleteCancel(true);
         return;
       }
       if (event.kind == InboundKind::kDone && IsCurrentResponse(event) &&
@@ -628,7 +657,7 @@ class VoiceClient final {
         ui_.SetState(DeviceUiState::kSpeaking);
         ResetBargeProbe();
         break;
-      case InboundKind::kPcm:
+      case InboundKind::kPcm: {
         if (!IsCurrentResponse(event) || !response_audio_started_ ||
             response_audio_ended_ || event.pcm.sequence != downlink_sequence_ ||
             ((event.pcm.sequence == 0U) != ((event.pcm.flags & 1U) != 0U))) {
@@ -640,13 +669,18 @@ class VoiceClient final {
           return;
         }
         MarkFirstResponseProgress();
-        if (!audio_.QueueTts24k(event.audio.data(), event.audio_size, event.pcm.sequence)) {
+        const QueueTtsResult queued = audio_.QueueTts24k(
+            event.audio.data(), event.audio_size, event.pcm.sequence);
+        if (queued != QueueTtsResult::kQueued) {
+          std::cerr << "boompi-client: TTS queue rejected; reason="
+                    << QueueTtsResultName(queued) << std::endl;
           AbortCurrent("TTS response cancel failed");
           return;
         }
         ++downlink_sequence_;
         response_audio_ended_ = (event.pcm.flags & 2U) != 0U;
         break;
+      }
       case InboundKind::kDone:
         if (!IsCurrentResponse(event) || event.response_id != response_id_ ||
             (response_audio_started_ && !response_audio_ended_)) {
@@ -708,7 +742,14 @@ class VoiceClient final {
     StartTurn(utterance_ended);
   }
 
-  void CompleteCancel() {
+  void CompleteCancel(const bool acknowledged) {
+    if (acknowledged && cancel_started_at_ != Clock::time_point{}) {
+      const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+          Clock::now() - cancel_started_at_);
+      std::cout << "boompi-client: cancel ACK wait_ms=" << wait.count()
+                << std::endl;
+    }
+    cancel_started_at_ = {};
     if (finish_after_cancel_ack_) {
       FinishTurn(false);
       return;
@@ -799,6 +840,12 @@ class VoiceClient final {
   // turn.start 成功后先发送最老的 pre-roll，再发送实时帧。若打断句在
   // cancel ACK 前已结束，最后一条冻结帧同时携带 END，不把 ACK 后的静音当成用户语音。
   bool StartTurn(const bool buffered_utterance_ended = false) {
+    const std::size_t buffered_frames = pre_count_;
+    if (buffered_utterance_ended && buffered_frames == 0U) {
+      // 先拒绝本地不完整输入，不能在 wire 上留下没有 PCM/commit 的孤立 turn。
+      LoseConnection("empty buffered barge turn");
+      return false;
+    }
     if (turn_ids_.session == 0U ||
         !SendControl(ControlKind::kTurnStart, turn_ids_)) {
       LoseConnection("turn.start failed");
@@ -810,11 +857,6 @@ class VoiceClient final {
     // 仍会取消当前 turn，而不是永久占住会话。
     state_deadline_ = Clock::now() + kMaximumTurnWait;
     ui_.SetState(DeviceUiState::kListening);
-    const std::size_t buffered_frames = pre_count_;
-    if (buffered_utterance_ended && buffered_frames == 0U) {
-      LoseConnection("empty buffered barge turn");
-      return false;
-    }
     for (std::size_t i = 0U; i < buffered_frames; ++i)
       if (!SendAudioOrRecover(pre_[(pre_head_ + i) % pre_.size()],
                               buffered_utterance_ended && i + 1U == buffered_frames,
@@ -918,7 +960,8 @@ class VoiceClient final {
       LoseConnection("response.cancel failed");
     else {
       state_ = State::kCancelPending;
-      state_deadline_ = Clock::now() + kCancelAckWait;
+      cancel_started_at_ = Clock::now();
+      state_deadline_ = cancel_started_at_ + kCancelAckWait;
     }
   }
 
@@ -1039,6 +1082,7 @@ class VoiceClient final {
   Clock::time_point next_connect_{};
   Clock::time_point heartbeat_deadline_{};
   Clock::time_point await_hint_at_{};
+  Clock::time_point cancel_started_at_{};
   std::uint64_t next_capture_sequence_{0U};
   std::uint32_t message_{1U};
   std::uint32_t uplink_sequence_{0U};

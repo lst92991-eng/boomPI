@@ -19,6 +19,13 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 0' INT TERM
 
+[ "${1:-}" != '--no-panel' ] || export BOOMPI_PROVISION_NO_PANEL=1
+
+[ -d /sys/class/net/wlan0 ] || {
+  echo 'boompi-provision: Wi-Fi interface wlan0 is unavailable' >&2
+  exit 1
+}
+
 killall wpa_supplicant 2>/dev/null || true
 mkdir -p /run
 cat > "$AP_CONF" <<'EOF'

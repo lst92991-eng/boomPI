@@ -142,7 +142,7 @@ bool LoadVoiceClientConfigFromEnvironment(VoiceClientConfig* const output,
   }
   if (output->snowboy_sensitivity.empty()) output->snowboy_sensitivity = "0.7";
   if (!IsSnowboySensitivity(output->snowboy_sensitivity)) return Bad("BOOMPI_SNOWBOY_SENSITIVITY", error);
-  if (!ReadFloat("BOOMPI_VAD_MIN_DBFS", -35.0F, -90.0F, 0.0F,
+  if (!ReadFloat("BOOMPI_VAD_MIN_DBFS", -30.0F, -90.0F, 0.0F,
                  &output->vad_min_dbfs, error) ||
       !ReadFloat("BOOMPI_BARGE_MIN_DBFS", -25.0F, -90.0F, 0.0F,
                  &output->barge_min_dbfs, error))

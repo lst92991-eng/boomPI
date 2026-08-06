@@ -20,6 +20,8 @@
 
 namespace {
 
+using boompi::audio::QueueTtsResult;
+
 constexpr std::size_t kTtsFrameBytes = 480U * sizeof(std::int16_t);
 constexpr std::size_t kMaximumTtsFrames = 70U;  // 1.4 s，低于生产 1.5 s 环容量。
 constexpr unsigned kSettleFrames = 250U;
@@ -294,12 +296,13 @@ int main(int argc, char* argv[]) {
   const std::size_t initial_frames =
       std::min(playback_frames, kPrequeueFrames);
   for (; next_fixture_frame < initial_frames; ++next_fixture_frame) {
-    if (!audio.QueueTts24k(
-                           fixture.data() +
-                               (next_fixture_frame % fixture_frames) * kTtsFrameBytes,
-                           kTtsFrameBytes, next_fixture_frame)) {
-      std::cerr << "boompi-aec-loop-hil: fixture queue failed: "
-                << audio.last_error() << '\n';
+    const QueueTtsResult queued = audio.QueueTts24k(
+        fixture.data() +
+            (next_fixture_frame % fixture_frames) * kTtsFrameBytes,
+        kTtsFrameBytes, next_fixture_frame);
+    if (queued != QueueTtsResult::kQueued) {
+      std::cerr << "boompi-aec-loop-hil: fixture queue failed; result="
+                << static_cast<unsigned>(queued) << '\n';
       return EXIT_FAILURE;
     }
   }
@@ -323,12 +326,14 @@ int main(int argc, char* argv[]) {
   std::uint32_t reference_timeline_frames = 0U, score_frame = 0U;
   for (unsigned index = 0U; index < kMaximumCaptureFrames; ++index) {
     if (next_fixture_frame < playback_frames) {
-      if (!audio.QueueTts24k(
-              fixture.data() +
-                  (next_fixture_frame % fixture_frames) * kTtsFrameBytes,
-              kTtsFrameBytes, next_fixture_frame)) {
-        std::cerr << "boompi-aec-loop-hil: streaming fixture queue failed: "
-                  << audio.last_error() << '\n';
+      const QueueTtsResult queued = audio.QueueTts24k(
+          fixture.data() +
+              (next_fixture_frame % fixture_frames) * kTtsFrameBytes,
+          kTtsFrameBytes, next_fixture_frame);
+      if (queued != QueueTtsResult::kQueued) {
+        std::cerr
+            << "boompi-aec-loop-hil: streaming fixture queue failed; result="
+            << static_cast<unsigned>(queued) << '\n';
         return EXIT_FAILURE;
       }
       ++next_fixture_frame;

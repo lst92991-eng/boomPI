@@ -41,6 +41,8 @@ void SetRealtimePriority(const char* name, int priority) noexcept {
 }
 
 struct AudioEngine::Impl final {
+  using Clock = std::chrono::steady_clock;
+
   struct TtsSlot final { std::array<std::int16_t, kTts24FrameSamples> pcm{}; std::size_t used{0U}; };
   enum class CaptureCommand : std::uint8_t {
     kNone, kResetListener, kPreparePlayback
@@ -60,6 +62,10 @@ struct AudioEngine::Impl final {
   std::array<TtsSlot, kTtsSlots> tts{};
   std::size_t tts_head{0U}, tts_tail{0U}, tts_count{0U}, queued_samples{0U};
   std::uint64_t capture_sequence{0U}, next_tts_sequence{0U}, rebuffer_events{0U};
+  std::size_t tts_high_water_samples{0U};
+  std::uint64_t maximum_pcm_gap_ms{0U};
+  std::uint64_t rebuffer_total_ms{0U}, rebuffer_maximum_ms{0U};
+  Clock::time_point last_pcm_at{}, rebuffer_started_at{};
   bool open{false}, capture_failed{false};
   bool active{false}, ending{false}, playback_started{false}, rebuffering{false};
   bool drop{false}, sequence_set{false};
@@ -71,9 +77,30 @@ struct AudioEngine::Impl final {
     std::lock_guard<std::mutex> lock(error_mutex);
     std::snprintf(error.data(), error.size(), "%s", text);
   }
+  void ClearError() noexcept {
+    std::lock_guard<std::mutex> lock(error_mutex);
+    error.fill('\0');
+  }
   void ClearQueue() noexcept {
     for (auto& slot : tts) { slot.pcm.fill(0); slot.used = 0U; }
     tts_head = tts_tail = tts_count = queued_samples = 0U;
+  }
+
+  void ResetPlaybackMetrics() noexcept {
+    tts_high_water_samples = 0U;
+    maximum_pcm_gap_ms = 0U;
+    rebuffer_events = rebuffer_total_ms = rebuffer_maximum_ms = 0U;
+    last_pcm_at = rebuffer_started_at = {};
+  }
+
+  void FinishRebufferInterval(const Clock::time_point now) noexcept {
+    if (rebuffer_started_at == Clock::time_point{}) return;
+    const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - rebuffer_started_at);
+    const auto milliseconds = static_cast<std::uint64_t>(duration.count());
+    rebuffer_total_ms += milliseconds;
+    rebuffer_maximum_ms = std::max(rebuffer_maximum_ms, milliseconds);
+    rebuffer_started_at = {};
   }
 
   void ClearCaptureQueue() noexcept {
@@ -200,11 +227,21 @@ struct AudioEngine::Impl final {
     std::lock_guard<std::mutex> lock(mutex);
     // DropPlayback 持有同一把锁先中断 PCM；因此这里可安全完成 prepare。
     if (drop && !discard) { discard = true; failed = false; backend.DropPlayback(); }
-    if (rebuffer_events != 0U)
-      std::fprintf(stderr, "boompi-client: TTS rebuffer events=%llu\n",
-                   static_cast<unsigned long long>(rebuffer_events));
+    FinishRebufferInterval(Clock::now());
+    std::fprintf(
+        stderr,
+        "boompi-client: TTS playback summary; queue_high_water_ms=%llu; "
+        "max_pcm_gap_ms=%llu; rebuffer_events=%llu; rebuffer_total_ms=%llu; "
+        "rebuffer_max_ms=%llu\n",
+        static_cast<unsigned long long>(tts_high_water_samples * 1000U /
+                                        24000U),
+        static_cast<unsigned long long>(maximum_pcm_gap_ms),
+        static_cast<unsigned long long>(rebuffer_events),
+        static_cast<unsigned long long>(rebuffer_total_ms),
+        static_cast<unsigned long long>(rebuffer_maximum_ms));
     active = ending = drop = playback_started = rebuffering = false;
-    rebuffer_events = 0U; ClearQueue();
+    ResetPlaybackMetrics();
+    ClearQueue();
     playback_scale.store(1.0F, std::memory_order_release);
     playback_failed.store(failed, std::memory_order_release);
     is_done.store(true, std::memory_order_release);
@@ -226,6 +263,7 @@ struct AudioEngine::Impl final {
                      tts_count != 0U;
             })) {
           rebuffering = true;
+          rebuffer_started_at = Clock::now();
           ++rebuffer_events;
         }
         condition.wait(lock, [this] {
@@ -242,6 +280,7 @@ struct AudioEngine::Impl final {
         if (stop.load(std::memory_order_acquire)) break;
         must_drop = drop;
         if (!must_drop && tts_count != 0U) {
+          FinishRebufferInterval(Clock::now());
           rebuffering = false;
           playback_started = true;
           slot = tts[tts_head];
@@ -286,6 +325,7 @@ bool AudioEngine::Open(const AudioEngineConfig& config) noexcept {
     Close();
     return false;
   }
+  impl_->ClearError();
   return true;
 }
 
@@ -317,17 +357,22 @@ bool AudioEngine::ResetListener() noexcept {
   return impl_->RunCaptureCommand(Impl::CaptureCommand::kResetListener);
 }
 
-bool AudioEngine::QueueTts24k(const std::uint8_t* const bytes, const std::size_t byte_count,
-                        const std::uint64_t sequence) noexcept {
-  if (impl_ == nullptr || !impl_->open || bytes == nullptr || byte_count == 0U || (byte_count & 1U) != 0U) return false;
+QueueTtsResult AudioEngine::QueueTts24k(
+    const std::uint8_t* const bytes, const std::size_t byte_count,
+    const std::uint64_t sequence) noexcept {
+  if (impl_ == nullptr || !impl_->open) return QueueTtsResult::kNotOpen;
+  if (bytes == nullptr || byte_count == 0U || (byte_count & 1U) != 0U)
+    return QueueTtsResult::kInvalidArgument;
   const std::size_t samples = byte_count / 2U;
   // WSS 事件已经回到 actor 线程，此处是 TTS ring 的唯一生产者。
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (!impl_->active || impl_->ending || samples > kTtsSlots * kTts24FrameSamples - impl_->queued_samples ||
-      (impl_->sequence_set && sequence != impl_->next_tts_sequence)) {
-    impl_->SetError("TTS queue is full, closed, or discontinuous");
-    return false;
-  }
+  if (!impl_->active) return QueueTtsResult::kNotActive;
+  if (impl_->ending) return QueueTtsResult::kEnding;
+  if (samples > kTtsSlots * kTts24FrameSamples - impl_->queued_samples)
+    return QueueTtsResult::kFull;
+  if (impl_->sequence_set && sequence != impl_->next_tts_sequence)
+    return QueueTtsResult::kDiscontinuous;
+  const auto queued_at = Impl::Clock::now();
   std::size_t source = 0U;
   while (source < samples) {
     if (impl_->tts_count == 0U || impl_->tts[(impl_->tts_tail + kTtsSlots - 1U) % kTtsSlots].used == kTts24FrameSamples) {
@@ -346,10 +391,20 @@ bool AudioEngine::QueueTts24k(const std::uint8_t* const bytes, const std::size_t
     source += copied;
   }
   impl_->queued_samples += samples;
+  impl_->tts_high_water_samples =
+      std::max(impl_->tts_high_water_samples, impl_->queued_samples);
+  if (impl_->last_pcm_at != Impl::Clock::time_point{}) {
+    const auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(
+        queued_at - impl_->last_pcm_at);
+    impl_->maximum_pcm_gap_ms = std::max(
+        impl_->maximum_pcm_gap_ms,
+        static_cast<std::uint64_t>(gap.count()));
+  }
+  impl_->last_pcm_at = queued_at;
   impl_->sequence_set = true;
   impl_->next_tts_sequence = sequence + 1U;
   impl_->condition.notify_one();
-  return true;
+  return QueueTtsResult::kQueued;
 }
 
 bool AudioEngine::BeginPlayback() noexcept {
@@ -361,9 +416,11 @@ bool AudioEngine::BeginPlayback() noexcept {
   // 返回后才置 active，随后的渲染热路径只属于 playback 线程。
   if (!impl_->RunCaptureCommand(Impl::CaptureCommand::kPreparePlayback))
     return false;
+  impl_->ClearError();
   impl_->sequence_set = impl_->ending = impl_->drop = impl_->playback_started =
       impl_->rebuffering = false;
-  impl_->rebuffer_events = 0U; impl_->active = true;
+  impl_->ResetPlaybackMetrics();
+  impl_->active = true;
   impl_->playback_scale.store(1.0F, std::memory_order_release);
   impl_->playback_failed.store(false, std::memory_order_release);
   impl_->is_done.store(false, std::memory_order_release);
@@ -425,7 +482,7 @@ void AudioEngine::Close() noexcept {
   impl_->backend.Close();
   impl_->open = impl_->active = impl_->ending = impl_->drop =
       impl_->playback_started = impl_->rebuffering = false;
-  impl_->rebuffer_events = 0U;
+  impl_->ResetPlaybackMetrics();
   impl_->stop.store(false, std::memory_order_release);
   impl_->capture_failed = false;
   impl_->capture_command = Impl::CaptureCommand::kNone;

@@ -69,7 +69,7 @@ Go server -> 设备会话、当前对话、Qwen 中国区适配、TLS 身份
   在 vendor 边界丢弃高度相关的 `refR`；
 - 上行：3A 输出的 16 kHz、S16_LE、mono 同时供 Snowboy、WebRTC VAD 和 WSS 使用。
 
-当前默认参数是 Snowboy `0.7`、VAD admission `-35 dBFS`、播放中近讲门限
+当前默认参数是 Snowboy `0.7`、VAD admission `-30 dBFS`、播放中近讲门限
 `-25 dBFS`。这些值是运行配置，不是声学指标；调整后必须重新完成真板测试。
 
 详细队列、故障和打断时序见 [音频运行时](audio-runtime.md)，vendor ABI 与依赖边界见

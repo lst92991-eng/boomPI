@@ -152,5 +152,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    show_qr()
+    if os.environ.get("BOOMPI_PROVISION_NO_PANEL") != "1":
+        show_qr()
     HTTPServer(("0.0.0.0", 80), Handler).serve_forever()

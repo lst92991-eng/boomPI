@@ -338,6 +338,26 @@ void CancelDeadlineConsumesDequeuedCaptureFrame() {
         "cancel frame-fence fabricated a sequence gap and extra listener reset");
 }
 
+void LateCancelAckCannotCrossDeadline() {
+  HarnessPlan plan{};
+  plan.capture = {Wake(), SpeechStart(), SpeechEnd(), StartResponse()};
+  CaptureStep touch = Quiet();
+  touch.actions.push_back(DeviceUiAction::kInterrupt);
+  plan.capture.push_back(touch);
+  CaptureStep late_ack = DelayedQuiet(260U);
+  late_ack.inbound.push_back(Event(InboundKind::kCancelled));
+  late_ack.stop_after = true;
+  plan.capture.push_back(std::move(late_ack));
+
+  const auto result = Run(std::move(plan));
+  Check(CountControl(result, ControlKind::kResponseCancel) == 1U,
+        "late ACK test did not send exactly one response.cancel");
+  Check(result.transport_closes >= 1U,
+        "ACK dequeued after its deadline revived the old transport");
+  Check(CountState(result, DeviceUiState::kHappy) == 0U,
+        "ACK dequeued after its deadline completed the cancelled turn");
+}
+
 void FollowUpDeadlineAdvancesWithoutCaptureFrames() {
   HarnessPlan plan{};
   plan.capture = {Wake(), SpeechStart(), SpeechEnd(), StartResponse()};
@@ -795,6 +815,26 @@ HarnessPlan BargeUtterancePlan() {
   return plan;
 }
 
+HarnessPlan MaximumBargeProbePlan() {
+  HarnessPlan plan{};
+  plan.capture = {Wake(), SpeechStart(), SpeechEnd(), StartResponse()};
+  for (unsigned i = 0U; i != 6U; ++i) {
+    auto step = NearVoice(true);
+    step.frame.vad_started = i == 0U;
+    plan.capture.push_back(step);
+  }
+  // 最慢合法路径在 reference wait 的最后 3 帧才观察到连续低参考。
+  for (unsigned i = 0U; i != 12U; ++i)
+    plan.capture.push_back(NearVoice(true));
+  for (unsigned i = 0U; i != 3U; ++i)
+    plan.capture.push_back(NearVoice(false));
+  for (unsigned i = 0U; i != 3U; ++i)
+    plan.capture.push_back(NearVoice(false));
+  for (unsigned i = 0U; i != 3U; ++i)
+    plan.capture.push_back(NearVoice(false));
+  return plan;
+}
+
 void CheckBargeCommittedAsNewTurn(const HarnessSnapshot& result) {
   Check(CountControl(result, ControlKind::kResponseCancel) == 1U,
         "barge utterance did not cancel exactly one response");
@@ -847,6 +887,23 @@ void BargeLongUtteranceCrossesAck() {
   plan.capture.push_back(SpeechEnd());
 
   CheckBargeCommittedAsNewTurn(Run(std::move(plan)));
+}
+
+void BargeBufferCoversDelayedAck() {
+  auto plan = MaximumBargeProbePlan();
+  // 150 帧覆盖 production 的 3 s ACK 窗；再覆盖确认 cancel 时 capture actor
+  // 可能已经持有的完整 4 槽队列。ACK 帧本身在事件封口后进入新 turn。
+  for (unsigned i = 0U; i != 154U; ++i)
+    plan.capture.push_back(NearVoice(false));
+  CaptureStep ack = SpeechEnd();
+  ack.inbound.push_back(Event(InboundKind::kCancelled));
+  ack.stop_after = true;
+  plan.capture.push_back(std::move(ack));
+
+  const auto result = Run(std::move(plan));
+  Check(result.connections == 1U,
+        "delayed cancel ACK unnecessarily rebuilt WSS");
+  CheckBargeCommittedAsNewTurn(result);
 }
 
 void CancelDoneReorderingIsIdempotent() {
@@ -983,6 +1040,8 @@ int main(const int argc, char** const argv) {
       CancelDeadlineAdvancesWithoutCaptureFrames();
     else if (scenario == "cancel-frame-timeout")
       CancelDeadlineConsumesDequeuedCaptureFrame();
+    else if (scenario == "cancel-late-ack")
+      LateCancelAckCannotCrossDeadline();
     else if (scenario == "follow-up-timeout")
       FollowUpDeadlineAdvancesWithoutCaptureFrames();
     else if (scenario == "follow-up-frame-timeout")
@@ -1017,6 +1076,8 @@ int main(const int argc, char** const argv) {
       BargeShortUtteranceEndsBeforeAck();
     else if (scenario == "barge-long-across-ack")
       BargeLongUtteranceCrossesAck();
+    else if (scenario == "barge-delayed-ack")
+      BargeBufferCoversDelayedAck();
     else if (scenario == "cancel-done") CancelDoneReorderingIsIdempotent();
     else if (scenario == "stale-epoch") StaleEpochCannotMutateNextTurn();
     else if (scenario == "session-error-after-turn")

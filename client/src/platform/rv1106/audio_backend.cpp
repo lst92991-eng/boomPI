@@ -212,6 +212,10 @@ struct AudioBackend::Impl final {
     if (code == 0) std::snprintf(error.data(), error.size(), "%s", text);
     else std::snprintf(error.data(), error.size(), "%s: %s", text, snd_strerror(code));
   }
+  void ClearError() noexcept {
+    std::lock_guard<std::mutex> lock(error_mutex);
+    error.fill('\0');
+  }
   bool ResetSwr(SwrContext* swr, const std::int16_t* input, int input_frames,
                 int output_frames, std::int16_t* output) noexcept {
     swr_close(swr); if (swr_init(swr) < 0) return false;
@@ -379,6 +383,7 @@ bool AudioBackend::Open(const AudioEngineConfig& config) noexcept {
   }
   impl_->open = true;
   impl_->capture_interrupted.store(false, std::memory_order_release);
+  impl_->ClearError();
   std::fprintf(stderr,
                "boompi-client: VAD configured; mode=%d; min_dbfs=%.1f; source=raw-mic-max\n",
                kVadMode, static_cast<double>(config.vad_min_dbfs));
@@ -522,6 +527,7 @@ bool AudioBackend::PreparePlayback() noexcept {
   impl_->playback_ended.store(false, std::memory_order_release);
   impl_->playback_interrupted.store(false, std::memory_order_release);
   impl_->playback_render_started.store(false, std::memory_order_release);
+  impl_->ClearError();
   return true;
 }
 

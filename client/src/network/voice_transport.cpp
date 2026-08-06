@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -33,6 +35,7 @@ constexpr std::size_t kMaxUplinkPcmBytes = 640U;
 constexpr std::size_t kMaxDownlinkPcmBytes = Inbound::kMaximumPcmBytes;
 constexpr std::size_t kMaxMessageBytes = kHeaderBytes + 64U * 1024U;
 constexpr std::size_t kMaxBufferedBytes = 28U * 1024U;  // 约 800 ms 上行帧。
+constexpr auto kSendDispatchWait = std::chrono::milliseconds(20);
 constexpr std::uint16_t kKnownFlags = 7;
 constexpr char kTeachingDeviceToken[] =
     "boompi-teaching-shared-token-v1-2026";
@@ -93,8 +96,8 @@ struct ParsedEnvelope final {
   WireIds ids{};
 };
 
-enum class QueueCapacity : std::uint8_t {
-  kAvailable,
+enum class SendStatus : std::uint8_t {
+  kSent,
   kFull,
   kUnavailable,
 };
@@ -233,6 +236,7 @@ class VoiceTransport::Impl final {
       if (!closing_) Fail(c->get_remote_close_reason().empty() ? "connection closed" :
                                                            c->get_remote_close_reason());
     });
+    client_.set_interrupt_handler([this](Hdl h) { HandlePendingSend(h); });
     client_.set_message_handler([this](Hdl, Client::message_ptr m) { OnMessage(m); });
     client_.set_ping_handler([this](Hdl, const std::string&) { Inbound e{}; e.kind = InboundKind::kHeartbeat; Emit(std::move(e)); return true; });
     websocketpp::lib::error_code ec;
@@ -296,15 +300,11 @@ class VoiceTransport::Impl final {
   bool SendText(const std::string& json,
                 const bool cancellation = false) {
     if (!connected_ || json.empty() || json.size() > 64U * 1024U) return false;
-    websocketpp::lib::error_code ec;
-    std::lock_guard<std::mutex> lock(send_mutex_);
-    const QueueCapacity capacity = CheckQueueCapacity(json.size());
-    if (capacity == QueueCapacity::kUnavailable ||
-        (capacity == QueueCapacity::kFull && !cancellation)) return false;
     // 每轮最多发一个取消控制帧。即使 PCM 已达到背压线，也允许这一个小帧排在
     // 已接受的音频之后，避免把局部拥塞放大成 TLS/provider 会话重建。
-    client_.send(hdl_, json, websocketpp::frame::opcode::text, ec);
-    return !ec;
+    return DispatchSend(json.data(), json.size(),
+                        websocketpp::frame::opcode::text,
+                        cancellation) == SendStatus::kSent;
   }
 
   SendOutcome SendPcm(const Pcm64Header& h, const std::uint8_t* pcm,
@@ -336,16 +336,13 @@ class VoiceTransport::Impl final {
     Put32(h.ids.turn, p + 56);
     Put32(h.ids.stream, p + 60);
     std::memcpy(p + 64, pcm, bytes);
-    websocketpp::lib::error_code ec;
-    std::lock_guard<std::mutex> lock(send_mutex_);
     // 缓冲满只是瞬时背压：本帧未发、sequence 不前移，由调用方取消当前 turn。
-    const QueueCapacity capacity = CheckQueueCapacity(kHeaderBytes + bytes);
-    if (capacity == QueueCapacity::kFull) return SendOutcome::kBackpressure;
-    if (capacity == QueueCapacity::kUnavailable) return SendOutcome::kRejected;
-    client_.send(hdl_, frame.data(), kHeaderBytes + bytes,
-                 websocketpp::frame::opcode::binary, ec);
-    if (ec) return SendOutcome::kRejected;
-    return SendOutcome::kOk;
+    const SendStatus status = DispatchSend(
+        frame.data(), kHeaderBytes + bytes,
+        websocketpp::frame::opcode::binary, false);
+    if (status == SendStatus::kFull) return SendOutcome::kBackpressure;
+    return status == SendStatus::kSent ? SendOutcome::kOk
+                                       : SendOutcome::kRejected;
   }
 
   void Close() noexcept {
@@ -353,7 +350,9 @@ class VoiceTransport::Impl final {
     // 避免 connected=false 时只停 perpetual work、却在 join 中永远等待 pending connect。
     if (!closing_.exchange(true)) {
       websocketpp::lib::error_code ec;
-      if (connected_.exchange(false)) client_.close(hdl_, websocketpp::close::status::normal, "", ec);
+      const bool was_connected = connected_.exchange(false);
+      CancelPendingSend();
+      if (was_connected) client_.close(hdl_, websocketpp::close::status::normal, "", ec);
       client_.stop_perpetual();
       client_.stop();
     }
@@ -362,21 +361,92 @@ class VoiceTransport::Impl final {
   bool connected() const noexcept { return connected_; }
 
  private:
+  struct PendingSend final {
+    std::array<std::uint8_t, kMaxMessageBytes> bytes{};
+    std::size_t size{0U};
+    websocketpp::frame::opcode::value opcode{
+        websocketpp::frame::opcode::text};
+    SendStatus status{SendStatus::kUnavailable};
+    bool cancellation{false};
+    bool queued{false};
+    bool done{false};
+  };
+
   static bool ValidIds(const WireIds& i) { return i.session && i.turn && i.stream && i.epoch; }
-  QueueCapacity CheckQueueCapacity(std::size_t bytes) noexcept {
-    try {
-      const std::size_t queued = client_.get_con_from_hdl(hdl_)->get_buffered_amount();
-      if (queued <= kMaxBufferedBytes &&
-          bytes <= kMaxBufferedBytes - queued) {
-        return QueueCapacity::kAvailable;
-      }
-      return QueueCapacity::kFull;
-    } catch (...) {
-      return QueueCapacity::kUnavailable;
+  SendStatus DispatchSend(const void* const bytes, const std::size_t size,
+                          const websocketpp::frame::opcode::value opcode,
+                          const bool cancellation) noexcept {
+    std::lock_guard<std::mutex> submit_lock(send_mutex_);
+    if (!connected_.load(std::memory_order_acquire) ||
+        closing_.load(std::memory_order_acquire) || bytes == nullptr ||
+        size == 0U || size > kMaxMessageBytes) {
+      return SendStatus::kUnavailable;
     }
+    std::unique_lock<std::mutex> lock(pending_mutex_);
+    if (pending_.queued) return SendStatus::kUnavailable;
+    std::memcpy(pending_.bytes.data(), bytes, size);
+    pending_.size = size;
+    pending_.opcode = opcode;
+    pending_.status = SendStatus::kUnavailable;
+    pending_.cancellation = cancellation;
+    pending_.queued = true;
+    pending_.done = false;
+    websocketpp::lib::error_code ec;
+    client_.interrupt(hdl_, ec);
+    if (ec) {
+      pending_.queued = false;
+      return SendStatus::kUnavailable;
+    }
+    if (!pending_changed_.wait_for(lock, kSendDispatchWait,
+                                   [this] { return pending_.done; })) {
+      // A rejected request must never be sent later: that would advance the
+      // wire sequence after the application has already cancelled the turn.
+      pending_.queued = false;
+      return SendStatus::kUnavailable;
+    }
+    return pending_.status;
+  }
+
+  void HandlePendingSend(const Hdl h) noexcept {
+    std::unique_lock<std::mutex> lock(pending_mutex_);
+    if (!pending_.queued) return;
+    SendStatus status = SendStatus::kUnavailable;
+    try {
+      websocketpp::lib::error_code ec;
+      const auto connection = client_.get_con_from_hdl(h, ec);
+      if (!ec && connection && connected_.load(std::memory_order_acquire) &&
+          !closing_.load(std::memory_order_acquire)) {
+        const std::size_t queued = connection->get_buffered_amount();
+        const bool full = queued > kMaxBufferedBytes ||
+                          pending_.size > kMaxBufferedBytes - queued;
+        if (full && !pending_.cancellation) {
+          status = SendStatus::kFull;
+        } else {
+          ec = connection->send(pending_.bytes.data(), pending_.size,
+                                pending_.opcode);
+          if (!ec) status = SendStatus::kSent;
+        }
+      }
+    } catch (...) {
+    }
+    pending_.status = status;
+    pending_.queued = false;
+    pending_.done = true;
+    lock.unlock();
+    pending_changed_.notify_one();
+  }
+
+  void CancelPendingSend() noexcept {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    if (!pending_.queued) return;
+    pending_.status = SendStatus::kUnavailable;
+    pending_.queued = false;
+    pending_.done = true;
+    pending_changed_.notify_one();
   }
   void Fail(std::string why) {
     connected_ = false;
+    CancelPendingSend();
     if (error_) try {
       error_(std::move(why));
     } catch (...) {
@@ -526,6 +596,9 @@ class VoiceTransport::Impl final {
   ErrorHandler error_;
   std::thread thread_;
   std::mutex send_mutex_;
+  std::mutex pending_mutex_;
+  std::condition_variable pending_changed_;
+  PendingSend pending_;
   std::atomic<bool> connected_{false};
   std::atomic<bool> closing_{false};
   std::array<std::uint8_t, 16> uuid_{};

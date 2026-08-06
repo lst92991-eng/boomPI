@@ -1,5 +1,5 @@
 #!/bin/sh
-# BusyBox 教学版入口：一个进程、三次有限重启、一个手工回退版本。
+# BusyBox 教学版入口：一个进程、三次有限重启、更新启动失败自动回滚。
 
 umask 077
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -23,7 +23,7 @@ prepare() {
 BOOMPI_DEVICE_ID=$device_id
 BOOMPI_VOLUME_PERCENT=60
 BOOMPI_SNOWBOY_SENSITIVITY=0.7
-BOOMPI_VAD_MIN_DBFS=-35
+BOOMPI_VAD_MIN_DBFS=-30
 BOOMPI_BARGE_MIN_DBFS=-25
 BOOMPI_CAPTURE_LEFT_POLARITY=1
 BOOMPI_CAPTURE_RIGHT_POLARITY=1
@@ -89,6 +89,19 @@ run_loop() {
   exit "$code"
 }
 
+launch_client() {
+  checks=${1:-1}
+  [ ! -f "$LOG" ] || [ "$(wc -c < "$LOG")" -le 1048576 ] || mv -f "$LOG" "$LOG.1"
+  nohup "$0" _run >> "$LOG" 2>&1 & echo $! > "$PID"
+  checked=0
+  while [ "$checked" -lt "$checks" ]; do
+    sleep 1
+    checked=$((checked + 1))
+    if ! running; then rm -f "$PID" "$CHILD_PID"; return 1; fi
+  done
+  return 0
+}
+
 start() {
   skip_provision=${1:-0}
   prepare
@@ -96,9 +109,7 @@ start() {
   rm -f "$PID"; [ -x "$APP" ] || fail 'client is not installed'
   load_config; "$APP" --check-config >/dev/null || fail 'configuration check failed'
   if [ "$skip_provision" -eq 0 ] && needs_provision; then launch_provision 0; return; fi
-  [ ! -f "$LOG" ] || [ "$(wc -c < "$LOG")" -le 1048576 ] || mv -f "$LOG" "$LOG.1"
-  nohup "$0" _run >> "$LOG" 2>&1 & echo $! > "$PID"
-  sleep 1; running || fail "start failed; inspect $LOG"
+  launch_client 1 || fail "start failed; inspect $LOG"
   echo "boompi-client started (pid $RUN_PID)"
 }
 stop() {
@@ -113,6 +124,12 @@ stop() {
   rm -f "$PID" "$CHILD_PID"; echo 'boompi-client stopped'
 }
 provision() {
+  [ -d /sys/class/net/wlan0 ] ||
+    fail 'Wi-Fi interface wlan0 is unavailable; client remains running'
+  for tool in hostapd dnsmasq python3; do
+    command -v "$tool" >/dev/null 2>&1 ||
+      fail "Wi-Fi provisioning needs $tool; client remains running"
+  done
   was_running=0; running && was_running=1
   [ "$was_running" -eq 0 ] || stop
   launch_provision "$was_running"
@@ -123,12 +140,39 @@ update() {
   [ -f "$source" ] && [ -x "$source" ] || fail 'update binary is invalid'
   prepare; load_config; "$source" --check-config >/dev/null || fail 'new binary check failed'
   was_running=0; running && was_running=1
+  rm -f "$APP.new"
+  cp "$source" "$APP.new" && chmod 755 "$APP.new" || {
+    rm -f "$APP.new"; fail 'copy failed'
+  }
+  have_backup=0
+  if [ -f "$APP" ]; then
+    rm -f "$APP.bak.new"
+    cp "$APP" "$APP.bak.new" && chmod 755 "$APP.bak.new" || {
+      rm -f "$APP.new" "$APP.bak.new"; fail 'backup failed'
+    }
+    mv -f "$APP.bak.new" "$APP.bak" || {
+      rm -f "$APP.new" "$APP.bak.new"; fail 'backup install failed'
+    }
+    have_backup=1
+  fi
   [ "$was_running" -eq 0 ] || stop
-  cp "$source" "$APP.new" && chmod 755 "$APP.new" || fail 'copy failed'
-  [ ! -f "$APP" ] || mv -f "$APP" "$APP.bak"
-  mv -f "$APP.new" "$APP" || fail 'install failed'
+  if ! mv -f "$APP.new" "$APP"; then
+    rm -f "$APP.new"
+    [ "$was_running" -eq 0 ] || launch_client 4 || true
+    fail 'install failed'
+  fi
   echo "boompi-client installed; backup=$APP.bak"
-  [ "$was_running" -eq 0 ] || start
+  [ "$was_running" -eq 0 ] && return
+  if launch_client 4; then
+    echo "boompi-client started (pid $RUN_PID)"
+    return
+  fi
+  [ "$have_backup" -eq 1 ] || fail 'new binary failed and no backup is available'
+  mv -f "$APP.bak" "$APP" || fail 'new binary failed and rollback install failed'
+  if launch_client 4; then
+    fail 'new binary failed; previous version restored'
+  fi
+  fail 'new binary failed; previous version restored but restart failed'
 }
 
 case ${1:-} in

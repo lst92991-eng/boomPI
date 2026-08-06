@@ -16,6 +16,7 @@ using boompi::audio::AudioEngine;
 using boompi::audio::AudioEngineConfig;
 using boompi::audio::CaptureFrame;
 using boompi::audio::CaptureResult;
+using boompi::audio::QueueTtsResult;
 namespace fake = boompi::test::audio_backend;
 
 bool Check(const bool condition, const char* const message) {
@@ -77,7 +78,8 @@ std::vector<std::uint8_t> Pcm24(const std::size_t samples,
 bool QueueFrame(AudioEngine* const engine, const std::uint64_t sequence,
                 const std::size_t samples = 480U) {
   const auto bytes = Pcm24(samples, static_cast<std::int16_t>(sequence + 1U));
-  return Check(engine->QueueTts24k(bytes.data(), bytes.size(), sequence),
+  return Check(engine->QueueTts24k(bytes.data(), bytes.size(), sequence) ==
+                   QueueTtsResult::kQueued,
                "QueueTts24k failed");
 }
 
@@ -242,6 +244,69 @@ bool TestResetPreservesQueuedPcm() {
   return true;
 }
 
+bool TestQueueResultsDoNotPolluteLastError() {
+  AudioEngine engine;
+  if (!OpenEngine(&engine)) return false;
+  const auto frame = Pcm24(480U, 1);
+  if (!Check(engine.QueueTts24k(nullptr, 0U, 0U) ==
+                 QueueTtsResult::kInvalidArgument,
+             "invalid PCM did not have a distinct queue result") ||
+      !Check(engine.QueueTts24k(frame.data(), frame.size(), 0U) ==
+                 QueueTtsResult::kNotActive,
+             "inactive playback did not have a distinct queue result") ||
+      !Check(engine.last_error().empty(),
+             "transient queue rejection polluted last_error") ||
+      !BeginPlayback(&engine))
+    return false;
+
+  const auto oversized = Pcm24(75U * 480U + 1U, 1);
+  if (!Check(engine.QueueTts24k(oversized.data(), oversized.size(), 0U) ==
+                 QueueTtsResult::kFull,
+             "oversized PCM did not report a full queue") ||
+      !Check(engine.QueueTts24k(frame.data(), frame.size(), 0U) ==
+                 QueueTtsResult::kQueued,
+             "valid PCM was not queued") ||
+      !Check(engine.QueueTts24k(frame.data(), frame.size(), 2U) ==
+                 QueueTtsResult::kDiscontinuous,
+             "sequence gap did not have a distinct queue result") ||
+      !Check(engine.last_error().empty(),
+             "queue flow control polluted last_error"))
+    return false;
+  engine.DropPlayback();
+  return Check(WaitForPlaybackDone(engine, 500ms),
+               "dropped playback did not finish");
+}
+
+bool TestSuccessfulOpenClearsOldError() {
+  AudioEngine engine;
+  if (!OpenEngine(&engine) ||
+      !Check(!engine.Open(AudioEngineConfig{}),
+             "duplicate Open unexpectedly succeeded") ||
+      !Check(!engine.last_error().empty(),
+             "duplicate Open did not publish its error"))
+    return false;
+  engine.Close();
+  return OpenEngine(&engine) &&
+         Check(engine.last_error().empty(),
+               "successful reopen retained an old error");
+}
+
+bool TestSuccessfulPlaybackClearsOldError() {
+  AudioEngine engine;
+  if (!OpenEngine(&engine) ||
+      !Check(!engine.Open(AudioEngineConfig{}),
+             "duplicate Open unexpectedly succeeded") ||
+      !Check(!engine.last_error().empty(),
+             "duplicate Open did not publish its error") ||
+      !BeginPlayback(&engine))
+    return false;
+  const bool cleared = Check(engine.last_error().empty(),
+                             "successful playback retained an old error");
+  engine.DropPlayback();
+  return cleared && Check(WaitForPlaybackDone(engine, 500ms),
+                          "dropped playback did not finish");
+}
+
 }  // namespace
 
 int main(const int argc, char** const argv) {
@@ -258,6 +323,12 @@ int main(const int argc, char** const argv) {
   else if (scenario == "bounded-capture") passed = TestBoundedCaptureWait();
   else if (scenario == "bounded-command") passed = TestBoundedCaptureCommand();
   else if (scenario == "reset-preserves-pcm") passed = TestResetPreservesQueuedPcm();
+  else if (scenario == "queue-results")
+    passed = TestQueueResultsDoNotPolluteLastError();
+  else if (scenario == "open-clears-error")
+    passed = TestSuccessfulOpenClearsOldError();
+  else if (scenario == "playback-clears-error")
+    passed = TestSuccessfulPlaybackClearsOldError();
   else {
     std::fprintf(stderr, "unknown scenario: %s\n", scenario.c_str());
     return 2;

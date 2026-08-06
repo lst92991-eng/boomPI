@@ -165,11 +165,13 @@ bool AudioEngine::ResetListener() noexcept {
   return state.audio_open && !state.audio_closed;
 }
 
-bool AudioEngine::QueueTts24k(const std::uint8_t*, const std::size_t,
-                              const std::uint64_t) noexcept {
+QueueTtsResult AudioEngine::QueueTts24k(const std::uint8_t*, const std::size_t,
+                                        const std::uint64_t) noexcept {
   auto& state = tests::State();
   std::lock_guard<std::mutex> lock(state.mutex);
-  return state.audio_open && !state.audio_closed;
+  return state.audio_open && !state.audio_closed
+             ? QueueTtsResult::kQueued
+             : QueueTtsResult::kNotOpen;
 }
 
 bool AudioEngine::BeginPlayback() noexcept {

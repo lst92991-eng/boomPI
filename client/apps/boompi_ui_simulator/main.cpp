@@ -13,23 +13,23 @@
 
 #include "boompi/ui/lvgl_screen.h"
 
-#ifndef BOOMPI_ICON_FONT_PATH
-#define BOOMPI_ICON_FONT_PATH ""
-#endif
-
 namespace {
 
-constexpr int kWidth = 320, kHeight = 240;
+constexpr int kWidth = 320;
+constexpr int kHeight = 240;
 std::array<std::uint16_t, kWidth * kHeight> g_frame{};
-int g_pointer_x = 0, g_pointer_y = 0;
+int g_pointer_x = 0;
+int g_pointer_y = 0;
 bool g_pointer_pressed = false;
 bool g_frame_dirty = true;
 
 void Flush(lv_disp_drv_t* driver, const lv_area_t* area, lv_color_t* source) {
   static_cast<void>(driver);
-  for (int y = area->y1; y <= area->y2; ++y)
-    for (int x = area->x1; x <= area->x2; ++x)
+  for (int y = area->y1; y <= area->y2; ++y) {
+    for (int x = area->x1; x <= area->x2; ++x) {
       g_frame[static_cast<std::size_t>(y) * kWidth + x] = source++->full;
+    }
+  }
   g_frame_dirty = true;
   lv_disp_flush_ready(driver);
 }
@@ -41,12 +41,16 @@ void ReadPointer(lv_indev_drv_t*, lv_indev_data_t* data) {
 }
 
 bool SaveFrame(const std::string& directory) {
-  SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(g_frame.data(), kWidth, kHeight, 16,
-                                                   kWidth * 2, 0xF800, 0x07E0, 0x001F, 0);
-  if (surface == nullptr) return false;
+  SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(
+      g_frame.data(), kWidth, kHeight, 16, kWidth * 2,
+      0xF800, 0x07E0, 0x001F, 0);
+  if (surface == nullptr) {
+    return false;
+  }
   const std::string temporary = directory + "/frame.tmp.bmp";
   const std::string output = directory + "/frame.bmp";
-  const bool ok = SDL_SaveBMP(surface, temporary.c_str()) == 0 && std::rename(temporary.c_str(), output.c_str()) == 0;
+  const bool ok = SDL_SaveBMP(surface, temporary.c_str()) == 0 &&
+                  std::rename(temporary.c_str(), output.c_str()) == 0;
   SDL_FreeSurface(surface);
   return ok;
 }
@@ -61,22 +65,36 @@ int main(int argc, char** argv) {
   // treats the missing digit as a placeholder glyph, so the clock would abort
   // in the software renderer.  Noto Sans CJK covers both Chinese and Latin.
   const char* font = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
-  const char* icon_font = BOOMPI_ICON_FONT_PATH;
   for (int i = 1; i < argc; ++i) {
-    if (std::strcmp(argv[i], "--preview-dir") == 0 && i + 1 < argc) preview_dir = argv[++i];
-    else if (std::strcmp(argv[i], "--font") == 0 && i + 1 < argc) font = argv[++i];
-    else if (std::strcmp(argv[i], "--icon-font") == 0 && i + 1 < argc) icon_font = argv[++i];
-    else if (std::strcmp(argv[i], "--demo-voice") == 0) demo_voice = true;
-    else if (std::strcmp(argv[i], "--demo-app") == 0 && i + 1 < argc) demo_app = std::atoi(argv[++i]);
+    if (std::strcmp(argv[i], "--preview-dir") == 0 && i + 1 < argc) {
+      preview_dir = argv[++i];
+    } else if (std::strcmp(argv[i], "--font") == 0 && i + 1 < argc) {
+      font = argv[++i];
+    } else if (std::strcmp(argv[i], "--demo-voice") == 0) {
+      demo_voice = true;
+    } else if (std::strcmp(argv[i], "--demo-app") == 0 && i + 1 < argc) {
+      demo_app = std::atoi(argv[++i]);
+    }
   }
-  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) return 1;
-  SDL_Window* window = SDL_CreateWindow("boomPI LVGL 320x240", SDL_WINDOWPOS_CENTERED,
-                                        SDL_WINDOWPOS_CENTERED, kWidth * 2, kHeight * 2,
-                                        preview_dir.empty() ? SDL_WINDOW_SHOWN : SDL_WINDOW_HIDDEN);
-  SDL_Renderer* renderer = window == nullptr ? nullptr : SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-  SDL_Texture* texture = renderer == nullptr ? nullptr : SDL_CreateTexture(
-      renderer, SDL_PIXELFORMAT_RGB565, SDL_TEXTUREACCESS_STREAMING, kWidth, kHeight);
-  if (preview_dir.empty() && texture == nullptr) return 2;
+  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
+    return 1;
+  }
+  SDL_Window* window = SDL_CreateWindow(
+      "boomPI LVGL 320x240", SDL_WINDOWPOS_CENTERED,
+      SDL_WINDOWPOS_CENTERED, kWidth * 2, kHeight * 2,
+      preview_dir.empty() ? SDL_WINDOW_SHOWN : SDL_WINDOW_HIDDEN);
+  SDL_Renderer* renderer =
+      window == nullptr
+          ? nullptr
+          : SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+  SDL_Texture* texture =
+      renderer == nullptr
+          ? nullptr
+          : SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB565,
+                              SDL_TEXTUREACCESS_STREAMING, kWidth, kHeight);
+  if (preview_dir.empty() && texture == nullptr) {
+    return 2;
+  }
 
   lv_init();
   static std::array<lv_color_t, kWidth * 32> draw_pixels{};
@@ -96,7 +114,9 @@ int main(int argc, char** argv) {
   lv_indev_drv_register(&pointer);
 
   boompi::ui::LvglScreen screen;
-  if (!screen.Create(font, icon_font)) return 3;
+  if (!screen.Create(font)) {
+    return 3;
+  }
   constexpr std::array states{
       boompi::ui::DeviceUiState::kIdle, boompi::ui::DeviceUiState::kListening,
       boompi::ui::DeviceUiState::kThinking, boompi::ui::DeviceUiState::kSpeaking,
@@ -125,8 +145,9 @@ int main(int argc, char** argv) {
     const auto started = std::chrono::steady_clock::now();
     SDL_Event event{};
     while (SDL_PollEvent(&event)) {
-      if (event.type == SDL_QUIT) running = false;
-      else if (event.type == SDL_MOUSEMOTION) {
+      if (event.type == SDL_QUIT) {
+        running = false;
+      } else if (event.type == SDL_MOUSEMOTION) {
         g_pointer_x = event.motion.x / 2;
         g_pointer_y = event.motion.y / 2;
       } else if (event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP) {
@@ -151,7 +172,9 @@ int main(int argc, char** argv) {
       SDL_RenderCopy(renderer, texture, nullptr, nullptr);
       SDL_RenderPresent(renderer);
     }
-    if (!preview_dir.empty() && g_frame_dirty && !SaveFrame(preview_dir)) return 3;
+    if (!preview_dir.empty() && g_frame_dirty && !SaveFrame(preview_dir)) {
+      return 3;
+    }
     g_frame_dirty = false;
     std::this_thread::sleep_until(started + std::chrono::milliseconds(16));
   }

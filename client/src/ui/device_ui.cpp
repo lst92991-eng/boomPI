@@ -1,72 +1,59 @@
 #include "boompi/ui/device_ui.h"
 
-#include "boompi/ui/lvgl_screen.h"
+#include <fcntl.h>
+#include <linux/i2c.h>
+#include <linux/i2c-dev.h>
+#include <linux/spi/spidev.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <condition_variable>
-#include <cctype>
 #include <csignal>
+#include <condition_variable>
 #include <cstdio>
-#include <cstring>
-#include <fcntl.h>
-#include <linux/i2c-dev.h>
-#include <linux/i2c.h>
-#include <linux/input.h>
-#include <linux/spi/spidev.h>
 #include <mutex>
 #include <new>
-#include <sys/ioctl.h>
-#include <sys/types.h>
-#include <sys/wait.h>
+#include <string>
 #include <thread>
-#include <unistd.h>
+
+#include <lvgl.h>
+
+#include "boompi/ui/lvgl_screen.h"
 
 namespace boompi::ui {
 namespace {
 
-constexpr int kPanelWidth = 240;
-constexpr int kPanelHeight = 320;
-constexpr int kLogicalWidth = 320;
-constexpr int kLogicalHeight = 240;
-constexpr int kDrawBufferRows = 32;
-constexpr int kTouchEventLimit = 32;
-constexpr unsigned kSpiSpeedHz = 80000000U;
-constexpr int kBacklightGpio = 53;
-constexpr int kDcGpio = 66;
-constexpr int kResetGpio = 67;
-constexpr int kTouchResetGpio = 64;
-constexpr int kTouchInterruptGpio = 73;
+constexpr int kPanelWidth = 240, kPanelHeight = 320;
+constexpr int kScreenWidth = 320, kScreenHeight = 240, kDrawRows = 32;
+constexpr int kBacklightGpio = 53, kDataCommandGpio = 66, kPanelResetGpio = 67;
+constexpr int kTouchResetGpio = 64, kTouchInterruptGpio = 73;
 constexpr int kGt911Address = 0x14;
-constexpr std::uint16_t kGt911StatusRegister = 0x814E;
-constexpr std::uint16_t kGt911PointRegister = 0x814F;
-constexpr std::size_t kActionQueueCapacity = 8U;
-constexpr std::size_t kCameraWidth = 320U;
-constexpr std::size_t kCameraHeight = 180U;
-constexpr std::size_t kCameraPixelCount = kCameraWidth * kCameraHeight;
-constexpr std::size_t kCameraFrameBytes =
-    kCameraPixelCount * sizeof(std::uint16_t);
-constexpr std::chrono::milliseconds kUiStartTimeout{3000};
-constexpr std::chrono::milliseconds kUiRefreshPeriod{33};  // 30 FPS on 80 MHz SPI.
+constexpr std::uint16_t kTouchStatus = 0x814E;
+constexpr std::uint16_t kTouchPoint = 0x814F;
+constexpr std::size_t kCameraPixels = 320U * 180U;
+constexpr std::size_t kCameraBytes = kCameraPixels * sizeof(std::uint16_t);
+constexpr unsigned kTouchFailureLimit = 3U;
+constexpr unsigned kTouchRecoveryLimit = 2U;
+constexpr unsigned kSpiSpeedHz = 80000000U;
 constexpr char kGpioRoot[] = "/sys/class/gpio";
-constexpr char kGt911I2cDevice[] = "/dev/i2c-3";
-constexpr char kPrimaryFont[] = "/userdata/boompi/fonts/NotoSansCJK-Regular.ttc";
+constexpr char kSettings[] = "/userdata/boompi/config/ui.settings";
+constexpr char kSettingsTemporary[] = "/userdata/boompi/config/ui.settings.tmp";
+constexpr char kProvision[] = "/usr/sbin/boompi-provision";
+constexpr char kFont[] = "/userdata/boompi/fonts/NotoSansCJK-Regular.ttc";
 constexpr char kFallbackFont[] = "/oem/usr/share/simsun_en.ttf";
-constexpr char kIconFont[] = "/userdata/boompi/fonts/tabler-icons-200-subset.ttf";
-constexpr char kUiSettings[] = "/userdata/boompi/config/ui.settings";
-constexpr char kUiSettingsTemporary[] =
-    "/userdata/boompi/config/ui.settings.tmp";
-constexpr char kCameraPipeline[] =
+constexpr char kCameraCommand[] =
     "/usr/bin/v4l2-ctl -d /dev/video14 "
     "--set-fmt-video=width=576,height=324,pixelformat=NV12 "
     "--stream-mmap=4 --stream-to=- 2>/run/boompi-camera-v4l2.log | "
-    "/usr/bin/ffmpeg -hide_banner -loglevel error -f rawvideo "
-    "-pixel_format nv12 -video_size 576x324 -framerate 25 -i pipe:0 "
-    "-vf 'fps=4,scale=320:180' -pix_fmt rgb565le -f rawvideo pipe:1 "
-    "2>/run/boompi-camera-ffmpeg.log";
+    "/usr/bin/ffmpeg -hide_banner -loglevel error -f rawvideo -pixel_format nv12 "
+    "-video_size 576x324 -framerate 25 -i pipe:0 -vf 'scale=320:180:flags=fast_bilinear' "
+    "-pix_fmt rgb565le -f rawvideo pipe:1 2>/run/boompi-camera-ffmpeg.log";
 
 bool WriteAll(int fd, const void* source, std::size_t bytes) {
   auto* data = static_cast<const std::uint8_t*>(source);
@@ -80,20 +67,30 @@ bool WriteAll(int fd, const void* source, std::size_t bytes) {
   return true;
 }
 
-bool WriteText(const std::string& path, const std::string& text) {
-  const int fd = open(path.c_str(), O_WRONLY | O_CLOEXEC);
+bool WriteText(const std::string& path, const std::string& text, int flags = O_WRONLY) {
+  const int fd = open(path.c_str(), flags | O_CLOEXEC, 0644);
   if (fd < 0) return false;
   const bool ok = WriteAll(fd, text.data(), text.size());
   close(fd);
   return ok;
 }
 
-int OpenGpio(const std::string& root, int number) {
-  const std::string base = root + "/gpio" + std::to_string(number);
+bool SaveVolume(std::uint8_t percent) {
+  const std::string text = std::to_string(percent) + "\n";
+  const int fd = open(kSettingsTemporary,
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  bool ok = fd >= 0 && WriteAll(fd, text.data(), text.size());
+  if (fd >= 0 && close(fd) != 0) ok = false;
+  if (ok) ok = std::rename(kSettingsTemporary, kSettings) == 0;
+  if (!ok) unlink(kSettingsTemporary);
+  return ok;
+}
+
+int OpenGpio(int number) {
+  const std::string base = std::string(kGpioRoot) + "/gpio" + std::to_string(number);
   if (access(base.c_str(), F_OK) != 0) {
-    if (!WriteText(root + "/export", std::to_string(number))) return -1;
-    for (int retry = 0; retry < 50 && access(base.c_str(), F_OK) != 0; ++retry)
-      usleep(10000);
+    if (!WriteText(std::string(kGpioRoot) + "/export", std::to_string(number))) return -1;
+    for (int retry = 0; retry < 50 && access(base.c_str(), F_OK) != 0; ++retry) usleep(10000);
   }
   if (!WriteText(base + "/direction", "out")) return -1;
   return open((base + "/value").c_str(), O_WRONLY | O_CLOEXEC);
@@ -104,373 +101,339 @@ bool SetGpio(int fd, bool high) {
   return fd >= 0 && lseek(fd, 0, SEEK_SET) == 0 && WriteAll(fd, &value, 1U);
 }
 
-// The current board answers at 0x14 while its flashed DT still describes
-// 0x5d.  Reproduce Goodix's documented address-selection/reset sequence
-// before using the userspace polling fallback.
-bool ResetGt911AtAddress14() {
-  const int reset = OpenGpio(kGpioRoot, kTouchResetGpio);
-  const int interrupt = OpenGpio(kGpioRoot, kTouchInterruptGpio);
-  if (reset < 0 || interrupt < 0) {
-    if (reset >= 0) close(reset);
-    if (interrupt >= 0) close(interrupt);
-    return false;
+int ReapProcessGroup(pid_t child) {
+  if (child <= 0) return -1;
+  int status = 0;
+  pid_t result = waitpid(child, &status, WNOHANG);
+  if (result == child) return status;
+  if (result < 0 && errno != EINTR) return -1;
+  static_cast<void>(kill(-child, SIGTERM));
+  for (int retry = 0; retry < 100; ++retry) {
+    result = waitpid(child, &status, WNOHANG);
+    if (result == child) return status;
+    if (result < 0 && errno != EINTR) return -1;
+    usleep(10000);
   }
-  bool ok = SetGpio(reset, false);
-  usleep(20000);
-  ok = SetGpio(interrupt, true) && ok;
-  usleep(2000);
-  ok = SetGpio(reset, true) && ok;
-  usleep(6000);
-  ok = SetGpio(interrupt, false) && ok;
-  usleep(50000);
-  close(interrupt);
-  close(reset);
-  ok = WriteText(std::string(kGpioRoot) + "/gpio" +
-                     std::to_string(kTouchInterruptGpio) + "/direction",
-                 "in") && ok;
-  usleep(60000);
-  return ok;
+  static_cast<void>(kill(-child, SIGKILL));
+  do {
+    result = waitpid(child, &status, 0);
+  } while (result < 0 && errno == EINTR);
+  return result == child ? status : -1;
 }
 
-bool IsGt911Name(char* name) {
-  for (char* cursor = name; *cursor != '\0'; ++cursor) {
-    *cursor = static_cast<char>(std::tolower(static_cast<unsigned char>(*cursor)));
+void LogCameraExit(int status) {
+  if (status < 0) {
+    std::fprintf(stderr, "boompi-ui: camera process status unavailable\n");
+  } else if (WIFEXITED(status)) {
+    std::fprintf(stderr, "boompi-ui: camera process exit=%d\n",
+                 WEXITSTATUS(status));
+  } else if (WIFSIGNALED(status)) {
+    std::fprintf(stderr, "boompi-ui: camera process signal=%d\n",
+                 WTERMSIG(status));
   }
-  return std::strstr(name, "gt911") != nullptr ||
-         std::strstr(name, "goodix") != nullptr;
 }
-
-int OpenGt911Event() {
-  for (int index = 0; index < kTouchEventLimit; ++index) {
-    char path[32]{};
-    std::snprintf(path, sizeof(path), "/dev/input/event%d", index);
-    const int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0) continue;
-    char name[128]{};
-    if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) >= 0 && IsGt911Name(name))
-      return fd;
-    close(fd);
-  }
-  return -1;
-}
-
-const char* FindTextFont() {
-  if (access(kPrimaryFont, R_OK) == 0) return kPrimaryFont;
-  return access(kFallbackFont, R_OK) == 0 ? kFallbackFont : nullptr;
-}
-
-enum class TouchBackend : std::uint8_t { kNone, kEvent, kI2c };
 
 }  // namespace
 
 struct DeviceUi::Impl final {
-  int spi{-1};
-  int touch{-1};
-  int dc{-1};
-  int reset{-1};
-  int backlight{-1};
-  TouchBackend touch_backend{TouchBackend::kNone};
+  struct View {
+    DeviceUiState state{DeviceUiState::kIdle};
+    std::uint8_t volume{60U};
+    std::array<std::string, 2> text;
+  };
+  using CameraFrame = std::array<std::uint16_t, kCameraPixels>;
 
-  int slot{0};
-  int pointer_x{0};
-  int pointer_y{0};
-  bool pointer_active{false};
-
-  std::atomic<bool> ready{false};
+  int spi{-1}, touch{-1}, data_command{-1}, panel_reset{-1}, backlight{-1};
+  int pointer_x{0}, pointer_y{0};
+  bool pointer_pressed{false};
+  unsigned touch_failures{0U}, touch_recovery_attempts{0U};
+  bool touch_disabled{false};
+  std::chrono::steady_clock::time_point next_touch_recovery{};
   std::atomic<bool> stop{false};
-  std::atomic<bool> display_failed{false};
-  std::mutex mutex;
-  std::condition_variable wake;
-  std::thread worker;
-  bool worker_started{false};
-  bool worker_succeeded{false};
-  bool state_dirty{true};
-  bool text_dirty{true};
-  bool volume_dirty{true};
-  bool camera_requested{false};
-  bool camera_request_dirty{false};
-  bool camera_frame_dirty{false};
-  DeviceUiState state{DeviceUiState::kIdle};
-  std::uint8_t volume_percent{60U};
-  std::uint8_t pending_volume_percent{60U};
-  bool volume_change_pending{false};
-  std::uint8_t settings_volume_percent{60U};
-  bool settings_save_pending{false};
-  std::array<std::array<char, 64>, 2> lines{};
-  std::array<DeviceUiAction, kActionQueueCapacity> actions{};
-  std::size_t action_head{0U};
-  std::size_t action_count{0U};
-  std::array<std::uint16_t, kCameraPixelCount> camera_frame{};
+  std::atomic<int> action{-1}, volume_change{-1};
   std::atomic<bool> camera_stop{false};
-  std::atomic<pid_t> camera_process{-1};
-  std::thread camera_worker;
-
+  std::atomic<pid_t> camera_pid{-1};
+  pid_t provision_pid{-1};
+  std::atomic<LvglScreen::CameraStatus> camera_status{LvglScreen::CameraStatus::kStopped};
+  std::mutex view_mutex;
+  std::condition_variable wake;
+  bool start_done{false}, start_ok{false}, view_dirty{true};
+  View view;
+  std::mutex camera_mutex;
+  bool camera_frame_ready{false};
+  CameraFrame camera_frame{};
+  std::thread ui_thread, camera_thread;
   LvglScreen screen;
   lv_disp_draw_buf_t draw_buffer{};
   lv_disp_drv_t display_driver{};
   lv_indev_drv_t input_driver{};
   lv_disp_t* display{nullptr};
   lv_indev_t* input{nullptr};
-  std::array<lv_color_t, kLogicalWidth * kDrawBufferRows> draw_pixels{};
+  std::array<lv_color_t, kScreenWidth * kDrawRows> draw_pixels{};
+  std::array<std::uint8_t, 4096> flush_pixels{};
 
-  bool Command(std::uint8_t command, const std::uint8_t* data = nullptr,
-               std::size_t bytes = 0U) {
-    if (!SetGpio(dc, false) || !WriteAll(spi, &command, 1U)) return false;
-    return bytes == 0U || (SetGpio(dc, true) && WriteAll(spi, data, bytes));
+  bool TakeView(View* next) {
+    std::lock_guard<std::mutex> lock(view_mutex);
+    if (!view_dirty) return false;
+    *next = view;
+    view_dirty = false;
+    return true;
   }
 
-  bool SetWindow(int column_start, int row_start, int column_end, int row_end) {
-    const std::uint8_t columns[] = {
-        static_cast<std::uint8_t>(column_start >> 8),
-        static_cast<std::uint8_t>(column_start),
-        static_cast<std::uint8_t>(column_end >> 8),
-        static_cast<std::uint8_t>(column_end)};
-    const std::uint8_t rows[] = {
-        static_cast<std::uint8_t>(row_start >> 8),
-        static_cast<std::uint8_t>(row_start),
-        static_cast<std::uint8_t>(row_end >> 8),
-        static_cast<std::uint8_t>(row_end)};
-    return Command(0x2A, columns, sizeof(columns)) &&
-           Command(0x2B, rows, sizeof(rows)) && Command(0x2C) &&
-           SetGpio(dc, true);
+  template <typename T>
+  void UpdateView(T View::*member, const T& value) {
+    std::lock_guard<std::mutex> lock(view_mutex);
+    view.*member = value;
+    view_dirty = true;
+    wake.notify_one();
   }
 
-  void FailDisplay() {
-    display_failed.store(true);
-    ready.store(false);
-    stop.store(true);
-    wake.notify_all();
+  template <typename T>
+  static bool Poll(std::atomic<int>& source, T* result) {
+    if (result == nullptr) return false;
+    const int value = source.exchange(-1);
+    if (value < 0) return false;
+    *result = static_cast<T>(value);
+    return true;
   }
 
-  // ST7789 保持已验证的竖屏寄存器配置，仅在 flush 时把 LVGL 横屏脏区旋转到面板扫描顺序。
-  static void FlushDisplay(lv_disp_drv_t* driver, const lv_area_t* area,
-                           lv_color_t* pixels) {
+  bool Command(std::uint8_t command, const std::uint8_t* data = nullptr, std::size_t bytes = 0U) {
+    if (!SetGpio(data_command, false) || !WriteAll(spi, &command, 1U)) return false;
+    return bytes == 0U || (SetGpio(data_command, true) && WriteAll(spi, data, bytes));
+  }
+
+  static void Flush(lv_disp_drv_t* driver, const lv_area_t* area, lv_color_t* pixels) {
     auto* self = static_cast<Impl*>(driver->user_data);
-    bool ok = self != nullptr && area != nullptr && pixels != nullptr;
-    if (ok) {
-      const int x1 = std::max(0, static_cast<int>(area->x1));
-      const int y1 = std::max(0, static_cast<int>(area->y1));
-      const int x2 = std::min(kLogicalWidth - 1, static_cast<int>(area->x2));
-      const int y2 = std::min(kLogicalHeight - 1, static_cast<int>(area->y2));
-      const int source_width = static_cast<int>(area->x2) -
-                               static_cast<int>(area->x1) + 1;
-      if (x1 <= x2 && y1 <= y2 && source_width > 0) {
-        ok = self->SetWindow(y1, kPanelHeight - 1 - x2, y2,
-                             kPanelHeight - 1 - x1);
-        std::array<std::uint8_t, 4096> block{};
-        std::size_t used = 0U;
-        for (int logical_x = x2; ok && logical_x >= x1; --logical_x) {
-          for (int logical_y = y1; ok && logical_y <= y2; ++logical_y) {
-            const std::size_t source_index = static_cast<std::size_t>(
-                (logical_y - static_cast<int>(area->y1)) * source_width +
-                logical_x - static_cast<int>(area->x1));
-            const std::uint16_t pixel = pixels[source_index].full;
-            block[used++] = static_cast<std::uint8_t>(pixel >> 8U);
-            block[used++] = static_cast<std::uint8_t>(pixel);
-            if (used == block.size()) {
-              ok = WriteAll(self->spi, block.data(), used);
-              used = 0U;
-            }
-          }
+    const int width = area->x2 - area->x1 + 1;
+    const int x1 = area->y1, x2 = area->y2;
+    const int y1 = kPanelHeight - 1 - area->x2, y2 = kPanelHeight - 1 - area->x1;
+    const std::uint8_t columns[] = {static_cast<std::uint8_t>(x1 >> 8), static_cast<std::uint8_t>(x1),
+                                    static_cast<std::uint8_t>(x2 >> 8), static_cast<std::uint8_t>(x2)};
+    const std::uint8_t rows[] = {static_cast<std::uint8_t>(y1 >> 8), static_cast<std::uint8_t>(y1),
+                                 static_cast<std::uint8_t>(y2 >> 8), static_cast<std::uint8_t>(y2)};
+    bool ok = self->Command(0x2A, columns, sizeof(columns)) && self->Command(0x2B, rows, sizeof(rows)) &&
+              self->Command(0x2C) && SetGpio(self->data_command, true);
+    std::size_t used = 0U;
+    for (int x = area->x2; ok && x >= area->x1; --x) {
+      for (int y = area->y1; y <= area->y2; ++y) {
+        const auto pixel = pixels[(y - area->y1) * width + x - area->x1].full;
+        self->flush_pixels[used++] = static_cast<std::uint8_t>(pixel >> 8U);
+        self->flush_pixels[used++] = static_cast<std::uint8_t>(pixel);
+        if (used == self->flush_pixels.size()) {
+          ok = WriteAll(self->spi, self->flush_pixels.data(), used);
+          used = 0U;
+          if (!ok) break;
         }
-        if (ok && used != 0U) ok = WriteAll(self->spi, block.data(), used);
       }
     }
-    if (!ok && self != nullptr) self->FailDisplay();
+    if (ok && used != 0U) ok = WriteAll(self->spi, self->flush_pixels.data(), used);
+    if (!ok) {
+      SetGpio(self->backlight, false);
+      self->stop.store(true);
+      self->wake.notify_one();
+    }
     lv_disp_flush_ready(driver);
   }
 
-  void QueueAction(DeviceUiAction action) {
-    std::lock_guard<std::mutex> lock(mutex);
-    if (action_count == actions.size()) {
-      action_head = (action_head + 1U) % actions.size();
-      --action_count;
+  bool InitPanel() {
+    if ((data_command = OpenGpio(kDataCommandGpio)) < 0 || (panel_reset = OpenGpio(kPanelResetGpio)) < 0 ||
+        (backlight = OpenGpio(kBacklightGpio)) < 0) return false;
+    SetGpio(backlight, false);
+    SetGpio(panel_reset, false);
+    usleep(100000);
+    if (!SetGpio(panel_reset, true)) return false;
+    usleep(100000);
+    // 每组数据依次为 command、payload size、payload。
+    static constexpr std::uint8_t init[] = {
+        0xB2, 5, 0x0C, 0x0C, 0, 0x33, 0x33, 0x36, 1, 0, 0x3A, 1, 0x55, 0xB7, 1, 0x55, 0xBB, 1, 0x1A,
+        0xC0, 1, 0x2C, 0xC2, 1, 1, 0xC3, 1, 0x19, 0xC6, 1, 0x0F, 0xD0, 1, 0xA7, 0xD0, 2, 0xA4, 0xA1,
+        0xD6, 1, 0xA1, 0xE0, 14, 0xF0, 3, 9, 0x0B, 0x0A, 0x16, 0x2B, 0x33, 0x41, 0x38, 0x14, 0x14,
+        0x29, 0x2F, 0xE1, 14, 0xF0, 4, 6, 9, 8, 4, 0x2B, 0x32, 0x41, 0x36, 0x12, 0x12, 0x2A, 0x30,
+        0x21, 0, 0x2A, 4, 0, 0, 0, 0xEF, 0x2B, 4, 0, 0, 1, 0x3F};
+    for (std::size_t at = 0U; at < sizeof(init);) {
+      const std::uint8_t size = init[at + 1U];
+      if (!Command(init[at], init + at + 2U, size)) return false;
+      at += size + 2U;
     }
-    const std::size_t tail = (action_head + action_count) % actions.size();
-    actions[tail] = action;
-    ++action_count;
+    if (!Command(0x11)) return false;
+    usleep(120000);
+    return Command(0x29) && SetGpio(backlight, true);
   }
 
-  void QueueVolumeChange(std::uint8_t percent, bool committed) {
-    std::lock_guard<std::mutex> lock(mutex);
-    // Dragging may emit one event per visual frame.  Keep only the newest
-    // preview so wake/interrupt actions cannot be displaced by slider noise.
-    pending_volume_percent = std::min<std::uint8_t>(percent, 100U);
-    volume_change_pending = true;
-    if (committed) {
-      // 单槽只保留最后一次提交，拖动过程不会反复写 flash。
-      settings_volume_percent = pending_volume_percent;
-      settings_save_pending = true;
+  bool InitTouch() {
+    const int touch_reset = OpenGpio(kTouchResetGpio), interrupt = OpenGpio(kTouchInterruptGpio);
+    if (touch_reset < 0 || interrupt < 0) {
+      if (touch_reset >= 0) close(touch_reset);
+      if (interrupt >= 0) close(interrupt);
+      return false;
     }
+    bool reset_ok = SetGpio(touch_reset, false);
+    usleep(20000);
+    reset_ok = SetGpio(interrupt, true) && reset_ok;  // INT=1 选择地址 0x14。
+    usleep(2000);
+    reset_ok = SetGpio(touch_reset, true) && reset_ok;
+    usleep(6000);
+    reset_ok = SetGpio(interrupt, false) && reset_ok;
+    usleep(50000);
+    close(touch_reset);
+    close(interrupt);
+    if (!reset_ok) return false;
+    const std::string irq = std::string(kGpioRoot) + "/gpio" + std::to_string(kTouchInterruptGpio) + "/direction";
+    if (!WriteText(irq, "in")) return false;
+    usleep(60000);
+    touch = open("/dev/i2c-3", O_RDWR | O_CLOEXEC);
+    std::uint8_t status = 0U;
+    if (touch >= 0 && ReadTouch(kTouchStatus, &status, 1U)) return true;
+    if (touch >= 0) close(touch);
+    touch = -1;
+    return false;
   }
 
-  void SavePendingVolumeSetting() {
-    std::uint8_t percent = 0U;
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      if (!settings_save_pending) return;
-      percent = settings_volume_percent;
-      settings_save_pending = false;
-    }
-
-    char text[16]{};
-    const int length = std::snprintf(text, sizeof(text), "%u\n",
-                                     static_cast<unsigned>(percent));
-    const int fd = open(kUiSettingsTemporary,
-                        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    const bool wrote = fd >= 0 && length > 0 &&
-                       static_cast<std::size_t>(length) < sizeof(text) &&
-                       WriteAll(fd, text, static_cast<std::size_t>(length));
-    if (fd >= 0) close(fd);
-    if (!wrote || std::rename(kUiSettingsTemporary, kUiSettings) != 0) {
-      unlink(kUiSettingsTemporary);
-      std::fprintf(stderr, "boompi-ui: volume setting save failed: %s\n",
-                   std::strerror(errno));
-    }
-  }
-
-  void BeginTouch() {
-    pointer_active = true;
-  }
-
-  void EndTouch() {
-    pointer_active = false;
-  }
-
-  void HandleEvent(const input_event& event) {
-    if (event.type != EV_ABS) return;
-    if (event.code == ABS_MT_SLOT) {
-      slot = event.value;
-      return;
-    }
-    if (slot != 0) return;
-    if (event.code == ABS_MT_POSITION_X) {
-      pointer_y = std::clamp(event.value, 0, kPanelWidth - 1);
-    } else if (event.code == ABS_MT_POSITION_Y) {
-      pointer_x = kPanelHeight - 1 -
-                  std::clamp(event.value, 0, kPanelHeight - 1);
-    } else if (event.code == ABS_MT_TRACKING_ID && event.value >= 0) {
-      BeginTouch();
-    } else if (event.code == ABS_MT_TRACKING_ID && event.value < 0) {
-      EndTouch();
-    }
-  }
-
-  bool ReadGt911(std::uint16_t address, std::uint8_t* data,
-                 std::size_t bytes) {
-    std::uint8_t register_address[] = {
-        static_cast<std::uint8_t>(address >> 8U),
-        static_cast<std::uint8_t>(address)};
-    i2c_msg messages[2]{};
-    messages[0].addr = kGt911Address;
-    messages[0].len = sizeof(register_address);
-    messages[0].buf = register_address;
-    messages[1].addr = kGt911Address;
-    messages[1].flags = I2C_M_RD;
-    messages[1].len = static_cast<__u16>(bytes);
-    messages[1].buf = data;
+  bool ReadTouch(std::uint16_t address, std::uint8_t* data, std::size_t size) {
+    std::uint8_t reg[] = {static_cast<std::uint8_t>(address >> 8U), static_cast<std::uint8_t>(address)};
+    i2c_msg messages[] = {{kGt911Address, 0, 2, reg},
+                          {kGt911Address, I2C_M_RD, static_cast<__u16>(size), data}};
     i2c_rdwr_ioctl_data transfer{messages, 2U};
     return ioctl(touch, I2C_RDWR, &transfer) == 2;
   }
 
-  bool ClearGt911Status() {
-    std::uint8_t command[] = {
-        static_cast<std::uint8_t>(kGt911StatusRegister >> 8U),
-        static_cast<std::uint8_t>(kGt911StatusRegister), 0U};
-    i2c_msg message{};
-    message.addr = kGt911Address;
-    message.len = sizeof(command);
-    message.buf = command;
+  bool ClearTouchStatus() {
+    std::uint8_t clear[] = {0x81, 0x4E, 0};
+    i2c_msg message{kGt911Address, 0, 3, clear};
     i2c_rdwr_ioctl_data transfer{&message, 1U};
     return ioctl(touch, I2C_RDWR, &transfer) == 1;
   }
 
-  void PollGt911() {
-    std::uint8_t status = 0U;
-    if (!ReadGt911(kGt911StatusRegister, &status, 1U) ||
-        (status & 0x80U) == 0U)
+  void TouchFailed(const char* stage) {
+    pointer_pressed = false;
+    if (touch_disabled) return;
+    ++touch_failures;
+    if (touch_failures < kTouchFailureLimit) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_touch_recovery) return;
+    if (touch_recovery_attempts >= kTouchRecoveryLimit) {
+      touch_disabled = true;
+      std::fprintf(stderr, "boompi-ui: GT911 disabled after bounded recovery\n");
       return;
-    const unsigned count = status & 0x0FU;
-    if (count == 0U) {
-      EndTouch();
-    } else if (count <= 5U) {
-      std::array<std::uint8_t, 8> point{};
-      if (ReadGt911(kGt911PointRegister, point.data(), point.size())) {
-        const int raw_x = point[1] | (static_cast<int>(point[2]) << 8);
-        const int raw_y = point[3] | (static_cast<int>(point[4]) << 8);
-        if (!pointer_active) BeginTouch();
-        pointer_y = std::clamp(raw_x, 0, kPanelWidth - 1);
-        pointer_x = kPanelHeight - 1 -
-                    std::clamp(raw_y, 0, kPanelHeight - 1);
-      }
     }
-    ClearGt911Status();
+
+    ++touch_recovery_attempts;
+    next_touch_recovery = now + std::chrono::seconds(2);
+    std::fprintf(stderr, "boompi-ui: GT911 %s failed; recovery %u/%u\n",
+                 stage, touch_recovery_attempts, kTouchRecoveryLimit);
+    if (touch >= 0) close(touch);
+    touch = -1;
+    if (InitTouch()) {
+      touch_failures = 0U;
+      touch_recovery_attempts = 0U;
+      std::fprintf(stderr, "boompi-ui: GT911 recovered\n");
+    } else if (touch_recovery_attempts == kTouchRecoveryLimit) {
+      touch_disabled = true;
+      std::fprintf(stderr, "boompi-ui: GT911 disabled after bounded recovery\n");
+    }
   }
 
-  void ReadEventInput(lv_indev_data_t* data) {
-    input_event event{};
-    while (read(touch, &event, sizeof(event)) == sizeof(event)) {
-      HandleEvent(event);
-      if (event.type == EV_SYN && event.code == SYN_REPORT) {
-        data->point.x = static_cast<lv_coord_t>(pointer_x);
-        data->point.y = static_cast<lv_coord_t>(pointer_y);
-        data->state = pointer_active ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
-        data->continue_reading = true;
+  void PollTouch() {
+    if (touch_disabled) {
+      pointer_pressed = false;
+      return;
+    }
+    std::uint8_t status = 0U;
+    if (!ReadTouch(kTouchStatus, &status, 1U)) {
+      TouchFailed("status read");
+      return;
+    }
+    if ((status & 0x80U) == 0U) {
+      touch_failures = 0U;
+      touch_recovery_attempts = 0U;
+      return;
+    }
+    const unsigned count = status & 0x0FU;
+    if (count == 0U) pointer_pressed = false;
+    else if (count <= 5U) {
+      std::array<std::uint8_t, 8> point{};
+      if (!ReadTouch(kTouchPoint, point.data(), point.size())) {
+        TouchFailed("point read");
         return;
       }
+      const int x = point[1] | (static_cast<int>(point[2]) << 8);
+      const int y = point[3] | (static_cast<int>(point[4]) << 8);
+      pointer_y = std::clamp(x, 0, kPanelWidth - 1);
+      pointer_x = kPanelHeight - 1 - std::clamp(y, 0, kPanelHeight - 1);
+      pointer_pressed = true;
+    } else {
+      pointer_pressed = false;
     }
+    if (!ClearTouchStatus()) {
+      TouchFailed("status clear");
+      return;
+    }
+    touch_failures = 0U;
+    touch_recovery_attempts = 0U;
   }
 
   static void ReadInput(lv_indev_drv_t* driver, lv_indev_data_t* data) {
     auto* self = static_cast<Impl*>(driver->user_data);
-    data->continue_reading = false;
-    if (self == nullptr) {
-      data->state = LV_INDEV_STATE_REL;
-      return;
-    }
-    if (self->touch_backend == TouchBackend::kEvent)
-      self->ReadEventInput(data);
-    else if (self->touch_backend == TouchBackend::kI2c)
-      self->PollGt911();
+    self->PollTouch();
     data->point.x = static_cast<lv_coord_t>(self->pointer_x);
     data->point.y = static_cast<lv_coord_t>(self->pointer_y);
-    data->state = self->pointer_active ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
+    data->state = self->pointer_pressed ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
   }
 
-  static void VoiceInterrupted(void* user_data) {
-    static_cast<Impl*>(user_data)->QueueAction(DeviceUiAction::kInterrupt);
-  }
-
-  static void AppAction(std::size_t index, void* user_data) {
-    if (index == 0U)
-      static_cast<Impl*>(user_data)->QueueAction(DeviceUiAction::kWake);
-  }
-
-  static void CameraActivity(bool active, void* user_data) {
-    auto* self = static_cast<Impl*>(user_data);
-    {
-      std::lock_guard<std::mutex> lock(self->mutex);
-      if (self->camera_requested == active) return;
-      self->camera_requested = active;
-      self->camera_request_dirty = true;
+  void StartProvisioning() {
+    if (provision_pid > 0) return;
+    if (access("/sys/class/net/wlan0", F_OK) != 0 || access(kProvision, X_OK) != 0) {
+      screen.SetProvisionMessage("配网服务不可用", true);
+      return;
     }
-    self->wake.notify_one();
+    const pid_t child = fork();
+    if (child == 0) {
+      if (setsid() < 0) _exit(126);
+      execl(kProvision, "boompi-provision", "--no-panel", static_cast<char*>(nullptr));
+      _exit(127);
+    }
+    if (child > 0)
+      provision_pid = child;
+    else
+      screen.SetProvisionMessage("配网服务启动失败", true);
   }
 
-  static void VolumeChanged(std::uint8_t percent,
-                            LvglScreen::VolumeChangePhase phase,
-                            void* user_data) {
-    auto* self = static_cast<Impl*>(user_data);
-    if (phase == LvglScreen::VolumeChangePhase::kBegin) return;
-    self->QueueVolumeChange(
-        percent, phase == LvglScreen::VolumeChangePhase::kCommit);
+  static void HandleEvent(LvglScreen::Event event, std::uint8_t value, void* context) {
+    auto* self = static_cast<Impl*>(context);
+    if (event == LvglScreen::Event::kWake)
+      self->action.store(static_cast<int>(DeviceUiAction::kWake));
+    else if (event == LvglScreen::Event::kInterrupt)
+      self->action.store(static_cast<int>(DeviceUiAction::kInterrupt));
+    else if (event == LvglScreen::Event::kProvision)
+      self->StartProvisioning();
+    else if (event == LvglScreen::Event::kCameraOn) self->StartCamera();
+    else if (event == LvglScreen::Event::kCameraOff) self->StopCamera();
+    else {
+      self->volume_change.store(value);
+      if (event == LvglScreen::Event::kVolumeCommit && !SaveVolume(value))
+        std::fprintf(stderr, "boompi-ui: volume setting save failed\n");
+    }
+  }
+
+  void CameraError(const char* reason) {
+    std::fprintf(stderr, "boompi-ui: camera %s\n", reason);
+    camera_status.store(LvglScreen::CameraStatus::kError);
+    wake.notify_one();
+  }
+
+  bool TakeCameraFrame(CameraFrame* frame) {
+    std::lock_guard<std::mutex> lock(camera_mutex);
+    if (!camera_frame_ready) return false;
+    *frame = camera_frame;
+    camera_frame_ready = false;
+    return true;
   }
 
   void CaptureCamera() {
     int output[2]{};
     if (pipe(output) != 0) {
-      std::fprintf(stderr, "boompi-ui: camera pipe failed: %s\n",
-                   std::strerror(errno));
+      CameraError("pipe failed");
       return;
     }
     const pid_t child = fork();
@@ -479,400 +442,253 @@ struct DeviceUi::Impl final {
       setpgid(0, 0);
       if (dup2(output[1], STDOUT_FILENO) < 0) _exit(126);
       close(output[1]);
-      execl("/bin/sh", "sh", "-c", kCameraPipeline,
-            static_cast<char*>(nullptr));
+      execl("/bin/sh", "sh", "-c", kCameraCommand, static_cast<char*>(nullptr));
       _exit(127);
     }
     close(output[1]);
     if (child < 0) {
       close(output[0]);
-      std::fprintf(stderr, "boompi-ui: camera fork failed: %s\n",
-                   std::strerror(errno));
+      CameraError("fork failed");
       return;
     }
-
-    setpgid(child, child);
-    camera_process.store(child);
-    std::fprintf(stderr, "boompi-ui: camera preview started; pid=%d\n",
-                 static_cast<int>(child));
-    std::array<std::uint8_t, kCameraFrameBytes> frame{};
+    static_cast<void>(setpgid(child, child));
+    camera_pid.store(child);
+    CameraFrame captured{};
+    auto* bytes = reinterpret_cast<std::uint8_t*>(captured.data());
+    std::size_t used = 0U;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const char* failure = nullptr;
+    bool have_frame = false;
     while (!camera_stop.load()) {
-      std::size_t offset = 0U;
-      while (offset < frame.size() && !camera_stop.load()) {
-        const ssize_t count = read(output[0], frame.data() + offset,
-                                   frame.size() - offset);
-        if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) {
-          offset = 0U;
-          break;
-        }
-        offset += static_cast<std::size_t>(count);
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        failure = have_frame ? "frame timeout" : "first frame timeout";
+        break;
       }
-      if (offset != frame.size()) break;
-      {
-        std::lock_guard<std::mutex> lock(mutex);
-        std::memcpy(camera_frame.data(), frame.data(), frame.size());
-        camera_frame_dirty = true;
+      int timeout_ms = static_cast<int>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+      if (timeout_ms < 1) timeout_ms = 1;
+      pollfd descriptor{output[0], POLLIN, 0};
+      int ready = 0;
+      do {
+        ready = ::poll(&descriptor, 1U, timeout_ms);
+      } while (ready < 0 && errno == EINTR && !camera_stop.load());
+      if (camera_stop.load()) break;
+      if (ready == 0) {
+        failure = have_frame ? "frame timeout" : "first frame timeout";
+        break;
       }
-      wake.notify_one();
+      if (ready < 0 || (descriptor.revents & POLLIN) == 0) {
+        failure = "stream ended";
+        break;
+      }
+      const ssize_t count = read(output[0], bytes + used, kCameraBytes - used);
+      if (count < 0 && errno == EINTR) continue;
+      if (count <= 0) {
+        failure = "stream read failed";
+        break;
+      }
+      used += static_cast<std::size_t>(count);
+      if (used == kCameraBytes) {
+        std::lock_guard<std::mutex> lock(camera_mutex);
+        camera_frame = captured;
+        camera_frame_ready = true;
+        used = 0U;
+        have_frame = true;
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        camera_status.store(LvglScreen::CameraStatus::kLive);
+        wake.notify_one();
+      }
     }
     close(output[0]);
-    if (kill(-child, SIGTERM) != 0 && errno != ESRCH) {
-      std::fprintf(stderr, "boompi-ui: camera stop signal failed: %s\n",
-                   std::strerror(errno));
-    }
-    int status = 0;
-    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-    camera_process.store(-1);
-    std::fprintf(stderr, "boompi-ui: camera preview stopped\n");
+    if (!camera_stop.load() && failure != nullptr) CameraError(failure);
+    LogCameraExit(ReapProcessGroup(child));
+    camera_pid.store(-1);
   }
 
   void StartCamera() {
-    if (camera_worker.joinable()) camera_worker.join();
+    if (camera_thread.joinable()) camera_thread.join();
     camera_stop.store(false);
+    camera_status.store(LvglScreen::CameraStatus::kStarting);
     try {
-      camera_worker = std::thread([this] { CaptureCamera(); });
+      camera_thread = std::thread([this] { CaptureCamera(); });
     } catch (...) {
-      std::fprintf(stderr, "boompi-ui: camera worker could not start\n");
+      CameraError("worker could not start");
     }
   }
 
   void StopCamera() {
     camera_stop.store(true);
-    const pid_t child = camera_process.load();
+    const pid_t child = camera_pid.load();
     if (child > 0) {
-      kill(-child, SIGTERM);
+      static_cast<void>(kill(-child, SIGTERM));
       usleep(100000);
-      if (camera_process.load() == child) kill(-child, SIGKILL);
+      if (camera_pid.load() == child) static_cast<void>(kill(-child, SIGKILL));
     }
-    if (camera_worker.joinable()) camera_worker.join();
-    camera_process.store(-1);
+    if (camera_thread.joinable()) camera_thread.join();
+    std::lock_guard<std::mutex> lock(camera_mutex);
+    camera_frame_ready = false;
+    camera_status.store(LvglScreen::CameraStatus::kStopped);
   }
 
-  bool InitializeLvgl() {
+  void Run() {
+    static_cast<void>(nice(5));
     lv_init();
     lv_disp_draw_buf_init(&draw_buffer, draw_pixels.data(), nullptr,
                           static_cast<std::uint32_t>(draw_pixels.size()));
     lv_disp_drv_init(&display_driver);
-    display_driver.hor_res = kLogicalWidth;
-    display_driver.ver_res = kLogicalHeight;
-    display_driver.flush_cb = FlushDisplay;
+    display_driver.hor_res = kScreenWidth;
+    display_driver.ver_res = kScreenHeight;
+    display_driver.flush_cb = Flush;
     display_driver.draw_buf = &draw_buffer;
     display_driver.user_data = this;
     display = lv_disp_drv_register(&display_driver);
-    if (display == nullptr) return false;
-
     lv_indev_drv_init(&input_driver);
     input_driver.type = LV_INDEV_TYPE_POINTER;
     input_driver.read_cb = ReadInput;
     input_driver.user_data = this;
     input = lv_indev_drv_register(&input_driver);
-    if (input == nullptr) return false;
-
-    const char* text_font = FindTextFont();
-    if (text_font == nullptr || access(kIconFont, R_OK) != 0 ||
-        !screen.Create(text_font, kIconFont))
-      return false;
-    screen.SetVoiceInterruptHandler(VoiceInterrupted, this);
-    screen.SetAppActionHandler(AppAction, this);
-    screen.SetCameraActivityHandler(CameraActivity, this);
-    screen.SetVolumeChangeHandler(VolumeChanged, this);
-    return true;
-  }
-
-  void ShutdownLvgl() {
-    screen.Destroy();
-    if (input != nullptr) {
-      lv_indev_delete(input);
-      input = nullptr;
-    }
-    if (display != nullptr) {
-      lv_disp_remove(display);
-      display = nullptr;
-    }
-  }
-
-  void SignalStartup(bool succeeded) {
+    const char* font = access(kFont, R_OK) == 0 ? kFont : kFallbackFont;
+    const bool ready = display != nullptr && input != nullptr && access(font, R_OK) == 0 && screen.Create(font);
+    if (ready) screen.SetEventHandler(HandleEvent, this);
     {
-      std::lock_guard<std::mutex> lock(mutex);
-      worker_started = true;
-      worker_succeeded = succeeded;
-      ready.store(succeeded);
+      std::lock_guard<std::mutex> lock(view_mutex);
+      start_ok = ready;
+      start_done = true;
     }
-    wake.notify_all();
-  }
-
-  // LVGL、触摸和 SPI 刷屏只由本线程调用，业务线程只交换模型快照和有界动作队列。
-  void Run() {
-    // RV1106 is single-core.  Keep display animation below the audio actor so
-    // an SPI refresh cannot consume the complete ALSA capture safety window.
-    static_cast<void>(nice(5));
-    const bool initialized = InitializeLvgl();
-    if (!initialized) {
-      ShutdownLvgl();
-      SignalStartup(false);
+    wake.notify_one();
+    if (!ready) {
+      screen.Destroy();
+      if (input != nullptr) lv_indev_delete(input);
+      if (display != nullptr) lv_disp_remove(display);
       return;
     }
-
-    DeviceUiState shown{};
-    std::uint8_t shown_volume = 60U;
-    std::array<std::array<char, 64>, 2> text{};
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      shown = state;
-      shown_volume = volume_percent;
-      text = lines;
-      state_dirty = false;
-      text_dirty = false;
-      volume_dirty = false;
-    }
-    screen.SetState(shown);
-    screen.SetText(text[0].data(), text[1].data());
-    screen.SetVolume(shown_volume);
-    SignalStartup(true);
-
-    auto previous = std::chrono::steady_clock::now();
+    auto shown_camera = LvglScreen::CameraStatus::kStopped;
+    auto tick = std::chrono::steady_clock::now();
+    auto last_frame = tick;
+    CameraFrame display_frame{};
     while (!stop.load()) {
+      if (provision_pid > 0) {
+        int status = 0;
+        if (waitpid(provision_pid, &status, WNOHANG) == provision_pid) {
+          const bool saved = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+          screen.SetProvisionMessage(saved ? "Wi-Fi 已保存，正在连接"
+                                           : "配网服务启动失败",
+                                     !saved);
+          provision_pid = -1;
+        }
+      }
       const auto now = std::chrono::steady_clock::now();
-      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-          now - previous).count();
-      previous = now;
-      if (elapsed > 0) {
-        lv_tick_inc(static_cast<std::uint32_t>(
-            std::min<std::int64_t>(elapsed, UINT32_MAX)));
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - tick).count();
+      tick = now;
+      if (elapsed > 0) lv_tick_inc(static_cast<std::uint32_t>(elapsed));
+      View next;
+      if (TakeView(&next)) {
+        screen.SetState(next.state);
+        screen.SetVolume(next.volume);
+        screen.SetText(next.text[0], next.text[1]);
       }
-
-      bool update_state = false;
-      bool update_text = false;
-      bool update_volume = false;
-      bool change_camera = false;
-      bool start_camera = false;
-      bool update_camera_frame = false;
-      std::array<std::uint16_t, kCameraPixelCount> camera_pixels{};
-      {
-        std::lock_guard<std::mutex> lock(mutex);
-        update_state = state_dirty;
-        update_text = text_dirty;
-        update_volume = volume_dirty;
-        change_camera = camera_request_dirty;
-        start_camera = camera_requested;
-        update_camera_frame = camera_frame_dirty;
-        if (update_state) shown = state;
-        if (update_text) text = lines;
-        if (update_volume) shown_volume = volume_percent;
-        if (update_camera_frame) camera_pixels = camera_frame;
-        state_dirty = false;
-        text_dirty = false;
-        volume_dirty = false;
-        camera_request_dirty = false;
-        camera_frame_dirty = false;
+      const auto status = camera_status.load();
+      if (status != shown_camera) {
+        shown_camera = status;
+        if (status == LvglScreen::CameraStatus::kStarting) last_frame = now;
+        screen.SetCameraStatus(status);
       }
-      if (change_camera) {
-        if (start_camera)
-          StartCamera();
-        else
-          StopCamera();
+      const bool new_frame = TakeCameraFrame(&display_frame);
+      if (new_frame && status == LvglScreen::CameraStatus::kLive) {
+        const auto frame_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame).count();
+        const unsigned fps_tenths = frame_ms > 0 ? static_cast<unsigned>(10000 / frame_ms) : 0U;
+        last_frame = now;
+        screen.SetCameraFrame(display_frame.data(), display_frame.size(), fps_tenths);
+        lv_refr_now(display);
       }
-      if (update_state) screen.SetState(shown);
-      if (update_text) screen.SetText(text[0].data(), text[1].data());
-      if (update_volume) screen.SetVolume(shown_volume);
-      if (update_camera_frame && start_camera)
-        screen.SetCameraFrame(camera_pixels.data(), camera_pixels.size());
-
       static_cast<void>(lv_timer_handler());
-      SavePendingVolumeSetting();
-      if (display_failed.load()) break;
-      std::unique_lock<std::mutex> lock(mutex);
-      // Subtitle deltas coalesce until the next visual frame.  State/page and
-      // camera lifecycle changes still wake immediately.
-      wake.wait_for(lock, kUiRefreshPeriod, [this] {
-        return stop.load() || state_dirty ||
-               volume_dirty || camera_request_dirty || camera_frame_dirty;
-      });
+      std::unique_lock<std::mutex> lock(view_mutex);
+      wake.wait_for(lock, std::chrono::milliseconds(30));
     }
-
+    if (provision_pid > 0) {
+      static_cast<void>(ReapProcessGroup(provision_pid));
+      provision_pid = -1;
+    }
     StopCamera();
-    ShutdownLvgl();
-    ready.store(false);
+    screen.Destroy();
+    if (input != nullptr) lv_indev_delete(input);
+    if (display != nullptr) lv_disp_remove(display);
   }
 };
 
 DeviceUi::~DeviceUi() noexcept { Close(); }
 
-std::uint8_t DeviceUi::LoadVolume(const std::uint8_t fallback) noexcept {
+std::uint8_t DeviceUi::LoadVolume(std::uint8_t fallback) noexcept {
   unsigned saved = 0U;
-  std::FILE* input = std::fopen(kUiSettings, "r");
-  if (input == nullptr) return std::min<std::uint8_t>(fallback, 100U);
-  const bool valid = std::fscanf(input, "%u", &saved) == 1 && saved <= 100U;
-  std::fclose(input);
-  return valid ? static_cast<std::uint8_t>(saved)
-               : std::min<std::uint8_t>(fallback, 100U);
+  std::FILE* file = std::fopen(kSettings, "r");
+  if (file == nullptr) return std::min<std::uint8_t>(fallback, 100U);
+  const bool valid = std::fscanf(file, "%u", &saved) == 1 && saved <= 100U;
+  std::fclose(file);
+  return valid ? static_cast<std::uint8_t>(saved) : std::min<std::uint8_t>(fallback, 100U);
 }
 
 bool DeviceUi::Open() noexcept {
   Close();
   impl_ = new (std::nothrow) Impl;
   if (impl_ == nullptr) return false;
-
   impl_->spi = open("/dev/spidev0.0", O_RDWR | O_CLOEXEC);
   std::uint8_t mode = 0U;
   std::uint8_t bits = 8U;
   std::uint32_t speed = kSpiSpeedHz;
-  if (impl_->spi < 0 || ioctl(impl_->spi, SPI_IOC_WR_MODE, &mode) < 0 ||
-      ioctl(impl_->spi, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0 ||
-      ioctl(impl_->spi, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0 ||
-      ioctl(impl_->spi, SPI_IOC_RD_MAX_SPEED_HZ, &speed) < 0) {
+  const bool ready = impl_->spi >= 0 && ioctl(impl_->spi, SPI_IOC_WR_MODE, &mode) == 0 &&
+      ioctl(impl_->spi, SPI_IOC_WR_BITS_PER_WORD, &bits) == 0 &&
+      ioctl(impl_->spi, SPI_IOC_WR_MAX_SPEED_HZ, &speed) == 0 &&
+      ioctl(impl_->spi, SPI_IOC_RD_MAX_SPEED_HZ, &speed) == 0 &&
+      impl_->InitPanel() && impl_->InitTouch();
+  if (!ready) {
     Close();
     return false;
   }
-  std::fprintf(stderr, "boompi-ui: SPI speed=%u Hz; refresh=30 FPS\n", speed);
-  impl_->dc = OpenGpio(kGpioRoot, kDcGpio);
-  impl_->reset = OpenGpio(kGpioRoot, kResetGpio);
-  impl_->backlight = OpenGpio(kGpioRoot, kBacklightGpio);
-  if (impl_->dc < 0 || impl_->reset < 0 || impl_->backlight < 0) {
-    Close();
-    return false;
-  }
-
-  SetGpio(impl_->backlight, false);
-  SetGpio(impl_->reset, false);
-  usleep(100000);
-  if (!SetGpio(impl_->reset, true)) {
-    Close();
-    return false;
-  }
-  usleep(100000);
-  static constexpr std::uint8_t init[] = {
-      0xB2, 5, 0x0C, 0x0C, 0,    0x33, 0x33, 0x36, 1, 0,    0x3A, 1,
-      0x55, 0xB7, 1,    0x55, 0xBB, 1,    0x1A, 0xC0, 1,    0x2C, 0xC2,
-      1,    1,    0xC3, 1,    0x19, 0xC6, 1,    0x0F, 0xD0, 1,    0xA7,
-      0xD0, 2,    0xA4, 0xA1, 0xD6, 1,    0xA1, 0xE0, 14,   0xF0, 3,
-      9,    0x0B, 0x0A, 0x16, 0x2B, 0x33, 0x41, 0x38, 0x14, 0x14, 0x29,
-      0x2F, 0xE1, 14,   0xF0, 4,    6,    9,    8,    4,    0x2B, 0x32,
-      0x41, 0x36, 0x12, 0x12, 0x2A, 0x30, 0x21, 0,    0x2A, 4,    0,
-      0,    0,    0xEF, 0x2B, 4,    0,    0,    1,    0x3F};
-  for (std::size_t offset = 0U; offset < sizeof(init);) {
-    const std::uint8_t command = init[offset++];
-    const std::uint8_t length = init[offset++];
-    if (!impl_->Command(command, init + offset, length)) {
-      Close();
-      return false;
-    }
-    offset += length;
-  }
-  if (!impl_->Command(0x11)) {
-    Close();
-    return false;
-  }
-  usleep(120000);
-  if (!impl_->Command(0x29) || !SetGpio(impl_->backlight, true)) {
-    Close();
-    return false;
-  }
-
-  impl_->touch = OpenGt911Event();
-  if (impl_->touch >= 0) {
-    impl_->touch_backend = TouchBackend::kEvent;
-  } else {
-    if (!ResetGt911AtAddress14()) {
-      Close();
-      return false;
-    }
-    impl_->touch = open(kGt911I2cDevice, O_RDWR | O_CLOEXEC);
-    if (impl_->touch >= 0 &&
-        ioctl(impl_->touch, I2C_SLAVE, kGt911Address) >= 0) {
-      impl_->touch_backend = TouchBackend::kI2c;
-    } else {
-      Close();
-      return false;
-    }
-  }
-
+  std::fprintf(stderr, "boompi-ui: SPI=%u Hz; touch=GT911/i2c-3\n", speed);
   try {
-    impl_->worker = std::thread([state = impl_] { state->Run(); });
+    impl_->ui_thread = std::thread([state = impl_] { state->Run(); });
   } catch (...) {
     Close();
     return false;
   }
-  std::unique_lock<std::mutex> lock(impl_->mutex);
-  const bool started = impl_->wake.wait_for(lock, kUiStartTimeout, [this] {
-    return impl_->worker_started;
-  });
-  const bool succeeded = started && impl_->worker_succeeded;
+  std::unique_lock<std::mutex> lock(impl_->view_mutex);
+  const bool started = impl_->wake.wait_for(lock, std::chrono::seconds(2),
+                                            [this] { return impl_->start_done; }) && impl_->start_ok;
   lock.unlock();
-  if (!succeeded) {
-    Close();
-    return false;
-  }
-  return true;
+  if (!started) Close();
+  return started;
 }
 
 void DeviceUi::SetState(DeviceUiState state) noexcept {
-  if (impl_ == nullptr || !impl_->ready.load()) return;
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (impl_->state == state) return;
-  impl_->state = state;
-  impl_->state_dirty = true;
-  impl_->wake.notify_one();
+  if (impl_ != nullptr) impl_->UpdateView(&Impl::View::state, state);
 }
 
 void DeviceUi::SetText(std::string_view first, std::string_view second) noexcept {
-  if (impl_ == nullptr || !impl_->ready.load()) return;
-  std::array<std::array<char, 64>, 2> updated{};
-  const std::string_view source[] = {first, second};
-  for (int line = 0; line < 2; ++line) {
-    const std::size_t length =
-        std::min(source[line].size(), updated[line].size() - 1U);
-    if (length != 0U)
-      std::memcpy(updated[line].data(), source[line].data(), length);
-  }
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (impl_->lines == updated) return;
-  impl_->lines = updated;
-  impl_->text_dirty = true;
-  impl_->wake.notify_one();
+  if (impl_ == nullptr) return;
+  impl_->UpdateView(&Impl::View::text, std::array<std::string, 2>{std::string(first), std::string(second)});
 }
 
-bool DeviceUi::PollAction(DeviceUiAction* action) noexcept {
-  if (action == nullptr || impl_ == nullptr) return false;
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (impl_->action_count == 0U) return false;
-  *action = impl_->actions[impl_->action_head];
-  impl_->action_head = (impl_->action_head + 1U) % impl_->actions.size();
-  --impl_->action_count;
-  return true;
+bool DeviceUi::PollAction(DeviceUiAction* result) noexcept {
+  return impl_ != nullptr && Impl::Poll(impl_->action, result);
 }
 
-bool DeviceUi::PollVolumeChange(std::uint8_t* percent) noexcept {
-  if (percent == nullptr || impl_ == nullptr) return false;
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (!impl_->volume_change_pending) return false;
-  *percent = impl_->pending_volume_percent;
-  impl_->volume_change_pending = false;
-  return true;
+bool DeviceUi::PollVolumeChange(std::uint8_t* result) noexcept {
+  return impl_ != nullptr && Impl::Poll(impl_->volume_change, result);
 }
 
-void DeviceUi::SetVolume(const std::uint8_t percent) noexcept {
-  if (impl_ == nullptr || !impl_->ready.load()) return;
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  const std::uint8_t limited = std::min<std::uint8_t>(percent, 100U);
-  if (impl_->volume_percent == limited) return;
-  impl_->volume_percent = limited;
-  impl_->volume_dirty = true;
-  impl_->wake.notify_one();
+void DeviceUi::SetVolume(std::uint8_t percent) noexcept {
+  if (impl_ != nullptr) impl_->UpdateView(&Impl::View::volume, std::min<std::uint8_t>(percent, 100U));
 }
 
 void DeviceUi::Close() noexcept {
   if (impl_ == nullptr) return;
-  impl_->ready.store(false);
   impl_->stop.store(true);
-  impl_->wake.notify_all();
-  if (impl_->worker.joinable()) impl_->worker.join();
+  impl_->wake.notify_one();
+  if (impl_->ui_thread.joinable()) impl_->ui_thread.join();
   SetGpio(impl_->backlight, false);
-  for (int fd : {impl_->touch, impl_->spi, impl_->dc, impl_->reset,
-                 impl_->backlight}) {
-    if (fd >= 0) close(fd);
-  }
+  const int descriptors[] = {impl_->touch, impl_->spi, impl_->data_command, impl_->panel_reset, impl_->backlight};
+  for (int fd : descriptors) if (fd >= 0) close(fd);
   delete impl_;
   impl_ = nullptr;
 }

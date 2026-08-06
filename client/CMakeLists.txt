@@ -50,8 +50,6 @@ if(BOOMPI_BUILD_UI_SIMULATOR)
   pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
   add_executable(boompi_ui_simulator apps/boompi_ui_simulator/main.cpp)
   target_compile_features(boompi_ui_simulator PRIVATE cxx_std_17)
-  target_compile_definitions(boompi_ui_simulator PRIVATE
-    BOOMPI_ICON_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/tabler-icons-200-subset.ttf")
   target_compile_options(boompi_ui_simulator PRIVATE -Wall -Wextra -Wpedantic
     $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:-Werror>)
   target_link_libraries(boompi_ui_simulator PRIVATE boompi_lvgl_ui
@@ -81,6 +79,45 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
   add_test(NAME voice-client-config-contract
     COMMAND boompi_voice_client_config_test)
 
+  find_package(OpenSSL QUIET)
+  find_path(BOOMPI_HOST_BOOST_INCLUDE_DIR NAMES boost/asio.hpp)
+  find_path(BOOMPI_HOST_CJSON_INCLUDE_DIR NAMES cjson/cJSON.h)
+  find_library(BOOMPI_HOST_CJSON_LIBRARY NAMES cjson libcjson)
+  if(OpenSSL_FOUND AND BOOMPI_HOST_BOOST_INCLUDE_DIR AND
+      BOOMPI_HOST_CJSON_INCLUDE_DIR AND BOOMPI_HOST_CJSON_LIBRARY)
+    add_executable(boompi_voice_transport_loopback_test
+      tests/voice_transport_loopback_test.cpp
+      src/network/voice_transport.cpp
+      src/config/voice_client_config.cpp)
+    target_compile_features(boompi_voice_transport_loopback_test PRIVATE
+      cxx_std_17)
+    target_compile_definitions(boompi_voice_transport_loopback_test PRIVATE
+      BOOST_ERROR_CODE_HEADER_ONLY=1 BOOST_SYSTEM_NO_DEPRECATED=1)
+    target_include_directories(boompi_voice_transport_loopback_test PRIVATE
+      include)
+    target_include_directories(boompi_voice_transport_loopback_test SYSTEM PRIVATE
+      "${PROJECT_SOURCE_DIR}/third_party"
+      "${BOOMPI_HOST_BOOST_INCLUDE_DIR}"
+      "${BOOMPI_HOST_CJSON_INCLUDE_DIR}")
+    if(MSVC)
+      target_compile_definitions(boompi_voice_transport_loopback_test PRIVATE
+        _CRT_SECURE_NO_WARNINGS)
+      target_compile_options(boompi_voice_transport_loopback_test PRIVATE
+        /W4 /utf-8 $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:/WX>)
+    else()
+      target_compile_options(boompi_voice_transport_loopback_test PRIVATE
+        -Wall -Wextra -Wpedantic
+        $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:-Werror>)
+    endif()
+    target_link_libraries(boompi_voice_transport_loopback_test PRIVATE
+      "${BOOMPI_HOST_CJSON_LIBRARY}" OpenSSL::SSL OpenSSL::Crypto
+      Threads::Threads ${CMAKE_DL_LIBS})
+    add_test(NAME voice-transport-loopback
+      COMMAND boompi_voice_transport_loopback_test)
+  else()
+    message(STATUS "voice-transport-loopback skipped: host OpenSSL, Boost, and cJSON development files are required")
+  endif()
+
   add_executable(boompi_voice_client_harness
     tests/voice_client_harness_test.cpp
     tests/support/voice_client_harness.cpp
@@ -102,7 +139,7 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
   foreach(_scenario IN ITEMS explicit-endpoint capture-hole touch-wake-stale-vad
       hello-timeout hello-frame-timeout
       heartbeat-timeout heartbeat-frame-timeout
-      capture-wall-timeout cancel-timeout cancel-frame-timeout
+      capture-wall-timeout cancel-timeout cancel-frame-timeout cancel-late-ack
       follow-up-timeout follow-up-frame-timeout
       drain-touch drain-barge drain-timeout drain-complete-timeout
       drain-complete-frame
@@ -110,7 +147,7 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
       barge-turn-discontinuity first-response-hint first-response-content
       stop-stalled-capture
       backpressure reconnect connection-subtitle abnormal-subtitle barge
-      barge-short-before-ack barge-long-across-ack
+      barge-short-before-ack barge-long-across-ack barge-delayed-ack
       cancel-done stale-epoch session-error-after-turn
       downlink-sequence-gap max-input)
     add_test(NAME voice-client-${_scenario}
@@ -132,7 +169,8 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
       tests/support include)
     target_link_libraries(boompi_audio_engine_harness PRIVATE Threads::Threads)
     foreach(_scenario IN ITEMS sub-grace-jitter confirmed-gap short-tail
-        bounded-close bounded-capture bounded-command reset-preserves-pcm)
+        bounded-close bounded-capture bounded-command reset-preserves-pcm
+        queue-results open-clears-error playback-clears-error)
       add_test(NAME audio-engine-${_scenario}
         COMMAND boompi_audio_engine_harness ${_scenario})
     endforeach()
@@ -250,11 +288,6 @@ target_link_libraries(boompi_protocol_json_test PRIVATE
   "${BOOMPI_CJSON_LIBRARY}" OpenSSL::SSL OpenSSL::Crypto
   Threads::Threads ${CMAKE_DL_LIBS} atomic)
 install(TARGETS boompi_client RUNTIME DESTINATION /userdata/boompi/bin)
-install(FILES assets/icons/tabler-icons-200-subset.ttf
-  DESTINATION /userdata/boompi/fonts)
-install(FILES assets/icons/TABLER-LICENSE.txt
-  DESTINATION /userdata/boompi/licenses/tabler-icons
-  RENAME LICENSE.txt)
 install(PROGRAMS scripts/boompi-clientctl scripts/boompi-provision
   DESTINATION /usr/sbin)
 install(PROGRAMS scripts/boompi-provision.py DESTINATION /usr/lib/boompi)

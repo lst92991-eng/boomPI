@@ -41,6 +41,17 @@ enum class CaptureResult : std::uint8_t {
   kFailed,
 };
 
+/// @brief TTS PCM 入队结果；瞬态流状态不写入硬件 `last_error`。
+enum class QueueTtsResult : std::uint8_t {
+  kQueued,
+  kNotOpen,
+  kInvalidArgument,
+  kNotActive,
+  kEnding,
+  kFull,
+  kDiscontinuous,
+};
+
 /// @brief 板端音频引擎的启动配置。
 ///
 /// 配置只在 `Open` 时复制；capture/playback 热路径不读取环境变量，也不创建 ALSA 或模型资源。
@@ -48,7 +59,7 @@ struct AudioEngineConfig final {
   std::string capture_pcm, playback_pcm;
   std::string snowboy_resource, snowboy_model, snowboy_sensitivity{"0.7"};
   float playback_gain{1.0F};
-  float vad_min_dbfs{-35.0F};
+  float vad_min_dbfs{-30.0F};
   std::int8_t left_polarity{1}, right_polarity{1};
 };
 
@@ -80,9 +91,10 @@ class AudioEngine final {
   bool ResetListener() noexcept;
 
   /// @brief 按服务端 sequence 把 little-endian 24 kHz mono PCM 复制到 1.5 秒有界环。
-  /// @return 队列关闭、满、序号断裂或参数非法时返回 false；绝不覆盖尚未播放的帧。
-  bool QueueTts24k(const std::uint8_t* pcm_bytes, std::size_t byte_count,
-                   std::uint64_t sequence) noexcept;
+  /// @return 明确区分生命周期、容量、序号和参数错误；绝不覆盖尚未播放的帧。
+  QueueTtsResult QueueTts24k(const std::uint8_t* pcm_bytes,
+                             std::size_t byte_count,
+                             std::uint64_t sequence) noexcept;
 
   /// @brief 开始新 TTS 流；先等采集线程在帧边界准备后端，再交给播放线程消费。
   /// 必须先于首个 PCM 包调用。
