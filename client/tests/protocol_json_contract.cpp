@@ -8,7 +8,10 @@
 namespace {
 
 using boompi::network::ParseEnvelope;
-using boompi::network::RequireUint32;
+using boompi::network::DecodeTextEvent;
+using boompi::network::InboundKind;
+
+constexpr char kDeviceId[] = "00112233-4455-6677-8899-aabbccddeeff";
 
 bool AcceptEnvelope(const std::string& json) {
   try {
@@ -21,11 +24,21 @@ bool AcceptEnvelope(const std::string& json) {
 
 bool AcceptHelloAck(const std::string& json) {
   try {
-    const auto envelope = ParseEnvelope(json);
-    if (envelope.type != "hello.ack") return false;
-    return RequireUint32(envelope.payload, "input_sample_rate_hz") == 16000U &&
-           RequireUint32(envelope.payload, "output_sample_rate_hz") == 24000U &&
-           RequireUint32(envelope.payload, "input_frame_ms") == 20U;
+    return DecodeTextEvent(json, kDeviceId).kind == InboundKind::kHelloAck;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool AcceptInbound(const std::string& type, const std::string& payload) {
+  const std::string json =
+      "{\"version\":1,\"type\":\"" + type +
+      "\",\"message_id\":\"m\",\"device_id\":\"" + kDeviceId +
+      "\",\"session_id\":1,\"turn_id\":1,\"stream_id\":1,"
+      "\"epoch\":1,\"payload\":" + payload + "}";
+  try {
+    (void)DecodeTextEvent(json, kDeviceId);
+    return true;
   } catch (...) {
     return false;
   }
@@ -45,9 +58,14 @@ int main() {
       {valid, true}, {valid + " \n\t", true},
       {R"([])", false},
       {R"({"version":"1","type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
-      {R"({"version":1,"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", true},
+      {R"({"version":1,"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
+      {R"({"version":1,"type":"hello.ack","\u0074ype":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
       {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"payload":{}})", false},
-      {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{},"extra":0})", true},
+      {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{},"extra":0})", false},
+      {R"({"version":1,"type":1,"message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
+      {R"({"version":1,"type":"hello.ack","message_id":true,"device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
+      {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":null,"session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
+      {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":true,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
       {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":-1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
       {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":-0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
       {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1.5,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
@@ -55,6 +73,7 @@ int main() {
       {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1e0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
       {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":4294967296,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
       {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":[]})", false},
+      {R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"future":{"key":1,"key":2}}})", false},
       {R"({"version":1,"type\u0000ignored":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
       {R"({"version":1,"type":"hello.ack\u0000ignored","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}})", false},
       {R"({"version":1,"type":"response.start","message_id":"m","device_id":"d","session_id":1,"turn_id":1,"stream_id":1,"epoch":1,"payload":{"response_id":"reply\u0000ignored"}})", false},
@@ -69,8 +88,10 @@ int main() {
     }
   }
   const std::vector<std::string> invalid_payloads = {
-      R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"input_sample_rate_hz":"16000","output_sample_rate_hz":24000,"input_frame_ms":20}})",
-      R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"input_sample_rate_hz":16000,"output_sample_rate_hz":24000}})",
+      R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"input_sample_rate_hz":"16000","output_sample_rate_hz":24000,"input_frame_ms":20}})",
+      R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"input_sample_rate_hz":16000,"output_sample_rate_hz":true,"input_frame_ms":20}})",
+      R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"input_sample_rate_hz":16000,"input_sample_rate_hz":16000,"output_sample_rate_hz":24000,"input_frame_ms":20}})",
+      R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"input_sample_rate_hz":16000,"output_sample_rate_hz":24000}})",
   };
   for (std::size_t index = 0; index < invalid_payloads.size(); ++index) {
     if (AcceptHelloAck(invalid_payloads[index])) {
@@ -78,11 +99,48 @@ int main() {
       ++failures;
     }
   }
-  const std::string compatible_payload =
-      R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"d","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"input_sample_rate_hz":16000,"input_sample_rate_hz":16000,"output_sample_rate_hz":24000,"input_frame_ms":20,"future":true}})";
-  if (!AcceptHelloAck(compatible_payload)) {
-    std::cerr << "compatible duplicate/unknown payload fields were rejected\n";
+  const std::string unknown_payload =
+      R"({"version":1,"type":"hello.ack","message_id":"m","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":1,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"input_sample_rate_hz":16000,"output_sample_rate_hz":24000,"input_frame_ms":20,"future":true}})";
+  if (AcceptHelloAck(unknown_payload)) {
+    std::cerr << "unknown hello.ack payload field was accepted\n";
     ++failures;
+  }
+
+  const std::vector<std::pair<std::string, std::string>> valid_inbound = {
+      {"response.start", R"({"response_id":"r"})"},
+      {"response.text_delta", R"({"response_id":"r","text":"delta"})"},
+      {"response.audio_start", R"({"response_id":"r","sample_rate_hz":24000})"},
+      {"response.cancelled", R"({"reason":"client_request"})"},
+      {"response.done", R"({"response_id":"r"})"},
+      {"error", R"({"code":"turn_error","message":"failed"})"},
+  };
+  for (const auto& item : valid_inbound) {
+    if (!AcceptInbound(item.first, item.second)) {
+      std::cerr << "valid inbound type " << item.first << " was rejected\n";
+      ++failures;
+    }
+  }
+  const std::vector<std::pair<std::string, std::string>> invalid_inbound = {
+      {"response.start", R"({"response_id":1})"},
+      {"response.text_delta", R"({"response_id":"r","text":false})"},
+      {"response.audio_start", R"({"response_id":"r","sample_rate_hz":"24000"})"},
+      {"response.cancelled", R"({"reason":null})"},
+      {"response.done", R"({"response_id":"r","response_id":"r"})"},
+      {"error", R"({"code":"turn_error","message":[]})"},
+      {"hello.ack", R"({"input_sample_rate_hz":16000,"output_sample_rate_hz":24000,"input_frame_ms":20,"extra":true})"},
+      {"response.start", R"({"response_id":"r","extra":true})"},
+      {"response.text_delta", R"({"response_id":"r","text":"delta","extra":true})"},
+      {"response.audio_start", R"({"response_id":"r","sample_rate_hz":24000,"extra":true})"},
+      {"response.cancelled", R"({"reason":"client_request","extra":true})"},
+      {"response.done", R"({"response_id":"r","extra":true})"},
+      {"error", R"({"code":"turn_error","message":"failed","extra":true})"},
+      {"future.type", R"({})"},
+  };
+  for (const auto& item : invalid_inbound) {
+    if (AcceptInbound(item.first, item.second)) {
+      std::cerr << "invalid inbound type " << item.first << " was accepted\n";
+      ++failures;
+    }
   }
   return failures == 0 ? 0 : 1;
 }

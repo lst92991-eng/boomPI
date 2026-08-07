@@ -441,6 +441,8 @@ func TestDeviceHelloRejectsInvalidTokenBeforeProviderOpen(t *testing.T) {
 		{name: "missing token", payload: json.RawMessage(`{}`)},
 		{name: "empty token", payload: json.RawMessage(`{"device_token":""}`)},
 		{name: "unknown field", payload: json.RawMessage(`{"device_token":"` + testDeviceToken + `","extra":true}`)},
+		{name: "uppercase alias", payload: json.RawMessage(`{"DEVICE_TOKEN":"` + testDeviceToken + `"}`)},
+		{name: "case alias beside exact field", payload: json.RawMessage(`{"device_token":"` + testDeviceToken + `","DEVICE_TOKEN":"` + testDeviceToken + `"}`)},
 	}
 
 	for _, testCase := range testCases {
@@ -623,6 +625,88 @@ func TestDeviceSessionIdleTimeoutUsesBusinessActivityAndReleasesDevice(t *testin
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("transport server did not stop")
+	}
+}
+
+func TestInvalidTurnStartDoesNotRefreshDeviceSessionIdleTimeout(t *testing.T) {
+	t.Setenv("DASHSCOPE_API_KEY", "offline-test-key")
+	t.Setenv("DASHSCOPE_WORKSPACE_ID", "offline-test-workspace")
+	cfg, err := config.Load("")
+	if err != nil {
+		t.Fatalf("config.Load() error = %v", err)
+	}
+	cfg.ListenAddress = "127.0.0.1"
+	cfg.WSSPort = freePort(t)
+	cfg.SessionIdleTimeout = 900 * time.Millisecond
+
+	serverIdentity, err := identity.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatalf("identity.LoadOrCreate() error = %v", err)
+	}
+	provider := newRoundTripBackend()
+	handler := &deviceHandler{
+		cfg: cfg, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), provider: provider,
+	}
+	wss, err := transport.NewServer(transport.Config{
+		Address: fmt.Sprintf("127.0.0.1:%d", cfg.WSSPort), TLSConfig: serverIdentity.TLSConfig,
+		PingInterval: time.Second, PongTimeout: 3 * time.Second,
+	}, handler)
+	if err != nil {
+		t.Fatalf("transport.NewServer() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- wss.Serve(ctx) }()
+	webSocket := dialTestServer(t, cfg.WSSPort)
+	defer webSocket.Close()
+	writeControl(t, webSocket, protocol.ControlEnvelope{
+		Version: protocol.Version, Type: "hello", MessageID: "client-1", DeviceID: testDeviceID,
+		Payload: json.RawMessage(`{"device_token":"` + testDeviceToken + `"}`),
+	})
+	helloAck := readControl(t, webSocket)
+
+	time.Sleep(500 * time.Millisecond)
+	writeControl(t, webSocket, protocol.ControlEnvelope{
+		Version: protocol.Version, Type: "turn.start", MessageID: "client-invalid", DeviceID: testDeviceID,
+		SessionID: helloAck.SessionID, TurnID: 11, StreamID: 12, Epoch: 2,
+		Payload: json.RawMessage(`{"sample_rate_hz":8000}`),
+	})
+	if rejected := readControl(t, webSocket); rejected.Type != "error" {
+		t.Fatalf("invalid turn.start response = %q, want error", rejected.Type)
+	}
+	select {
+	case <-provider.session.closed:
+	case <-time.After(650 * time.Millisecond):
+		t.Fatal("invalid turn.start incorrectly refreshed the device session deadline")
+	}
+
+	cancel()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("transport.Serve() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("transport server did not stop")
+	}
+}
+
+func TestStaleRetiredTurnCommitRequiresExactEmptyPayload(t *testing.T) {
+	state := &connectionState{turn: activeTurn{
+		deviceID: testDeviceID, sessionID: 7, turnID: 11,
+		uplinkStream: 12, epoch: 2, active: false,
+	}}
+	commit := protocol.ControlEnvelope{
+		Type: "turn.commit", DeviceID: testDeviceID, SessionID: 7,
+		TurnID: 11, StreamID: 12, Epoch: 2, Payload: json.RawMessage(`{}`),
+	}
+	if !staleRetiredTurnControl(state, commit) {
+		t.Fatal("exact stale turn.commit was not treated as idempotent")
+	}
+	commit.Payload = json.RawMessage(`{"extra":true}`)
+	if staleRetiredTurnControl(state, commit) {
+		t.Fatal("stale turn.commit with extra payload bypassed strict validation")
 	}
 }
 

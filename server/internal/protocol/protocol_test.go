@@ -34,13 +34,27 @@ func TestControlEnvelopeRoundTrip(t *testing.T) {
 
 func TestControlEnvelopeRejectsInvalidNumericFields(t *testing.T) {
 	for _, field := range []string{"version", "session_id", "turn_id", "stream_id", "epoch"} {
-		for _, value := range []string{"null", `"1"`, "1.5", "-1", "4294967296", "true"} {
+		for _, value := range []string{"null", `"1"`, "1.0", "1e0", "1.5", "-1", "4294967296", "true"} {
 			t.Run(field+"_"+strings.NewReplacer(`"`, "quote", ".", "dot", "-", "negative").Replace(value), func(t *testing.T) {
 				data := controlJSONWithNumericField(field, value)
 				if _, err := DecodeControl(data); err == nil {
 					t.Fatalf("DecodeControl() accepted %s=%s", field, value)
 				}
 			})
+		}
+	}
+}
+
+func TestControlEnvelopeRejectsInvalidFieldTypes(t *testing.T) {
+	cases := [][]byte{
+		[]byte(`{"version":1,"type":1,"message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}}`),
+		[]byte(`{"version":1,"type":"hello","message_id":true,"device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}}`),
+		[]byte(`{"version":1,"type":"hello","message_id":"1","device_id":null,"session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}}`),
+		[]byte(`{"version":1,"type":"hello","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":[]}`),
+	}
+	for index, data := range cases {
+		if _, err := DecodeControl(data); err == nil {
+			t.Fatalf("DecodeControl() accepted invalid field type case %d", index)
 		}
 	}
 }
@@ -63,11 +77,23 @@ func TestControlEnvelopeRejectsUnknownField(t *testing.T) {
 	}
 }
 
-func TestControlEnvelopeUsesDecodedDuplicateValueAndRejectsNonObjectPayload(t *testing.T) {
-	duplicate := []byte(`{"version":1,"type":"hello","type":"turn.start","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}}`)
-	decoded, err := DecodeControl(duplicate)
-	if err != nil || decoded.Type != "turn.start" {
-		t.Fatalf("DecodeControl() duplicate value = %q, error = %v", decoded.Type, err)
+func TestControlEnvelopeRejectsCaseInsensitiveFieldAlias(t *testing.T) {
+	data := []byte(`{"version":1,"type":"hello","TYPE":"turn.cancel","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}}`)
+	if _, err := DecodeControl(data); err == nil {
+		t.Fatal("DecodeControl() accepted a case-insensitive field alias")
+	}
+}
+
+func TestControlEnvelopeRejectsDuplicateKeysAndNonObjectPayload(t *testing.T) {
+	duplicates := [][]byte{
+		[]byte(`{"version":1,"type":"hello","type":"turn.start","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}}`),
+		[]byte(`{"version":1,"type":"hello","\u0074ype":"turn.start","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}}`),
+		[]byte(`{"version":1,"type":"hello","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"nested":{"key":1,"key":2}}}`),
+	}
+	for index, duplicate := range duplicates {
+		if _, err := DecodeControl(duplicate); err == nil {
+			t.Fatalf("DecodeControl() accepted duplicate case %d", index)
+		}
 	}
 	nonObject := ControlEnvelope{Version: 1, Type: "hello", MessageID: "1", DeviceID: "00112233-4455-6677-8899-aabbccddeeff", Payload: json.RawMessage(`[]`)}
 	if _, err := EncodeControl(nonObject); err == nil {

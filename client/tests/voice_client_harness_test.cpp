@@ -228,12 +228,14 @@ void ExplicitEndpointConnectsWithoutSavedServer() {
 void HelloDeadlineAdvancesWithoutCaptureFrames() {
   HarnessPlan plan{};
   plan.acknowledge_hello = false;
-  plan.capture = {Quiet(), Timeout(true)};
+  // kHelloAckWait is 30 ms in the harness. Two 20 ms actor polls cross it
+  // deterministically without relying on scheduler overhead.
+  plan.capture = {Quiet(), Timeout(), Timeout(true)};
 
   const auto result = Run(std::move(plan));
   Check(CountControl(result, ControlKind::kHello) == 1U,
         "hello timeout test never sent hello");
-  Check(result.capture_timeouts == 1U,
+  Check(result.capture_timeouts == 2U,
         "hello deadline was not exercised without capture frames");
   Check(result.transport_closes >= 1U,
         "missing hello ACK did not close the timed-out transport");
@@ -258,13 +260,14 @@ void HelloDeadlineConsumesDequeuedCaptureFrame() {
 void HeartbeatDeadlineAdvancesWithoutCaptureFrames() {
   HarnessPlan plan{};
   plan.reconnect_pause_ms = 0U;
-  plan.capture = {Quiet(), Timeout(), Timeout(), Timeout(), Timeout(),
-                  Timeout(), Timeout(), Timeout(true)};
+  plan.capture.push_back(Quiet());
+  for (unsigned tick = 0U; tick != 32U; ++tick)
+    plan.capture.push_back(Timeout(tick == 31U));
 
   const auto result = Run(std::move(plan));
   Check(CountControl(result, ControlKind::kHello) >= 1U,
         "heartbeat timeout test never established a session");
-  Check(result.capture_timeouts == 7U,
+  Check(result.capture_timeouts == 32U,
         "heartbeat deadline was not exercised without capture frames");
   Check(result.transport_closes >= 1U,
         "missing heartbeat did not close the timed-out transport");
@@ -287,10 +290,12 @@ void HeartbeatDeadlineConsumesDequeuedCaptureFrame() {
 
 void CaptureWallDeadlineCancelsWithoutReconnect() {
   HarnessPlan plan{};
-  plan.capture = {Wake(), SpeechStart(), Timeout(), Timeout(), Timeout(true)};
+  plan.capture = {Wake(), SpeechStart()};
+  for (unsigned tick = 0U; tick != 14U; ++tick)
+    plan.capture.push_back(Timeout(tick == 13U));
 
   const auto result = Run(std::move(plan));
-  Check(result.capture_timeouts == 3U,
+  Check(result.capture_timeouts == 14U,
         "capture wall deadline was not exercised without capture frames");
   Check(CountControl(result, ControlKind::kTurnCancel) == 1U,
         "capture wall deadline did not cancel the incomplete turn");
@@ -367,10 +372,13 @@ void FollowUpDeadlineAdvancesWithoutCaptureFrames() {
   CaptureStep playback_finished = Timeout();
   playback_finished.playback_done = true;
   plan.capture.push_back(playback_finished);
+  // FinishTurn starts the 30 ms follow-up deadline after the preceding poll.
+  // Two further 20 ms polls cross it deterministically.
+  plan.capture.push_back(Timeout());
   plan.capture.push_back(Timeout(true));
 
   const auto result = Run(std::move(plan));
-  Check(result.capture_timeouts == 2U,
+  Check(result.capture_timeouts == 3U,
         "follow-up deadline was not exercised without capture frames");
   Check(CountState(result, DeviceUiState::kHappy) == 1U,
         "completed playback did not enter follow-up");
@@ -684,6 +692,48 @@ void FirstContentReplacesResponseHint() {
         "first text left the progress hint visible");
 }
 
+void ResponseProgressCannotExtendTheAbsoluteDeadline() {
+  // A validated delta may extend the 300 ms no-progress window. Two deltas
+  // 160 ms apart therefore remain on the original WSS session.
+  HarnessPlan progress{};
+  progress.capture = {Wake(), SpeechStart(), SpeechEnd()};
+  CaptureStep started = Quiet();
+  started.inbound.push_back(Event(InboundKind::kResponseStart));
+  progress.capture.push_back(std::move(started));
+  for (unsigned index = 0U; index != 2U; ++index) {
+    CaptureStep delta = DelayedQuiet(160U);
+    delta.inbound.push_back(TextDelta(index == 0U ? "progress-1" : "progress-2"));
+    delta.stop_after = index == 1U;
+    progress.capture.push_back(std::move(delta));
+  }
+  const auto progressing = Run(std::move(progress));
+  Check(CountControl(progressing, ControlKind::kResponseCancel) == 0U,
+        "validated response progress did not extend the inactivity window");
+  Check(progressing.connections == 1U,
+        "validated response progress rebuilt WSS");
+
+  // Continuous valid progress still cannot move the 450 ms harness hard cap.
+  // The fifth delta is dequeued after that cap and must not revive the turn.
+  HarnessPlan absolute{};
+  absolute.capture = {Wake(), SpeechStart(), SpeechEnd()};
+  CaptureStep absolute_start = Quiet();
+  absolute_start.inbound.push_back(Event(InboundKind::kResponseStart));
+  absolute.capture.push_back(std::move(absolute_start));
+  for (unsigned index = 0U; index != 5U; ++index) {
+    CaptureStep delta = DelayedQuiet(95U);
+    delta.inbound.push_back(TextDelta("still-streaming"));
+    delta.stop_after = index == 4U;
+    absolute.capture.push_back(std::move(delta));
+  }
+  const auto expired = Run(std::move(absolute));
+  Check(CountControl(expired, ControlKind::kResponseCancel) == 1U,
+        "streaming response crossed its absolute deadline");
+  Check(CountControl(expired, ControlKind::kTurnCancel) == 0U,
+        "absolute response deadline cancelled the wrong identity");
+  Check(expired.connections == 1U,
+        "absolute response deadline unnecessarily rebuilt WSS");
+}
+
 void StopDuringBlockedCaptureIsBounded() {
   HarnessPlan plan{};
   plan.stop_during_capture_timeout = true;
@@ -692,6 +742,8 @@ void StopDuringBlockedCaptureIsBounded() {
   const auto elapsed = std::chrono::steady_clock::now() - started;
   Check(result.capture_timeouts == 1U,
         "harness did not exercise the capture timeout path");
+  Check(result.capture_poll_wait_ms == 20U,
+        "Transport dispatch poll was not bounded to one 20 ms audio period");
   Check(elapsed < std::chrono::milliseconds(500),
         "stop flag could not escape a blocked capture wait");
 }
@@ -874,6 +926,25 @@ void BargeShortUtteranceEndsBeforeAck() {
   plan.capture.push_back(std::move(ack));
 
   CheckBargeCommittedAsNewTurn(Run(std::move(plan)));
+
+  // A local capture hole can empty the admitted barge buffer while the old
+  // response cancellation is still pending. The ACK retires that response,
+  // but the empty replacement input must not rebuild a healthy WSS session.
+  auto empty = BargeUtterancePlan();
+  CaptureStep gap = Quiet();
+  gap.sequence_gap_before = true;
+  empty.capture.push_back(std::move(gap));
+  CaptureStep empty_ack = Quiet();
+  empty_ack.inbound.push_back(Event(InboundKind::kCancelled));
+  empty_ack.stop_after = true;
+  empty.capture.push_back(std::move(empty_ack));
+  const auto discarded = Run(std::move(empty));
+  Check(CountControl(discarded, ControlKind::kResponseCancel) == 1U,
+        "empty barge did not finish the old response cancellation");
+  Check(CountControl(discarded, ControlKind::kTurnStart) == 1U,
+        "empty barge fabricated a replacement turn");
+  Check(discarded.connections == 1U,
+        "empty barge rebuilt healthy WSS");
 }
 
 void BargeLongUtteranceCrossesAck() {
@@ -1061,8 +1132,10 @@ int main(const int argc, char** const argv) {
       BargeTurnDiscontinuityKeepsConnection();
     else if (scenario == "first-response-hint")
       ResponseStartDoesNotHideFirstResponseHint();
-    else if (scenario == "first-response-content")
+    else if (scenario == "first-response-content") {
       FirstContentReplacesResponseHint();
+      ResponseProgressCannotExtendTheAbsoluteDeadline();
+    }
     else if (scenario == "stop-stalled-capture")
       StopDuringBlockedCaptureIsBounded();
     else if (scenario == "backpressure") BackpressureDoesNotReconnect();

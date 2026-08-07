@@ -16,6 +16,7 @@ struct SharedState final {
   std::size_t capture_reads{0U};
   std::size_t processed_frames{0U};
   std::size_t capture_interrupts{0U};
+  std::uint64_t playback_xruns{0U};
   bool open{false};
   bool capture_interrupted{false};
 };
@@ -42,8 +43,21 @@ void Reset() noexcept {
   state.capture_reads = 0U;
   state.processed_frames = 0U;
   state.capture_interrupts = 0U;
+  state.playback_xruns = 0U;
   state.open = false;
   state.capture_interrupted = false;
+}
+
+void InjectPlaybackXruns(const std::uint64_t count) noexcept {
+  auto& state = State();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.playback_xruns += count;
+}
+
+std::uint64_t PlaybackXrunsSnapshot() noexcept {
+  auto& state = State();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  return state.playback_xruns;
 }
 
 void PushCapture(const audio::CaptureFrame& frame) noexcept {
@@ -176,6 +190,9 @@ void AudioBackend::InterruptCapture() noexcept {
 }
 
 void AudioBackend::InterruptPlayback() noexcept {}
+std::uint64_t AudioBackend::playback_xruns() const noexcept {
+  return test::audio_backend::PlaybackXrunsSnapshot();
+}
 std::string AudioBackend::last_error() const { return {}; }
 
 void AudioBackend::Close() noexcept {

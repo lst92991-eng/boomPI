@@ -112,6 +112,18 @@ bool TestSubGraceJitter() {
                "continuous playback rendered an unexpected frame count");
 }
 
+bool TestPlaybackXrunCounter() {
+  AudioEngine engine;
+  if (!OpenEngine(&engine) || !PrimePlayback(&engine)) return false;
+  fake::InjectPlaybackXruns(2U);
+  if (!Check(engine.EndPlayback(), "EndPlayback failed after playback XRUN") ||
+      !Check(WaitForPlaybackDone(engine, 500ms),
+             "playback did not finish after recovered XRUN"))
+    return false;
+  return Check(fake::PlaybackXrunsSnapshot() == 2U,
+               "playback XRUN counter did not preserve recovered events");
+}
+
 bool TestRebufferAfterConfirmedGap() {
   AudioEngine engine;
   if (!OpenEngine(&engine) || !PrimePlayback(&engine)) return false;
@@ -316,7 +328,8 @@ int main(const int argc, char** const argv) {
   }
   const std::string scenario = argv[1];
   bool passed = false;
-  if (scenario == "sub-grace-jitter") passed = TestSubGraceJitter();
+  if (scenario == "sub-grace-jitter")
+    passed = TestSubGraceJitter() && TestPlaybackXrunCounter();
   else if (scenario == "confirmed-gap") passed = TestRebufferAfterConfirmedGap();
   else if (scenario == "short-tail") passed = TestEndPlaybackShortTail();
   else if (scenario == "bounded-close") passed = TestBoundedClose();

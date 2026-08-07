@@ -50,11 +50,11 @@ Every WebSocket text frame is one complete UTF-8 JSON object with these top-leve
 Rules:
 
 - `version` is the JSON integer `1`, not the string `"1"`.
-- All nine fields are present. A field not applicable to pre-session traffic uses numeric `0`; it is not omitted or encoded as `null`.
+- Every envelope contains exactly the nine documented fields. A field not applicable to pre-session traffic uses numeric `0`; it is not omitted or encoded as `null`, and extra envelope fields are rejected.
 - Maximum text-frame size is 65,536 bytes after UTF-8 encoding.
-- `type` is 1–64 visible ASCII bytes (`0x21`–`0x7e`). Receivers must not change state for an unknown type.
-- `payload` is always an object. Individual message schemas must define their own required fields and bounds.
-- Senders do not emit duplicate JSON object keys. The teaching receiver validates the required value it reads instead of performing a second lexical duplicate-key scan. Invalid UTF-8, fractional/negative IDs and values outside unsigned 32-bit range remain invalid.
+- `type` is 1–64 visible ASCII bytes (`0x21`–`0x7e`). Receivers reject an unknown type without changing state.
+- `payload` is always an object. Each known message accepts exactly the fields in its v1 schema; missing, extra or incorrectly typed fields are rejected.
+- JSON object keys are unique at every nesting level. Receivers reject duplicate decoded keys before state mutation, including equivalent escaped spellings such as `"type"` and `"\u0074ype"`. Invalid UTF-8, fractional/negative IDs and values outside unsigned 32-bit range remain invalid.
 - JSON member order and whitespace have no semantic meaning.
 
 ### 4.1 Initial message set
@@ -192,7 +192,7 @@ Because discovery is unauthenticated, the device treats every response as a hint
 ## 9. Compatibility
 
 - A v1 parser accepts only major version `1` unless capability negotiation explicitly adds another version.
-- V1 senders emit the documented fields. Receivers validate every required field, type and bound, and may ignore unknown fields; duplicate fields have no compatibility meaning and senders must not emit them.
+- V1 senders emit exactly the documented envelope and payload fields. Receivers reject unknown, missing or incorrectly typed fields, duplicate object keys, and unsupported message types before state mutation.
 - An added optional field cannot change existing v1 meanings. A peer must negotiate a later version or capability before relying on that field.
 - New message types require documentation and capability negotiation before use.
 - New binary-header fields require a later negotiated header/version; v1 header length remains exactly 64.

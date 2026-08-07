@@ -57,6 +57,7 @@ struct HarnessSnapshot final {
   std::size_t playback_ends{0U};
   std::size_t playback_drops{0U};
   std::size_t capture_timeouts{0U};
+  std::size_t capture_poll_wait_ms{0U};
 };
 
 /// 安装一段确定性输入脚本。stop 的生命周期必须覆盖 RunVoiceClient。

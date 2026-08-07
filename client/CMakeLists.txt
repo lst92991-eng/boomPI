@@ -8,6 +8,8 @@ option(BOOMPI_BUILD_UI_SIMULATOR "Build the 320x240 LVGL desktop preview"
   ${_boompi_ui_simulator_default})
 option(BOOMPI_BUILD_AEC_LOOP_HIL
   "Build the opt-in RV1106 local-playback AEC regression probe" OFF)
+option(BOOMPI_REQUIRE_HOST_TRANSPORT_TEST
+  "Fail host configuration unless the real VoiceTransport tests can run" OFF)
 option(BOOMPI_AEC_LOOP_ENABLE_STDT
   "Enable vendor STDT in the opt-in AEC regression probe" ON)
 option(BOOMPI_AEC_LOOP_ACTIVE_PROBE
@@ -89,33 +91,44 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
       tests/voice_transport_loopback_test.cpp
       src/network/voice_transport.cpp
       src/config/voice_client_config.cpp)
-    target_compile_features(boompi_voice_transport_loopback_test PRIVATE
-      cxx_std_17)
-    target_compile_definitions(boompi_voice_transport_loopback_test PRIVATE
-      BOOST_ERROR_CODE_HEADER_ONLY=1 BOOST_SYSTEM_NO_DEPRECATED=1)
-    target_include_directories(boompi_voice_transport_loopback_test PRIVATE
-      include)
-    target_include_directories(boompi_voice_transport_loopback_test SYSTEM PRIVATE
-      "${PROJECT_SOURCE_DIR}/third_party"
-      "${BOOMPI_HOST_BOOST_INCLUDE_DIR}"
-      "${BOOMPI_HOST_CJSON_INCLUDE_DIR}")
-    if(MSVC)
-      target_compile_definitions(boompi_voice_transport_loopback_test PRIVATE
-        _CRT_SECURE_NO_WARNINGS)
-      target_compile_options(boompi_voice_transport_loopback_test PRIVATE
-        /W4 /utf-8 $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:/WX>)
-    else()
-      target_compile_options(boompi_voice_transport_loopback_test PRIVATE
-        -Wall -Wextra -Wpedantic
-        $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:-Werror>)
-    endif()
-    target_link_libraries(boompi_voice_transport_loopback_test PRIVATE
-      "${BOOMPI_HOST_CJSON_LIBRARY}" OpenSSL::SSL OpenSSL::Crypto
-      Threads::Threads ${CMAKE_DL_LIBS})
+    add_executable(boompi_protocol_json_test
+      tests/protocol_json_contract.cpp
+      src/config/voice_client_config.cpp)
+    foreach(_target IN ITEMS boompi_voice_transport_loopback_test
+        boompi_protocol_json_test)
+      target_compile_features(${_target} PRIVATE cxx_std_17)
+      target_compile_definitions(${_target} PRIVATE
+        BOOST_ERROR_CODE_HEADER_ONLY=1 BOOST_SYSTEM_NO_DEPRECATED=1)
+      target_include_directories(${_target} PRIVATE include)
+      target_include_directories(${_target} SYSTEM PRIVATE
+        "${PROJECT_SOURCE_DIR}/third_party"
+        "${BOOMPI_HOST_BOOST_INCLUDE_DIR}"
+        "${BOOMPI_HOST_CJSON_INCLUDE_DIR}")
+      if(MSVC)
+        target_compile_definitions(${_target} PRIVATE
+          _CRT_SECURE_NO_WARNINGS)
+        target_compile_options(${_target} PRIVATE
+          /W4 /utf-8 $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:/WX>)
+      else()
+        target_compile_options(${_target} PRIVATE
+          -Wall -Wextra -Wpedantic
+          $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:-Werror>)
+      endif()
+      target_link_libraries(${_target} PRIVATE
+        "${BOOMPI_HOST_CJSON_LIBRARY}" OpenSSL::SSL OpenSSL::Crypto
+        Threads::Threads ${CMAKE_DL_LIBS})
+    endforeach()
     add_test(NAME voice-transport-loopback
       COMMAND boompi_voice_transport_loopback_test)
+    add_test(NAME protocol-json-contract
+      COMMAND boompi_protocol_json_test)
   else()
-    message(STATUS "voice-transport-loopback skipped: host OpenSSL, Boost, and cJSON development files are required")
+    if(BOOMPI_REQUIRE_HOST_TRANSPORT_TEST)
+      message(FATAL_ERROR
+        "Real VoiceTransport tests require host OpenSSL, Boost, and cJSON development files")
+    endif()
+    message(STATUS
+      "Real VoiceTransport tests skipped: host OpenSSL, Boost, and cJSON development files are required")
   endif()
 
   add_executable(boompi_voice_client_harness

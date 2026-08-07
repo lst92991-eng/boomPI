@@ -1,3 +1,4 @@
+/// @file application 与板级实时音频之间的固定帧、队列和播放生命周期契约。
 #pragma once
 
 #include <array>
@@ -8,6 +9,7 @@
 
 namespace boompi::audio {
 
+/// 16 kHz 音频的 20 ms 帧长。整个客户端以这一个时间单位推进 VAD、唤醒和上传时序。
 constexpr std::size_t kVoiceFrameSamples16k = 320U;
 using VoiceFrame16k = std::array<std::int16_t, kVoiceFrameSamples16k>;
 
@@ -21,45 +23,55 @@ using VoiceFrame16k = std::array<std::int16_t, kVoiceFrameSamples16k>;
 struct CaptureFrame final {
   VoiceFrame16k pcm{};
 #ifdef BOOMPI_AEC_LOOP_DIAGNOSTICS
-  // HIL-only snapshot of the exact 3A input planes. Production builds do not
-  // carry or copy these samples.
+  /// HIL 构建保存送入 3A 前的四个 16 kHz 平面，用来核对布线、极性和参考时序。
+  /// 产品构建不包含该字段，避免在实时路径额外复制 4 × 320 个 sample。
   std::array<VoiceFrame16k, 4U> aec_input{};
 #endif
+  /// `sequence` 标识 application 实际收到的处理帧；序号空洞表示队列边界已丢失连续性。
   std::uint64_t sequence{0U};
   /// 该 PCM 对应采集 period 结束时的 steady-clock 时间；随 3A 固定一帧延迟一起延后。
   std::uint64_t timestamp_us{0U};
+  /// `input_dbfs` 取双路原始麦克风中较大值，负责 VAD 准入；`voice_dbfs` 来自 AEC 后单声道，
+  /// 负责播放期间的近讲判断。两者用途不同，调参时需要分别观察。
   float input_dbfs{-120.0F}, voice_dbfs{-120.0F};
+  /// `vad_now` 是当前帧电平；started/ended 是带 120/700 ms 滞回后的边沿事件。
   bool wake{false}, vad_now{false}, vad_started{false}, vad_ended{false};
+  /// `actor_overrun` 是 `discontinuity` 的一个具体来源：application 超过 80 ms 未消费。
   bool discontinuity{false}, actor_overrun{false};
+  /// `near_voice` 已应用 AEC 预热/尾音抑制；`reference_active` 与本帧 DSP 输出处于同一时间轴。
   bool near_voice{false}, reference_active{false};
 };
 
 /// @brief application 等待下一帧的结果，区分正常轮询超时和音频故障。
 enum class CaptureResult : std::uint8_t {
-  kFrame,
-  kTimeout,
-  kFailed,
+  kFrame,    ///< 已返回一帧，调用者取得该帧所有权。
+  kTimeout,  ///< 本次等待期内无帧，音频链路仍可继续工作。
+  kFailed,   ///< 生命周期错误或采集线程失败，应读取 `last_error` 并结束音频循环。
 };
 
 /// @brief TTS PCM 入队结果；瞬态流状态不写入硬件 `last_error`。
 enum class QueueTtsResult : std::uint8_t {
-  kQueued,
-  kNotOpen,
-  kInvalidArgument,
-  kNotActive,
-  kEnding,
-  kFull,
-  kDiscontinuous,
+  kQueued,           ///< PCM 已完整复制进有界环。
+  kNotOpen,          ///< AudioEngine 尚未打开或已经关闭。
+  kInvalidArgument,  ///< 空包、空指针或奇数字节，无法组成 S16_LE sample。
+  kNotActive,        ///< 还未开始当前播放会话。
+  kEnding,           ///< 已收到流结束标记，当前会话不再接受 PCM。
+  kFull,             ///< 1.5 秒容量不足；调用方需要把它当作明确背压处理。
+  kDiscontinuous,    ///< 服务端 PCM sequence 出现空洞，继续播放会掩盖音频缺失。
 };
 
 /// @brief 板端音频引擎的启动配置。
 ///
 /// 配置只在 `Open` 时复制；capture/playback 热路径不读取环境变量，也不创建 ALSA 或模型资源。
 struct AudioEngineConfig final {
+  /// ALSA PCM 名称由板端配置给出，便于匹配不同镜像中的 card/device 编号。
   std::string capture_pcm, playback_pcm;
+  /// Snowboy 模型资源在 Open 时交给旧 ABI bridge，实时线程只保留已创建句柄。
   std::string snowboy_resource, snowboy_model, snowboy_sensitivity{"0.7"};
+  /// 默认播放增益与原始麦克风 VAD 准入门限；运行中音量可经原子值更新。
   float playback_gain{1.0F};
   float vad_min_dbfs{-30.0F};
+  /// 麦克风焊接极性只能取 +1/-1；数字回采参考不应用此设置。
   std::int8_t left_polarity{1}, right_polarity{1};
 };
 
@@ -97,13 +109,16 @@ class AudioEngine final {
                              std::uint64_t sequence) noexcept;
 
   /// @brief 开始新 TTS 流；先等采集线程在帧边界准备后端，再交给播放线程消费。
-  /// 必须先于首个 PCM 包调用。
+  ///
+  /// 必须先于首个 PCM 包调用。帧边界握手保证 capture 侧先武装 AEC 预热，随后播放
+  /// 线程才可能产生硬件参考，避免跨线程同时修改播放会话状态。
   bool BeginPlayback() noexcept;
 
   /// @brief 标记当前 TTS 已收完；播放线程会消费最后一个短帧、drain ALSA，再置完成状态。
   bool EndPlayback() noexcept;
 
-  /// `SetPlaybackScale` 只调整后续渲染增益；`DropPlayback` 异步唤醒播放线程并清空尚未渲染的 TTS。
+  /// `SetPlaybackGain` 保存用户音量，`SetPlaybackScale` 叠加会话内临时衰减；两者只影响
+  /// 后续渲染。`DropPlayback` 异步唤醒播放线程并清空尚未渲染的 TTS，用于打断旧回复。
   void SetPlaybackGain(float gain) noexcept;
   void SetPlaybackScale(float scale) noexcept;
   void DropPlayback() noexcept;

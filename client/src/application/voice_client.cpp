@@ -1,10 +1,22 @@
-/// @file 对话状态机：只编排已经实现的音频与 WSS 能力，不承载底层算法。
+/**
+ * @file voice_client.cpp
+ * @brief 用单一 application actor 编排唤醒、收音、云端响应、播放和打断。
+ *
+ * 主线程每次取得一帧 20 ms 音频，先推进超时，再消费有限数量的 WSS 事件，最后
+ * 根据当前 State 处理该帧。会话身份、turn/epoch、字幕和打断阶段都由该线程独占，
+ * 音频实时线程与 WSS 线程只能通过有界队列提交结果。这种所有权让学生可以沿时间
+ * 顺序阅读完整对话，也避免多条线程同时改写状态机。
+ *
+ * 底层 AEC/VAD/Snowboy 位于 audio/platform，TLS/WebSocket 编解码位于 network；
+ * 本文件只决定何时调用这些能力以及一次对话在何种条件下继续、取消或重连。
+ */
 #include "boompi/application/voice_client.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -41,7 +53,13 @@ using network::VoiceTransport;
 using network::WireIds;
 using ui::DeviceUiAction;
 using ui::DeviceUiState;
+
+// application 使用固定 20 ms 帧作为全部时间计量单位。25 帧 pre-roll 可以在
+// VAD 边沿到达后补回前 500 ms，保留辅音较轻的句首和唤醒后的自然起音。
 constexpr std::size_t kPreRollFrames = 25U;
+
+// 打断探针依次经历：正常音量下形成候选、静音等待参考消失、等待声学尾音、
+// 再确认近讲。各阶段单独计数，便于把听感问题映射到明确的声学决策。
 constexpr unsigned kBargeCandidateFrames = 6U;
 constexpr unsigned kBargeReferenceLowFrames = 3U;
 constexpr unsigned kBargeReferenceWaitFrames = 15U;
@@ -63,7 +81,8 @@ constexpr std::size_t kCaptureQueueSlackFrames = 4U;
 constexpr std::size_t kBargeBufferFrames =
     kMaximumBargeProbeFrames + kCancelAckFrames + kCaptureQueueSlackFrames;
 constexpr std::uint32_t kMaximumTurnFrames = 3000U;  // 60 s：单次用户语音上限。
-/// Host harness 缩短等待但保留各 deadline 的相对顺序；板端始终采用 production_ms。
+
+/// Host harness 缩短墙钟等待以快速覆盖超时分支；板端始终采用 production_ms。
 constexpr auto TestableDuration([[maybe_unused]] const int production_ms,
                                 [[maybe_unused]] const int harness_ms) {
 #if defined(BOOMPI_VOICE_CLIENT_HARNESS)
@@ -79,6 +98,9 @@ constexpr auto kSpeechStartWait = TestableDuration(6000, 250);
 constexpr auto kMaximumTurnWait = TestableDuration(60000, 250);
 constexpr auto kFirstResponseHint = TestableDuration(15000, 15);
 constexpr auto kResponseWait = TestableDuration(30000, 300);
+// 合法流式进度可以续期 30 s 无进展窗口，但不能让一个 response 永久占住 turn。
+// 5 min 与服务端允许的 provider timeout 上限一致；harness 使用短墙钟验证硬边界。
+constexpr auto kResponseAbsoluteWait = TestableDuration(300000, 450);
 constexpr auto kCancelAckWait = TestableDuration(kCancelAckWaitMs, 250);
 constexpr auto kDrainPlaybackWait = TestableDuration(30000, 20);
 constexpr auto kFollowUpWait = TestableDuration(3000, 30);
@@ -87,8 +109,12 @@ constexpr auto kFollowUpWait = TestableDuration(3000, 30);
 // 判定为近讲；500 ms pre-roll 仍保留真实发言的句首。
 constexpr unsigned kFollowUpNearFrames = 20U;
 constexpr unsigned kEventsPerCaptureFrame = 8U;
-constexpr auto kActorPollInterval = std::chrono::milliseconds(100);
+// Capture 没有交付帧时，20 ms poll 仍给 Transport inbound、UI 和 deadline
+// 提供与音频 period 相同的最坏调度机会；真板用 actor queue 的 max_dispatch_ms 验证。
+constexpr auto kActorPollInterval = std::chrono::milliseconds(20);
+constexpr auto kObservabilityLogInterval = std::chrono::seconds(60);
 
+/// 把播放队列的细分拒绝原因转换为稳定日志，便于区分生命周期错误、断帧和容量不足。
 const char* QueueTtsResultName(const QueueTtsResult result) noexcept {
   switch (result) {
     case QueueTtsResult::kQueued: return "queued";
@@ -102,26 +128,42 @@ const char* QueueTtsResultName(const QueueTtsResult result) noexcept {
   return "unknown";
 }
 
-/** WSS 线程单生产、主 actor 单消费；固定 64 项，溢出时主动断线而不是覆盖事件。 */
+/**
+ * @brief WSS 单生产者与 application 单消费者之间的有界事件队列。
+ *
+ * 回调只移动一条已经解码的事件并立即返回，协议状态继续由 actor 独占。固定容量
+ * 可以限制云端突发消息占用的内存；溢出会留下明确标志，actor 随后重建会话，避免
+ * 覆盖控制事件后继续运行一个身份不完整的 turn。
+ */
 class EventQueue final {
  public:
   bool Push(Inbound event) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (count_ == slots_.size()) {
       overflow_ = true;
+      ++dropped_;
       return false;
     }
-    slots_[tail_] = std::move(event);
+    slots_[tail_].event = std::move(event);
+    slots_[tail_].queued_at = Clock::now();
     tail_ = (tail_ + 1U) % slots_.size();
     ++count_;
+    ++enqueued_;
+    high_water_ = std::max(high_water_, count_);
     return true;
   }
   bool Pop(Inbound* event) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (count_ == 0U) return false;
-    *event = std::move(slots_[head_]);
+    const auto dispatch_delay = std::chrono::duration_cast<std::chrono::microseconds>(
+        Clock::now() - slots_[head_].queued_at);
+    max_dispatch_us_ = std::max(
+        max_dispatch_us_, static_cast<std::uint64_t>(dispatch_delay.count()));
+    *event = std::move(slots_[head_].event);
+    slots_[head_] = {};
     head_ = (head_ + 1U) % slots_.size();
     --count_;
+    ++dequeued_;
     return true;
   }
   bool overflowed() const {
@@ -134,17 +176,64 @@ class EventQueue final {
     for (auto& slot : slots_) slot = {};
     head_ = tail_ = count_ = 0U;
     overflow_ = false;
+    enqueued_ = dequeued_ = dropped_ = 0U;
+    max_dispatch_us_ = 0U;
+    high_water_ = 0U;
+  }
+  void LogSummary(const char* const phase) const {
+    std::size_t high_water = 0U;
+    std::size_t pending = 0U;
+    std::uint64_t max_dispatch_us = 0U;
+    std::uint64_t enqueued = 0U;
+    std::uint64_t dequeued = 0U;
+    std::uint64_t dropped = 0U;
+    {
+      // fprintf 可能阻塞在日志后端；只在锁内复制计数，避免挡住 Transport 入队。
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (enqueued_ == 0U && dropped_ == 0U) return;
+      high_water = high_water_;
+      pending = count_;
+      max_dispatch_us = max_dispatch_us_;
+      enqueued = enqueued_;
+      dequeued = dequeued_;
+      dropped = dropped_;
+    }
+    std::fprintf(
+        stderr,
+        "boompi-client: actor queue summary; phase=%s; high_water_events=%zu; "
+        "max_dispatch_ms=%.3f; enqueued=%llu; dequeued=%llu; dropped=%llu; "
+        "pending=%zu\n",
+        phase, high_water, static_cast<double>(max_dispatch_us) / 1000.0,
+        static_cast<unsigned long long>(enqueued),
+        static_cast<unsigned long long>(dequeued),
+        static_cast<unsigned long long>(dropped), pending);
   }
  private:
+  struct Slot final {
+    Inbound event{};
+    Clock::time_point queued_at{};
+  };
   mutable std::mutex mutex_;
-  std::array<Inbound, 64U> slots_{};
+  std::array<Slot, 64U> slots_{};
   std::size_t head_{0U};
   std::size_t tail_{0U};
   std::size_t count_{0U};
+  std::size_t high_water_{0U};
+  std::uint64_t enqueued_{0U};
+  std::uint64_t dequeued_{0U};
+  std::uint64_t dropped_{0U};
+  std::uint64_t max_dispatch_us_{0U};
   bool overflow_{false};
 };
 
-/// 一轮对话的完整状态。所有转换只发生在 application actor 线程。
+/**
+ * @brief 一轮语音交互的业务状态，所有转换只发生在 application actor 线程。
+ *
+ * 正常路径：WaitingForWake → WaitingForSpeech → CapturingSpeech →
+ * WaitingForResponse → PlayingResponse → DrainingPlayback → WaitingForFollowUp。
+ * 播放或收尾阶段确认近讲后进入 CancelPending，收到取消结果后携带已缓存语音开始
+ * 新 turn。枚举直接表达产品体验，后续阅读 OnFrame 和 HandleEvent 时可逐项对照。
+ */
 enum class State : std::uint8_t {
   kWaitingForWake,
   kWaitingForSpeech,
@@ -155,6 +244,13 @@ enum class State : std::uint8_t {
   kDrainingPlayback,
   kWaitingForFollowUp,
 };
+
+/**
+ * @brief 播放期近讲的声学确认子状态。
+ *
+ * 它只回答“当前候选能否安全打断播放”，不会创建 turn。通过后由 ConfirmBarge
+ * 发送 response.cancel，并由 CancelPending 保存用户继续说出的音频。
+ */
 enum class BargeProbe : std::uint8_t {
   kIdle,
   kWaitReferenceLow,
@@ -162,6 +258,13 @@ enum class BargeProbe : std::uint8_t {
   kVerify,
 };
 
+/**
+ * @brief 语音产品的唯一业务 actor，串行维护会话身份和用户可见状态。
+ *
+ * AudioEngine、VoiceTransport 和 DeviceUi 各自拥有工作线程；本类通过它们的小型
+ * 接口和有界队列进行协作。除 endpoint 快照外，成员不需要业务锁，因为 Run 所在
+ * 线程是所有会话字段的唯一写入者。
+ */
 class VoiceClient final {
  public:
   VoiceClient(const config::VoiceClientConfig& config, std::string* error)
@@ -169,13 +272,22 @@ class VoiceClient final {
         endpoint_{config.server_ip, config.server_port,
                   config.server_spki_sha256},
         error_(error) {}
+
+  // 退出时先阻止新的网络工作并关闭 WSS，再停止音频实时线程，最后等待可能正在
+  // 执行 DHCP/发现的网络辅助线程。各模块在自己的 Close 中释放所拥有的资源。
   ~VoiceClient() {
     stop_network_.store(true, std::memory_order_release);
     if (transport_) transport_->Close();
+    events_.LogSummary("shutdown");
     audio_.Close();
     if (network_thread_.joinable()) network_thread_.join();
   }
 
+  /**
+   * @brief 初始化三个子系统并在调用线程持续推进 application actor。
+   * @param stop 由进程信号处理器设置的停止标志；为空时由测试 harness 控制退出。
+   * @return 正常收到停止请求时返回 true，关键资源或状态机发生不可恢复错误时返回 false。
+   */
   bool Run(const volatile std::sig_atomic_t* stop) {
     // 主线程就是 application actor。Capture 每 20 ms 返回一次，因此连接完成、网络事件
     // 和状态 deadline 都在同一串行时序中处理，不需要给会话字段再加锁。
@@ -198,6 +310,7 @@ class VoiceClient final {
     try { network_thread_ = std::thread(&VoiceClient::NetworkLoop, this); }
     catch (...) { return Fail("network thread creation failed"); }
     next_connect_ = Clock::now();
+    next_observability_log_ = Clock::now() + kObservabilityLogInterval;
     std::cout << "boompi-client: voice loop ready; wake_word=snowboy"
               << "; wake_sensitivity=" << config_.snowboy_sensitivity
               << "; vad_min_dbfs=" << config_.vad_min_dbfs
@@ -215,16 +328,19 @@ class VoiceClient final {
       const bool frame_still_current = AdvanceDeadlines(Clock::now());
       if (listener_failed_) return Fail(audio_.last_error());
       DrainEvents();
+      const auto after_dispatch = Clock::now();
+      if (after_dispatch >= next_observability_log_) {
+        events_.LogSummary("periodic");
+        next_observability_log_ = after_dispatch + kObservabilityLogInterval;
+      }
       PollUi();
       if (listener_failed_) return Fail(audio_.last_error());
       if (events_.overflowed()) LoseConnection("network event queue overflow");
       if (capture == CaptureResult::kFailed) return Fail(audio_.last_error());
       if (capture == CaptureResult::kTimeout) continue;
       if (!frame_still_current) {
-        // Deadline/drain transitions may intentionally reject the frame that
-        // was already dequeued above.  It still belongs to the continuous
-        // capture timeline; consume its sequence here so the following real
-        // frame is not misreported as an ALSA/actor discontinuity.
+        // deadline 或 drain 转换可能主动拒绝刚刚出队的帧。它仍属于连续采集时间线，
+        // 因此在这里消费 sequence，避免下一帧被误报为 ALSA/actor 断帧。
         next_capture_sequence_ = frame.sequence + 1U;
         continue;
       }
@@ -235,12 +351,14 @@ class VoiceClient final {
   }
 
  private:
+  /// 将不可恢复错误发布到 UI 和 main；具体资源由析构路径按所有权关闭。
   bool Fail(std::string why) {
     ui_.SetState(DeviceUiState::kError);
     if (error_ != nullptr) *error_ = std::move(why);
     return false;
   }
   bool SendControl(ControlKind kind, WireIds ids) {
+    // message_id 只用于控制消息去重与诊断；业务身份仍由 session/turn/stream/epoch 决定。
     Control control{};
     control.kind = kind;
     control.message_id = "client-" + std::to_string(message_++);
@@ -255,6 +373,7 @@ class VoiceClient final {
     return SameTurn(left, right) && left.stream == right.stream;
   }
   bool IsStale(const WireIds& ids) const {
+    // 同一 session 中较小 epoch 的延迟事件属于已经封口的历史轮次，可以安全忽略。
     return turn_ids_.session != 0U && ids.turn != 0U &&
            ids.session == turn_ids_.session &&
            ids.epoch != 0U && ids.epoch < turn_ids_.epoch;
@@ -263,20 +382,33 @@ class VoiceClient final {
     return response_ids_.session != 0U && SameIds(event.ids, response_ids_);
   }
   void ProtocolViolation(const char* reason) {
+    // 身份或顺序错误会破坏后续判定基础，关闭持久连接可重新取得干净的 session。
     std::cerr << "boompi-client: protocol error; reason=" << reason << std::endl;
     LoseConnection(reason);
   }
   void ResetResponse() {
+    // response 是 turn 内的服务端输出流；推进 turn 或重连时必须一起清除其序号与阶段。
     response_ids_ = {};
     response_id_.clear();
     downlink_sequence_ = 0U;
     response_audio_started_ = false;
     response_audio_ended_ = false;
+    response_absolute_deadline_ = {};
+  }
+
+  void RefreshResponseWait() {
+    const auto inactivity_deadline = Clock::now() + kResponseWait;
+    state_deadline_ = response_absolute_deadline_ == Clock::time_point{}
+        ? inactivity_deadline
+        : std::min(inactivity_deadline, response_absolute_deadline_);
   }
   void ResetListener() {
+    // ResetListener 只重置唤醒/VAD 判定历史，连续 ALSA 采集和 Rockchip 3A 仍保持运行。
     if (!audio_.ResetListener())
       listener_failed_ = true;
   }
+
+  /// 返回不切断 UTF-8 多字节字符的字节边界，供固定尺寸字幕区域安全截取文本。
   static std::size_t Utf8Cut(std::string_view text, std::size_t limit) {
     std::size_t end = std::min(text.size(), limit);
     if (end != text.size()) while (end != 0U &&
@@ -284,6 +416,7 @@ class VoiceClient final {
     return end;
   }
   void ShowText(const std::string& delta) {
+    // 字幕只保留最近 126 字节并分成两行。边界按 UTF-8 调整，防止 LVGL 收到残缺编码。
     subtitle_ += delta;
     if (subtitle_.size() > 126U) {
       subtitle_.erase(0U, subtitle_.size() - 126U);
@@ -309,6 +442,7 @@ class VoiceClient final {
     ClearSubtitle();
   }
   void ApplyVolume(const std::uint8_t percent) {
+    // 用户百分比与板级增益在 application 合成；AudioEngine 原子更新后续播放帧的增益。
     volume_ = std::min<std::uint8_t>(percent, 100U);
     audio_.SetPlaybackGain(static_cast<float>(volume_) *
                            config_.speaker_gain_percent / 10000.0F);
@@ -316,6 +450,7 @@ class VoiceClient final {
   }
 
   void PollUi() {
+    // UI worker 只发布离散动作和音量快照；实际状态转换仍在 actor 中串行完成。
     std::uint8_t selected_volume = volume_;
     if (ui_.PollVolumeChange(&selected_volume))
       ApplyVolume(selected_volume);
@@ -340,6 +475,8 @@ class VoiceClient final {
   }
 
   bool AdvanceDeadlines(const Clock::time_point now) {
+    // 所有业务 deadline 集中在一个入口，并在本轮网络事件之前执行。相同事件时序
+    // 因此得到确定结果，也方便学生查看每个状态超时后进入何处。
     if (turn_ids_.session == 0U) {
       if (!transport_ || now < state_deadline_) return true;
       LoseConnection("connect or hello timeout");
@@ -352,6 +489,16 @@ class VoiceClient final {
     if (state_ == State::kDrainingPlayback && audio_.playback_done()) {
       if (audio_.playback_failed()) listener_failed_ = true;
       else FinishTurn(true);
+      return false;
+    }
+    const bool response_in_progress =
+        state_ == State::kWaitingForResponse ||
+        state_ == State::kPlayingResponse ||
+        state_ == State::kDrainingPlayback;
+    if (response_in_progress &&
+        response_absolute_deadline_ != Clock::time_point{} &&
+        now >= response_absolute_deadline_) {
+      AbortCurrent("response absolute timeout cancel failed");
       return false;
     }
     if (state_ != State::kWaitingForWake && now >= state_deadline_) {
@@ -381,6 +528,7 @@ class VoiceClient final {
   }
 
   void ResetBargeProbe() {
+    // 任何探针结束都恢复正常播放比例，防止拒绝路径遗留静音状态。
     barge_probe_frames_ = barge_cooldown_frames_ = 0U;
     barge_probe_ = BargeProbe::kIdle;
     audio_.SetPlaybackScale(1.0F);
@@ -400,6 +548,7 @@ class VoiceClient final {
   }
 
   void BeginListening(const char* reason) {
+    // 唤醒只打开有限时长的说话窗口，真正创建 turn 仍等待 VAD 起始边沿。
     state_ = State::kWaitingForSpeech;
     state_deadline_ = Clock::now() + kSpeechStartWait;
     ui_.SetState(DeviceUiState::kListening);
@@ -408,6 +557,8 @@ class VoiceClient final {
   }
 
   void NetworkLoop() {
+    // DHCP、Wi-Fi 和 UDP 发现可能阻塞数秒，放在辅助线程可保证 20 ms 音频 actor
+    // 持续排空采集队列。结果通过 mutex 快照和原子就绪标志一次性发布。
     NetworkBootstrapResult configured{
         config_.server_ip, config_.server_port, config_.server_spki_sha256};
     const NetworkBootstrapResult* const explicit_server =
@@ -429,7 +580,7 @@ class VoiceClient final {
     }
   }
 
-  // Connect 只启动 WSS/ASIO 线程；hello 必须等 open callback 确认 connected 后由 actor 发送。
+  // Connect 只启动 WSS/ASIO 线程；hello 等 open callback 确认 connected 后由 actor 发送。
   void StartConnect() {
     try {
       transport_ = std::make_unique<VoiceTransport>();
@@ -458,6 +609,7 @@ class VoiceClient final {
   }
 
   void FinishConnect() {
+    // TLS/WebSocket open 与协议 hello 属于两个阶段。hello.ack 到达前 session 身份仍为空。
     if (!transport_ || hello_sent_ || !transport_->connected()) return;
     if (!SendControl(ControlKind::kHello, {})) {
       LoseConnection("hello send failed");
@@ -467,10 +619,11 @@ class VoiceClient final {
     }
   }
 
-  // 连接错误会使当前 turn 失效。旧事件、旧音频和旧 epoch 必须一起清掉，不能重传。
+  // 连接错误会使当前 turn 失效。旧事件、旧音频和旧 epoch 必须一起清掉且禁止重传。
   void LoseConnection(const char* reason) {
     if (transport_) transport_->Close();
     transport_.reset();
+    events_.LogSummary("disconnect");
     events_.Clear();
     audio_.DropPlayback();
     ClearSubtitle();
@@ -505,7 +658,7 @@ class VoiceClient final {
     }
   }
 
-  // 本地音频连续性/容量故障只取消当前轮次；WSS/TLS 仍健康时不能丢掉持久 provider 会话。
+  // 本地音频连续性或容量故障只取消当前轮次；健康的 WSS/TLS 会话继续复用。
   void AbortCurrent(const char* failure) {
     audio_.DropPlayback();
     ResetBargeProbe();
@@ -531,10 +684,13 @@ class VoiceClient final {
       return;
     }
     if (event.kind == InboundKind::kHeartbeat) {
+      // 服务端驱动心跳；每次收到后重新建立失联上限，actor 无需额外发送定时包。
       heartbeat_deadline_ = Clock::now() + kHeartbeatWait;
       return;
     }
     if (event.kind == InboundKind::kHelloAck) {
+      // hello.ack 首次赋予 session 与 epoch。任何已有 turn 或非零 turn/stream 都说明
+      // 服务端和客户端对握手阶段的理解不同，继续处理会污染后续身份判断。
       if (!hello_sent_ || turn_ids_.session != 0U || event.ids.session == 0U ||
           event.ids.turn != 0U || event.ids.stream != 0U || event.ids.epoch == 0U) {
         ProtocolViolation("invalid hello.ack identity");
@@ -617,7 +773,6 @@ class VoiceClient final {
       return;
     }
 
-    state_deadline_ = Clock::now() + kResponseWait;
     switch (event.kind) {
       case InboundKind::kResponseStart:
         if (state_ != State::kWaitingForResponse ||
@@ -631,6 +786,7 @@ class VoiceClient final {
         downlink_sequence_ = 0U;
         response_audio_started_ = false;
         response_audio_ended_ = false;
+        RefreshResponseWait();
         if (!await_hint_visible_) ClearSubtitle();
         break;
       case InboundKind::kTextDelta:
@@ -638,6 +794,7 @@ class VoiceClient final {
           ProtocolViolation("wrong response.text_delta identity");
           return;
         }
+        RefreshResponseWait();
         MarkFirstResponseProgress();
         ShowText(event.text);
         break;
@@ -654,10 +811,13 @@ class VoiceClient final {
         }
         response_audio_started_ = true;
         state_ = State::kPlayingResponse;
+        RefreshResponseWait();
         ui_.SetState(DeviceUiState::kSpeaking);
         ResetBargeProbe();
         break;
       case InboundKind::kPcm: {
+        // PCM sequence 必须从零连续递增，首帧和末帧由 flags 标记。检测到服务端
+        // discontinuity 后取消当前回答，防止把缺口两侧音频无提示地拼接播放。
         if (!IsCurrentResponse(event) || !response_audio_started_ ||
             response_audio_ended_ || event.pcm.sequence != downlink_sequence_ ||
             ((event.pcm.sequence == 0U) != ((event.pcm.flags & 1U) != 0U))) {
@@ -679,6 +839,7 @@ class VoiceClient final {
         }
         ++downlink_sequence_;
         response_audio_ended_ = (event.pcm.flags & 2U) != 0U;
+        RefreshResponseWait();
         break;
       }
       case InboundKind::kDone:
@@ -702,6 +863,7 @@ class VoiceClient final {
   }
 
   void AdvanceTurn() {
+    // turn/stream/epoch 同步推进，为下一次用户输入建立全新身份并隔离迟到下行事件。
     ++turn_ids_.turn;
     ++turn_ids_.stream;
     ++turn_ids_.epoch;
@@ -734,6 +896,11 @@ class VoiceClient final {
       return;
     }
     const bool utterance_ended = barge_ended_;
+    if (utterance_ended && pre_count_ == 0U) {
+      std::cerr << "boompi-client: empty buffered barge discarded" << std::endl;
+      FinishTurn(false);
+      return;
+    }
     barge_turn_admitted_ = false;
     barge_ended_ = false;
     audio_.DropPlayback();
@@ -743,6 +910,8 @@ class VoiceClient final {
   }
 
   void CompleteCancel(const bool acknowledged) {
+    // cancel 结束后有三种去向：普通取消进入追问窗，已确认近讲立即创建新 turn，
+    // 缓冲溢出则丢弃本次不完整语句并回到可继续交互状态。
     if (acknowledged && cancel_started_at_ != Clock::time_point{}) {
       const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(
           Clock::now() - cancel_started_at_);
@@ -800,6 +969,8 @@ class VoiceClient final {
   }
 
   SendOutcome SendAudio(const CaptureFrame& frame, bool end) {
+    // 一帧 16 kHz mono PCM 映射成一帧 PCM64；sequence、采集时间戳和四元身份
+    // 让服务端能够发现丢帧，并把音频归入唯一 turn。
     Pcm64Header h{};
     h.flags = static_cast<std::uint16_t>(
         (uplink_sequence_ == 0U ? 1U : 0U) | (end ? 2U : 0U));
@@ -828,9 +999,13 @@ class VoiceClient final {
   }
 
   void WaitForResponse() {
+    // turn.commit 后停止上传并进入云端等待；15 秒提示只改善长模型首包时的可见反馈。
+    const auto now = Clock::now();
     state_ = State::kWaitingForResponse;
-    state_deadline_ = Clock::now() + kResponseWait;
-    await_hint_at_ = Clock::now() + kFirstResponseHint;
+    response_absolute_deadline_ = now + kResponseAbsoluteWait;
+    state_deadline_ = std::min(now + kResponseWait,
+                               response_absolute_deadline_);
+    await_hint_at_ = now + kFirstResponseHint;
     await_hint_pending_ = true;
     await_hint_visible_ = false;
     ui_.SetState(DeviceUiState::kThinking);
@@ -843,7 +1018,11 @@ class VoiceClient final {
     const std::size_t buffered_frames = pre_count_;
     if (buffered_utterance_ended && buffered_frames == 0U) {
       // 先拒绝本地不完整输入，不能在 wire 上留下没有 PCM/commit 的孤立 turn。
-      LoseConnection("empty buffered barge turn");
+      std::cerr << "boompi-client: empty buffered barge discarded" << std::endl;
+      state_ = State::kWaitingForFollowUp;
+      state_deadline_ = Clock::now() + kFollowUpWait;
+      ui_.SetState(DeviceUiState::kHappy);
+      ResetListener();
       return false;
     }
     if (turn_ids_.session == 0U ||
@@ -854,7 +1033,7 @@ class VoiceClient final {
     uplink_sequence_ = 0U;
     state_ = State::kCapturingSpeech;
     // 帧数上限保证有效音频不超 60 s；墙钟上限保证 ALSA 长期无帧时
-    // 仍会取消当前 turn，而不是永久占住会话。
+    // 仍会取消当前 turn，避免会话永久停留在采集态。
     state_deadline_ = Clock::now() + kMaximumTurnWait;
     ui_.SetState(DeviceUiState::kListening);
     for (std::size_t i = 0U; i < buffered_frames; ++i)
@@ -875,6 +1054,8 @@ class VoiceClient final {
   }
 
   void Commit(const CaptureFrame& frame) {
+    // 最后一帧同时携带 END，随后发送 turn.commit。该顺序保证服务端先收齐 PCM，
+    // 再启动 ASR/LLM/TTS 流水线。
     if (!SendAudioOrRecover(frame, true, "turn commit failed")) return;
     if (!SendControl(ControlKind::kTurnCommit, turn_ids_)) {
       LoseConnection("turn commit failed");
@@ -944,6 +1125,8 @@ class VoiceClient final {
   }
 
   void ConfirmBarge(const CaptureFrame& frame) {
+    // ConfirmBarge 是播放期打断的业务提交点：立即停旧音频，隔离旧 response，
+    // 并保留已确认的近讲帧，等待 cancel ACK 后作为下一 turn 的开头上传。
     audio_.DropPlayback();
     ResetBargeProbe();
     ClearSubtitle();
@@ -965,7 +1148,7 @@ class VoiceClient final {
     }
   }
 
-  // 唯一的帧驱动入口；网络事件和取消 helper 也可转换状态，且必须共享同一 actor。
+  // 唯一的帧驱动入口；网络事件和取消 helper 也可转换状态，所有路径共享同一 actor。
   void OnFrame(const CaptureFrame& frame) {
     const bool sequence_gap = frame.sequence != next_capture_sequence_;
     next_capture_sequence_ = frame.sequence + 1U;
@@ -1068,6 +1251,9 @@ class VoiceClient final {
   std::atomic<bool> stop_network_{false};
   std::atomic<bool> endpoint_ready_{false};
   std::atomic<bool> network_needed_{true};
+
+  // 该环同时服务普通 500 ms pre-roll 和打断等待 ACK 的扩展缓存。它保存完整
+  // CaptureFrame，上传时仍能校验原始 sequence 和 timestamp。
   // 预卷帧与当前 turn 使用同一 capture sequence，便于发现 ALSA xrun 后的伪连续。
   std::array<CaptureFrame, kBargeBufferFrames> pre_{};
   std::size_t pre_head_{0U};
@@ -1078,8 +1264,12 @@ class VoiceClient final {
   std::uint32_t downlink_sequence_{0U};
   std::string response_id_;
   State state_{State::kWaitingForWake};
+
+  // steady_clock deadline 只比较进程内经过时间，不受系统校时或 RTC 变化影响。
   Clock::time_point state_deadline_{};
+  Clock::time_point response_absolute_deadline_{};
   Clock::time_point next_connect_{};
+  Clock::time_point next_observability_log_{};
   Clock::time_point heartbeat_deadline_{};
   Clock::time_point await_hint_at_{};
   Clock::time_point cancel_started_at_{};
@@ -1115,6 +1305,7 @@ class VoiceClient final {
 bool RunVoiceClient(const config::VoiceClientConfig& config,
                     const volatile std::sig_atomic_t* stop,
                     std::string* const error) {
+  // 异常统一收敛成 main 可打印的错误文本，避免第三方库异常穿过 C 风格进程入口。
   try { VoiceClient client(config, error); return client.Run(stop); }
   catch (const std::bad_alloc&) {
     if (error != nullptr) *error = "voice client allocation failed";

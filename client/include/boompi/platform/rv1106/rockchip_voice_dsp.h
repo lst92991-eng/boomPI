@@ -1,3 +1,4 @@
+/// @file 将产品 20 ms 帧适配到 Rockchip librkaudio 固定分块 ABI。
 #pragma once
 
 #include <array>
@@ -7,6 +8,7 @@
 namespace boompi::platform::rv1106 {
 
 constexpr std::size_t kRockchipVoiceFrameSamples16k = 320U;
+/// Rockchip 3A 对外统一使用 16 kHz/S16/20 ms，便于和 VAD、Snowboy 共用同一帧。
 using RockchipVoiceFrame16k =
     std::array<std::int16_t, kRockchipVoiceFrameSamples16k>;
 
@@ -53,13 +55,18 @@ class RockchipVoiceDsp final {
  private:
   static constexpr std::size_t kVendorBlockSamples = 256U;
   static constexpr std::size_t kVendorInputChannels = 3U;
+  /// 512 frame 输入 FIFO 可同时容纳上一轮余数和下一帧 320 samples。
   static constexpr std::size_t kInputFifoFrames = 512U;
+  /// 输出 FIFO 覆盖一帧预置静音和 vendor 分块产生的最大暂存量。
   static constexpr std::size_t kOutputFifoSamples = 640U;
 
+  /// 清除所有跨调用余数；`prime_output` 为 Open 建立固定的一帧算法延迟。
   void ResetFifos(bool prime_output) noexcept;
 
+  /// vendor 句柄与参数树生命周期绑定，只有 capture 线程可以访问。
   void* handle_{nullptr};
   void* parameters_{nullptr};
+  /// 输入按 `[mic-left,mic-right,ref-left]` 逐 sample 交错保存。
   std::array<std::int16_t, kInputFifoFrames * kVendorInputChannels>
       input_fifo_{};
   std::array<std::int16_t, kOutputFifoSamples> output_fifo_{};

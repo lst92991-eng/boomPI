@@ -222,17 +222,17 @@ func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connec
 		if receiveErr != nil {
 			var congestion *transport.TurnCongestionError
 			if errors.As(receiveErr, &congestion) {
-				signalDeviceSessionActivity(activity)
 				if err := h.handleTurnCongestion(workerCtx, connection, actor, state, congestion); err != nil {
 					return err
 				}
+				signalDeviceSessionActivity(activity)
 				continue
 			}
 			return receiveErr
 		}
-		signalDeviceSessionActivity(activity)
 		if message.Control != nil {
 			if staleRetiredTurnControl(state, *message.Control) {
+				signalDeviceSessionActivity(activity)
 				continue
 			}
 			if err := h.handleControl(workerCtx, connection, actor, state, *message.Control); err != nil {
@@ -252,9 +252,11 @@ func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connec
 				_ = sendProtocolError(workerCtx, connection, state, err)
 				return err
 			}
+			signalDeviceSessionActivity(activity)
 			continue
 		}
 		if pcmBelongsToRetiredTurn(state, *message.PCMHeader) {
+			signalDeviceSessionActivity(activity)
 			continue
 		}
 		if err := h.handlePCM(workerCtx, actor, state, *message.PCMHeader, message.PCM); err != nil {
@@ -267,6 +269,7 @@ func (h *deviceHandler) Handle(ctx context.Context, connection *transport.Connec
 			_ = sendProtocolError(workerCtx, connection, state, err)
 			return err
 		}
+		signalDeviceSessionActivity(activity)
 	}
 }
 
@@ -403,7 +406,7 @@ func pcmBelongsToRetiredTurn(state *connectionState, header protocol.PCMHeader) 
 }
 
 func staleRetiredTurnControl(state *connectionState, envelope protocol.ControlEnvelope) bool {
-	if envelope.Type != "turn.commit" {
+	if envelope.Type != "turn.commit" || !emptyObjectPayload(envelope.Payload) {
 		return false
 	}
 	state.mu.Lock()
@@ -471,18 +474,19 @@ func authenticateHello(payload json.RawMessage, expectedToken string) error {
 }
 
 func parseHelloDeviceToken(payload json.RawMessage) (string, error) {
-	var hello struct {
-		DeviceToken string `json:"device_token"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&hello); err != nil || hello.DeviceToken == "" {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil || len(fields) != 1 {
 		return "", errDeviceAuthentication
 	}
-	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+	encodedToken, exists := fields["device_token"]
+	if !exists {
 		return "", errDeviceAuthentication
 	}
-	return hello.DeviceToken, nil
+	var token string
+	if err := json.Unmarshal(encodedToken, &token); err != nil || token == "" {
+		return "", errDeviceAuthentication
+	}
+	return token, nil
 }
 
 func (h *deviceHandler) handleControl(ctx context.Context, connection *transport.Connection, actor *session.Actor, state *connectionState, envelope protocol.ControlEnvelope) error {
@@ -789,7 +793,6 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 			if !turn.active || event.Epoch != uint64(turn.epoch) {
 				continue
 			}
-			signalDeviceSessionActivity(activity)
 			switch event.Type {
 			case backend.EventStarted:
 				if pacer.epoch != 0 {
@@ -866,7 +869,10 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, connection *transport
 					return err
 				}
 				pacer.reset()
+			default:
+				return fmt.Errorf("unsupported provider event type %d", event.Type)
 			}
+			signalDeviceSessionActivity(activity)
 		}
 	}
 }

@@ -16,6 +16,8 @@ struct RenderCall final {
 };
 
 void Reset() noexcept;
+void InjectPlaybackXruns(std::uint64_t count) noexcept;
+std::uint64_t PlaybackXrunsSnapshot() noexcept;
 void PushCapture(const audio::CaptureFrame& frame) noexcept;
 bool WaitForCaptureReads(std::size_t count,
                          std::chrono::milliseconds timeout) noexcept;
@@ -54,6 +56,7 @@ class AudioBackend final {
   void DropPlayback() noexcept;
   void InterruptCapture() noexcept;
   void InterruptPlayback() noexcept;
+  std::uint64_t playback_xruns() const noexcept;
   std::string last_error() const;
   void Close() noexcept;
 

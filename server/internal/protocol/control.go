@@ -34,11 +34,18 @@ func DecodeControl(data []byte) (ControlEnvelope, error) {
 	if !utf8.Valid(data) {
 		return ControlEnvelope{}, errors.New("control message is not valid UTF-8")
 	}
+	if err := rejectDuplicateObjectKeys(data); err != nil {
+		return ControlEnvelope{}, fmt.Errorf("validate control object keys: %w", err)
+	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return ControlEnvelope{}, fmt.Errorf("decode control fields: %w", err)
 	}
-	for _, required := range []string{"version", "type", "message_id", "device_id", "session_id", "turn_id", "stream_id", "epoch", "payload"} {
+	requiredFields := [...]string{"version", "type", "message_id", "device_id", "session_id", "turn_id", "stream_id", "epoch", "payload"}
+	if len(fields) != len(requiredFields) {
+		return ControlEnvelope{}, fmt.Errorf("control envelope must contain exactly %d fields", len(requiredFields))
+	}
+	for _, required := range requiredFields {
 		if _, exists := fields[required]; !exists {
 			return ControlEnvelope{}, fmt.Errorf("control envelope is missing field %q", required)
 		}
@@ -61,6 +68,57 @@ func DecodeControl(data []byte) (ControlEnvelope, error) {
 		return ControlEnvelope{}, err
 	}
 	return envelope, nil
+}
+
+func rejectDuplicateObjectKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := scanJSONValue(decoder); err != nil {
+		return err
+	}
+	return ensureJSONEOF(decoder)
+}
+
+func scanJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, composite := token.(json.Delim)
+	if !composite {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		keys := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, keyErr := decoder.Token()
+			if keyErr != nil {
+				return keyErr
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("JSON object key is not a string")
+			}
+			if _, duplicate := keys[key]; duplicate {
+				return fmt.Errorf("duplicate JSON object key %q", key)
+			}
+			keys[key] = struct{}{}
+			if err := scanJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+	case '[':
+		for decoder.More() {
+			if err := scanJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+	default:
+		return errors.New("unexpected JSON delimiter")
+	}
+	return err
 }
 
 func EncodeControl(envelope ControlEnvelope) ([]byte, error) {

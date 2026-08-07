@@ -98,6 +98,8 @@ CaptureResult AudioEngine::Capture(
   {
     std::unique_lock<std::mutex> lock(state.mutex);
     if (!state.audio_open || state.audio_closed) return CaptureResult::kFailed;
+    state.snapshot.capture_poll_wait_ms =
+        static_cast<std::size_t>(timeout.count());
 
     if (state.snapshot.network_bootstraps == 0U) {
       state.changed.wait_for(lock, std::chrono::milliseconds(100), [&state] {

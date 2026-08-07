@@ -383,7 +383,7 @@ void BasicWireAndClose() {
   Check(transport_error.empty(), "happy-path transport reported an error");
 }
 
-void BackpressureKeepsCancellationAvailable() {
+void BackpressureKeepsControlAvailable() {
   LoopbackServer server(MakeTestIdentity(), true);
   VoiceTransport transport;
   Check(transport.Connect(ConfigFor(server), [](Inbound) {}, [](std::string) {}),
@@ -416,6 +416,13 @@ void BackpressureKeepsCancellationAvailable() {
   }
   Check(full, "stalled WSS did not reach the fixed transport bound");
 
+  Control commit{};
+  commit.kind = ControlKind::kTurnCommit;
+  commit.message_id = "client-commit";
+  commit.ids = header.ids;
+  Check(transport.SendControl(commit),
+        "bounded PCM queue rejected the turn.commit control frame");
+
   Control cancel{};
   cancel.kind = ControlKind::kTurnCancel;
   cancel.message_id = "client-cancel";
@@ -433,7 +440,7 @@ void BackpressureKeepsCancellationAvailable() {
 int main() {
   try {
     BasicWireAndClose();
-    BackpressureKeepsCancellationAvailable();
+    BackpressureKeepsControlAvailable();
   } catch (const std::exception& error) {
     std::cerr << "voice transport loopback: " << error.what() << '\n';
     return EXIT_FAILURE;

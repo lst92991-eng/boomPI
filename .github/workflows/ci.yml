@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest
+          - ubuntu-24.04
           - windows-latest
           - macos-latest
 
@@ -48,13 +48,24 @@ jobs:
           python --version
           go version
 
+      - name: Install Linux VoiceTransport test dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libboost-dev libcjson-dev libssl-dev
+
       - name: Validate protocol fixtures
         run: python scripts/verify_protocol_fixtures.py
 
       - name: Run Python checks
         run: python -m unittest discover -s scripts/tests -p "test_*.py" -v
 
+      - name: Configure C++ host tests (Linux, transport required)
+        if: runner.os == 'Linux'
+        run: cmake --preset host-debug -DBOOMPI_REQUIRE_HOST_TRANSPORT_TEST=ON
+
       - name: Configure C++ host tests
+        if: runner.os != 'Linux'
         run: cmake --preset host-debug
 
       - name: Build C++ host tests
@@ -62,6 +73,10 @@ jobs:
 
       - name: Run C++ host tests
         run: ctest --preset host-debug
+
+      - name: Confirm real VoiceTransport loopback ran
+        if: runner.os == 'Linux'
+        run: ctest --preset host-debug --tests-regex '^voice-transport-loopback$' --output-on-failure
 
       - name: Run Go tests
         working-directory: server

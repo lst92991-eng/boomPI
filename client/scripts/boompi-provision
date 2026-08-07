@@ -2,22 +2,162 @@
 # 开启临时热点；手机提交 Wi-Fi 后立即退出热点并启动语音客户端。
 
 set -e
+umask 077
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 AP_CONF=/run/boompi-hostapd.conf
 HOSTAPD_PID=/run/boompi-hostapd.pid
 DNSMASQ_PID=/run/boompi-dnsmasq.pid
 PORTAL_PID=/run/boompi-portal.pid
+OWNER_DIR=/run/boompi-provision.owner
+OWNER_PID=$OWNER_DIR/pid
+OWNER_LOCK=/run/boompi-provision.owner.lock
+OWNS_PROVISION=0
+OWNS_OWNER_LOCK=0
+
+acquire_owner_lock() {
+  exec 9>"$OWNER_LOCK"
+  if ! flock -n 9; then
+    echo 'boompi-provision: owner state is changing' >&2
+    exec 9>&-
+    return 1
+  fi
+  OWNS_OWNER_LOCK=1
+}
+
+release_owner_lock() {
+  [ "$OWNS_OWNER_LOCK" -eq 1 ] || return 0
+  flock -u 9 2>/dev/null || true
+  exec 9>&-
+  OWNS_OWNER_LOCK=0
+}
+
+owner_active() {
+  kill -0 "$1" 2>/dev/null &&
+    tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null |
+      grep -qx '/usr/sbin/boompi-provision'
+}
+
+# wlan0、热点守护进程和公共 PID 文件属于同一配网会话，先认领目录再修改任一资源。
+take_owner() {
+  mkdir -p /run
+  acquire_owner_lock || exit 1
+  if ! mkdir "$OWNER_DIR" 2>/dev/null; then
+    owner=$(cat "$OWNER_PID" 2>/dev/null || true)
+    case $owner in
+      ''|*[!0-9]*)
+        echo 'boompi-provision: provisioning owner state is incomplete' >&2
+        release_owner_lock
+        exit 1
+        ;;
+    esac
+    if owner_active "$owner"; then
+      echo "boompi-provision: provisioning already has an owner (pid $owner)" >&2
+      release_owner_lock
+      exit 1
+    fi
+    cleanup_stale_locked || {
+      release_owner_lock
+      exit 1
+    }
+    mkdir "$OWNER_DIR" 2>/dev/null || {
+      echo 'boompi-provision: provisioning owner changed while starting' >&2
+      release_owner_lock
+      exit 1
+    }
+  fi
+  OWNS_PROVISION=1
+  echo "$$" > "$OWNER_PID"
+  release_owner_lock
+}
 
 cleanup() {
-  [ ! -r "$PORTAL_PID" ] || kill "$(cat "$PORTAL_PID")" 2>/dev/null || true
-  [ ! -r "$DNSMASQ_PID" ] || kill "$(cat "$DNSMASQ_PID")" 2>/dev/null || true
-  [ ! -r "$HOSTAPD_PID" ] || kill "$(cat "$HOSTAPD_PID")" 2>/dev/null || true
+  # 启动竞争中的失败者不清理公共 PID 文件，也不会关闭当前 owner 的热点。
+  [ "$OWNS_PROVISION" -eq 1 ] || return 0
+  cleanup_result=0
+  stop_service "$PORTAL_PID" /usr/lib/boompi/boompi-provision.py || cleanup_result=1
+  stop_service "$DNSMASQ_PID" --pid-file=/run/boompi-dnsmasq.pid || cleanup_result=1
+  stop_service "$HOSTAPD_PID" /run/boompi-hostapd.conf || cleanup_result=1
+  [ "$cleanup_result" -eq 0 ] || return 1
   rm -f "$AP_CONF" "$HOSTAPD_PID" "$DNSMASQ_PID" "$PORTAL_PID"
   ifconfig wlan0 0.0.0.0 down 2>/dev/null || true
   ifconfig wlan0 up 2>/dev/null || true
+  rm -f "$OWNER_PID"
+  rmdir "$OWNER_DIR" 2>/dev/null || true
 }
-trap cleanup EXIT
+
+# 正常保存、信号退出和异常退出都在释放 owner 前确认三个配网服务已经停止。
+stop_service() {
+  pid_file=$1
+  identity=$2
+  [ -r "$pid_file" ] || return 0
+  service_pid=$(cat "$pid_file" 2>/dev/null || true)
+  case $service_pid in ''|*[!0-9]*) return 0 ;; esac
+  if ! service_owned "$service_pid" "$identity"; then
+    echo "boompi-provision: stale PID $service_pid does not own $pid_file" >&2
+    return 0
+  fi
+  service_owned "$service_pid" "$identity" &&
+    kill -TERM "$service_pid" 2>/dev/null || return 0
+  waited=0
+  while service_owned "$service_pid" "$identity" && [ "$waited" -lt 3 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  service_owned "$service_pid" "$identity" && kill -KILL "$service_pid" 2>/dev/null || true
+  waited=0
+  while service_owned "$service_pid" "$identity" && [ "$waited" -lt 2 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if service_owned "$service_pid" "$identity"; then
+    echo "boompi-provision: process $service_pid did not exit" >&2
+    return 1
+  fi
+  wait "$service_pid" 2>/dev/null || true
+}
+
+service_owned() {
+  kill -0 "$1" 2>/dev/null &&
+    tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null |
+      grep -qx -- "$2"
+}
+
+cleanup_stale_locked() {
+  stale_owner=$(cat "$OWNER_PID" 2>/dev/null || true)
+  case $stale_owner in
+    ''|*[!0-9]*) ;;
+    *)
+      if owner_active "$stale_owner"; then
+        echo "boompi-provision: provisioning owner $stale_owner is still active" >&2
+        return 1
+      fi
+      ;;
+  esac
+  OWNS_PROVISION=1
+  result=0
+  cleanup || result=$?
+  OWNS_PROVISION=0
+  return "$result"
+}
+
+cleanup_stale() {
+  acquire_owner_lock || return 1
+  result=0
+  cleanup_stale_locked || result=$?
+  release_owner_lock
+  return "$result"
+}
+
+trap 'cleanup; release_owner_lock' EXIT
 trap 'exit 0' INT TERM
+command -v flock >/dev/null 2>&1 || {
+  echo 'boompi-provision: flock is unavailable' >&2
+  exit 1
+}
+if [ "${1:-}" = '--cleanup-stale' ]; then
+  cleanup_stale
+  exit $?
+fi
 
 [ "${1:-}" != '--no-panel' ] || export BOOMPI_PROVISION_NO_PANEL=1
 
@@ -26,6 +166,7 @@ trap 'exit 0' INT TERM
   exit 1
 }
 
+take_owner
 killall wpa_supplicant 2>/dev/null || true
 mkdir -p /run
 cat > "$AP_CONF" <<'EOF'

@@ -1,4 +1,11 @@
-/// @file WSS/TLS 驱动及当前 v1 wire 校验；不包含对话状态转换。
+/**
+ * @file voice_transport.cpp
+ * @brief WSS/TLS 驱动、boomPI v1 单帧编解码和有界跨线程发送。
+ *
+ * WebSocket++ 的 ASIO 线程拥有连接回调和实际 send 操作。application 线程通过
+ * 一个单槽缓冲提交控制帧或 PCM，并在 20 ms 内得到结果。这里验证 wire 结构与
+ * TLS 身份；turn、epoch、response 和 sequence 的跨帧状态留给 application actor。
+ */
 #include "boompi/network/voice_transport.h"
 
 #include "boompi/config/voice_client_config.h"
@@ -9,11 +16,14 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -30,16 +40,21 @@
 namespace boompi::network {
 namespace {
 
+// v1 固定头为 64 字节；20 ms 的 16 kHz/24 kHz mono S16_LE 分别为 640/960 字节。
 constexpr std::size_t kHeaderBytes = 64;
 constexpr std::size_t kMaxUplinkPcmBytes = 640U;
 constexpr std::size_t kMaxDownlinkPcmBytes = Inbound::kMaximumPcmBytes;
 constexpr std::size_t kMaxMessageBytes = kHeaderBytes + 64U * 1024U;
+// WebSocket++ 待发送水位约容纳 800 ms 上行音频，超过后把拥塞交给 turn owner 处理。
 constexpr std::size_t kMaxBufferedBytes = 28U * 1024U;  // 约 800 ms 上行帧。
+// 调用线程最多等待一个音频帧周期，防止网络调度阻塞采集数据的应用侧消费。
 constexpr auto kSendDispatchWait = std::chrono::milliseconds(20);
 constexpr std::uint16_t kKnownFlags = 7;
+// 固定教学口令只负责拒绝无关客户端；服务端身份由 TLS SPKI pin 提供。
 constexpr char kTeachingDeviceToken[] =
     "boompi-teaching-shared-token-v1-2026";
 
+// wire header 的多字节整数统一为大端；PCM payload 按协议继续保持 S16_LE。
 void Put16(std::uint16_t v, std::uint8_t* p) {
   p[0] = static_cast<std::uint8_t>(v >> 8U); p[1] = static_cast<std::uint8_t>(v);
 }
@@ -70,6 +85,8 @@ std::string Quote(const std::string& value) {
   }
   out.push_back('"'); return out;
 }
+
+/// 同一个 device_id 同时进入 JSON 文本和 PCM 头；这里预先得到后者需要的 16 字节形式。
 bool ParseUuid(const std::string& value, std::array<std::uint8_t, 16>* out) {
   if (!out || !boompi::config::IsValidDeviceId(value)) return false;
   std::size_t n = 0; int high = -1;
@@ -89,6 +106,7 @@ struct CJsonDelete final {
 using JsonRoot = std::unique_ptr<cJSON, CJsonDelete>;
 
 struct ParsedEnvelope final {
+  // root 独占 cJSON 树，payload 只是树内借用指针，其生命周期随整个返回对象移动。
   JsonRoot root;
   const cJSON* payload{nullptr};
   std::string type;
@@ -96,12 +114,7 @@ struct ParsedEnvelope final {
   WireIds ids{};
 };
 
-enum class SendStatus : std::uint8_t {
-  kSent,
-  kFull,
-  kUnavailable,
-};
-
+/// 内部状态区分“已交给 WebSocket++”“发送水位满”和“连接/调度不可用”。
 [[noreturn]] void InvalidJson(const char* why) {
   throw std::runtime_error(why);
 }
@@ -140,6 +153,8 @@ bool VisibleAscii(const std::string& value) {
 }
 
 void RejectNonIntegerNumberSyntax(const std::string& json) {
+  // cJSON 将所有 JSON number 保存为 double；先检查原始语法，才能严格拒绝指数、
+  // 小数和负号，维持协议所要求的无符号十进制整数表示。
   bool in_string = false, escaped = false, in_number = false;
   for (const char byte : json) {
     if (in_string) {
@@ -180,7 +195,51 @@ void RejectEscapedNul(const std::string& json) {
   }
 }
 
+void RejectDuplicateObjectKeys(const cJSON* const root) {
+  std::vector<const cJSON*> pending{root};
+  while (!pending.empty()) {
+    const cJSON* const value = pending.back();
+    pending.pop_back();
+    if (cJSON_IsObject(value)) {
+      std::unordered_set<std::string_view> keys;
+      for (const cJSON* child = value->child; child != nullptr;
+           child = child->next) {
+        if (child->string == nullptr ||
+            !keys.emplace(child->string).second) {
+          InvalidJson("duplicate or invalid JSON object key");
+        }
+        pending.push_back(child);
+      }
+    } else if (cJSON_IsArray(value)) {
+      for (const cJSON* child = value->child; child != nullptr;
+           child = child->next) {
+        pending.push_back(child);
+      }
+    }
+  }
+}
+
+void RequireExactObjectFields(
+    const cJSON* const object,
+    const std::initializer_list<std::string_view> expected) {
+  if (!cJSON_IsObject(object)) InvalidJson("JSON value must be an object");
+  std::size_t count = 0U;
+  for (const cJSON* child = object->child; child != nullptr;
+       child = child->next) {
+    ++count;
+    const std::string_view key = child->string == nullptr
+                                     ? std::string_view{}
+                                     : std::string_view{child->string};
+    if (std::find(expected.begin(), expected.end(), key) == expected.end()) {
+      InvalidJson("unknown JSON object field");
+    }
+  }
+  if (count != expected.size()) InvalidJson("missing JSON object field");
+}
+
 ParsedEnvelope ParseEnvelope(const std::string& json) {
+  // 校验顺序遵循“先限制字节和编码，再解析，再读取字段”，恶意长度和非法 UTF-8
+  // 不会进入 cJSON，也不会在 application actor 中产生任何状态变化。
   if (json.empty() || json.size() > 64U * 1024U || !websocketpp::utf8_validator::validate(json))
     InvalidJson("invalid text message");
   RejectEscapedNul(json);
@@ -188,8 +247,13 @@ ParsedEnvelope ParseEnvelope(const std::string& json) {
   ParsedEnvelope parsed;
   parsed.root.reset(cJSON_ParseWithLengthOpts(json.c_str(), json.size() + 1U, &parse_end, true));
   if (!parsed.root || parse_end != json.c_str() + json.size()) InvalidJson("invalid JSON text");
+  RejectDuplicateObjectKeys(parsed.root.get());
   RejectNonIntegerNumberSyntax(json);
   if (!cJSON_IsObject(parsed.root.get())) InvalidJson("JSON envelope must be an object");
+  RequireExactObjectFields(parsed.root.get(),
+                           {"version", "type", "message_id", "device_id",
+                            "session_id", "turn_id", "stream_id", "epoch",
+                            "payload"});
   if (RequireUint32(parsed.root.get(), "version") != 1U) InvalidJson("unsupported protocol version");
   parsed.type = RequireString(parsed.root.get(), "type", 1, 64);
   if (!VisibleAscii(parsed.type)) InvalidJson("control type is not visible ASCII");
@@ -202,9 +266,73 @@ ParsedEnvelope ParseEnvelope(const std::string& json) {
   return parsed;
 }
 
+Inbound DecodeTextEvent(const std::string& json,
+                        const std::string& expected_device_id) {
+  const ParsedEnvelope parsed = ParseEnvelope(json);
+  const std::string& type = parsed.type;
+  const cJSON* const body = parsed.payload;
+  Inbound event;
+  event.ids = parsed.ids;
+  if (parsed.device_id != expected_device_id)
+    throw std::runtime_error("wrong device identity");
+  if (type == "hello.ack") {
+    event.kind = InboundKind::kHelloAck;
+    RequireExactObjectFields(body, {"input_sample_rate_hz",
+                                    "output_sample_rate_hz",
+                                    "input_frame_ms"});
+    if (RequireUint32(body, "input_sample_rate_hz") != 16000 ||
+        RequireUint32(body, "output_sample_rate_hz") != 24000 ||
+        RequireUint32(body, "input_frame_ms") != 20)
+      throw std::runtime_error("unsupported hello audio contract");
+  } else if (type == "response.start") {
+    event.kind = InboundKind::kResponseStart;
+    RequireExactObjectFields(body, {"response_id"});
+    event.response_id = RequireString(body, "response_id", 1, 128);
+  } else if (type == "response.text_delta") {
+    event.kind = InboundKind::kTextDelta;
+    RequireExactObjectFields(body, {"response_id", "text"});
+    event.response_id = RequireString(body, "response_id", 1, 128);
+    event.text = RequireString(body, "text", 1, 4096);
+  } else if (type == "response.audio_start") {
+    event.kind = InboundKind::kAudioStart;
+    RequireExactObjectFields(body, {"response_id", "sample_rate_hz"});
+    event.response_id = RequireString(body, "response_id", 1, 128);
+    if (RequireUint32(body, "sample_rate_hz") != 24000)
+      throw std::runtime_error("unsupported response audio rate");
+  } else if (type == "response.cancelled") {
+    event.kind = InboundKind::kCancelled;
+    RequireExactObjectFields(body, {"reason"});
+    event.text = RequireString(body, "reason", 1, 64);
+  } else if (type == "response.done") {
+    event.kind = InboundKind::kDone;
+    RequireExactObjectFields(body, {"response_id"});
+    event.response_id = RequireString(body, "response_id", 1, 128);
+  } else if (type == "error") {
+    event.kind = InboundKind::kError;
+    RequireExactObjectFields(body, {"code", "message"});
+    event.error_code = RequireString(body, "code", 1, 64);
+    event.text = RequireString(body, "message", 1, 512);
+  } else {
+    throw std::runtime_error("unsupported control type");
+  }
+  return event;
+}
+
 }  // namespace
 
+/**
+ * @brief VoiceTransport 的连接与线程私有实现。
+ *
+ * client_ 及连接句柄由 ASIO 线程驱动；pending_ 是 application 到 ASIO 的唯一
+ * 发送交接槽。回调只发布结构化 Inbound，不保存活动 turn 或 response。
+ */
 class VoiceTransport::Impl final {
+  enum class SendStatus : std::uint8_t {
+    kSent,
+    kFull,
+    kUnavailable,
+  };
+
   using Client = websocketpp::client<websocketpp::config::asio_tls_client>;
   using Hdl = websocketpp::connection_hdl;
   using Tls = websocketpp::lib::shared_ptr<websocketpp::lib::asio::ssl::context>;
@@ -212,12 +340,15 @@ class VoiceTransport::Impl final {
   ~Impl() { Close(); }
 
   bool Connect(TransportConfig c, InboundHandler in, ErrorHandler err) {
-    // UUID 与 SPKI pin 在启动线程前一次性验证；普通连接绝不降级为明文或 VERIFY_NONE。
+    // UUID 与 SPKI pin 在启动线程前一次性验证；校验失败直接拒绝启动，连接路径
+    // 始终使用 wss、TLS 1.2+ 和 VERIFY_PEER，不提供明文降级分支。
     if (thread_.joinable() || c.host.empty() || !ParseUuid(c.device_id, &uuid_) ||
         !DecodePin(c.spki_sha256_base64) || c.port == 0) return false;
     config_ = std::move(c); inbound_ = std::move(in); error_ = std::move(err);
     client_.clear_access_channels(websocketpp::log::alevel::all);
     client_.clear_error_channels(websocketpp::log::elevel::all);
+    // perpetual work 让同一条 WSS 跨越多个对话 turn；Close 负责停止 event loop。
+    // 下列 handler 都运行在该 ASIO 线程，回调只能快速投递到 application actor。
     client_.init_asio(); client_.start_perpetual();
     client_.set_tls_init_handler([this](Hdl) { return MakeTls(); });
     client_.set_open_handler([this](Hdl h) {
@@ -252,6 +383,8 @@ class VoiceTransport::Impl final {
   }
 
   bool Send(const Control& c) {
+    // 枚举与 v1 payload 一一对应，调用方无法注入临时 JSON schema。hello 在分配
+    // session 前使用全零 ids；其余控制帧必须携带完整四元组。
     if (c.message_id.empty() || c.message_id.size() > 64) return false;
     const char* type = nullptr;
     std::string payload;
@@ -292,23 +425,22 @@ class VoiceTransport::Impl final {
         ",\"stream_id\":" + std::to_string(c.ids.stream) +
         ",\"epoch\":" + std::to_string(c.ids.epoch) +
         ",\"payload\":" + payload + "}";
-    const bool cancellation = c.kind == ControlKind::kTurnCancel ||
-                              c.kind == ControlKind::kResponseCancel;
-    return SendText(json, cancellation);
+    return SendText(json);
   }
 
-  bool SendText(const std::string& json,
-                const bool cancellation = false) {
+  bool SendText(const std::string& json) {
     if (!connected_ || json.empty() || json.size() > 64U * 1024U) return false;
-    // 每轮最多发一个取消控制帧。即使 PCM 已达到背压线，也允许这一个小帧排在
-    // 已接受的音频之后，避免把局部拥塞放大成 TLS/provider 会话重建。
+    // 控制帧体积小且由 application 状态机限频。即使 PCM 已达到背压线，
+    // turn.commit/cancel 也必须排在已接受音频之后，才能有界结束当前 turn。
     return DispatchSend(json.data(), json.size(),
-                        websocketpp::frame::opcode::text,
-                        cancellation) == SendStatus::kSent;
+                         websocketpp::frame::opcode::text,
+                         true) == SendStatus::kSent;
   }
 
   SendOutcome SendPcm(const Pcm64Header& h, const std::uint8_t* pcm,
                       std::size_t bytes) {
+    // 这里只验证单帧可编码条件和 START/sequence=0 的对应关系。后续 sequence
+    // 是否连续由 application actor 决定，因为发送结果会影响它能否安全前移序号。
     if (!connected_ || !pcm || bytes == 0 ||
         bytes > kMaxUplinkPcmBytes || bytes % 2 ||
         h.flags & ~kKnownFlags || !ValidIds(h.ids) ||
@@ -361,21 +493,34 @@ class VoiceTransport::Impl final {
   bool connected() const noexcept { return connected_; }
 
  private:
+  /**
+   * @brief application 线程与 ASIO 线程之间的单槽发送邮箱。
+   *
+   * payload 在提交线程中复制，因此不借用采集缓冲；queued/done 由
+   * pending_mutex_ 保护，condition_variable 将 ASIO 的确定结果交还调用者。
+   */
   struct PendingSend final {
     std::array<std::uint8_t, kMaxMessageBytes> bytes{};
     std::size_t size{0U};
     websocketpp::frame::opcode::value opcode{
         websocketpp::frame::opcode::text};
     SendStatus status{SendStatus::kUnavailable};
-    bool cancellation{false};
+    bool control{false};
     bool queued{false};
     bool done{false};
   };
 
   static bool ValidIds(const WireIds& i) { return i.session && i.turn && i.stream && i.epoch; }
+
+  /**
+   * @brief 将一帧同步交接给 ASIO 线程，并在有界时间内取得发送结论。
+   *
+   * send_mutex_ 保证多个 application 调用者仍按提交顺序进入单槽；interrupt
+   * 只唤醒 ASIO event loop，真正的 websocketpp::send 由 HandlePendingSend 执行。
+   */
   SendStatus DispatchSend(const void* const bytes, const std::size_t size,
                           const websocketpp::frame::opcode::value opcode,
-                          const bool cancellation) noexcept {
+                          const bool control) noexcept {
     std::lock_guard<std::mutex> submit_lock(send_mutex_);
     if (!connected_.load(std::memory_order_acquire) ||
         closing_.load(std::memory_order_acquire) || bytes == nullptr ||
@@ -388,7 +533,7 @@ class VoiceTransport::Impl final {
     pending_.size = size;
     pending_.opcode = opcode;
     pending_.status = SendStatus::kUnavailable;
-    pending_.cancellation = cancellation;
+    pending_.control = control;
     pending_.queued = true;
     pending_.done = false;
     websocketpp::lib::error_code ec;
@@ -408,6 +553,8 @@ class VoiceTransport::Impl final {
   }
 
   void HandlePendingSend(const Hdl h) noexcept {
+    // buffered_amount 只能在连接所属线程读取。普通音频受硬水位限制；状态机产生的
+    // 小型控制帧可越过该水位，避免已接受音频失去 commit/cancel 收尾信号。
     std::unique_lock<std::mutex> lock(pending_mutex_);
     if (!pending_.queued) return;
     SendStatus status = SendStatus::kUnavailable;
@@ -419,7 +566,7 @@ class VoiceTransport::Impl final {
         const std::size_t queued = connection->get_buffered_amount();
         const bool full = queued > kMaxBufferedBytes ||
                           pending_.size > kMaxBufferedBytes - queued;
-        if (full && !pending_.cancellation) {
+        if (full && !pending_.control) {
           status = SendStatus::kFull;
         } else {
           ec = connection->send(pending_.bytes.data(), pending_.size,
@@ -444,6 +591,8 @@ class VoiceTransport::Impl final {
     pending_.done = true;
     pending_changed_.notify_one();
   }
+
+  // 连接失败同时唤醒可能正在等待的发送者，再把错误投递给 application。
   void Fail(std::string why) {
     connected_ = false;
     CancelPendingSend();
@@ -452,6 +601,8 @@ class VoiceTransport::Impl final {
     } catch (...) {
     }
   }
+
+  // InboundHandler 的线程边界到此为止；处理会话状态前需由调用方投递到 actor。
   void Emit(Inbound event) {
     if (inbound_) try {
       inbound_(std::move(event));
@@ -461,6 +612,7 @@ class VoiceTransport::Impl final {
   }
 
   bool DecodePin(const std::string& text) {
+    // 标准 Base64 的 SHA-256 digest 长度固定为 44 字符；解码数组多留一个 padding 字节。
     if (!boompi::config::IsValidSpkiSha256(text)) return false;
     std::array<unsigned char, 33> decoded{};
     const int n = EVP_DecodeBlock(decoded.data(), reinterpret_cast<const unsigned char*>(text.data()), 44);
@@ -468,7 +620,7 @@ class VoiceTransport::Impl final {
     std::copy_n(decoded.begin(), pin_.size(), pin_.begin()); return true;
   }
   static int VerifyPin(X509_STORE_CTX* store, void* arg) {
-    // 固定的是证书公钥 SPKI SHA-256，不是整张证书；同一密钥续签不会导致设备失配。
+    // pin 覆盖证书公钥 SPKI 的 SHA-256；同一密钥续签证书仍保持设备身份连续。
     auto* self = static_cast<Impl*>(arg); X509* cert = X509_STORE_CTX_get0_cert(store);
     if (!self || !cert || X509_check_purpose(cert, X509_PURPOSE_SSL_SERVER, 0) <= 0) return 0;
     X509_PUBKEY* key = X509_get_X509_PUBKEY(cert); int n = i2d_X509_PUBKEY(key, nullptr);
@@ -480,6 +632,8 @@ class VoiceTransport::Impl final {
     X509_STORE_CTX_set_error(store, X509_V_OK); return 1;
   }
   Tls MakeTls() {
+    // 教学局域网允许自签身份，信任锚由已保存 SPKI 提供；同时保留服务端用途检查、
+    // TLS 1.2 下限和压缩禁用，避免连接在证书链缺失时退化为空身份校验。
     auto ctx = websocketpp::lib::make_shared<websocketpp::lib::asio::ssl::context>(websocketpp::lib::asio::ssl::context::tls_client);
     SSL_CTX_set_min_proto_version(ctx->native_handle(), TLS1_2_VERSION);
     SSL_CTX_set_options(ctx->native_handle(), SSL_OP_NO_COMPRESSION);
@@ -491,45 +645,7 @@ class VoiceTransport::Impl final {
     // 传输层只把一帧解码成有类型的事件。跨帧的 turn/epoch/response
     // 顺序由 application actor 单线程判定，避免这里再隐藏一套会话状态机。
     try {
-      const ParsedEnvelope parsed = ParseEnvelope(json);
-      const std::string& type = parsed.type;
-      const cJSON* body = parsed.payload;
-      Inbound e;
-      e.ids = parsed.ids;
-      if (parsed.device_id != config_.device_id)
-        throw std::runtime_error("wrong device identity");
-      if (type == "hello.ack") {
-        e.kind = InboundKind::kHelloAck;
-        if (RequireUint32(body, "input_sample_rate_hz") != 16000 ||
-            RequireUint32(body, "output_sample_rate_hz") != 24000 ||
-            RequireUint32(body, "input_frame_ms") != 20)
-          throw std::runtime_error("unsupported hello audio contract");
-      } else if (type == "response.start") {
-        e.kind = InboundKind::kResponseStart;
-        e.response_id = RequireString(body, "response_id", 1, 128);
-      } else if (type == "response.text_delta") {
-        e.kind = InboundKind::kTextDelta;
-        e.response_id = RequireString(body, "response_id", 1, 128);
-        e.text = RequireString(body, "text", 1, 4096);
-      } else if (type == "response.audio_start") {
-        e.kind = InboundKind::kAudioStart;
-        e.response_id = RequireString(body, "response_id", 1, 128);
-        if (RequireUint32(body, "sample_rate_hz") != 24000)
-          throw std::runtime_error("unsupported response audio rate");
-      } else if (type == "response.cancelled") {
-        e.kind = InboundKind::kCancelled;
-        e.text = RequireString(body, "reason", 1, 64);
-      } else if (type == "response.done") {
-        e.kind = InboundKind::kDone;
-        e.response_id = RequireString(body, "response_id", 1, 128);
-      } else if (type == "error") {
-        e.kind = InboundKind::kError;
-        e.error_code = RequireString(body, "code", 1, 64);
-        e.text = RequireString(body, "message", 1, 512);
-      } else {
-        throw std::runtime_error("unsupported control type");
-      }
-      Emit(std::move(e));
+      Emit(DecodeTextEvent(json, config_.device_id));
     } catch (const std::exception& e) {
       ProtocolError(e.what());
     }
@@ -568,6 +684,7 @@ class VoiceTransport::Impl final {
   }
 
   void OnMessage(const Client::message_ptr& message) {
+    // 每个 WebSocket message 恰好承载一个控制对象或一帧 PCM；opcode 决定解码器。
     if (message->get_payload().size() > kMaxMessageBytes) {
       return ProtocolError("message too large");
     }
@@ -581,6 +698,7 @@ class VoiceTransport::Impl final {
   }
 
   void ProtocolError(const std::string& why) {
+    // wire 违规会使当前流边界失去可信度，关闭整条连接并由 application 建立新 epoch。
     Fail(why);
     websocketpp::lib::error_code ec;
     client_.close(hdl_, websocketpp::close::status::policy_violation,
