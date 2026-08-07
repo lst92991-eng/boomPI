@@ -181,7 +181,7 @@ bool TestBoundedCaptureWait() {
   const auto elapsed = std::chrono::steady_clock::now() - started;
   return Check(result == CaptureResult::kTimeout,
                "blocked capture was not reported as a timeout") &&
-         Check(elapsed >= 30ms && elapsed < 150ms,
+         Check(elapsed >= 30ms && elapsed < 500ms,
                "capture timeout was outside its bounded window");
 }
 

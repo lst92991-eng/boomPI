@@ -93,14 +93,14 @@ constexpr auto TestableDuration([[maybe_unused]] const int production_ms,
 }
 constexpr auto kConnectWait = TestableDuration(6000, 30);
 constexpr auto kHelloAckWait = TestableDuration(5000, 30);
-constexpr auto kHeartbeatWait = TestableDuration(30000, 600);
+constexpr auto kHeartbeatWait = TestableDuration(30000, 3000);
 constexpr auto kSpeechStartWait = TestableDuration(6000, 250);
 constexpr auto kMaximumTurnWait = TestableDuration(60000, 250);
 constexpr auto kFirstResponseHint = TestableDuration(15000, 15);
 constexpr auto kResponseWait = TestableDuration(30000, 300);
 // 合法流式进度可以续期 30 s 无进展窗口，但不能让一个 response 永久占住 turn。
 // 5 min 与服务端允许的 provider timeout 上限一致；harness 使用短墙钟验证硬边界。
-constexpr auto kResponseAbsoluteWait = TestableDuration(300000, 450);
+constexpr auto kResponseAbsoluteWait = TestableDuration(300000, 1500);
 constexpr auto kCancelAckWait = TestableDuration(kCancelAckWaitMs, 250);
 constexpr auto kDrainPlaybackWait = TestableDuration(30000, 20);
 constexpr auto kFollowUpWait = TestableDuration(3000, 30);

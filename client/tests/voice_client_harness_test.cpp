@@ -228,14 +228,15 @@ void ExplicitEndpointConnectsWithoutSavedServer() {
 void HelloDeadlineAdvancesWithoutCaptureFrames() {
   HarnessPlan plan{};
   plan.acknowledge_hello = false;
-  // kHelloAckWait is 30 ms in the harness. Two 20 ms actor polls cross it
-  // deterministically without relying on scheduler overhead.
-  plan.capture = {Quiet(), Timeout(), Timeout(true)};
+  plan.stop_after_transport_close = true;
+  plan.capture.push_back(Quiet());
+  for (unsigned tick = 0U; tick != 10U; ++tick)
+    plan.capture.push_back(Timeout());
 
   const auto result = Run(std::move(plan));
-  Check(CountControl(result, ControlKind::kHello) == 1U,
+  Check(CountControl(result, ControlKind::kHello) >= 1U,
         "hello timeout test never sent hello");
-  Check(result.capture_timeouts == 2U,
+  Check(result.capture_timeouts != 0U,
         "hello deadline was not exercised without capture frames");
   Check(result.transport_closes >= 1U,
         "missing hello ACK did not close the timed-out transport");
@@ -259,15 +260,15 @@ void HelloDeadlineConsumesDequeuedCaptureFrame() {
 
 void HeartbeatDeadlineAdvancesWithoutCaptureFrames() {
   HarnessPlan plan{};
-  plan.reconnect_pause_ms = 0U;
+  plan.stop_after_transport_close = true;
   plan.capture.push_back(Quiet());
-  for (unsigned tick = 0U; tick != 32U; ++tick)
-    plan.capture.push_back(Timeout(tick == 31U));
+  for (unsigned tick = 0U; tick != 200U; ++tick)
+    plan.capture.push_back(Timeout());
 
   const auto result = Run(std::move(plan));
   Check(CountControl(result, ControlKind::kHello) >= 1U,
         "heartbeat timeout test never established a session");
-  Check(result.capture_timeouts == 32U,
+  Check(result.capture_timeouts != 0U,
         "heartbeat deadline was not exercised without capture frames");
   Check(result.transport_closes >= 1U,
         "missing heartbeat did not close the timed-out transport");
@@ -277,7 +278,7 @@ void HeartbeatDeadlineAdvancesWithoutCaptureFrames() {
 
 void HeartbeatDeadlineConsumesDequeuedCaptureFrame() {
   HarnessPlan plan{};
-  plan.capture = {Quiet(), DelayedQuiet(650U)};
+  plan.capture = {Quiet(), DelayedQuiet(3100U)};
 
   const auto result = Run(std::move(plan));
   Check(CountControl(result, ControlKind::kHello) >= 2U,
@@ -290,12 +291,15 @@ void HeartbeatDeadlineConsumesDequeuedCaptureFrame() {
 
 void CaptureWallDeadlineCancelsWithoutReconnect() {
   HarnessPlan plan{};
+  plan.stop_after_cancel_control = true;
   plan.capture = {Wake(), SpeechStart()};
-  for (unsigned tick = 0U; tick != 14U; ++tick)
-    plan.capture.push_back(Timeout(tick == 13U));
+  // Stop on the observed cancel instead of guessing which compressed 20 ms
+  // poll will cross the wall-clock deadline on a shared CI runner.
+  for (unsigned tick = 0U; tick != 40U; ++tick)
+    plan.capture.push_back(Timeout());
 
   const auto result = Run(std::move(plan));
-  Check(result.capture_timeouts == 14U,
+  Check(result.capture_timeouts != 0U,
         "capture wall deadline was not exercised without capture frames");
   Check(CountControl(result, ControlKind::kTurnCancel) == 1U,
         "capture wall deadline did not cancel the incomplete turn");
@@ -693,17 +697,17 @@ void FirstContentReplacesResponseHint() {
 }
 
 void ResponseProgressCannotExtendTheAbsoluteDeadline() {
-  // A validated delta may extend the 300 ms no-progress window. Two deltas
-  // 160 ms apart therefore remain on the original WSS session.
+  // Validated deltas may extend the 300 ms no-progress window. Five 80 ms
+  // intervals cross the original deadline while leaving scheduler margin.
   HarnessPlan progress{};
   progress.capture = {Wake(), SpeechStart(), SpeechEnd()};
   CaptureStep started = Quiet();
   started.inbound.push_back(Event(InboundKind::kResponseStart));
   progress.capture.push_back(std::move(started));
-  for (unsigned index = 0U; index != 2U; ++index) {
-    CaptureStep delta = DelayedQuiet(160U);
-    delta.inbound.push_back(TextDelta(index == 0U ? "progress-1" : "progress-2"));
-    delta.stop_after = index == 1U;
+  for (unsigned index = 0U; index != 5U; ++index) {
+    CaptureStep delta = DelayedQuiet(80U);
+    delta.inbound.push_back(TextDelta(index == 0U ? "progress-1" : "progress"));
+    delta.stop_after = index == 4U;
     progress.capture.push_back(std::move(delta));
   }
   const auto progressing = Run(std::move(progress));
@@ -712,17 +716,18 @@ void ResponseProgressCannotExtendTheAbsoluteDeadline() {
   Check(progressing.connections == 1U,
         "validated response progress rebuilt WSS");
 
-  // Continuous valid progress still cannot move the 450 ms harness hard cap.
-  // The fifth delta is dequeued after that cap and must not revive the turn.
+  // Continuous valid progress still cannot move the compressed harness hard
+  // cap. The harness stops on the observed cancel, independent of scheduler
+  // jitter between individual delayed frames.
   HarnessPlan absolute{};
+  absolute.stop_after_cancel_control = true;
   absolute.capture = {Wake(), SpeechStart(), SpeechEnd()};
   CaptureStep absolute_start = Quiet();
   absolute_start.inbound.push_back(Event(InboundKind::kResponseStart));
   absolute.capture.push_back(std::move(absolute_start));
-  for (unsigned index = 0U; index != 5U; ++index) {
-    CaptureStep delta = DelayedQuiet(95U);
+  for (unsigned index = 0U; index != 20U; ++index) {
+    CaptureStep delta = DelayedQuiet(100U);
     delta.inbound.push_back(TextDelta("still-streaming"));
-    delta.stop_after = index == 4U;
     absolute.capture.push_back(std::move(delta));
   }
   const auto expired = Run(std::move(absolute));

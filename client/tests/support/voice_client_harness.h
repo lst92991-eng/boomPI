@@ -32,6 +32,8 @@ struct HarnessPlan final {
   bool fallback_server_available{true};
   bool acknowledge_hello{true};
   bool stop_during_capture_timeout{false};
+  bool stop_after_cancel_control{false};
+  bool stop_after_transport_close{false};
 };
 
 struct PcmSend final {

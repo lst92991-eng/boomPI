@@ -273,6 +273,10 @@ bool VoiceTransport::SendControl(const Control& control) {
       hello.ids.epoch = static_cast<std::uint32_t>(state.snapshot.connections);
       inbound = state.inbound;
     }
+    if (state.plan.stop_after_cancel_control && state.stop != nullptr &&
+        (control.kind == ControlKind::kTurnCancel ||
+         control.kind == ControlKind::kResponseCancel))
+      *state.stop = 1;
   }
   if (inbound) inbound(std::move(hello));
   return true;
@@ -300,6 +304,8 @@ void VoiceTransport::Close() noexcept {
   impl_->closed = true;
   impl_->connected = false;
   ++state.snapshot.transport_closes;
+  if (state.plan.stop_after_transport_close && state.stop != nullptr)
+    *state.stop = 1;
   if (state.active_transport == this) {
     state.active_transport = nullptr;
     state.inbound = {};

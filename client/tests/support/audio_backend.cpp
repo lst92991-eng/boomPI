@@ -4,6 +4,7 @@
 #include <deque>
 #include <mutex>
 #include <new>
+#include <thread>
 #include <utility>
 
 namespace boompi::test::audio_backend { namespace {
@@ -173,6 +174,10 @@ bool AudioBackend::Render20ms(const std::int16_t* const pcm24,
     state.render_calls.push_back(std::move(call));
   }
   state.condition.notify_all();
+  // The board backend advances one 20 ms ALSA period per call. Giving the
+  // fake backend the same media clock prevents it from draining 180 ms of
+  // queued audio instantaneously and turning scheduler jitter into underruns.
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
   return true;
 }
 
