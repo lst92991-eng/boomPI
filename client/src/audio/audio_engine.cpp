@@ -32,7 +32,11 @@ constexpr int kPlaybackPriority = 30;
 
 void SetRealtimePriority(const char* name, int priority) noexcept {
   // SCHED_FIFO 是板端低延迟优化。缺少权限时保留普通线程继续运行，日志用于确认部署能力。
+#if defined(__APPLE__)
+  static_cast<void>(pthread_setname_np(name));
+#else
   static_cast<void>(pthread_setname_np(pthread_self(), name));
+#endif
   sched_param parameters{};
   parameters.sched_priority = priority;
   const int result = pthread_setschedparam(
