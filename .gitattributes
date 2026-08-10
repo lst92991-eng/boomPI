@@ -18,5 +18,7 @@ client/scripts/* text eol=lf
 *.png binary
 *.jpg binary
 *.jpeg binary
+*.pdf binary
+*.docx binary
 *.wav binary
 *.pcm binary
