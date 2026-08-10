@@ -1,0 +1,7 @@
+HOST_ARCH=x86_64
+PRETTY_NAME="Ubuntu 26.04 LTS"
+KERNEL=Linux 6.18.33.1-microsoft-standard-WSL2
+
+采集日期：2026-08-10
+采集命令：uname -m；读取 /etc/os-release 的 PRETTY_NAME；uname -sr
+用途：只确认本轮开发环境身份，不代表所有读者必须使用同一版本。
