@@ -2,6 +2,10 @@
 
 固定链路：ALSA 48 kHz / 4ch → 联合重采样16 kHz → Rockchip双麦单参考3A → Snowboy/VAD → VoiceAudio语义事件 → VoiceApp → VoiceLink。下行24 kHz mono经有界TTS ring、重采样、音量和limiter后输出48 kHz stereo。
 
+`VoiceAudio::Process`由主线程持续调用，推进输入/插话判定并取得事件；timeout仅限制等待采集帧，不是整个函数的耗时上限。`ListenMode::Wake/FollowUp`只选择准入策略，6秒/3秒的开口窗口仍由应用管理。
+
+下行协议已固定一包最多480样本，因此AudioEngine按一包一槽入队，不再跨槽拆拼。非末帧恰好480样本，短槽之后拒绝追加，等待EndPlayback或DropPlayback；保留1.5秒容量、sequence连续性与自然尾播规则。
+
 帧契约和板级标定在 `board_voice_profile.h`。一个ALSA frame是同一采样时刻的所有通道；960个48 kHz frames才是20 ms。
 
 | 缓冲 | 容量 | 超限行为 |

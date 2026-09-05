@@ -18,6 +18,7 @@ namespace {
 using boompi::audio::AudioEvent;
 using boompi::audio::AudioEventKind;
 using boompi::audio::kTtsFrameSamples;
+using boompi::audio::ListenMode;
 using boompi::audio::VoiceAudio;
 using boompi::audio::VoiceFrameContract;
 
@@ -47,8 +48,8 @@ const std::uint8_t* Frame(const std::vector<std::uint8_t>& fixture, std::size_t 
   return fixture.data() + index % (fixture.size() / kFrameBytes) * kFrameBytes;
 }
 
-bool Poll(VoiceAudio* voice, AudioEvent* event, bool* have_event) {
-  *have_event = voice->Poll(event, std::chrono::milliseconds(20));
+bool ProcessAudio(VoiceAudio* voice, AudioEvent* event, bool* have_event) {
+  *have_event = voice->Process(event, std::chrono::milliseconds(20));
   if ((*have_event && event->kind == AudioEventKind::Fault) || !voice->healthy()) {
     std::cerr << "boompi-aec-loop-hil: " << voice->last_error() << '\n';
     return false;
@@ -83,7 +84,7 @@ int main(int argc, char* argv[]) {
   std::uint64_t settle_wakes = 0U;
   const auto settled_at = Clock::now() + std::chrono::seconds(5);
   while (Clock::now() < settled_at) {
-    if (!Poll(&voice, &event, &have_event)) {
+    if (!ProcessAudio(&voice, &event, &have_event)) {
       return EXIT_FAILURE;
     }
     if (have_event && event.kind == AudioEventKind::Wake) {
@@ -108,9 +109,9 @@ int main(int argc, char* argv[]) {
   const auto playback_limit =
       Clock::now() + std::chrono::seconds(5) +
       std::chrono::milliseconds(total_frames * VoiceFrameContract::frame_ms);
-  // Poll是语义事件，不等于一帧。音源发送和总超时都使用真实墙钟。
+  // 每次处理不一定返回一个PCM帧；发送节奏和总超时均由单调时钟决定。
   while (Clock::now() < playback_limit && !playback_done) {
-    if (!Poll(&voice, &event, &have_event)) {
+    if (!ProcessAudio(&voice, &event, &have_event)) {
       return EXIT_FAILURE;
     }
     if (have_event && event.kind == AudioEventKind::Barge) {
@@ -134,13 +135,13 @@ int main(int argc, char* argv[]) {
 
   bool would_follow_up = false;
   if (!would_barge && playback_done) {
-    if (!voice.Listen(true)) {
+    if (!voice.Listen(ListenMode::FollowUp)) {
       std::cerr << "boompi-aec-loop-hil: " << voice.last_error() << '\n';
       return EXIT_FAILURE;
     }
     const auto post_limit = Clock::now() + std::chrono::seconds(1);
     while (Clock::now() < post_limit) {
-      if (!Poll(&voice, &event, &have_event)) {
+      if (!ProcessAudio(&voice, &event, &have_event)) {
         return EXIT_FAILURE;
       }
       if (have_event && event.kind == AudioEventKind::SpeechStart) {

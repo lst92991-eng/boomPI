@@ -50,9 +50,9 @@ enum class CaptureResult : std::uint8_t {
 enum class QueueTtsResult : std::uint8_t {
   kQueued,           ///< PCM 已完整复制进有界环。
   kNotOpen,          ///< AudioEngine 尚未打开或已经关闭。
-  kInvalidArgument,  ///< 空包、空指针或奇数字节，无法组成 S16_LE sample。
+  kInvalidArgument,  ///< 空包、空指针、奇数字节或超过一帧，无法接收为固定 20 ms PCM。
   kNotActive,        ///< 还未开始当前播放会话。
-  kEnding,           ///< 已收到流结束标记，当前会话不再接受 PCM。
+  kEnding,           ///< 短末帧已入队或已声明结束，当前会话不再接受 PCM。
   kFull,             ///< 1.5 秒容量不足；调用方需要把它当作明确背压处理。
   kDiscontinuous,    ///< 服务端 PCM sequence 出现空洞，继续播放会掩盖音频缺失。
 };
@@ -101,7 +101,8 @@ class AudioEngine final {
   /// @brief 清空 Snowboy/VAD 的当前判定历史，不停止持续采集或 Rockchip 3A。
   bool ResetListener() noexcept;
 
-  /// @brief 按服务端 sequence 把 little-endian 24 kHz mono PCM 复制到 1.5 秒有界环。
+  /// @brief 每包 1～480 个 S16_LE/24 kHz mono 样本，一包复制到 1.5 秒有界环的一个槽。
+  /// 短包只允许作为末帧，入队后只能 EndPlayback 或 DropPlayback，不能追加 PCM。
   /// @return 明确区分生命周期、容量、序号和参数错误；绝不覆盖尚未播放的帧。
   QueueTtsResult QueueTts24k(const std::uint8_t* pcm_bytes, std::size_t byte_count,
                              std::uint64_t sequence) noexcept;

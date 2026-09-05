@@ -39,7 +39,7 @@ constexpr std::size_t kMaximumBargeProbeFrames = kBargeCandidateFrames +
                                                  kBargeReferenceWaitFrames +
                                                  kBargeEchoClearFrames + kBargeConfirmFrames;
 constexpr std::size_t kEventSlots = 64U;
-constexpr unsigned kCaptureDrainPerPoll = 8U;
+constexpr unsigned kCaptureDrainLimit = 8U;
 constexpr auto kPlaybackStopWait = std::chrono::milliseconds(60);
 
 static_assert(kPreRollFrames <= kBargeHistoryFrames,
@@ -413,7 +413,7 @@ struct VoiceAudio::Impl final {
   }
 
   void DrainReadyCapture() noexcept {
-    for (unsigned drained = 0U; drained < kCaptureDrainPerPoll && !fatal; ++drained) {
+    for (unsigned drained = 0U; drained < kCaptureDrainLimit && !fatal; ++drained) {
       if (CaptureOnce(std::chrono::milliseconds::zero()) != CaptureResult::kFrame) {
         break;
       }
@@ -462,7 +462,7 @@ bool VoiceAudio::Open(const std::uint8_t volume) {
   return true;
 }
 
-bool VoiceAudio::Poll(AudioEvent* const event, const std::chrono::milliseconds timeout) {
+bool VoiceAudio::Process(AudioEvent* const event, const std::chrono::milliseconds timeout) {
   if (impl_ == nullptr || !impl_->open || event == nullptr ||
       timeout < std::chrono::milliseconds::zero()) {
     return false;
@@ -482,7 +482,7 @@ bool VoiceAudio::Poll(AudioEvent* const event, const std::chrono::milliseconds t
   return impl_->PopEvent(event);
 }
 
-bool VoiceAudio::Listen(const bool follow_up) {
+bool VoiceAudio::Listen(const ListenMode mode) {
   if (impl_ == nullptr || !impl_->open || impl_->fatal || impl_->playback_generation != 0U) {
     return false;
   }
@@ -495,8 +495,8 @@ bool VoiceAudio::Listen(const bool follow_up) {
     return false;
   }
   impl_->ClearError();
-  impl_->input_state =
-      follow_up ? Impl::InputState::kFollowingUp : Impl::InputState::kListening;
+  impl_->input_state = mode == ListenMode::FollowUp ? Impl::InputState::kFollowingUp
+                                                    : Impl::InputState::kListening;
   return true;
 }
 

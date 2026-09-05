@@ -1,18 +1,13 @@
-/**
- * @file device_ui.cpp
- * @brief 驱动 RV1106 的 ST7789P3、GT911，并运行 LVGL 页面线程。
+/** @file device_ui.cpp
+ * @brief UI 线程按顺序接收快照、更新页面并处理用户操作。
  *
- * application 通过快照和动作邮箱通信。LVGL、SPI、GT911 只在 UI worker 中访问；
- * SC3336 进程与帧缓冲由 camera_capture.cpp 管理。
+ * DisplayTouch 管理板端屏幕/触摸，CameraCapture 管理预览管线。
+ * LVGL 对象只在 UI worker 内创建、访问和销毁。
  */
 #include "boompi/ui/device_ui.h"
 
 #include <fcntl.h>
-#include <linux/i2c-dev.h>
-#include <linux/i2c.h>
-#include <linux/spi/spidev.h>
 #include <lvgl.h>
-#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -28,26 +23,14 @@
 #include <string>
 #include <thread>
 
+#include "../platform/rv1106/display_touch.h"
 #include "boompi/ui/lvgl_screen.h"
 #include "camera_capture.h"
 
 namespace boompi::ui {
 namespace {
 
-// 面板原生方向为 240x320，产品界面按 320x240 横屏绘制；刷屏和触摸都在端口层旋转。
-constexpr int kPanelWidth = 240, kPanelHeight = 320;
 constexpr int kScreenWidth = 320, kScreenHeight = 240, kDrawRows = 32;
-// GPIO 编号来自当前 RV1106 板级连线，修改硬件版本时需要与 DTS 和网表一同核对。
-constexpr int kBacklightGpio = 53, kDataCommandGpio = 66, kPanelResetGpio = 67;
-constexpr int kTouchResetGpio = 64, kTouchInterruptGpio = 73;
-constexpr int kGt911Address = 0x14;
-constexpr std::uint16_t kTouchStatus = 0x814E;
-constexpr std::uint16_t kTouchPoint = 0x814F;
-constexpr unsigned kTouchFailureLimit = 3U;
-constexpr unsigned kTouchRecoveryLimit = 2U;
-// spidev 接收的是上限请求，Open() 还会回读驱动实际接受的频率并记录到日志。
-constexpr unsigned kSpiSpeedHz = 80000000U;
-constexpr char kGpioRoot[] = "/sys/class/gpio";
 constexpr char kSettings[] = "/userdata/boompi/config/ui.settings";
 constexpr char kSettingsTemporary[] = "/userdata/boompi/config/ui.settings.tmp";
 constexpr char kProvision[] = "/usr/sbin/boompi-provision";
@@ -70,21 +53,11 @@ bool WriteAll(int fd, const void* source, std::size_t bytes) {
   return true;
 }
 
-bool WriteText(const std::string& path, const std::string& text, int flags = O_WRONLY) {
-  const int fd = open(path.c_str(), flags | O_CLOEXEC, 0644);
-  if (fd < 0) {
-    return false;
-  }
-  const bool ok = WriteAll(fd, text.data(), text.size());
-  close(fd);
-  return ok;
-}
-
 /**
  * @brief 以临时文件加 rename 的方式提交音量。
  *
- * 掉电或进程被杀时，旧配置保持完整；临时文件权限也避免课堂局域网中的普通用户
- * 读取或篡改设备设置。调用点只发生在滑块释放事件，拖动过程不会频繁写闪存。
+ * 提交前先写完临时文件，避免正式配置留下半行数据。仅在滑块释放时保存，
+ * 拖动预览不会频繁写闪存。
  */
 bool SaveVolume(std::uint8_t percent) {
   const std::string text = std::to_string(percent) + "\n";
@@ -106,57 +79,26 @@ bool SaveVolume(std::uint8_t percent) {
   return ok;
 }
 
-/**
- * @brief 通过旧 sysfs GPIO ABI 导出输出脚并保持 value fd 打开。
- *
- * export 后节点由内核异步创建，因此等待窗口限制为约 500 ms。返回的 fd 由
- * DeviceUi::Close() 统一释放，GPIO 本身保留导出状态供下一次启动复用。
- */
-int OpenGpio(int number) {
-  const std::string base = std::string(kGpioRoot) + "/gpio" + std::to_string(number);
-  if (access(base.c_str(), F_OK) != 0) {
-    if (!WriteText(std::string(kGpioRoot) + "/export", std::to_string(number))) {
-      return -1;
-    }
-    for (int retry = 0; retry < 50 && access(base.c_str(), F_OK) != 0; ++retry) {
-      usleep(10000);
-    }
-  }
-  if (!WriteText(base + "/direction", "out")) {
-    return -1;
-  }
-  return open((base + "/value").c_str(), O_WRONLY | O_CLOEXEC);
-}
-
-bool SetGpio(int fd, bool high) {
-  const char value = high ? '1' : '0';
-  return fd >= 0 && lseek(fd, 0, SEEK_SET) == 0 && WriteAll(fd, &value, 1U);
-}
-
 }  // namespace
 
 struct DeviceUi::Impl final {
-  using View = UiView;
   using CameraFrame = CameraCapture::Frame;
 
   Impl() noexcept : camera(wake) {}
 
-  // 下列设备 fd 只在 Open()/UI worker/Close() 的受控生命周期内使用。
-  int spi{-1}, touch{-1}, data_command{-1}, panel_reset{-1}, backlight{-1};
-  // GT911 坐标由 UI worker 更新，LVGL input callback 在同一线程读取。
-  int pointer_x{0}, pointer_y{0};
-  bool pointer_pressed{false};
-  unsigned touch_failures{0U}, touch_recovery_attempts{0U};
-  bool touch_disabled{false};
-  std::chrono::steady_clock::time_point next_touch_recovery{};
+  platform::rv1106::DisplayTouch hardware;
   std::atomic<bool> stop{false};
   std::atomic<int> action{-1}, volume_change{-1};
   pid_t provision_pid{-1};
   std::mutex view_mutex;
   std::condition_variable wake;
   CameraCapture camera;
+  CameraStatus shown_camera{CameraStatus::Stopped};
+  std::chrono::steady_clock::time_point last_frame{};
+  bool have_display_frame{false};
+  CameraFrame display_frame{};
   bool start_done{false}, start_ok{false}, view_dirty{true};
-  View view;
+  UiView view;
   std::thread ui_thread;
   LvglScreen screen;
   lv_disp_draw_buf_t draw_buffer{};
@@ -165,10 +107,9 @@ struct DeviceUi::Impl final {
   lv_disp_t* display{nullptr};
   lv_indev_t* input{nullptr};
   std::array<lv_color_t, kScreenWidth * kDrawRows> draw_pixels{};
-  std::array<std::uint8_t, 4096> flush_pixels{};
 
-  /** @brief UI worker 原子取得最近一次完整 View，并清除 dirty 标志。 */
-  bool TakeView(View* next) {
+  /** @brief UI worker 原子取得最近一次完整 UiView，并清除 dirty 标志。 */
+  bool TakeView(UiView* next) {
     std::lock_guard<std::mutex> lock(view_mutex);
     if (!view_dirty) {
       return false;
@@ -178,294 +119,26 @@ struct DeviceUi::Impl final {
     return true;
   }
 
-  void UpdateView(const View& value) {
+  void UpdateView(const UiView& value) {
     std::lock_guard<std::mutex> lock(view_mutex);
     view = value;
     view_dirty = true;
     wake.notify_one();
   }
 
-  /**
-   * @brief 按 ST7789P3 的 D/C 时序发送一条命令及可选 payload。
-   *
-   * D/C 拉低覆盖命令字节，payload 发送前再拉高；整个调用只在 UI worker 中发生，
-   * 因而 GPIO 电平和 SPI 字节流不会被其他页面更新交叉打断。
-   */
-  bool Command(std::uint8_t command, const std::uint8_t* data = nullptr,
-               std::size_t bytes = 0U) {
-    if (!SetGpio(data_command, false) || !WriteAll(spi, &command, 1U)) {
-      return false;
-    }
-    return bytes == 0U || (SetGpio(data_command, true) && WriteAll(spi, data, bytes));
-  }
-
-  /**
-   * @brief 将 LVGL 横屏脏矩形旋转并刷入 ST7789P3 原生坐标。
-   *
-   * LVGL 的 RGB565 主机字节序像素在这里转成面板要求的高字节在前，并使用固定
-   * 4 KiB 暂存块限制栈和单次 write 大小。刷屏失败时熄灭背光并请求 UI worker
-   * 退出，防止用户继续看到冻结画面；无论成功与否都必须调用 flush_ready，解除
-   * LVGL 内部的绘制等待。
-   */
   static void Flush(lv_disp_drv_t* driver, const lv_area_t* area, lv_color_t* pixels) {
     auto* self = static_cast<Impl*>(driver->user_data);
-    const int width = area->x2 - area->x1 + 1;
-    const int x1 = area->y1, x2 = area->y2;
-    const int y1 = kPanelHeight - 1 - area->x2, y2 = kPanelHeight - 1 - area->x1;
-    const std::uint8_t columns[] = {
-        static_cast<std::uint8_t>(x1 >> 8), static_cast<std::uint8_t>(x1),
-        static_cast<std::uint8_t>(x2 >> 8), static_cast<std::uint8_t>(x2)};
-    const std::uint8_t rows[] = {
-        static_cast<std::uint8_t>(y1 >> 8), static_cast<std::uint8_t>(y1),
-        static_cast<std::uint8_t>(y2 >> 8), static_cast<std::uint8_t>(y2)};
-    bool ok = self->Command(0x2A, columns, sizeof(columns)) &&
-              self->Command(0x2B, rows, sizeof(rows)) && self->Command(0x2C) &&
-              SetGpio(self->data_command, true);
-    std::size_t used = 0U;
-    for (int x = area->x2; ok && x >= area->x1; --x) {
-      for (int y = area->y1; y <= area->y2; ++y) {
-        const auto pixel = pixels[(y - area->y1) * width + x - area->x1].full;
-        self->flush_pixels[used++] = static_cast<std::uint8_t>(pixel >> 8U);
-        self->flush_pixels[used++] = static_cast<std::uint8_t>(pixel);
-        if (used == self->flush_pixels.size()) {
-          ok = WriteAll(self->spi, self->flush_pixels.data(), used);
-          used = 0U;
-          if (!ok) {
-            break;
-          }
-        }
-      }
-    }
-    if (ok && used != 0U) {
-      ok = WriteAll(self->spi, self->flush_pixels.data(), used);
-    }
-    if (!ok) {
-      SetGpio(self->backlight, false);
+    if (!self->hardware.Flush(*area, pixels)) {
       self->stop.store(true);
       self->wake.notify_one();
     }
+    // 失败也必须确认本次 flush，让 LVGL 能结束当前绘制并退出。
     lv_disp_flush_ready(driver);
   }
 
-  /**
-   * @brief 按上电时序复位并初始化 ST7789P3 面板。
-   *
-   * 背光先保持关闭，避免复位和寄存器配置期间显示随机显存；RESET 的两个 100 ms
-   * 窗口以及 Sleep Out 后的 120 ms 来自控制器上电要求。只有 Display On 成功后才
-   * 点亮背光，因此 Open() 的成功意味着用户能够看到完整初始化后的页面。
-   */
-  bool InitPanel() {
-    if ((data_command = OpenGpio(kDataCommandGpio)) < 0 ||
-        (panel_reset = OpenGpio(kPanelResetGpio)) < 0 ||
-        (backlight = OpenGpio(kBacklightGpio)) < 0) {
-      return false;
-    }
-    if (!SetGpio(backlight, false) || !SetGpio(panel_reset, false)) {
-      return false;
-    }
-    usleep(100000);
-    if (!SetGpio(panel_reset, true)) {
-      return false;
-    }
-    usleep(100000);
-    // 初始化表绑定当前面板模组；每组数据依次为 command、payload size、payload。
-    // 维护时应对照模组厂商序列整体更新，单独猜测 gamma 或电源寄存器会产生隐蔽色偏。
-    static constexpr std::uint8_t init[] = {
-        0xB2, 5,    0x0C, 0x0C, 0,    0x33, 0x33, 0x36, 1,    0,    0x3A, 1,    0x55,
-        0xB7, 1,    0x55, 0xBB, 1,    0x1A, 0xC0, 1,    0x2C, 0xC2, 1,    1,    0xC3,
-        1,    0x19, 0xC6, 1,    0x0F, 0xD0, 1,    0xA7, 0xD0, 2,    0xA4, 0xA1, 0xD6,
-        1,    0xA1, 0xE0, 14,   0xF0, 3,    9,    0x0B, 0x0A, 0x16, 0x2B, 0x33, 0x41,
-        0x38, 0x14, 0x14, 0x29, 0x2F, 0xE1, 14,   0xF0, 4,    6,    9,    8,    4,
-        0x2B, 0x32, 0x41, 0x36, 0x12, 0x12, 0x2A, 0x30, 0x21, 0,    0x2A, 4,    0,
-        0,    0,    0xEF, 0x2B, 4,    0,    0,    1,    0x3F};
-    for (std::size_t at = 0U; at < sizeof(init);) {
-      const std::uint8_t size = init[at + 1U];
-      if (!Command(init[at], init + at + 2U, size)) {
-        return false;
-      }
-      at += size + 2U;
-    }
-    if (!Command(0x11)) {
-      return false;
-    }
-    usleep(120000);
-    return Command(0x29) && SetGpio(backlight, true);
-  }
-
-  /**
-   * @brief 复位 GT911、锁定 0x14 地址并打开 I2C-3。
-   *
-   * GT911 在 RESET 上升沿采样 INT 电平；这里用 INT=1 选择 0x14，随后把该 GPIO
-   * 恢复为输入。初始化结束前先试读状态寄存器，避免把线路故障延迟到 LVGL 循环。
-   */
-  bool InitTouch() {
-    const int touch_reset = OpenGpio(kTouchResetGpio),
-              interrupt = OpenGpio(kTouchInterruptGpio);
-    if (touch_reset < 0 || interrupt < 0) {
-      if (touch_reset >= 0) {
-        close(touch_reset);
-      }
-      if (interrupt >= 0) {
-        close(interrupt);
-      }
-      return false;
-    }
-    bool reset_ok = SetGpio(touch_reset, false);
-    usleep(20000);
-    reset_ok = SetGpio(interrupt, true) && reset_ok;  // RESET 上升沿前用 INT=1 选择地址 0x14。
-    usleep(2000);
-    reset_ok = SetGpio(touch_reset, true) && reset_ok;
-    usleep(6000);
-    reset_ok = SetGpio(interrupt, false) && reset_ok;
-    usleep(50000);
-    close(touch_reset);
-    close(interrupt);
-    if (!reset_ok) {
-      return false;
-    }
-    const std::string irq =
-        std::string(kGpioRoot) + "/gpio" + std::to_string(kTouchInterruptGpio) + "/direction";
-    if (!WriteText(irq, "in")) {
-      return false;
-    }
-    usleep(60000);
-    touch = open("/dev/i2c-3", O_RDWR | O_CLOEXEC);
-    std::uint8_t status = 0U;
-    if (touch >= 0 && ReadTouch(kTouchStatus, &status, 1U)) {
-      return true;
-    }
-    if (touch >= 0) {
-      close(touch);
-    }
-    touch = -1;
-    return false;
-  }
-
-  /**
-   * @brief 使用一次 I2C_RDWR combined transfer 读取 GT911 寄存器。
-   *
-   * 寄存器地址为大端 16 位，write/read 两条 message 之间保持 repeated-start，避免
-   * STOP 让控制器丢失当前地址。调用方与恢复逻辑都属于 UI worker，无需额外锁。
-   */
-  bool ReadTouch(std::uint16_t address, std::uint8_t* data, std::size_t size) {
-    std::uint8_t reg[] = {static_cast<std::uint8_t>(address >> 8U),
-                          static_cast<std::uint8_t>(address)};
-    i2c_msg messages[] = {{kGt911Address, 0, 2, reg},
-                          {kGt911Address, I2C_M_RD, static_cast<__u16>(size), data}};
-    i2c_rdwr_ioctl_data transfer{messages, 2U};
-    return ioctl(touch, I2C_RDWR, &transfer) == 2;
-  }
-
-  /** @brief 写零确认本轮触摸数据，使 GT911 可以发布下一组坐标。 */
-  bool ClearTouchStatus() {
-    std::uint8_t clear[] = {0x81, 0x4E, 0};
-    i2c_msg message{kGt911Address, 0, 3, clear};
-    i2c_rdwr_ioctl_data transfer{&message, 1U};
-    return ioctl(touch, I2C_RDWR, &transfer) == 1;
-  }
-
-  /**
-   * @brief 对连续 I2C 故障执行有界复位，保护 UI 循环免受永久重试占用。
-   *
-   * 单次瞬态错误只释放按压状态；连续三次后最多复位两轮，每轮间隔两秒。耗尽预算
-   * 后保持显示可用并禁用触摸，错误会在日志中明确暴露，音频和页面刷新可以继续。
-   */
-  void TouchFailed(const char* stage) {
-    pointer_pressed = false;
-    if (touch_disabled) {
-      return;
-    }
-    ++touch_failures;
-    if (touch_failures < kTouchFailureLimit) {
-      return;
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now < next_touch_recovery) {
-      return;
-    }
-    if (touch_recovery_attempts >= kTouchRecoveryLimit) {
-      touch_disabled = true;
-      std::fprintf(stderr, "boompi-ui: GT911 disabled after bounded recovery\n");
-      return;
-    }
-
-    ++touch_recovery_attempts;
-    next_touch_recovery = now + std::chrono::seconds(2);
-    std::fprintf(stderr, "boompi-ui: GT911 %s failed; recovery %u/%u\n", stage,
-                 touch_recovery_attempts, kTouchRecoveryLimit);
-    if (touch >= 0) {
-      close(touch);
-    }
-    touch = -1;
-    if (InitTouch()) {
-      touch_failures = 0U;
-      touch_recovery_attempts = 0U;
-      std::fprintf(stderr, "boompi-ui: GT911 recovered\n");
-    } else if (touch_recovery_attempts == kTouchRecoveryLimit) {
-      touch_disabled = true;
-      std::fprintf(stderr, "boompi-ui: GT911 disabled after bounded recovery\n");
-    }
-  }
-
-  /**
-   * @brief 读取一组 GT911 点数据并转换到 320x240 横屏坐标。
-   *
-   * 当前产品只消费第一触点。原生面板的 x/y 轴与横屏 LVGL 坐标交换，其中横向还
-   * 需要反转；每组 ready 数据在处理后显式清状态，遗漏确认会让控制器停留在旧点。
-   */
-  void PollTouch() {
-    if (touch_disabled) {
-      pointer_pressed = false;
-      return;
-    }
-    std::uint8_t status = 0U;
-    if (!ReadTouch(kTouchStatus, &status, 1U)) {
-      TouchFailed("status read");
-      return;
-    }
-    if ((status & 0x80U) == 0U) {
-      touch_failures = 0U;
-      touch_recovery_attempts = 0U;
-      return;
-    }
-    const unsigned count = status & 0x0FU;
-    if (count == 0U) {
-      pointer_pressed = false;
-    } else if (count <= 5U) {
-      std::array<std::uint8_t, 8> point{};
-      if (!ReadTouch(kTouchPoint, point.data(), point.size())) {
-        TouchFailed("point read");
-        return;
-      }
-      const int x = point[1] | (static_cast<int>(point[2]) << 8);
-      const int y = point[3] | (static_cast<int>(point[4]) << 8);
-      pointer_y = std::clamp(x, 0, kPanelWidth - 1);
-      pointer_x = kPanelHeight - 1 - std::clamp(y, 0, kPanelHeight - 1);
-      pointer_pressed = true;
-    } else {
-      pointer_pressed = false;
-    }
-    if (!ClearTouchStatus()) {
-      TouchFailed("status clear");
-      return;
-    }
-    touch_failures = 0U;
-    touch_recovery_attempts = 0U;
-  }
-
-  /**
-   * @brief LVGL pointer 回调，在 UI worker 内同步采样 GT911。
-   *
-   * LVGL 会从 lv_timer_handler() 调用这里，坐标、按压状态和页面事件因此保持同一
-   * 线程顺序，不需要把 lv_indev_data_t 暴露给其他线程。
-   */
   static void ReadInput(lv_indev_drv_t* driver, lv_indev_data_t* data) {
     auto* self = static_cast<Impl*>(driver->user_data);
-    self->PollTouch();
-    data->point.x = static_cast<lv_coord_t>(self->pointer_x);
-    data->point.y = static_cast<lv_coord_t>(self->pointer_y);
-    data->state = self->pointer_pressed ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
+    self->hardware.ReadInput(data);
   }
 
   /**
@@ -525,19 +198,54 @@ struct DeviceUi::Impl final {
     }
   }
 
-  static LvglScreen::CameraStatus ScreenCameraStatus(
-      const CameraCapture::Status status) noexcept {
-    switch (status) {
-      case CameraCapture::Status::Stopped:
-        return LvglScreen::CameraStatus::kStopped;
-      case CameraCapture::Status::Starting:
-        return LvglScreen::CameraStatus::kStarting;
-      case CameraCapture::Status::Live:
-        return LvglScreen::CameraStatus::kLive;
-      case CameraCapture::Status::Error:
-        return LvglScreen::CameraStatus::kError;
+  /** @brief 只收取已退出的配网进程结果，不阻塞页面等待配网。 */
+  void PollProvisioning() {
+    if (provision_pid > 0) {
+      int status = 0;
+      if (waitpid(provision_pid, &status, WNOHANG) == provision_pid) {
+        const bool saved = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        screen.SetProvisionMessage(saved ? "Wi-Fi 已保存，正在连接" : "配网服务启动失败",
+                                   !saved);
+        provision_pid = -1;
+      }
     }
-    return LvglScreen::CameraStatus::kError;
+  }
+
+  // 复制快照后已释放 view_mutex，绘制不会长时间阻塞 application 发布状态。
+  void ShowLatestView() {
+    UiView next;
+    if (TakeView(&next)) {
+      screen.SetState(next.state);
+      screen.SetVolume(next.volume);
+      screen.SetText(next.text.data(), {});
+    }
+  }
+
+  void ShowLatestCamera(std::chrono::steady_clock::time_point now) {
+    const auto status = camera.status();
+    if (status != shown_camera) {
+      shown_camera = status;
+      if (status == CameraStatus::Starting) {
+        last_frame = now;
+        have_display_frame = false;
+      }
+      screen.SetCameraStatus(status);
+    }
+    const bool new_frame = camera.TakeFrame(&display_frame);
+    if (new_frame && status == CameraStatus::Live) {
+      // FPS 基于真正交给页面的相邻帧计算，表示用户看到的预览吞吐量。
+      const auto frame_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame).count();
+      const unsigned fps_tenths = have_display_frame && frame_ms > 0
+                                      ? static_cast<unsigned>(10000 / frame_ms)
+                                      : CameraCapture::kTargetFps * 10U;
+      last_frame = now;
+      have_display_frame = true;
+      screen.SetCameraFrame(display_frame.data(), display_frame.size(), fps_tenths);
+      camera.MarkDisplayed();
+      // 摄像头帧到达时立即刷新，避免等待普通 30 ms UI 周期额外增加预览延迟。
+      lv_refr_now(display);
+    }
   }
 
   /**
@@ -580,30 +288,12 @@ struct DeviceUi::Impl final {
     }
     wake.notify_one();
     if (!ready) {
-      screen.Destroy();
-      if (input != nullptr) {
-        lv_indev_delete(input);
-      }
-      if (display != nullptr) {
-        lv_disp_remove(display);
-      }
+      ReleaseUi();
       return;
     }
-    auto shown_camera = CameraCapture::Status::Stopped;
     auto tick = std::chrono::steady_clock::now();
-    auto last_frame = tick;
-    bool have_display_frame = false;
-    CameraFrame display_frame{};
     while (!stop.load()) {
-      if (provision_pid > 0) {
-        int status = 0;
-        if (waitpid(provision_pid, &status, WNOHANG) == provision_pid) {
-          const bool saved = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-          screen.SetProvisionMessage(saved ? "Wi-Fi 已保存，正在连接" : "配网服务启动失败",
-                                     !saved);
-          provision_pid = -1;
-        }
-      }
+      PollProvisioning();
       const auto now = std::chrono::steady_clock::now();
       const auto elapsed =
           std::chrono::duration_cast<std::chrono::milliseconds>(now - tick).count();
@@ -611,36 +301,8 @@ struct DeviceUi::Impl final {
       if (elapsed > 0) {
         lv_tick_inc(static_cast<std::uint32_t>(elapsed));
       }
-      View next;
-      if (TakeView(&next)) {
-        screen.SetState(next.state);
-        screen.SetVolume(next.volume);
-        screen.SetText(next.text.data(), {});
-      }
-      const auto status = camera.status();
-      if (status != shown_camera) {
-        shown_camera = status;
-        if (status == CameraCapture::Status::Starting) {
-          last_frame = now;
-          have_display_frame = false;
-        }
-        screen.SetCameraStatus(ScreenCameraStatus(status));
-      }
-      const bool new_frame = camera.TakeFrame(&display_frame);
-      if (new_frame && status == CameraCapture::Status::Live) {
-        // FPS 基于真正交给页面的相邻帧计算，表示用户看到的预览吞吐量。
-        const auto frame_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame).count();
-        const unsigned fps_tenths = have_display_frame && frame_ms > 0
-                                        ? static_cast<unsigned>(10000 / frame_ms)
-                                        : CameraCapture::kTargetFps * 10U;
-        last_frame = now;
-        have_display_frame = true;
-        screen.SetCameraFrame(display_frame.data(), display_frame.size(), fps_tenths);
-        camera.MarkDisplayed();
-        // 摄像头帧到达时立即刷新，避免等待普通 30 ms UI 周期额外增加预览延迟。
-        lv_refr_now(display);
-      }
+      ShowLatestView();
+      ShowLatestCamera(now);
       static_cast<void>(lv_timer_handler());
       std::unique_lock<std::mutex> lock(view_mutex);
       wake.wait_for(lock, std::chrono::milliseconds(30));
@@ -688,21 +350,10 @@ bool DeviceUi::Open() {
   if (impl_ == nullptr) {
     return false;
   }
-  impl_->spi = open("/dev/spidev0.0", O_RDWR | O_CLOEXEC);
-  std::uint8_t mode = 0U;
-  std::uint8_t bits = 8U;
-  std::uint32_t speed = kSpiSpeedHz;
-  // 外设按 SPI参数 → 面板 → 触摸的顺序建立；任一步失败都走 Close() 的统一回收。
-  const bool ready = impl_->spi >= 0 && ioctl(impl_->spi, SPI_IOC_WR_MODE, &mode) == 0 &&
-                     ioctl(impl_->spi, SPI_IOC_WR_BITS_PER_WORD, &bits) == 0 &&
-                     ioctl(impl_->spi, SPI_IOC_WR_MAX_SPEED_HZ, &speed) == 0 &&
-                     ioctl(impl_->spi, SPI_IOC_RD_MAX_SPEED_HZ, &speed) == 0 &&
-                     impl_->InitPanel() && impl_->InitTouch();
-  if (!ready) {
+  if (!impl_->hardware.Open()) {
     Close();
     return false;
   }
-  std::fprintf(stderr, "boompi-ui: SPI=%u Hz; touch=GT911/i2c-3\n", speed);
   try {
     impl_->ui_thread = std::thread([state = impl_] {
       try {
@@ -766,14 +417,7 @@ void DeviceUi::Close() noexcept {
   if (impl_->ui_thread.joinable()) {
     impl_->ui_thread.join();
   }
-  SetGpio(impl_->backlight, false);
-  const int descriptors[] = {impl_->touch, impl_->spi, impl_->data_command, impl_->panel_reset,
-                             impl_->backlight};
-  for (int fd : descriptors) {
-    if (fd >= 0) {
-      close(fd);
-    }
-  }
+  impl_->hardware.Close();
   delete impl_;
   impl_ = nullptr;
 }

@@ -2,6 +2,8 @@
 
 服务端作为一个配置工具部署。客户端主课程围绕 VoiceApp、VoiceAudio、VoiceLink、DeviceUi 四个具体边界展开。
 
+逐步补写和验证见[分关实验](../teaching/README.md)。DeviceUi只协调页面、快照和资源；SPI屏幕、GT911触摸及其恢复顺序由私有DisplayTouch拥有。VoiceAudio用Process推进音频处理，用ListenMode区分唤醒后的开口与回答后的追问。
+
 ```text
 main → VoiceApp（唯一六状态）
          ├─ VoiceAudio → AudioEngine → RV1106 ALSA / 3A / Snowboy / VAD

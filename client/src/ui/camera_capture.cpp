@@ -130,7 +130,7 @@ void CameraCapture::ClearFrame() noexcept {
 void CameraCapture::Fail(const char* const reason) noexcept {
   std::fprintf(stderr, "boompi-ui: camera %s\n", reason);
   ClearFrame();
-  status_.store(Status::Error);
+  status_.store(CameraStatus::Error);
   ui_wake_.notify_one();
 }
 
@@ -158,7 +158,7 @@ void CameraCapture::Start() noexcept {
   ClearFrame();
   displayed_frames_.store(0U);
   stop_.store(false);
-  status_.store(Status::Starting);
+  status_.store(CameraStatus::Starting);
   ui_wake_.notify_one();
   try {
     worker_ = std::thread(&CameraCapture::Run, this);
@@ -181,7 +181,7 @@ void CameraCapture::Stop() noexcept {
     worker_.join();
   }
   ClearFrame();
-  status_.store(Status::Stopped);
+  status_.store(CameraStatus::Stopped);
   ui_wake_.notify_one();
 }
 
@@ -275,7 +275,7 @@ void CameraCapture::Run() noexcept {
       frame_ = captured;
       frame_ready_ = true;
     }
-    status_.store(Status::Live);
+    status_.store(CameraStatus::Live);
     ui_wake_.notify_one();
     used = 0U;
     have_frame = true;

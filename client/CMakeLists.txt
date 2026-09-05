@@ -50,7 +50,7 @@ if(BOOMPI_BUILD_UI_SIMULATOR)
   if(UNIX AND NOT BOOMPI_TARGET_RV1106)
     # Host 只编译真实 SPI/I2C UI 边界，不打开设备；屏幕逻辑由 SDL 验证。
     add_library(boompi_device_ui_compile OBJECT
-      src/ui/device_ui.cpp src/ui/camera_capture.cpp)
+      src/ui/device_ui.cpp src/ui/camera_capture.cpp src/platform/rv1106/display_touch.cpp)
     target_compile_features(boompi_device_ui_compile PRIVATE cxx_std_17)
     target_compile_options(boompi_device_ui_compile PRIVATE -Wall -Wextra -Wpedantic
       $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:-Werror>)
@@ -127,6 +127,7 @@ add_executable(boompi_client
   src/platform/rv1106/audio_thread.cpp
   src/platform/rv1106/alsa_audio.cpp
   src/platform/rv1106/rockchip_voice_dsp.cpp
+  src/platform/rv1106/display_touch.cpp
   src/ui/device_ui.cpp
   src/ui/camera_capture.cpp)
 target_compile_features(boompi_client PRIVATE cxx_std_17)

@@ -58,7 +58,7 @@ struct AudioEngine::Impl final {
   CaptureCommand capture_command{CaptureCommand::kNone};
   bool command_succeeded{false};
   std::array<TtsSlot, kTtsSlots> tts{};
-  std::size_t tts_head{0U}, tts_tail{0U}, tts_count{0U}, queued_samples{0U};
+  std::size_t tts_head{0U}, tts_count{0U}, queued_samples{0U};
   // capture_sequence 描述本地处理时间线；next_tts_sequence 检查服务端下行包是否连续。
   std::uint64_t capture_sequence{0U}, next_tts_sequence{0U}, rebuffer_events{0U};
   // capture 指标覆盖整个 Open 生命周期：XRUN 与 actor 落后分开计数，水位用 20 ms 帧表示。
@@ -93,7 +93,7 @@ struct AudioEngine::Impl final {
       slot.pcm.fill(0);
       slot.used = 0U;
     }
-    tts_head = tts_tail = tts_count = queued_samples = 0U;
+    tts_head = tts_count = queued_samples = 0U;
   }
 
   void ResetPlaybackMetrics() noexcept {
@@ -483,7 +483,8 @@ QueueTtsResult AudioEngine::QueueTts24k(const std::uint8_t* const bytes,
   if (impl_ == nullptr || !impl_->open) {
     return QueueTtsResult::kNotOpen;
   }
-  if (bytes == nullptr || byte_count == 0U || (byte_count & 1U) != 0U) {
+  if (bytes == nullptr || byte_count == 0U || byte_count > kTts24FrameSamples * 2U ||
+      (byte_count & 1U) != 0U) {
     return QueueTtsResult::kInvalidArgument;
   }
   const std::size_t samples = byte_count / 2U;
@@ -492,36 +493,29 @@ QueueTtsResult AudioEngine::QueueTts24k(const std::uint8_t* const bytes,
   if (!impl_->active) {
     return QueueTtsResult::kNotActive;
   }
-  if (impl_->ending) {
+  const std::size_t tail = (impl_->tts_head + impl_->tts_count) % kTtsSlots;
+  const std::size_t previous = (tail + kTtsSlots - 1U) % kTtsSlots;
+  // 短帧只能是最后一包；保留它等待 EndPlayback，不能再用下一包补满。
+  if (impl_->ending ||
+      (impl_->tts_count != 0U && impl_->tts[previous].used != kTts24FrameSamples)) {
     return QueueTtsResult::kEnding;
   }
-  if (samples > kTtsSlots * kTts24FrameSamples - impl_->queued_samples) {
+  if (impl_->tts_count == kTtsSlots) {
     return QueueTtsResult::kFull;
   }
   if (impl_->sequence_set && sequence != impl_->next_tts_sequence) {
     return QueueTtsResult::kDiscontinuous;
   }
   const auto queued_at = Impl::Clock::now();
-  std::size_t source = 0U;
-  while (source < samples) {
-    // 网络包大小与 20 ms slot 无关：可填满前一槽，也可跨多个槽，媒体序号按包检查。
-    const std::size_t last_slot = (impl_->tts_tail + kTtsSlots - 1U) % kTtsSlots;
-    if (impl_->tts_count == 0U || impl_->tts[last_slot].used == kTts24FrameSamples) {
-      impl_->tts_tail = (impl_->tts_tail + 1U) % kTtsSlots;
-      ++impl_->tts_count;
-    }
-    auto& slot = impl_->tts[(impl_->tts_tail + kTtsSlots - 1U) % kTtsSlots];
-    const std::size_t copied = std::min(samples - source, kTts24FrameSamples - slot.used);
-    for (std::size_t i = 0U; i < copied; ++i) {
-      // 线协议固定为 little-endian S16，显式解码避免依赖 CPU 端序和未对齐访问。
-      const std::size_t offset = 2U * (source + i);
-      const std::uint16_t value = static_cast<std::uint16_t>(bytes[offset]) |
-                                  (static_cast<std::uint16_t>(bytes[offset + 1U]) << 8U);
-      slot.pcm[slot.used + i] = static_cast<std::int16_t>(value);
-    }
-    slot.used += copied;
-    source += copied;
+  auto& slot = impl_->tts[tail];
+  for (std::size_t i = 0U; i < samples; ++i) {
+    // 一包对应一个槽。显式解码 S16_LE，不依赖 CPU 端序或字节地址对齐。
+    const std::uint16_t value = static_cast<std::uint16_t>(bytes[2U * i]) |
+                                (static_cast<std::uint16_t>(bytes[2U * i + 1U]) << 8U);
+    slot.pcm[i] = static_cast<std::int16_t>(value);
   }
+  slot.used = samples;
+  ++impl_->tts_count;
   impl_->queued_samples += samples;
   impl_->tts_high_water_samples =
       std::max(impl_->tts_high_water_samples, impl_->queued_samples);

@@ -10,6 +10,8 @@
 #include <mutex>
 #include <thread>
 
+#include "boompi/ui/ui_view.h"
+
 namespace boompi::ui {
 
 /** 终止由调用方建立的子进程组，并回收组长进程。 */
@@ -27,7 +29,6 @@ class CameraCapture final {
   static constexpr std::size_t kHeight = 180U;
   static constexpr unsigned kTargetFps = 5U;
   using Frame = std::array<std::uint16_t, kWidth * kHeight>;
-  enum class Status : std::uint8_t { Stopped, Starting, Live, Error };
 
   explicit CameraCapture(std::condition_variable& ui_wake) noexcept : ui_wake_(ui_wake) {}
   ~CameraCapture() noexcept;
@@ -38,7 +39,7 @@ class CameraCapture final {
   void Stop() noexcept;
   bool TakeFrame(Frame* output) noexcept;
   void MarkDisplayed() noexcept;
-  Status status() const noexcept {
+  CameraStatus status() const noexcept {
     return status_.load();
   }
 
@@ -51,7 +52,7 @@ class CameraCapture final {
   std::atomic<bool> stop_{false};
   std::atomic<pid_t> child_{-1};
   std::atomic<std::uint64_t> displayed_frames_{0U};
-  std::atomic<Status> status_{Status::Stopped};
+  std::atomic<CameraStatus> status_{CameraStatus::Stopped};
   std::mutex frame_mutex_;
   bool frame_ready_{false};
   Frame frame_{};

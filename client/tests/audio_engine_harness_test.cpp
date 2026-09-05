@@ -20,6 +20,7 @@ using boompi::audio::AudioEvent;
 using boompi::audio::AudioEventKind;
 using boompi::audio::CaptureFrame;
 using boompi::audio::CaptureResult;
+using boompi::audio::ListenMode;
 using boompi::audio::QueueTtsResult;
 using boompi::audio::VoiceAudio;
 namespace fake = boompi::test::audio_backend;
@@ -87,9 +88,9 @@ bool OpenVoice(VoiceAudio* const voice) {
          Check(fake::WaitForCaptureReads(1U, 500ms), "VoiceAudio capture actor did not start");
 }
 
-bool BeginVoiceListen(VoiceAudio* const voice, const bool follow_up) {
-  auto listen = std::async(std::launch::async, [voice, follow_up] {
-    return voice->Listen(follow_up);
+bool BeginVoiceListen(VoiceAudio* const voice, const ListenMode mode) {
+  auto listen = std::async(std::launch::async, [voice, mode] {
+    return voice->Listen(mode);
   });
   for (std::size_t attempt = 0U;
        attempt < 10U && listen.wait_for(0ms) != std::future_status::ready; ++attempt) {
@@ -118,7 +119,7 @@ bool BeginVoicePlayback(VoiceAudio* const voice, const std::uint32_t generation,
 
 bool PollInjected(VoiceAudio* const voice, CaptureFrame frame, AudioEvent* const event) {
   fake::PushCapture(frame);
-  return voice->Poll(event, 100ms);
+  return voice->Process(event, 100ms);
 }
 
 bool QueueFrame(AudioEngine* const engine, const std::uint64_t sequence,
@@ -210,7 +211,15 @@ bool TestEndPlaybackShortTail() {
   }
 
   std::this_thread::sleep_for(60ms);
-  if (!QueueFrame(&engine, 9U, 240U) ||
+  if (!QueueFrame(&engine, 9U, 240U)) {
+    return false;
+  }
+  const auto extra = Pcm24(480U, 99);
+  if (!Check(engine.QueueTts24k(extra.data(), extra.size(), 10U) == QueueTtsResult::kEnding,
+             "PCM after a short tail was accepted") ||
+      !Check(engine.last_error().empty(), "short-tail rejection polluted last_error") ||
+      !Check(fake::RenderCallsSnapshot().size() == 9U,
+             "a short tail rendered before EndPlayback") ||
       !Check(engine.EndPlayback(), "EndPlayback rejected a short tail") ||
       !Check(WaitForPlaybackDone(engine, 500ms),
              "short tail was stranded behind the rebuffer threshold")) {
@@ -219,7 +228,27 @@ bool TestEndPlaybackShortTail() {
   const auto calls = fake::RenderCallsSnapshot();
   return Check(calls.size() == 10U, "short tail was not rendered") &&
          Check(calls.back().pcm.size() == 240U,
-               "short tail size changed before reaching the backend");
+               "short tail size changed before reaching the backend") &&
+         Check(calls.back().pcm == std::vector<std::int16_t>(240U, 10),
+               "rejected PCM changed the accepted short tail");
+}
+
+bool TestSingleFrameReply(std::size_t samples, std::int16_t value) {
+  AudioEngine engine;
+  if (!OpenEngine(&engine) || !BeginPlayback(&engine)) {
+    return false;
+  }
+  const auto bytes = Pcm24(samples, value);
+  if (!Check(engine.QueueTts24k(bytes.data(), bytes.size(), 0U) == QueueTtsResult::kQueued,
+             "single-frame reply was rejected") ||
+      !Check(engine.EndPlayback(), "single-frame EndPlayback failed") ||
+      !Check(WaitForPlaybackDone(engine, 500ms), "single-frame reply did not finish")) {
+    return false;
+  }
+  const auto calls = fake::RenderCallsSnapshot();
+  return Check(calls.size() == 1U, "one packet did not produce one render") &&
+         Check(calls.front().pcm == std::vector<std::int16_t>(samples, value),
+               "single-frame sample count or signed PCM changed");
 }
 
 bool TestBoundedClose() {
@@ -345,10 +374,13 @@ bool TestQueueResultsDoNotPolluteLastError() {
     return false;
   }
 
-  const auto oversized = Pcm24(75U * 480U + 1U, 1);
-  if (!Check(
-          engine.QueueTts24k(oversized.data(), oversized.size(), 0U) == QueueTtsResult::kFull,
-          "oversized PCM did not report a full queue") ||
+  const auto oversized = Pcm24(481U, 1);
+  if (!Check(engine.QueueTts24k(oversized.data(), oversized.size(), 0U) ==
+                 QueueTtsResult::kInvalidArgument,
+             "PCM larger than one 20 ms frame was accepted") ||
+      !Check(engine.QueueTts24k(frame.data(), frame.size() - 1U, 0U) ==
+                 QueueTtsResult::kInvalidArgument,
+             "odd PCM byte count was accepted") ||
       !Check(engine.QueueTts24k(frame.data(), frame.size(), 0U) == QueueTtsResult::kQueued,
              "valid PCM was not queued") ||
       !Check(
@@ -359,6 +391,37 @@ bool TestQueueResultsDoNotPolluteLastError() {
   }
   engine.DropPlayback();
   return Check(WaitForPlaybackDone(engine, 500ms), "dropped playback did not finish");
+}
+
+bool TestQueueCapacity() {
+  AudioEngine engine;
+  if (!OpenEngine(&engine) || !BeginPlayback(&engine)) {
+    return false;
+  }
+  fake::BlockPlayback(fake::PlaybackBlock::kRender);
+  for (std::uint64_t sequence = 0U; sequence < 9U; ++sequence) {
+    if (!QueueFrame(&engine, sequence)) {
+      return false;
+    }
+  }
+  if (!Check(fake::WaitForPlaybackBlocked(500ms), "capacity test did not block the consumer")) {
+    return false;
+  }
+  // 一帧已由播放线程取走。剩余 75 个槽填满后，下一整帧必须返回背压。
+  for (std::uint64_t sequence = 9U; sequence <= 75U; ++sequence) {
+    if (!QueueFrame(&engine, sequence)) {
+      return false;
+    }
+  }
+  const auto extra = Pcm24(480U, 999);
+  const bool rejected =
+      Check(engine.QueueTts24k(extra.data(), extra.size(), 76U) == QueueTtsResult::kFull,
+            "full 1.5-second queue accepted another frame") &&
+      Check(engine.last_error().empty(), "queue backpressure polluted last_error");
+  engine.DropPlayback();
+  return rejected &&
+         Check(WaitForPlaybackDone(engine, 500ms), "full queue did not stop after drop") &&
+         Check(!engine.playback_failed(), "dropping a full queue became a playback failure");
 }
 
 bool TestSuccessfulOpenClearsOldError() {
@@ -444,7 +507,7 @@ bool TestPlaybackPrepareFailure() {
 
 bool TestVoiceAudioPreRollOrder() {
   VoiceAudio voice;
-  if (!OpenVoice(&voice) || !BeginVoiceListen(&voice, false)) {
+  if (!OpenVoice(&voice) || !BeginVoiceListen(&voice, ListenMode::Wake)) {
     return false;
   }
 
@@ -470,7 +533,7 @@ bool TestVoiceAudioPreRollOrder() {
 
   std::uint64_t previous_sequence = 0U;
   for (std::int16_t expected = 32; expected <= 56; ++expected) {
-    if (!Check(voice.Poll(&event, 100ms) && event.kind == AudioEventKind::Pcm,
+    if (!Check(voice.Process(&event, 100ms) && event.kind == AudioEventKind::Pcm,
                "pre-roll PCM was missing") ||
         !Check(event.pcm[0] == expected,
                "pre-roll did not retain the newest contiguous 25 frames") ||
@@ -492,7 +555,7 @@ bool TestVoiceAudioPreRollOrder() {
 
 bool TestVoiceAudioFollowUpDropsOldEnd() {
   VoiceAudio voice;
-  if (!OpenVoice(&voice) || !BeginVoiceListen(&voice, true)) {
+  if (!OpenVoice(&voice) || !BeginVoiceListen(&voice, ListenMode::FollowUp)) {
     return false;
   }
 
@@ -531,7 +594,7 @@ bool TestVoiceAudioFollowUpDropsOldEnd() {
     }
   }
   for (std::int16_t expected = 100; expected <= 119; ++expected) {
-    if (!Check(voice.Poll(&event, 100ms) && event.kind == AudioEventKind::Pcm,
+    if (!Check(voice.Process(&event, 100ms) && event.kind == AudioEventKind::Pcm,
                "new follow-up PCM was missing") ||
         !Check(event.pcm[0] == expected, "old short utterance contaminated new follow-up") ||
         !Check(!event.end, "old VAD END truncated the new follow-up")) {
@@ -640,7 +703,8 @@ int main(const int argc, char** const argv) {
   } else if (scenario == "confirmed-gap") {
     passed = TestRebufferAfterConfirmedGap();
   } else if (scenario == "short-tail") {
-    passed = TestEndPlaybackShortTail();
+    passed = TestEndPlaybackShortTail() && TestSingleFrameReply(1U, -32768) &&
+             TestSingleFrameReply(480U, 32767);
   } else if (scenario == "bounded-close") {
     passed = TestBoundedClose();
   } else if (scenario == "bounded-capture") {
@@ -650,7 +714,7 @@ int main(const int argc, char** const argv) {
   } else if (scenario == "reset-preserves-pcm") {
     passed = TestResetPreservesQueuedPcm();
   } else if (scenario == "queue-results") {
-    passed = TestQueueResultsDoNotPolluteLastError();
+    passed = TestQueueResultsDoNotPolluteLastError() && TestQueueCapacity();
   } else if (scenario == "open-clears-error") {
     passed = TestSuccessfulOpenClearsOldError();
   } else if (scenario == "playback-clears-error") {

@@ -14,6 +14,7 @@ enum class DeviceUiState : std::uint8_t {
   kOffline,
   kError,
 };
+enum class CameraStatus : std::uint8_t { Stopped, Starting, Live, Error };
 enum class UiActionKind : std::uint8_t { Wake, Interrupt, Volume };
 struct UiAction {
   UiActionKind kind{UiActionKind::Wake};

@@ -26,8 +26,16 @@ constexpr std::uint32_t kBackground = 0x0A1220;
 constexpr std::uint32_t kText = 0xF3F6FA;
 constexpr std::uint32_t kMuted = 0x8492A6;
 constexpr std::uint32_t kBlue = 0x4DA6FF;
-// 索引同时决定桌面排列和 ShowApp() 路由，调整顺序时要同步检查对应页面分支。
-constexpr std::array<const char*, 4> kApps{{"小智", "摄像头", "时间", "WiFi"}};
+using Page = LvglScreen::Page;
+struct AppEntry {
+  const char* title;
+  Page page;
+};
+// 排列顺序只影响桌面位置，事件直接携带页面身份。
+constexpr std::array<AppEntry, 4> kApps{{{"小智", Page::kVoice},
+                                         {"摄像头", Page::kCamera},
+                                         {"时间", Page::kClock},
+                                         {"WiFi", Page::kWifi}}};
 
 /** @brief 把 application 状态映射成静态表情与默认文案，页面不复制业务状态机。 */
 struct VoiceView final {
@@ -97,13 +105,11 @@ lv_font_t* LoadFont(const char* path, std::uint16_t size) {
 }  // namespace
 
 struct LvglScreen::Impl final {
-  // Page 只表示当前对象树类型，真实语音和摄像头生命周期仍由外层模块拥有。
-  enum class Page : std::uint8_t { kHome, kVoice, kCamera, kOther, kClock };
   static constexpr std::size_t kPixelCount = 320U * 180U;
 
   struct AppClick final {
     Impl* owner;
-    std::size_t index;
+    Page page;
   };
 
   // 所有 lv_obj_t/lv_timer_t 指针仅在 LVGL 所有者线程访问，页面切换后按 Begin() 重置。
@@ -126,7 +132,7 @@ struct LvglScreen::Impl final {
   std::string subtitle_text;
   Page page{Page::kHome};
   DeviceUiState voice_state{DeviceUiState::kIdle};
-  CameraStatus camera_state{CameraStatus::kStopped};
+  CameraStatus camera_state{CameraStatus::Stopped};
   unsigned fps_tenths{};
   std::uint8_t volume{60U};
 
@@ -160,7 +166,7 @@ struct LvglScreen::Impl final {
     Label(lv_scr_act(), title, text_font, kText, 100, 8, 120, 24);
   }
 
-  /** @brief 重建桌面对象树，并为每个按钮绑定稳定存储的索引上下文。 */
+  /** @brief 重建桌面对象树，并为每个按钮绑定稳定存储的页面上下文。 */
   void BuildHome() {
     Begin(Page::kHome);
     Label(lv_scr_act(), "boomPI", text_font, kText, 10, 8, 80, 24);
@@ -171,9 +177,9 @@ struct LvglScreen::Impl final {
       lv_obj_t* button = lv_btn_create(lv_scr_act());
       lv_obj_set_pos(button, x, y);
       lv_obj_set_size(button, 148, 86);
-      app_clicks[index] = {this, index};
+      app_clicks[index] = {this, kApps[index].page};
       lv_obj_add_event_cb(button, AppClicked, LV_EVENT_CLICKED, &app_clicks[index]);
-      Label(button, kApps[index], text_font, kText, 2, 31, 140, 24);
+      Label(button, kApps[index].title, text_font, kText, 2, 31, 140, 24);
     }
     UpdateClock();
   }
@@ -181,7 +187,7 @@ struct LvglScreen::Impl final {
   /**
    * @brief 建立小智表情、字幕和音量交互页面。
    *
-   * 表情点击只在 Speaking/SpeakingTail 产生打断；滑块拖动持续预览 gain，释放时
+   * 表情点击只在 Speaking 产生打断；滑块拖动持续预览 gain，释放时
    * 再提交持久化。页面重建会恢复 Impl 中保存的状态、字幕和音量。
    */
   void BuildVoice() {
@@ -212,7 +218,7 @@ struct LvglScreen::Impl final {
    */
   void BuildCamera() {
     Begin(Page::kCamera);
-    camera_state = CameraStatus::kStarting;
+    camera_state = CameraStatus::Starting;
     Header("SC3336");
     camera_info = Label(lv_scr_act(), "", text_font, kBlue, 160, 7, 152, 24);
     camera_image = lv_img_create(lv_scr_act());
@@ -222,53 +228,63 @@ struct LvglScreen::Impl final {
   }
 
   /**
-   * @brief 建立配网页或时钟页。
+   * @brief 建立 Wi-Fi 配网页。
    *
    * Wi-Fi 二维码编码临时热点的固定 SSID/密码，手机扫码后连接 boomPI-Setup；
    * AppClicked 随后发布 Provision，板端脚本负责真正启动热点和保存用户网络凭据。
    * 页面文字只显示过程结果，绝不接收或记录用户 Wi-Fi 密码。
    */
-  void BuildOther(std::size_t index) {
-    Begin(Page::kOther);
-    Header(kApps[index]);
-    if (index == 3U) {
-      lv_obj_t* qr =
-          lv_qrcode_create(lv_scr_act(), 104, lv_color_hex(0x08111C), lv_color_hex(0xFFFFFF));
-      constexpr char payload[] = "WIFI:T:WPA;S:boomPI-Setup;P:boompi-setup;;";
-      lv_obj_set_pos(qr, 108, 48);
-      lv_qrcode_update(qr, payload, sizeof(payload) - 1U);
-      Label(lv_scr_act(), "boomPI-Setup", text_font, kText, 60, 166, 200, 24);
-      provision_info =
-          Label(lv_scr_act(), "扫描二维码连接配网热点", text_font, kMuted, 30, 197, 260, 24);
-      return;
-    }
-    page = Page::kClock;
+  void BuildWifi() {
+    Begin(Page::kWifi);
+    Header("WiFi");
+    lv_obj_t* qr =
+        lv_qrcode_create(lv_scr_act(), 104, lv_color_hex(0x08111C), lv_color_hex(0xFFFFFF));
+    constexpr char payload[] = "WIFI:T:WPA;S:boomPI-Setup;P:boompi-setup;;";
+    lv_obj_set_pos(qr, 108, 48);
+    lv_qrcode_update(qr, payload, sizeof(payload) - 1U);
+    Label(lv_scr_act(), "boomPI-Setup", text_font, kText, 60, 166, 200, 24);
+    provision_info =
+        Label(lv_scr_act(), "扫描二维码连接配网热点", text_font, kMuted, 30, 197, 260, 24);
+  }
+
+  void BuildClock() {
+    Begin(Page::kClock);
+    Header("时间");
     clock = Label(lv_scr_act(), "", text_font, kText, 30, 105, 260, 30);
     UpdateClock();
   }
 
   /**
-   * @brief 根据桌面索引切换页面，并发布摄像头资源边界事件。
+   * @brief 根据明确的页面身份切换，并发布摄像头资源边界事件。
    *
    * CameraOn/CameraOff 紧跟页面切换，使进入页面才占用 ISP，离开页面立即释放；
    * 已经位于摄像头页时不重复发 CameraOn，避免 UI worker 等待仍在运行的采集线程。
    */
-  void ShowApp(std::size_t index) {
-    if (index >= kApps.size()) {
-      return;
-    }
+  void ShowApp(Page next) {
     const bool was_camera = page == Page::kCamera;
-    if (index == 0U) {
-      BuildVoice();
-    } else if (index == 1U) {
-      BuildCamera();
-    } else {
-      BuildOther(index);
+    switch (next) {
+      case Page::kHome:
+        BuildHome();
+        break;
+      case Page::kVoice:
+        BuildVoice();
+        break;
+      case Page::kCamera:
+        BuildCamera();
+        break;
+      case Page::kClock:
+        BuildClock();
+        break;
+      case Page::kWifi:
+        BuildWifi();
+        break;
+      default:
+        return;
     }
-    if (was_camera && index != 1U) {
+    if (was_camera && next != Page::kCamera) {
       Emit(Event::kCameraOff);
     }
-    if (!was_camera && index == 1U) {
+    if (!was_camera && next == Page::kCamera) {
       Emit(Event::kCameraOn);
     }
   }
@@ -303,7 +319,7 @@ struct LvglScreen::Impl final {
     if (page != Page::kCamera) {
       return;
     }
-    if (camera_state == CameraStatus::kLive) {
+    if (camera_state == CameraStatus::Live) {
       lv_obj_clear_flag(camera_image, LV_OBJ_FLAG_HIDDEN);
       lv_label_set_text_fmt(camera_info, "LIVE %u.%u FPS", fps_tenths / 10U, fps_tenths % 10U);
     } else {
@@ -314,7 +330,7 @@ struct LvglScreen::Impl final {
     lv_obj_invalidate(camera_image);
   }
 
-  /** @brief 只在桌面更新本地时钟，避免已销毁 clock 指针被定时器访问。 */
+  /** @brief 只在桌面和时钟页更新本地时钟，避免已销毁 clock 指针被定时器访问。 */
   void UpdateClock() {
     if (page != Page::kHome && page != Page::kClock) {
       return;
@@ -328,11 +344,7 @@ struct LvglScreen::Impl final {
   /** @brief 返回桌面，并在离开摄像头页后立即请求释放采集资源。 */
   static void BackClicked(lv_event_t* event) {
     auto* self = static_cast<Impl*>(lv_event_get_user_data(event));
-    const bool was_camera = self->page == Page::kCamera;
-    self->BuildHome();
-    if (was_camera) {
-      self->Emit(Event::kCameraOff);
-    }
+    self->ShowApp(Page::kHome);
   }
 
   /**
@@ -343,11 +355,11 @@ struct LvglScreen::Impl final {
    */
   static void AppClicked(lv_event_t* event) {
     auto* click = static_cast<AppClick*>(lv_event_get_user_data(event));
-    click->owner->ShowApp(click->index);
-    if (click->index == 0U) {
+    click->owner->ShowApp(click->page);
+    if (click->page == Page::kVoice) {
       click->owner->Emit(Event::kWake);
     }
-    if (click->index == 3U) {
+    if (click->page == Page::kWifi) {
       click->owner->Emit(Event::kProvision);
     }
   }
@@ -415,8 +427,8 @@ bool LvglScreen::Create(const char* font_path) noexcept {
   return true;
 }
 
-void LvglScreen::OpenApp(std::size_t index) noexcept {
-  impl_->ShowApp(index);
+void LvglScreen::OpenApp(Page page) noexcept {
+  impl_->ShowApp(page);
 }
 
 void LvglScreen::SetEventHandler(EventHandler handler, void* data) noexcept {
@@ -442,7 +454,7 @@ void LvglScreen::SetCameraStatus(CameraStatus state) noexcept {
     return;
   }
   impl_->camera_state = state;
-  if (state != CameraStatus::kLive) {
+  if (state != CameraStatus::Live) {
     // 错误或停止时清空旧像素，用户不会把冻结的最后一帧误认为实时画面。
     impl_->fps_tenths = 0U;
     impl_->pixels.fill(0U);
@@ -467,7 +479,7 @@ void LvglScreen::SetState(DeviceUiState state) noexcept {
   impl_->voice_state = state;
   const bool active = state >= DeviceUiState::kListening && state <= DeviceUiState::kHappy;
   // 语音从唤醒词启动时自动进入小智页；用户主动浏览其他页面时不强制抢占页面。
-  if (active && impl_->page == Impl::Page::kHome) {
+  if (active && impl_->page == Page::kHome) {
     impl_->BuildVoice();
   }
   impl_->RenderVoice();

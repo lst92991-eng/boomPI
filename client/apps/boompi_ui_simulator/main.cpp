@@ -155,8 +155,11 @@ int main(int argc, char** argv) {
   if (demo_voice) {
     state = 1U;
     apply_state();
-  } else if (demo_app >= 0) {
-    screen.OpenApp(static_cast<std::size_t>(demo_app));
+  } else if (demo_app >= 0 && demo_app < 4) {
+    constexpr std::array pages{
+        boompi::ui::LvglScreen::Page::kVoice, boompi::ui::LvglScreen::Page::kCamera,
+        boompi::ui::LvglScreen::Page::kClock, boompi::ui::LvglScreen::Page::kWifi};
+    screen.OpenApp(pages[static_cast<std::size_t>(demo_app)]);
   }
   auto next_state = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   bool running = true;

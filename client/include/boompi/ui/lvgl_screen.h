@@ -25,8 +25,7 @@ namespace boompi::ui {
  */
 class LvglScreen final {
  public:
-  /** @brief 摄像头采集链路向页面报告的生命周期阶段。 */
-  enum class CameraStatus : std::uint8_t { kStopped, kStarting, kLive, kError };
+  enum class Page : std::uint8_t { kHome, kVoice, kCamera, kClock, kWifi };
 
   /**
    * @brief 页面产生的用户事件。
@@ -51,8 +50,8 @@ class LvglScreen final {
    */
   bool Create(const char* font_path) noexcept;
 
-  /** @brief 打开桌面索引对应的页面，主要供模拟器生成固定页面预览。 */
-  void OpenApp(std::size_t index) noexcept;
+  /** @brief 打开指定页面，主要供模拟器生成固定页面预览。 */
+  void OpenApp(Page page) noexcept;
 
   /** @brief 注册同步事件回调；回调运行在调用 LVGL handler 的同一线程。 */
   void SetEventHandler(EventHandler handler, void* data) noexcept;

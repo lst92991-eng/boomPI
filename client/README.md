@@ -1,6 +1,13 @@
 # boomPI 客户端：教学版 v2
 
-先读 `src/application/voice_client.cpp`。服务端是配套 EXE，学生只配置 Key；无需学习 Go 或云端 SDK。
+教学复现先从[分关实验](../docs/teaching/README.md)开始：配置、固定帧、播放队列、语句输入、WSS、六态问答、插话、界面，最后完成真板验收。每关复用真实产品源码和已有测试，不用课程宏拼出多个产品。
+
+这是一份源码上的递进补写实验，不是已经导出的独立阶段源码快照。已有基础、只想先理解完整业务时，再读 `src/application/voice_client.cpp`。服务端是配套 EXE，学生只配置 Key；无需学习 Go 或云端 SDK。
+
+```sh
+python3 scripts/teaching_lab.py
+python3 scripts/teaching_lab.py 1 --build-dir build/lesson-host
+```
 
 ## 一条主线
 
@@ -20,6 +27,8 @@ Speaking ── 确认近讲 ──→ Uploading（新 generation，撤回旧回
 
 业务主线不读取 dBFS、硬件参考、SPKI 或握手状态。底层实现仍开放给进阶课程阅读。
 
+`VoiceAudio::Process`明确承担采集判定的推进职责；不是只读取一个事件。`ListenMode::Wake/FollowUp`区分两种听音方式；`StopAndListen`表示停止当前轮后继续等追问。固定20ms的下行音频一包入一个播放槽，仅末帧允许不足一槽，不再提供任意长度跨槽拼包。
+
 ## 阅读顺序
 
 | 课程 | 源码入口 | 学生需要解释的事情 |
@@ -30,12 +39,13 @@ Speaking ── 确认近讲 ──→ Uploading（新 generation，撤回旧回
 | 4 | audio/audio_engine.cpp | 两条实时线程和固定容量队列的所有权 |
 | 5 | platform/rv1106/audio_backend.cpp | 48→16 kHz、3A、Snowboy、VAD 的先后关系 |
 | 6 | platform/rv1106/alsa_audio.cpp | Mode1 四通道、period、XRUN 与中断退出 |
-| 7 | ui/lvgl_screen.cpp、ui/device_ui.cpp | 页面、触摸、音量、摄像头资源的生命周期 |
+| 7 | ui/lvgl_screen.cpp、ui/device_ui.cpp | 页面、音量、摄像头资源的生命周期 |
+| 8 | platform/rv1106/display_touch.cpp | SPI屏幕、I²C触摸、复位与故障恢复 |
 
 上述路径相对 `client/src/`。课程按同一份产品代码递进，不用宏拼出多个产品。
 
 读正常问答时，先顺着 `OnAudio → SendInputFrame → OnNetwork → PlayReplyFrame`。
-需要了解异常再看 `HandleAudioFault`、`StopTurn` 和 `OnTimeout`。主状态中不处理声学门限和TLS细节。
+需要了解异常再看 `HandleAudioFault`、`StopAndListen` 和 `OnTimeout`。主状态中不处理声学门限和TLS细节。
 
 采集端从 `AudioBackend::ProcessCapture20ms` 向下看：修正极性、重采样、3A、语音判定和发布。
 `audio_format.h` 定义帧格式，`board_voice_profile.h` 保存板级标定，公开音频接口只依赖前者。

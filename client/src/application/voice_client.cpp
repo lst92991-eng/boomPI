@@ -23,12 +23,14 @@ using ReadClock = Clock::time_point (*)();
 using namespace std::chrono_literals;
 using audio::AudioEvent;
 using audio::AudioEventKind;
+using audio::ListenMode;
 using network::LinkEvent;
 using network::LinkEventKind;
 using network::SendResult;
 using ui::DeviceUiState;
 
 enum class State { Offline, Idle, Listening, Uploading, Waiting, Speaking };
+enum class ReplyHistory { Keep, Retract };
 
 constexpr auto kWakeWindow = 6s;
 constexpr auto kFollowUpWindow = 3s;
@@ -62,8 +64,8 @@ class VoiceApp final {
       }
 
       AudioEvent sound;
-      const bool available = audio_.Poll(&sound, 20ms);
-      // Poll可能等待20ms。先处理这段等待中发生的超时，再使用刚取出的语音。
+      const bool available = audio_.Process(&sound, 20ms);
+      // 音频处理可能跨过截止时刻，先处理超时，再使用本次取得的语音。
       const bool expired = OnTimeout();
       if (available && !expired) {
         OnAudio(sound);
@@ -170,13 +172,13 @@ class VoiceApp final {
     return true;
   }
 
-  void Listen(bool follow_up) {
+  void WaitForSpeech(ListenMode mode) {
     audio_.CancelInput();
-    if (!audio_.Listen(follow_up)) {
+    if (!audio_.Listen(mode)) {
       Fail(audio_.last_error());
       return;
     }
-    Enter(State::Listening, follow_up ? kFollowUpWindow : kWakeWindow);
+    Enter(State::Listening, mode == ListenMode::FollowUp ? kFollowUpWindow : kWakeWindow);
   }
 
   void Offline() {
@@ -187,23 +189,23 @@ class VoiceApp final {
   }
 
   /**
-   * @brief 停止当前问答；retract表示撤回用户尚未听完的回答历史。
+   * @brief 停止当前问答后继续听三秒；history 决定是否撤回未听完的回答。
    *
    * 输入缺帧或超时时不能发送END，否则服务端会把残缺语句当成完整问题。
    * STOP使用新的generation，失败后退回离线，等待网络模块重新连接。
    */
-  void StopTurn(bool retract) {
+  void StopAndListen(ReplyHistory history) {
     audio_.StopPlayback();
     audio_.CancelInput();
     view_.ClearText();
     if (!NextGeneration()) {
       return;
     }
-    if (!link_.Stop(generation_, retract)) {
+    if (!link_.Stop(generation_, history == ReplyHistory::Retract)) {
       Offline();
       return;
     }
-    Listen(/*follow_up=*/true);
+    WaitForSpeech(ListenMode::FollowUp);
   }
 
   void BeginUpload(bool supersede) {
@@ -227,7 +229,7 @@ class VoiceApp final {
     const SendResult result =
         link_.SendAudio(generation_, event.pcm.data(), first_frame, last_frame, replace_answer);
     if (result == SendResult::Backpressure) {
-      StopTurn(/*retract=*/false);
+      StopAndListen(ReplyHistory::Keep);
       return;
     }
     if (result != SendResult::Ok) {
@@ -247,7 +249,7 @@ class VoiceApp final {
     if (!audio_.healthy()) {
       Fail(audio_.last_error());
     } else if (HasActiveTurn()) {
-      StopTurn(state_ == State::Speaking);
+      StopAndListen(state_ == State::Speaking ? ReplyHistory::Retract : ReplyHistory::Keep);
     } else if (state_ != State::Offline) {
       audio_.CancelInput();
       Enter(State::Idle);
@@ -258,7 +260,7 @@ class VoiceApp final {
     switch (event.kind) {
       case AudioEventKind::Wake:
         if (state_ == State::Idle) {
-          Listen(/*follow_up=*/false);
+          WaitForSpeech(ListenMode::Wake);
         }
         break;
       case AudioEventKind::SpeechStart:
@@ -277,7 +279,7 @@ class VoiceApp final {
       case AudioEventKind::PlaybackDone:
         // 旧播放线程的完成通知，不能结束已经开始的新回答。
         if (event.generation == generation_ && state_ == State::Speaking) {
-          Listen(/*follow_up=*/true);
+          WaitForSpeech(ListenMode::FollowUp);
         }
         break;
       case AudioEventKind::Fault:
@@ -293,7 +295,7 @@ class VoiceApp final {
       if (!audio_.healthy()) {
         Fail(audio_.last_error());
       } else {
-        StopTurn(/*retract=*/true);
+        StopAndListen(ReplyHistory::Retract);
       }
       return;
     }
@@ -325,7 +327,7 @@ class VoiceApp final {
     if (event.kind == LinkEventKind::Error) {
       std::fprintf(stderr, "boompi: reply failed; code=%s\n", event.code.c_str());
       if (HasActiveTurn()) {
-        StopTurn(state_ == State::Speaking);
+        StopAndListen(state_ == State::Speaking ? ReplyHistory::Retract : ReplyHistory::Keep);
       }
       return;
     }
@@ -345,7 +347,7 @@ class VoiceApp final {
       case LinkEventKind::Done:
         // 纯文本回答没有PlaybackDone；带音频的回答要等声卡尾播结束。
         if (state_ == State::Waiting) {
-          Listen(/*follow_up=*/true);
+          WaitForSpeech(ListenMode::FollowUp);
         }
         break;
       default:
@@ -360,10 +362,10 @@ class VoiceApp final {
       ui_.Show(view_);
     } else if (action.kind == ui::UiActionKind::Interrupt) {
       if (state_ == State::Speaking || state_ == State::Waiting) {
-        StopTurn(/*retract=*/true);
+        StopAndListen(ReplyHistory::Retract);
       }
     } else if (state_ == State::Idle) {
-      Listen(/*follow_up=*/false);
+      WaitForSpeech(ListenMode::Wake);
     }
   }
 
@@ -376,7 +378,7 @@ class VoiceApp final {
       audio_.CancelInput();
       Enter(State::Idle);
     } else if (HasActiveTurn()) {
-      StopTurn(state_ == State::Speaking);
+      StopAndListen(state_ == State::Speaking ? ReplyHistory::Retract : ReplyHistory::Keep);
     } else {
       return false;
     }

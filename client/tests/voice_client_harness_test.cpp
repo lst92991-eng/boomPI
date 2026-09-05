@@ -9,6 +9,7 @@
 namespace harness {
 using boompi::audio::AudioEvent;
 using boompi::audio::AudioEventKind;
+using boompi::audio::ListenMode;
 using boompi::network::LinkEvent;
 using boompi::network::LinkEventKind;
 using boompi::network::SendResult;
@@ -33,7 +34,7 @@ struct State {
   std::vector<std::pair<std::uint32_t, bool>> stops;
   std::vector<boompi::ui::UiView> views;
   std::vector<std::uint32_t> played;
-  std::vector<bool> listen;
+  std::vector<ListenMode> listen;
   std::vector<SendResult> results;
   std::uint64_t time_ms{0};
   volatile std::sig_atomic_t stop{0};
@@ -110,7 +111,7 @@ VoiceAudio::~VoiceAudio() noexcept {
 bool VoiceAudio::Open(std::uint8_t) {
   return true;
 }
-bool VoiceAudio::Poll(AudioEvent* event, std::chrono::milliseconds) {
+bool VoiceAudio::Process(AudioEvent* event, std::chrono::milliseconds) {
   auto& s = harness::state;
   if (s.next == s.steps.size()) {
     s.stop = 1;
@@ -128,8 +129,8 @@ bool VoiceAudio::Poll(AudioEvent* event, std::chrono::milliseconds) {
   *event = *step.audio;
   return true;
 }
-bool VoiceAudio::Listen(bool follow_up) {
-  harness::state.listen.push_back(follow_up);
+bool VoiceAudio::Listen(ListenMode mode) {
+  harness::state.listen.push_back(mode);
   return true;
 }
 bool VoiceAudio::Play(std::uint32_t gen, const std::uint8_t*, std::size_t, std::uint32_t, bool,
@@ -220,7 +221,16 @@ int main() {
   require(state.packets.size() == 2 && state.packets[0].start && !state.packets[0].end &&
               state.packets[1].end && state.packets[0].sample == 11,
           "START/PCM/END preserve audio");
-  require(state.listen.size() == 2 && state.listen.back(), "physical end enters follow-up");
+  require(state.listen == std::vector<ListenMode>{ListenMode::Wake, ListenMode::FollowUp},
+          "wake and physical end select the matching listen mode");
+
+  steps = Question();
+  steps.push_back(N(Reply()));
+  steps.push_back(N(Net(LinkEventKind::Done, 1)));
+  steps.push_back(Delay(20));
+  require(Run(steps) && state.listen == std::vector<ListenMode>{ListenMode::Wake} &&
+              state.views.back().state == DeviceUiState::kSpeaking,
+          "network END and done do not start follow-up before physical playback ends");
 
   steps = Question();
   steps.push_back(N(Reply()));
@@ -249,6 +259,8 @@ int main() {
   require(state.stops.size() == 1 && state.stops[0].second &&
               state.packets.back().generation == 3 && !state.packets.back().supersede,
           "STOP uses new fence; next ordinary question remains normal");
+  require(state.listen == std::vector<ListenMode>{ListenMode::Wake, ListenMode::FollowUp},
+          "touch stop also opens follow-up listening");
 
   steps = Question();
   steps.push_back(N(Net(LinkEventKind::Done, 1)));
@@ -272,7 +284,8 @@ int main() {
               state.views.back().state == DeviceUiState::kOffline,
           "disconnect cancels upload");
   require(Run(Question(), {SendResult::Backpressure}, true, false) &&
-              state.views.back().state == DeviceUiState::kOffline,
+              state.views.back().state == DeviceUiState::kOffline &&
+              state.listen == std::vector<ListenMode>{ListenMode::Wake},
           "failed STOP becomes offline");
 
   steps = Question();

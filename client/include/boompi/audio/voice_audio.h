@@ -18,6 +18,9 @@
 
 namespace boompi::audio {
 
+/// 唤醒后正常准入；回答后追问需要较长的人声确认，避免残留尾音再次触发。
+enum class ListenMode : std::uint8_t { Wake, FollowUp };
+
 enum class AudioEventKind : std::uint8_t {
   Wake,
   SpeechStart,
@@ -46,10 +49,14 @@ class VoiceAudio final {
 
   /// 打开声卡和算法；音量范围为 0～100，超出上限按 100 处理。
   bool Open(std::uint8_t volume = 60U);
-  /// 对话线程按顺序消费事件；即使暂时无事件，也要持续 Poll 以处理采集帧。
-  bool Poll(AudioEvent* event, std::chrono::milliseconds timeout);
-  /// 开始等候人声；追问使用较长的人声确认窗口，降低回复尾音触发的概率。
-  bool Listen(bool follow_up);
+  /**
+   * @brief 在对话线程推进采集判定、打断和播放完成，并取出一个事件。
+   * 即使没有事件也要持续调用。timeout 只限制等待新采集帧，不包含后续处理耗时。
+   * @return true 表示取到事件；false 时可用 healthy() 区分暂时无事件与致命故障。
+   */
+  bool Process(AudioEvent* event, std::chrono::milliseconds timeout);
+  /// 开始等候人声；mode 选择语音准入规则，等候多久仍由对话层决定。
+  bool Listen(ListenMode mode);
   /// 提交一帧回复音频。start 仅允许 sequence=0；只有末帧可不足 20 ms。
   bool Play(std::uint32_t generation, const std::uint8_t* pcm, std::size_t bytes,
             std::uint32_t sequence, bool start, bool end);
