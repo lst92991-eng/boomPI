@@ -20,6 +20,12 @@ struct SharedState final {
   std::uint64_t playback_xruns{0U};
   bool open{false};
   bool capture_interrupted{false};
+  PlaybackBlock playback_block{PlaybackBlock::kNone};
+  bool playback_blocked{false}, playback_interrupted{false};
+  bool owner_order_valid{true}, playback_prepared{false};
+  bool fail_playback_preparation{false};
+  std::thread::id capture_thread{}, playback_thread{};
+  std::size_t armed_sessions{0U}, prepared_sessions{0U};
 };
 
 SharedState& State() {
@@ -32,6 +38,21 @@ bool WaitUntil(Predicate predicate, std::chrono::milliseconds timeout) noexcept 
   auto& state = State();
   std::unique_lock<std::mutex> lock(state.mutex);
   return state.condition.wait_for(lock, timeout, predicate);
+}
+
+bool WaitInPlayback(PlaybackBlock stage, std::unique_lock<std::mutex>& lock) {
+  auto& state = State();
+  state.owner_order_valid &= state.playback_prepared &&
+      state.playback_thread == std::this_thread::get_id();
+  if (state.playback_block == stage) {
+    state.playback_blocked = true;
+    state.condition.notify_all();
+    // 测试本身也有截止时间：若产品漏掉 interrupt，报告失败而不是挂死测试进程。
+    if (!state.condition.wait_for(lock, std::chrono::seconds(1), [&state] {
+      return !state.open || state.playback_interrupted;
+    })) return false;
+  }
+  return !state.playback_interrupted;
 }
 
 }  // namespace
@@ -47,6 +68,36 @@ void Reset() noexcept {
   state.playback_xruns = 0U;
   state.open = false;
   state.capture_interrupted = false;
+  state.playback_block = PlaybackBlock::kNone;
+  state.playback_blocked = state.playback_interrupted = false;
+  state.owner_order_valid = true;
+  state.playback_prepared = false;
+  state.fail_playback_preparation = false;
+  state.capture_thread = state.playback_thread = {};
+  state.armed_sessions = state.prepared_sessions = 0U;
+}
+
+void BlockPlayback(PlaybackBlock stage) noexcept {
+  auto& state = State();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.playback_block = stage;
+}
+
+void FailPlaybackPreparation() noexcept {
+  auto& state = State();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.fail_playback_preparation = true;
+}
+
+bool WaitForPlaybackBlocked(std::chrono::milliseconds timeout) noexcept {
+  return WaitUntil([] { return State().playback_blocked; }, timeout);
+}
+
+bool PlaybackOwnerOrderIsValid() noexcept {
+  auto& state = State();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  return state.owner_order_valid && state.prepared_sessions != 0U &&
+      state.armed_sessions == state.prepared_sessions;
 }
 
 void InjectPlaybackXruns(const std::uint64_t count) noexcept {
@@ -129,6 +180,7 @@ bool AudioBackend::ReadCapture20ms(bool* const discontinuity) noexcept {
   if (impl_ == nullptr || discontinuity == nullptr) return false;
   auto& state = test::audio_backend::State();
   std::unique_lock<std::mutex> lock(state.mutex);
+  state.capture_thread = std::this_thread::get_id();
   ++state.capture_reads;
   state.condition.notify_all();
   state.condition.wait(lock, [&state] {
@@ -159,7 +211,25 @@ bool AudioBackend::ProcessCapture20ms(const bool discontinuity,
 }
 
 bool AudioBackend::ResetListener() noexcept { return true; }
-bool AudioBackend::PreparePlayback() noexcept { return true; }
+bool AudioBackend::ArmPlayback() noexcept {
+  auto& state = test::audio_backend::State();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.owner_order_valid &= state.capture_thread == std::this_thread::get_id();
+  ++state.armed_sessions;
+  return true;
+}
+
+bool AudioBackend::PreparePlayback() noexcept {
+  auto& state = test::audio_backend::State();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.playback_thread = std::this_thread::get_id();
+  state.owner_order_valid &= state.playback_thread != state.capture_thread &&
+      state.armed_sessions == state.prepared_sessions + 1U;
+  ++state.prepared_sessions;
+  state.playback_prepared = !state.fail_playback_preparation;
+  state.playback_interrupted = false;
+  return state.playback_prepared;
+}
 
 bool AudioBackend::Render20ms(const std::int16_t* const pcm24,
                               const std::size_t samples,
@@ -170,8 +240,10 @@ bool AudioBackend::Render20ms(const std::int16_t* const pcm24,
   call.gain = gain;
   auto& state = test::audio_backend::State();
   {
-    std::lock_guard<std::mutex> lock(state.mutex);
+    std::unique_lock<std::mutex> lock(state.mutex);
     state.render_calls.push_back(std::move(call));
+    if (!test::audio_backend::WaitInPlayback(
+            test::audio_backend::PlaybackBlock::kRender, lock)) return false;
   }
   state.condition.notify_all();
   // The board backend advances one 20 ms ALSA period per call. Giving the
@@ -181,8 +253,19 @@ bool AudioBackend::Render20ms(const std::int16_t* const pcm24,
   return true;
 }
 
-bool AudioBackend::DrainPlayback() noexcept { return true; }
-void AudioBackend::DropPlayback() noexcept {}
+bool AudioBackend::DrainPlayback() noexcept {
+  auto& state = test::audio_backend::State();
+  std::unique_lock<std::mutex> lock(state.mutex);
+  return test::audio_backend::WaitInPlayback(
+      test::audio_backend::PlaybackBlock::kDrain, lock);
+}
+void AudioBackend::DropPlayback() noexcept {
+  auto& state = test::audio_backend::State();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  // 尚未渲染就取消时，允许播放线程直接 drop，不要求先 prepare。
+  state.owner_order_valid &= std::this_thread::get_id() != state.capture_thread;
+  state.playback_prepared = false;
+}
 
 void AudioBackend::InterruptCapture() noexcept {
   auto& state = test::audio_backend::State();
@@ -194,7 +277,14 @@ void AudioBackend::InterruptCapture() noexcept {
   state.condition.notify_all();
 }
 
-void AudioBackend::InterruptPlayback() noexcept {}
+void AudioBackend::InterruptPlayback() noexcept {
+  auto& state = test::audio_backend::State();
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.playback_interrupted = true;
+  }
+  state.condition.notify_all();
+}
 std::uint64_t AudioBackend::playback_xruns() const noexcept {
   return test::audio_backend::PlaybackXrunsSnapshot();
 }

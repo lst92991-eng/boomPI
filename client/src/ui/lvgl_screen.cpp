@@ -27,8 +27,7 @@ constexpr std::uint32_t kText = 0xF3F6FA;
 constexpr std::uint32_t kMuted = 0x8492A6;
 constexpr std::uint32_t kBlue = 0x4DA6FF;
 // 索引同时决定桌面排列和 ShowApp() 路由，调整顺序时要同步检查对应页面分支。
-constexpr std::array<const char*, 7> kApps{{
-    "小智", "摄像头", "时间", "WiFi", "天气", "资源", "YOLO"}};
+constexpr std::array<const char*, 4> kApps{{"小智", "摄像头", "时间", "WiFi"}};
 
 /** @brief 把 application 状态映射成静态表情与默认文案，页面不复制业务状态机。 */
 struct VoiceView final {
@@ -37,7 +36,7 @@ struct VoiceView final {
   const lv_img_dsc_t* face;
 };
 
-const std::array<VoiceView, 8> kVoiceViews{{
+const std::array<VoiceView, 7> kVoiceViews{{
     {"随时可以说话", "说出唤醒词开始对话", &emoji_1f642_64},
     {"正在聆听", "我在听，请继续", &emoji_1f62f_64},
     {"正在思考", "正在组织回答", &emoji_1f914_64},
@@ -45,7 +44,6 @@ const std::array<VoiceView, 8> kVoiceViews{{
     {"回答完成", "随时可以继续问我", &emoji_1f642_64},
     {"暂时离线", "等待网络恢复", &emoji_1f614_64},
     {"发生错误", "请检查网络后重试", &emoji_1f614_64},
-    {"即将说完", "轻触表情仍可打断", &emoji_1f606_64},
 }};
 
 constexpr std::array<const char*, 4> kCameraStatus{{
@@ -101,7 +99,7 @@ lv_font_t* LoadFont(const char* path, std::uint16_t size) {
 
 struct LvglScreen::Impl final {
   // Page 只表示当前对象树类型，真实语音和摄像头生命周期仍由外层模块拥有。
-  enum class Page : std::uint8_t { kHome, kVoice, kCamera, kOther };
+  enum class Page : std::uint8_t { kHome, kVoice, kCamera, kOther, kClock };
   static constexpr std::size_t kPixelCount = 320U * 180U;
 
   struct AppClick final {
@@ -167,14 +165,14 @@ struct LvglScreen::Impl final {
     Label(lv_scr_act(), "boomPI", text_font, kText, 10, 8, 80, 24);
     clock = Label(lv_scr_act(), "", text_font, kText, 235, 8, 70, 24);
     for (std::size_t index = 0U; index < kApps.size(); ++index) {
-      const int x = 5 + static_cast<int>(index % 4U) * 79;
-      const int y = 43 + static_cast<int>(index / 4U) * 94;
+      const int x = 8 + static_cast<int>(index % 2U) * 156;
+      const int y = 43 + static_cast<int>(index / 2U) * 94;
       lv_obj_t* button = lv_btn_create(lv_scr_act());
       lv_obj_set_pos(button, x, y);
-      lv_obj_set_size(button, 72, 86);
+      lv_obj_set_size(button, 148, 86);
       app_clicks[index] = {this, index};
       lv_obj_add_event_cb(button, AppClicked, LV_EVENT_CLICKED, &app_clicks[index]);
-      Label(button, kApps[index], text_font, kText, 2, 31, 68, 24);
+      Label(button, kApps[index], text_font, kText, 2, 31, 140, 24);
     }
     UpdateClock();
   }
@@ -223,7 +221,7 @@ struct LvglScreen::Impl final {
   }
 
   /**
-   * @brief 建立配网页或课程占位页。
+   * @brief 建立配网页或时钟页。
    *
    * Wi-Fi 二维码编码临时热点的固定 SSID/密码，手机扫码后连接 boomPI-Setup；
    * AppClicked 随后发布 Provision，板端脚本负责真正启动热点和保存用户网络凭据。
@@ -243,8 +241,9 @@ struct LvglScreen::Impl final {
                              text_font, kMuted, 30, 197, 260, 24);
       return;
     }
-    Label(lv_scr_act(), "功能将在后续课程接入", text_font, kMuted,
-          30, 105, 260, 30);
+    page = Page::kClock;
+    clock = Label(lv_scr_act(), "", text_font, kText, 30, 105, 260, 30);
+    UpdateClock();
   }
 
   /**
@@ -305,7 +304,7 @@ struct LvglScreen::Impl final {
 
   /** @brief 只在桌面更新本地时钟，避免已销毁 clock 指针被定时器访问。 */
   void UpdateClock() {
-    if (page != Page::kHome) return;
+    if (page != Page::kHome && page != Page::kClock) return;
     const std::time_t now = std::time(nullptr);
     std::tm local{};
     localtime_r(&now, &local);
@@ -336,9 +335,9 @@ struct LvglScreen::Impl final {
   /** @brief 仅在扬声器仍有有效回复时把表情点击解释为打断意图。 */
   static void FaceClicked(lv_event_t* event) {
     Impl* self = static_cast<Impl*>(lv_event_get_user_data(event));
-    const bool speaking = self->voice_state == DeviceUiState::kSpeaking ||
-                          self->voice_state == DeviceUiState::kSpeakingTail;
+    const bool speaking = self->voice_state == DeviceUiState::kSpeaking;
     if (speaking) self->Emit(Event::kInterrupt);
+    else self->Emit(Event::kWake);
   }
 
   /**
@@ -433,9 +432,7 @@ void LvglScreen::SetCameraFrame(const std::uint16_t* pixels, std::size_t pixel_c
 void LvglScreen::SetState(DeviceUiState state) noexcept {
   if (impl_ == nullptr) return;
   impl_->voice_state = state;
-  const bool active = (state >= DeviceUiState::kListening &&
-                       state <= DeviceUiState::kHappy) ||
-                      state == DeviceUiState::kSpeakingTail;
+  const bool active = state >= DeviceUiState::kListening && state <= DeviceUiState::kHappy;
   // 语音从唤醒词启动时自动进入小智页；用户主动浏览其他页面时不强制抢占页面。
   if (active && impl_->page == Impl::Page::kHome)
     impl_->BuildVoice();
@@ -444,10 +441,14 @@ void LvglScreen::SetState(DeviceUiState state) noexcept {
 
 void LvglScreen::SetText(std::string_view first, std::string_view second) noexcept {
   if (impl_ == nullptr) return;
-  std::string text(first);
-  if (!text.empty() && !second.empty()) text.push_back('\n');
-  text.append(second);
-  impl_->subtitle_text = SupportedText(impl_->text_font, text);
+  try {
+    std::string text(first);
+    if (!text.empty() && !second.empty()) text.push_back('\n');
+    text.append(second);
+    impl_->subtitle_text = SupportedText(impl_->text_font, text);
+  } catch (...) {
+    impl_->subtitle_text.clear();
+  }
   impl_->RenderVoice();
 }
 

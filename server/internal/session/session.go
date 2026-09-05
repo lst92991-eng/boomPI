@@ -3,381 +3,276 @@ package session
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lst92991-eng/boomPI/server/internal/backend"
-)
-
-var (
-	ErrClosed            = errors.New("session actor is closed")
-	ErrInvalidTransition = errors.New("invalid session transition")
-	ErrStaleEpoch        = errors.New("stale session epoch")
+	"github.com/lst92991-eng/boomPI/server/internal/protocol"
 )
 
 const (
-	commandCapacity      = 32
-	urgentCapacity       = 4
-	eventCapacity        = 8
-	pcmFrameBytes16kMono = 320 * 2
+	// 34 ordinary frames + 2 reserved STARTs + one in the provider call and
+	// one in the socket reader stay below the 40-frame (800 ms) input budget.
+	commandCapacity          = 34
+	urgentCapacity           = 2
+	eventCapacity            = 8
+	providerOperationTimeout = 700 * time.Millisecond
 )
 
-// Event adds the device epoch to a provider-neutral response event. Consumers
-// use Epoch to reject data that was already delivered when a turn was cancelled.
+var ErrCongested = errors.New("session input queue full")
+var ErrClosed = errors.New("session closed")
+
 type Event struct {
-	Epoch uint64
+	Generation uint32
 	backend.ConversationEvent
 }
 
-type operation uint8
-
-const (
-	startTurn operation = iota + 1
-	appendPCM
-	commit
-	cancelTurn
-)
-
 type command struct {
-	ctx    context.Context
-	op     operation
-	epoch  uint64
-	pcm    []byte
-	result chan error
+	generation                uint32
+	start, stop, end, retract bool
+	pcm                       []byte
+	queuedAt                  time.Time
 }
 
-type phase uint8
+func (c command) boundary() bool { return c.start || c.stop }
 
-const (
-	idle phase = iota
-	listening
-	responding
-)
-
-// actorState is owned exclusively by Actor.run.
-type actorState struct {
-	phase      phase
-	latest     uint64
-	epoch      uint64
-	responseID string
-	pending    *Event
-}
-
+// Actor is the sole owner of provider calls. Enqueue never waits for provider
+// cancellation. One worker serializes cleanup and input; no per-barge goroutine
+// or unbounded canceled-provider queue exists.
 type Actor struct {
 	provider backend.ConversationSession
-	commands chan command
-	urgent   chan command
 	events   chan Event
+	wake     chan struct{}
 	done     chan struct{}
 	stop     context.CancelFunc
-	stopOnce sync.Once
-	closeErr error
+	latest   atomic.Uint32
+	mu       sync.Mutex
+	commands []command
+	closed   bool
 }
 
-// Open creates the provider connection, then starts the one goroutine that
-// owns all turn state.
 func Open(ctx context.Context, provider backend.ConversationBackend, cfg backend.SessionConfig) (*Actor, error) {
-	if ctx == nil || provider == nil {
-		return nil, errors.New("context and conversation backend are required")
-	}
 	actorCtx, stop := context.WithCancel(ctx)
-	providerSession, err := provider.Open(actorCtx, cfg)
+	session, err := provider.Open(actorCtx, cfg)
 	if err != nil {
 		stop()
-		return nil, fmt.Errorf("open conversation backend: %w", err)
+		return nil, err
 	}
-	if providerSession == nil {
+	if session == nil {
 		stop()
-		return nil, errors.New("conversation backend returned a nil session")
+		return nil, errors.New("provider returned nil session")
 	}
-	a := &Actor{
-		provider: providerSession,
-		commands: make(chan command, commandCapacity),
-		urgent:   make(chan command, urgentCapacity),
-		events:   make(chan Event, eventCapacity),
-		done:     make(chan struct{}),
-		stop:     stop,
-	}
+	a := &Actor{provider: session, events: make(chan Event, eventCapacity), wake: make(chan struct{}, 1), done: make(chan struct{}), stop: stop}
 	go a.run(actorCtx)
 	return a, nil
 }
 
-func (a *Actor) StartTurn(ctx context.Context, epoch uint64) error {
-	return a.send(ctx, startTurn, epoch, nil)
-}
-
-// AppendPCM copies one 20 ms, 16 kHz S16_LE mono frame before returning.
-func (a *Actor) AppendPCM(ctx context.Context, epoch uint64, pcm []byte) error {
-	if len(pcm) != pcmFrameBytes16kMono {
-		return fmt.Errorf("PCM frame must contain %d bytes", pcmFrameBytes16kMono)
+func (a *Actor) Submit(header protocol.PCMHeader, pcm []byte) error {
+	if len(pcm) != protocol.UplinkFrameBytes {
+		return errors.New("invalid session PCM frame")
 	}
-	return a.send(ctx, appendPCM, epoch, append([]byte(nil), pcm...))
+	return a.enqueue(command{
+		generation: header.Generation, start: header.Flags&protocol.PCMFlagStart != 0,
+		end: header.Flags&protocol.PCMFlagEnd != 0, retract: header.Flags&protocol.PCMFlagSupersede != 0,
+		pcm: append([]byte(nil), pcm...), queuedAt: time.Now(),
+	})
 }
 
-func (a *Actor) Commit(ctx context.Context, epoch uint64) error {
-	return a.send(ctx, commit, epoch, nil)
-}
-
-// Cancel is urgent and idempotent for an epoch that has already retired.
-func (a *Actor) Cancel(ctx context.Context, epoch uint64) error {
-	return a.send(ctx, cancelTurn, epoch, nil)
+func (a *Actor) Stop(generation uint32, retract bool) error {
+	return a.enqueue(command{generation: generation, stop: true, retract: retract, queuedAt: time.Now()})
 }
 
 func (a *Actor) Events() <-chan Event { return a.events }
 
 func (a *Actor) Close() error {
-	a.stopOnce.Do(a.stop)
+	a.stop()
 	<-a.done
-	return a.closeErr
+	return nil
 }
 
-func (a *Actor) send(ctx context.Context, op operation, epoch uint64, pcm []byte) error {
-	if ctx == nil {
-		return errors.New("context is required")
-	}
-	if epoch == 0 {
-		return errors.New("epoch must be non-zero")
-	}
-	cmd := command{ctx: ctx, op: op, epoch: epoch, pcm: pcm, result: make(chan error, 1)}
-	queue := a.commands
-	if op == cancelTurn {
-		queue = a.urgent
-	}
-	select {
-	case queue <- cmd:
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-a.done:
+func (a *Actor) enqueue(cmd command) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
 		return ErrClosed
 	}
-	select {
-	case err := <-cmd.result:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-a.done:
-		return ErrClosed
+	if cmd.boundary() {
+		if cmd.generation <= a.latest.Load() {
+			return errors.New("generation must increase")
+		}
+		a.latest.Store(cmd.generation)
+		// Boundary commands retain their retract intent until the worker applies
+		// them. A later NORMAL must not erase a previously requested SUPERSEDE.
+		kept := a.commands[:0]
+		for _, queued := range a.commands {
+			if queued.boundary() {
+				kept = append(kept, queued)
+			}
+		}
+		clear(a.commands[len(kept):])
+		a.commands = kept
 	}
+	pcm, urgent := 0, 0
+	for _, queued := range a.commands {
+		if queued.boundary() {
+			urgent++
+		} else {
+			pcm++
+		}
+	}
+	if (cmd.boundary() && urgent >= urgentCapacity) || (!cmd.boundary() && pcm >= commandCapacity) {
+		return ErrCongested
+	}
+	a.commands = append(a.commands, cmd)
+	select {
+	case a.wake <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (a *Actor) pop() (command, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.commands) == 0 {
+		return command{}, false
+	}
+	cmd := a.commands[0]
+	a.commands[0] = command{}
+	a.commands = a.commands[1:]
+	return cmd, true
 }
 
 func (a *Actor) run(ctx context.Context) {
-	state := actorState{phase: idle}
-	defer a.shutdown(&state)
-
+	defer func() {
+		a.stop()
+		a.mu.Lock()
+		a.closed = true
+		clear(a.commands)
+		a.commands = nil
+		a.mu.Unlock()
+		_ = a.provider.Close()
+		close(a.events)
+		close(a.done)
+	}()
+	var generation uint32
+	var responseID string
+	responding := false
+	var pending *Event
 	for {
-		// Give barge-in cancellation priority over queued PCM.
-		select {
-		case cmd := <-a.urgent:
-			cmd.result <- a.apply(cmd, &state)
+		if ctx.Err() != nil {
+			return
+		}
+		if cmd, ok := a.pop(); ok {
+			if cmd.boundary() {
+				// Cancel guarantees no more old events after it returns; draining
+				// here is safe before the new generation can produce any output.
+				opCtx, cancel := context.WithTimeout(ctx, providerOperationTimeout)
+				err := a.provider.Cancel(opCtx)
+				if err == nil && cmd.retract {
+					discarder, ok := a.provider.(backend.CompletedResponseDiscarder)
+					if !ok {
+						err = errors.New("provider cannot retract completed response")
+					} else {
+						err = discarder.DiscardLastResponse(opCtx)
+					}
+				}
+				cancel()
+				if err != nil {
+					return
+				}
+				if !a.drainProviderEvents() {
+					return
+				}
+				pending = nil
+				responseID = ""
+				responding = false
+				generation = cmd.generation
+			}
+			if cmd.stop || cmd.generation != a.latest.Load() {
+				continue
+			}
+			if cmd.generation != generation || responding || time.Since(cmd.queuedAt) > 800*time.Millisecond {
+				return
+			}
+			opCtx, cancel := context.WithTimeout(ctx, providerOperationTimeout)
+			err := a.provider.SendAudio(opCtx, cmd.pcm)
+			if err == nil && cmd.end {
+				err = a.provider.Commit(opCtx)
+				responding = err == nil
+			}
+			cancel()
+			if err != nil {
+				return
+			}
 			continue
-		default:
 		}
-
-		var providerEvents <-chan backend.ConversationEvent
-		if state.pending == nil {
-			providerEvents = a.provider.Events()
+		if pending != nil && pending.Generation != a.latest.Load() {
+			pending = nil
 		}
-		var output chan<- Event
+		var output chan Event
 		var next Event
-		if state.pending != nil {
-			output, next = a.events, *state.pending
+		providerEvents := a.provider.Events()
+		if pending != nil {
+			output, next = a.events, *pending
+			providerEvents = nil
 		}
-
 		select {
 		case <-ctx.Done():
 			return
-		case cmd := <-a.urgent:
-			cmd.result <- a.apply(cmd, &state)
-		case cmd := <-a.commands:
-			if err := cmd.ctx.Err(); err != nil {
-				cmd.result <- err
-			} else {
-				cmd.result <- a.apply(cmd, &state)
-			}
+		case <-a.wake:
+		case output <- next:
+			pending = nil
 		case raw, ok := <-providerEvents:
 			if !ok {
-				a.reportClosedStream(&state)
 				return
 			}
-			state.pending = accept(raw, &state)
-		case output <- next:
-			state.pending = nil
+			if !responding || generation != a.latest.Load() {
+				continue
+			}
+			if raw.Type == backend.EventStarted {
+				if responseID != "" || raw.ResponseID == "" {
+					return
+				}
+				responseID = raw.ResponseID
+			} else if responseID == "" || raw.ResponseID != responseID {
+				return
+			}
+			if !validProviderEvent(raw) {
+				return
+			}
+			pending = &Event{Generation: generation, ConversationEvent: raw}
+			if raw.Type == backend.EventDone || raw.Type == backend.EventError {
+				responding = false
+			}
 		}
 	}
 }
 
-func (a *Actor) apply(cmd command, state *actorState) error {
-	switch cmd.op {
-	case startTurn:
-		if state.phase != idle {
-			return ErrInvalidTransition
-		}
-		if cmd.epoch <= state.latest {
-			return ErrStaleEpoch
-		}
-		state.phase, state.latest, state.epoch = listening, cmd.epoch, cmd.epoch
-		state.responseID = ""
-		return nil
-
-	case appendPCM:
-		if stale(cmd.epoch, state) {
-			return ErrStaleEpoch
-		}
-		if state.phase != listening || cmd.epoch != state.epoch {
-			return ErrInvalidTransition
-		}
-		if err := a.provider.SendAudio(cmd.ctx, cmd.pcm); err != nil {
-			return fmt.Errorf("send audio: %w", err)
-		}
-		return nil
-
-	case commit:
-		if stale(cmd.epoch, state) {
-			return ErrStaleEpoch
-		}
-		if state.phase != listening || cmd.epoch != state.epoch {
-			return ErrInvalidTransition
-		}
-		if err := a.provider.Commit(cmd.ctx); err != nil {
-			return fmt.Errorf("commit audio: %w", err)
-		}
-		state.phase = responding
-		return nil
-
-	case cancelTurn:
-		if state.phase == idle {
-			if cmd.epoch < state.latest {
-				return nil
-			}
-			if cmd.epoch != state.latest {
-				return ErrInvalidTransition
-			}
-			if discarder, ok := a.provider.(backend.CompletedResponseDiscarder); ok {
-				if err := discarder.DiscardLastResponse(cmd.ctx); err != nil {
-					return fmt.Errorf("discard completed response: %w", err)
-				}
-			}
-			return nil
-		}
-		if cmd.epoch < state.epoch {
-			return nil
-		}
-		if cmd.epoch != state.epoch {
-			return ErrInvalidTransition
-		}
-		responseWasActive := state.phase == responding
-		if err := a.provider.Cancel(cmd.ctx); err != nil {
-			return fmt.Errorf("cancel response: %w", err)
-		}
-		if responseWasActive {
-			if discarder, ok := a.provider.(backend.CompletedResponseDiscarder); ok {
-				if err := discarder.DiscardLastResponse(cmd.ctx); err != nil {
-					return fmt.Errorf("discard cancelled response: %w", err)
-				}
-			}
-		}
-		a.drainProviderEvents()
-		if state.pending != nil && state.pending.Epoch == state.epoch {
-			state.pending = nil
-		}
-		state.phase, state.epoch, state.responseID = idle, 0, ""
-		return nil
-	}
-	return errors.New("unknown session operation")
-}
-
-// Cancel establishes a provider fence first, so every event left in the
-// provider channel belongs to the retired epoch and can be drained safely.
-func (a *Actor) drainProviderEvents() {
+func (a *Actor) drainProviderEvents() bool {
 	for {
 		select {
 		case _, ok := <-a.provider.Events():
 			if !ok {
-				return
+				return false
 			}
 		default:
-			return
+			return true
 		}
 	}
 }
 
-func stale(epoch uint64, state *actorState) bool {
-	return epoch < state.epoch || (state.phase == idle && epoch <= state.latest)
-}
-
-func accept(raw backend.ConversationEvent, state *actorState) *Event {
-	if state.phase != responding {
-		return nil
-	}
-	if err := validProviderEvent(raw); err != nil {
-		state.phase, state.responseID = idle, ""
-		return &Event{Epoch: state.epoch, ConversationEvent: backend.ConversationEvent{Type: backend.EventError, Err: err}}
-	}
-	if state.responseID == "" {
-		state.responseID = raw.ResponseID
-	}
-	if raw.ResponseID != "" && raw.ResponseID != state.responseID {
-		return nil
-	}
-	raw.PCM = append([]byte(nil), raw.PCM...)
-	event := &Event{Epoch: state.epoch, ConversationEvent: raw}
-	if raw.Type == backend.EventDone || raw.Type == backend.EventError {
-		state.phase, state.responseID = idle, ""
-	}
-	return event
-}
-
-func validProviderEvent(event backend.ConversationEvent) error {
+func validProviderEvent(event backend.ConversationEvent) bool {
 	switch event.Type {
-	case backend.EventStarted:
-		if event.ResponseID != "" {
-			return nil
-		}
+	case backend.EventStarted, backend.EventDone:
+		return event.ResponseID != ""
 	case backend.EventTextDelta:
-		if event.ResponseID != "" && event.Text != "" {
-			return nil
-		}
+		return len(event.Text) > 0 && len(event.Text) <= 64*1024
 	case backend.EventAudio:
-		if event.ResponseID != "" && len(event.PCM) > 0 && event.SampleRateHz > 0 {
-			return nil
-		}
-	case backend.EventDone:
-		if event.ResponseID != "" {
-			return nil
-		}
+		return event.SampleRateHz == 24_000 && len(event.PCM) > 0 && len(event.PCM) <= protocol.DownlinkFrameBytes && len(event.PCM)%2 == 0
 	case backend.EventError:
-		if event.Err != nil {
-			return nil
-		}
+		return event.Err != nil
 	}
-	return fmt.Errorf("invalid provider event type %d", event.Type)
-}
-
-func (a *Actor) reportClosedStream(state *actorState) {
-	if state.phase == idle {
-		return
-	}
-	event := Event{Epoch: state.epoch, ConversationEvent: backend.ConversationEvent{
-		Type: backend.EventError, Err: errors.New("conversation backend event stream closed"),
-	}}
-	select {
-	case a.events <- event:
-	default:
-	}
-}
-
-func (a *Actor) shutdown(state *actorState) {
-	if state.phase != idle {
-		cancelCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		if err := a.provider.Cancel(cancelCtx); err != nil && !errors.Is(err, context.Canceled) {
-			a.closeErr = fmt.Errorf("cancel active turn: %w", err)
-		}
-		cancel()
-	}
-	if err := a.provider.Close(); err != nil && a.closeErr == nil {
-		a.closeErr = fmt.Errorf("close conversation backend: %w", err)
-	}
-	close(a.events)
-	close(a.done)
+	return false
 }

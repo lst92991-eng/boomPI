@@ -103,8 +103,9 @@ bool WriteText(const std::string& path, const std::string& text, int flags = O_W
 bool SaveVolume(std::uint8_t percent) {
   const std::string text = std::to_string(percent) + "\n";
   const int fd = open(kSettingsTemporary,
-                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
   bool ok = fd >= 0 && WriteAll(fd, text.data(), text.size());
+  if (ok) ok = fsync(fd) == 0;
   if (fd >= 0 && close(fd) != 0) ok = false;
   if (ok) ok = std::rename(kSettingsTemporary, kSettings) == 0;
   if (!ok) unlink(kSettingsTemporary);
@@ -212,11 +213,7 @@ void LogCameraStats(std::uint64_t pipeline_frames,
 
 struct DeviceUi::Impl final {
   // application 写入 View 快照，UI worker 一次取走完整副本，避免状态和字幕跨帧撕裂。
-  struct View {
-    DeviceUiState state{DeviceUiState::kIdle};
-    std::uint8_t volume{60U};
-    std::array<std::string, 2> text;
-  };
+  using View = UiView;
   using CameraFrame = std::array<std::uint16_t, kCameraPixels>;
 
   // 下列设备 fd 只在 Open()/UI worker/Close() 的受控生命周期内使用。
@@ -263,11 +260,9 @@ struct DeviceUi::Impl final {
     return true;
   }
 
-  /** @brief 跨线程发布一个 View 成员，并唤醒可能正在等待的 UI worker。 */
-  template <typename T>
-  void UpdateView(T View::*member, const T& value) {
+  void UpdateView(const View& value) {
     std::lock_guard<std::mutex> lock(view_mutex);
-    view.*member = value;
+    view = value;
     view_dirty = true;
     wake.notify_one();
   }
@@ -349,8 +344,7 @@ struct DeviceUi::Impl final {
   bool InitPanel() {
     if ((data_command = OpenGpio(kDataCommandGpio)) < 0 || (panel_reset = OpenGpio(kPanelResetGpio)) < 0 ||
         (backlight = OpenGpio(kBacklightGpio)) < 0) return false;
-    SetGpio(backlight, false);
-    SetGpio(panel_reset, false);
+    if (!SetGpio(backlight, false) || !SetGpio(panel_reset, false)) return false;
     usleep(100000);
     if (!SetGpio(panel_reset, true)) return false;
     usleep(100000);
@@ -559,9 +553,9 @@ struct DeviceUi::Impl final {
   static void HandleEvent(LvglScreen::Event event, std::uint8_t value, void* context) {
     auto* self = static_cast<Impl*>(context);
     if (event == LvglScreen::Event::kWake)
-      self->action.store(static_cast<int>(DeviceUiAction::kWake));
+      self->action.store(static_cast<int>(UiActionKind::Wake));
     else if (event == LvglScreen::Event::kInterrupt)
-      self->action.store(static_cast<int>(DeviceUiAction::kInterrupt));
+      self->action.store(static_cast<int>(UiActionKind::Interrupt));
     else if (event == LvglScreen::Event::kProvision)
       self->StartProvisioning();
     else if (event == LvglScreen::Event::kCameraOn) self->StartCamera();
@@ -812,7 +806,7 @@ struct DeviceUi::Impl final {
       if (TakeView(&next)) {
         screen.SetState(next.state);
         screen.SetVolume(next.volume);
-        screen.SetText(next.text[0], next.text[1]);
+        screen.SetText(next.text.data(), {});
       }
       const auto status = camera_status.load();
       if (status != shown_camera) {
@@ -841,15 +835,21 @@ struct DeviceUi::Impl final {
       std::unique_lock<std::mutex> lock(view_mutex);
       wake.wait_for(lock, std::chrono::milliseconds(30));
     }
+    ReleaseUi();
+  }
+
+  // 正常退出和分配失败共用同一回收顺序，避免留下camera线程或配网进程。
+  void ReleaseUi() {
     if (provision_pid > 0) {
       static_cast<void>(ReapProcessGroup(provision_pid));
       provision_pid = -1;
     }
     StopCamera();
-    // LVGL 对象先于已注册的 input/display 删除，销毁期间仍可访问活动 display。
     screen.Destroy();
     if (input != nullptr) lv_indev_delete(input);
     if (display != nullptr) lv_disp_remove(display);
+    input = nullptr;
+    display = nullptr;
   }
 };
 
@@ -864,7 +864,7 @@ std::uint8_t DeviceUi::LoadVolume(std::uint8_t fallback) noexcept {
   return valid ? static_cast<std::uint8_t>(saved) : std::min<std::uint8_t>(fallback, 100U);
 }
 
-bool DeviceUi::Open() noexcept {
+bool DeviceUi::Open() {
   Close();
   impl_ = new (std::nothrow) Impl;
   if (impl_ == nullptr) return false;
@@ -884,7 +884,15 @@ bool DeviceUi::Open() noexcept {
   }
   std::fprintf(stderr, "boompi-ui: SPI=%u Hz; touch=GT911/i2c-3\n", speed);
   try {
-    impl_->ui_thread = std::thread([state = impl_] { state->Run(); });
+    impl_->ui_thread = std::thread([state = impl_] {
+      try { state->Run(); }
+      catch (...) {
+        std::fprintf(stderr, "boompi-ui: display worker failed\n");
+        state->stop.store(true);
+        state->wake.notify_all();
+        state->ReleaseUi();
+      }
+    });
   } catch (...) {
     Close();
     return false;
@@ -898,25 +906,16 @@ bool DeviceUi::Open() noexcept {
   return started;
 }
 
-void DeviceUi::SetState(DeviceUiState state) noexcept {
-  if (impl_ != nullptr) impl_->UpdateView(&Impl::View::state, state);
+void DeviceUi::Show(const UiView& view) noexcept {
+  if (impl_ != nullptr) impl_->UpdateView(view);
 }
 
-void DeviceUi::SetText(std::string_view first, std::string_view second) noexcept {
-  if (impl_ == nullptr) return;
-  impl_->UpdateView(&Impl::View::text, std::array<std::string, 2>{std::string(first), std::string(second)});
-}
-
-bool DeviceUi::PollAction(DeviceUiAction* result) noexcept {
-  return impl_ != nullptr && Impl::Poll(impl_->action, result);
-}
-
-bool DeviceUi::PollVolumeChange(std::uint8_t* result) noexcept {
-  return impl_ != nullptr && Impl::Poll(impl_->volume_change, result);
-}
-
-void DeviceUi::SetVolume(std::uint8_t percent) noexcept {
-  if (impl_ != nullptr) impl_->UpdateView(&Impl::View::volume, std::min<std::uint8_t>(percent, 100U));
+bool DeviceUi::Poll(UiAction* result) noexcept {
+  if (impl_ == nullptr || result == nullptr) return false;
+  if (Impl::Poll(impl_->action, &result->kind)) return true;
+  if (!Impl::Poll(impl_->volume_change, &result->volume)) return false;
+  result->kind = UiActionKind::Volume;
+  return true;
 }
 
 void DeviceUi::Close() noexcept {

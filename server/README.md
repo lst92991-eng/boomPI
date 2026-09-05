@@ -66,4 +66,8 @@ go vet ./...
 go build -trimpath -o boompi-server ./cmd/boompi-server
 ```
 
-项目保持 `CGO_ENABLED=0`。默认测试不调用付费 Qwen；真实 provider 测试必须显式启用。线级格式以 [protocol-v1.md](../protocol/protocol-v1.md) 为准。
+项目保持 `CGO_ENABLED=0`。默认测试不调用付费 Qwen；真实 provider 测试必须显式启用。唯一线级格式是 [protocol-v2.md](../protocol/protocol-v2.md)，客户端和服务端须一起升级。
+
+v2 的一条连接只有一个递增 generation。上行 START 创建输入，END 提交；播放中打断用新 generation 的 START|SUPERSEDE，无需等待取消 ACK。普通 START 保留已完成历史，SUPERSEDE 或 STOP 的 retract=true 撤回最后一段未听完的回答；STOP 的 generation 是新的退休栅栏。
+
+WSS handler 直接读取并设置代际栅栏，然后投递到唯一的有界输入队列。固定一个 session worker 串行执行 provider 取消和新输入，取消最长 700 ms，PCM 排队最长 800 ms。队列、序号或期限违规会关闭连接，残缺输入不会被伪造为正常提交；连续打断不会创建无界 worker。下行按 20 ms 节奏发送，保留一帧以便真实末帧携带 END，纯文本回答不生成空音频。

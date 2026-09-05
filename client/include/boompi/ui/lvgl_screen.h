@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <string_view>
 
-#include "boompi/ui/device_ui.h"
+#include "boompi/ui/ui_view.h"
 
 namespace boompi::ui {
 

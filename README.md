@@ -107,4 +107,4 @@ cmake --build --preset rv1106-release --parallel
 - 不要把 WSS 端口暴露到公网；不要提交 `config.yaml`、`state/`、API Key、Wi-Fi 密码、模型或私有 SDK。
 - 默认不保存原始 PCM 和完整对话。
 
-协议以 [protocol-v1.md](protocol/protocol-v1.md) 为准，开发规则见 [AGENTS.md](AGENTS.md)，架构总览见 [system-overview.md](docs/architecture/system-overview.md)。
+当前仅支持 [protocol-v2.md](protocol/protocol-v2.md)，客户端和服务端必须配套升级。学生从 [客户端教学阅读顺序](client/README.md) 进入六状态主线，服务端只作为配置工具。开发规则见 [AGENTS.md](AGENTS.md)，架构总览见 [system-overview.md](docs/architecture/system-overview.md)。

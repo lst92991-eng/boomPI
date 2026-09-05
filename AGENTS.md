@@ -9,7 +9,7 @@
 - 双麦、单参考 Rockchip 3A；
 - Snowboy 唤醒、WebRTC VAD、500 ms pre-roll；
 - 持久 WSS、Qwen ASR/对话/流式 TTS；
-- 播放中打断旧回复并提交新问题，三秒追问；
+- 播放中打断旧回复并立即提交新 generation，三秒追问；
 - LVGL 320×240 桌面、静态小智表情、字幕、触摸和音量；
 - 以太网优先、Wi-Fi 配网和 SC3336 本地预览。
 
@@ -27,15 +27,15 @@ YOLO、在线音乐、长期记忆、账号系统、OTA 和多模态上传暂不
 ## 3. 目录职责
 
 ```text
-client/src/application/      对话状态机与 turn/epoch 编排
-client/src/audio/            有界采集和播放队列
+client/src/application/      唯一六状态对话与 generation 分配
+client/src/audio/            VoiceAudio、生产声学判定、pre-roll 与有界音频队列
 client/src/config/           板端环境配置
 client/src/network/          网络选择、发现和持久 WSS
 client/src/platform/rv1106/  ALSA、重采样、3A、Snowboy、VAD
 client/src/ui/               LVGL、触摸和摄像头预览
 server/internal/app/         服务组合与单设备会话
 server/internal/backend/     Qwen pipeline 和唯一 provider 接口
-server/internal/protocol/    v1 控制帧与 PCM
+server/internal/protocol/    唯一 v2 控制帧与固定20ms PCM
 protocol/                    跨语言线协议
 ```
 
@@ -63,16 +63,16 @@ playback volume     = 60%
 pre-roll            = 500 ms
 ```
 
-打断成功的定义是：确认近讲、停止旧 TTS、发送 cancel、隔离旧 epoch，并把保留的近讲 PCM 作为新 turn 提交。仅停止扬声器不算成功。
+打断成功的定义是：确认近讲、停止旧 TTS、以新 generation 的 START|SUPERSEDE 退休旧回复，并把保留的近讲 PCM 作为新 turn 提交。v2 不等待 cancel ACK；仅停止扬声器不算成功。
 
 ## 5. 线程所有权
 
 | 上下文 | 唯一职责 |
 | --- | --- |
-| application actor | 会话状态、turn/epoch、唤醒/VAD/打断 |
+| application actor | 六状态、generation、普通提问/替换回答、追问窗口 |
 | capture，`SCHED_FIFO 40` | ALSA capture、3A、Snowboy/VAD、发布 20 ms 帧 |
 | playback，`SCHED_FIFO 30` | TTS ring、重采样、ALSA write/drop/drain |
-| WSS | TLS/WebSocket I/O 和协议事件 |
+| VoiceLink | 网络建链、TLS/WebSocket、握手心跳重连和协议事件 |
 | UI worker | 所有 LVGL、触摸和音量配置写入 |
 | camera worker | SC3336 拉流和固定大小帧交接 |
 
@@ -117,7 +117,7 @@ cmake --preset rv1106-release
 cmake --build --preset rv1106-release --parallel
 ```
 
-工具链、sysroot 和外部库只通过 `BOOMPI_*` 环境变量或 Git 忽略的 `CMakeUserPresets.json` 注入。不要搜索相邻 SDK，不要提交个人绝对路径、模型、vendor 二进制、日志、core、生成配置或 build 目录。
+工具链、sysroot 和外部库优先通过 `BOOMPI_RV1106_SDK_ROOT` 及教师维护的 SDK 清单注入；已有 `BOOMPI_*` 或 Git 忽略的 `CMakeUserPresets.json` 仍可用于维护。不要搜索相邻 SDK，不要提交个人绝对路径、模型、vendor 二进制、日志、core、生成配置或 build 目录。
 
 Snowboy bridge 单独使用旧 C++ ABI；不得把 `_GLIBCXX_USE_CXX11_ABI=0` 扩散到整个客户端。
 
@@ -128,7 +128,8 @@ Snowboy bridge 单独使用旧 C++ ABI；不得把 `_GLIBCXX_USE_CXX11_ABI=0` �
 - 错误必须指出阶段且不输出 secret；返回值不能混合背压、断线和协议错误。
 - 头文件只暴露必要边界，不跨层 include 私有 vendor 头。
 - 不用压缩排版、合并语句或生成代码伪造低行数。
-- 客户端产品胶水以约 2500 ELOC 为方向，LVGL 资源、测试和第三方库单独统计。增加代码时先说明它解决的真实问题。
+- 客户端教学胶水以约 2500 ELOC 为方向；完整第一方客户端（含私有驱动和UI）以约4200 ELOC为评审目标，资源、测试和第三方单列。使用 scripts/measure_client.py 诚实统计，不通过移动目录或压行达标。
+- 声学参数仅由 board_voice_profile.h 的维护者profile拥有，学生配置不包含门限、极性或模型路径。VoiceApp不读取dBFS/reference或处理hello/heartbeat。
 
 ## 10. 完成标准
 

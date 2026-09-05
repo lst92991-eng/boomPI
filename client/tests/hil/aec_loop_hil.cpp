@@ -1,514 +1,165 @@
-/** @file 有界播放样本回归：绕过唤醒和网络，复用生产音频链测量自激候选。 */
+/**
+ * @file aec_loop_hil.cpp
+ * @brief 真板固定音源探针；直接使用生产 VoiceAudio，不复制 VAD/barge 状态机。
+ */
+#include "boompi/audio/voice_audio.h"
+
 #include <algorithm>
-#include <array>
 #include <chrono>
-#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
-#include <limits>
-#include <string>
+#include <string_view>
 #include <vector>
 
-#include "boompi/audio/audio_engine.h"
-#include "boompi/config/voice_client_config.h"
-
-#ifndef BOOMPI_AEC_LOOP_ACTIVE_PROBE
-#define BOOMPI_AEC_LOOP_ACTIVE_PROBE 0
-#endif
-
 namespace {
+using boompi::audio::AudioEvent;
+using boompi::audio::AudioEventKind;
+using boompi::audio::VoiceAudio;
+using boompi::audio::VoiceFrameContract;
+using boompi::audio::kTtsFrameSamples;
 
-using boompi::audio::QueueTtsResult;
-
-constexpr std::size_t kTtsFrameBytes = 480U * sizeof(std::int16_t);
-constexpr std::size_t kMaximumTtsFrames = 70U;  // 1.4 s，低于生产 1.5 s 环容量。
-constexpr unsigned kSettleFrames = 250U;
-constexpr unsigned kPostPlaybackFrames = 50U;
-constexpr unsigned kPreadaptRepeats = 4U;
+constexpr std::uint8_t kVolume = 60U;
+constexpr std::size_t kFrameBytes =
+    kTtsFrameSamples * sizeof(std::int16_t);
+constexpr std::size_t kMaximumFixtureFrames =
+    VoiceFrameContract::FramesForMs(1400U);
+constexpr std::size_t kInitialQueueFrames =
+    VoiceFrameContract::FramesForMs(180U);
+using Clock = std::chrono::steady_clock;
 constexpr unsigned kPlaybackRepeats = 6U;
-constexpr unsigned kPreadaptGuardFrames = 1U;  // 对齐 3A 固定的 20 ms 输出启动延迟。
-constexpr unsigned kMaximumCaptureFrames = 500U;
-constexpr unsigned kBargeCandidateFrames = 6U, kBargeConfirmFrames = 3U;
-constexpr unsigned kFollowUpConfirmFrames = 20U;
-constexpr unsigned kBargeReferenceLowFrames = 3U, kBargeReferenceWaitFrames = 15U;
-constexpr unsigned kBargeEchoClearFrames = 3U, kBargeRetryCooldownFrames = 15U;
-constexpr std::size_t kPrequeueFrames = 8U;
-constexpr int kCorrelationStrideSamples = 4;
-constexpr double kDbfsFloor = -120.0;
-using SignalSet = std::array<std::vector<std::int16_t>, 5U>;
-enum class ProbeState : std::uint8_t { kIdle, kWaitReferenceLow, kClear, kVerify };
 
-struct Metrics final {
-  std::uint64_t squared_sum{0U};
-  std::uint64_t sample_count{0U};
-  std::uint32_t playback_frames{0U};
-  std::uint32_t vad_frames{0U};
-  std::uint32_t near_frames{0U};
-  std::uint32_t discontinuities{0U};
-  unsigned vad_run{0U};
-  unsigned near_run{0U};
-  unsigned maximum_vad_run{0U};
-  unsigned maximum_near_run{0U};
-  unsigned post_vad_run{0U};
-  unsigned post_near_run{0U};
-  unsigned maximum_post_vad_run{0U};
-  unsigned maximum_post_near_run{0U};
-  std::uint32_t reference_frames{0U};
-  std::uint32_t post_vad_frames{0U};
-  std::uint32_t post_near_frames{0U};
-  int first_reference_frame{-1};
-  int first_near_ms{-1};
-  int peak{0};
-  bool post_vad_started{false};
-  SignalSet signals{};
-};
-
-struct Correlation final {
-  double value{0.0};
-  int lag_samples{0};
-};
-
-double RmsDbfs(const std::vector<std::int16_t>& signal) {
-  if (signal.empty()) return kDbfsFloor;
-  long double squared_sum = 0.0;
-  for (const std::int16_t sample : signal) {
-    const long double value = sample;
-    squared_sum += value * value;
-  }
-  if (squared_sum == 0.0) return kDbfsFloor;
-  const double rms = std::sqrt(static_cast<double>(
-      squared_sum / static_cast<long double>(signal.size())));
-  return 20.0 * std::log10(rms / 32768.0);
-}
-
-double Mean(const std::vector<std::int16_t>& signal) {
-  if (signal.empty()) return 0.0;
-  long double sum = 0.0;
-  for (const std::int16_t sample : signal) sum += sample;
-  return static_cast<double>(sum / static_cast<long double>(signal.size()));
-}
-
-double AcRmsDbfs(const std::vector<std::int16_t>& signal) {
-  if (signal.empty()) return kDbfsFloor;
-  const long double mean = Mean(signal);
-  long double squared_sum = 0.0;
-  for (const std::int16_t sample : signal) {
-    const long double value = static_cast<long double>(sample) - mean;
-    squared_sum += value * value;
-  }
-  if (squared_sum == 0.0) return kDbfsFloor;
-  const double rms = std::sqrt(static_cast<double>(
-      squared_sum / static_cast<long double>(signal.size())));
-  return 20.0 * std::log10(rms / 32768.0);
-}
-
-Correlation BestCorrelation(const std::vector<std::int16_t>& reference,
-                            const std::vector<std::int16_t>& response,
-                            const int maximum_lag_samples) {
-  Correlation best{};
-  if (reference.size() != response.size() || reference.empty()) return best;
-  const long double reference_mean = Mean(reference);
-  const long double response_mean = Mean(response);
-  for (int lag = 0; lag <= maximum_lag_samples;
-       lag += kCorrelationStrideSamples) {
-    long double cross = 0.0, reference_energy = 0.0, response_energy = 0.0;
-    const std::size_t offset = static_cast<std::size_t>(lag);
-    for (std::size_t i = 0U; i + offset < reference.size();
-         i += static_cast<std::size_t>(kCorrelationStrideSamples)) {
-      const long double x =
-          static_cast<long double>(reference[i]) - reference_mean;
-      const long double y =
-          static_cast<long double>(response[i + offset]) - response_mean;
-      cross += x * y;
-      reference_energy += x * x;
-      response_energy += y * y;
-    }
-    if (reference_energy == 0.0 || response_energy == 0.0) continue;
-    const double correlation = static_cast<double>(
-        cross / std::sqrt(reference_energy * response_energy));
-    if (std::abs(correlation) > std::abs(best.value)) {
-      best.value = correlation;
-      best.lag_samples = lag;
-    }
-  }
-  return best;
-}
-
-void AppendSignals(const boompi::audio::CaptureFrame& frame,
-                   SignalSet* const signals) {
-#ifdef BOOMPI_AEC_LOOP_DIAGNOSTICS
-  for (std::size_t channel = 0U; channel < frame.aec_input.size(); ++channel) {
-    (*signals)[channel].insert((*signals)[channel].end(),
-                               frame.aec_input[channel].begin(),
-                               frame.aec_input[channel].end());
-  }
-  (*signals)[4U].insert((*signals)[4U].end(), frame.pcm.begin(),
-                        frame.pcm.end());
-#else
-  static_cast<void>(frame);
-  static_cast<void>(signals);
-#endif
-}
-
-bool ReadFixture(const char* const path, std::vector<std::uint8_t>* output) {
-  if (path == nullptr || output == nullptr) return false;
+bool ReadFixture(const char* path, std::vector<std::uint8_t>* fixture) {
   std::ifstream input(path, std::ios::binary | std::ios::ate);
   if (!input) return false;
-  const std::streamoff size = input.tellg();
-  const std::streamoff maximum =
-      static_cast<std::streamoff>(kMaximumTtsFrames * kTtsFrameBytes);
-  if (size <= 0 || size > maximum || size % kTtsFrameBytes != 0) return false;
-  output->resize(static_cast<std::size_t>(size));
-  input.seekg(0, std::ios::beg);
-  return input.read(reinterpret_cast<char*>(output->data()), size).good();
+  const std::streamoff length = input.tellg();
+  if (length <= 0 ||
+      static_cast<std::uint64_t>(length) >
+          kMaximumFixtureFrames * kFrameBytes ||
+      static_cast<std::uint64_t>(length) % kFrameBytes != 0U)
+    return false;
+  fixture->resize(static_cast<std::size_t>(length));
+  input.seekg(0);
+  return input.read(reinterpret_cast<char*>(fixture->data()), length).good();
 }
 
-bool HasReference(const boompi::audio::CaptureFrame& frame) {
-#ifdef BOOMPI_AEC_LOOP_DIAGNOSTICS
-  for (std::size_t channel = 2U; channel < 4U; ++channel) {
-    for (const std::int16_t sample : frame.aec_input[channel]) {
-      if (sample > 64 || sample < -64) return true;
-    }
-  }
-#endif
-  return false;
+const std::uint8_t* Frame(const std::vector<std::uint8_t>& fixture,
+                          std::size_t index) {
+  return fixture.data() +
+         index % (fixture.size() / kFrameBytes) * kFrameBytes;
 }
 
-void ObservePlayback(const boompi::audio::CaptureFrame& frame,
-                     const std::uint32_t playback_frame,
-                     Metrics* const metrics) {
-  if (frame.discontinuity) ++metrics->discontinuities;
-  ++metrics->playback_frames;
-  if (HasReference(frame)) {
-    ++metrics->reference_frames;
-    if (metrics->first_reference_frame < 0) {
-      metrics->first_reference_frame = static_cast<int>(playback_frame);
-    }
+bool Poll(VoiceAudio* voice, AudioEvent* event, bool* have_event) {
+  *have_event = voice->Poll(event, std::chrono::milliseconds(20));
+  if ((*have_event && event->kind == AudioEventKind::Fault) ||
+      !voice->healthy()) {
+    std::cerr << "boompi-aec-loop-hil: " << voice->last_error() << '\n';
+    return false;
   }
-  metrics->vad_run = frame.vad_now ? metrics->vad_run + 1U : 0U;
-  metrics->near_run = frame.near_voice ? metrics->near_run + 1U : 0U;
-  metrics->maximum_vad_run = std::max(metrics->maximum_vad_run,
-                                      metrics->vad_run);
-  metrics->maximum_near_run = std::max(metrics->maximum_near_run,
-                                       metrics->near_run);
-  if (frame.vad_now) ++metrics->vad_frames;
-  if (frame.near_voice) {
-    ++metrics->near_frames;
-    if (metrics->first_near_ms < 0 && metrics->first_reference_frame >= 0) {
-      metrics->first_near_ms =
-          (static_cast<int>(playback_frame) - metrics->first_reference_frame) *
-          20;
-    }
-  }
-  for (const std::int16_t sample : frame.pcm) {
-    const int value = sample;
-    metrics->peak = std::max(metrics->peak, std::abs(value));
-    metrics->squared_sum += static_cast<std::uint64_t>(
-        static_cast<std::int64_t>(value) * value);
-    ++metrics->sample_count;
-  }
-  AppendSignals(frame, &metrics->signals);
+  return true;
 }
-
-void ObservePostPlayback(const boompi::audio::CaptureFrame& frame,
-                         Metrics* const metrics) {
-  if (frame.discontinuity) ++metrics->discontinuities;
-  metrics->post_vad_run = frame.vad_now ? metrics->post_vad_run + 1U : 0U;
-  metrics->post_near_run =
-      frame.near_voice ? metrics->post_near_run + 1U : 0U;
-  metrics->maximum_post_vad_run =
-      std::max(metrics->maximum_post_vad_run, metrics->post_vad_run);
-  metrics->maximum_post_near_run =
-      std::max(metrics->maximum_post_near_run, metrics->post_near_run);
-  if (frame.vad_now) ++metrics->post_vad_frames;
-  if (frame.near_voice) ++metrics->post_near_frames;
-  metrics->post_vad_started = metrics->post_vad_started || frame.vad_started;
-}
-
 }  // namespace
 
 int main(int argc, char* argv[]) {
+  if (argc == 2 && std::string_view(argv[1]) == "--help") {
+    std::cout << "usage: boompi-aec-loop-hil <24k-mono-s16le.raw>\n";
+    return EXIT_SUCCESS;
+  }
   if (argc != 2) {
     std::cerr << "usage: boompi-aec-loop-hil <24k-mono-s16le.raw>\n";
     return EXIT_FAILURE;
   }
-
   std::vector<std::uint8_t> fixture;
   if (!ReadFixture(argv[1], &fixture)) {
-    std::cerr << "boompi-aec-loop-hil: fixture must be 20 ms aligned, nonempty, and <= 1.4 s\n";
+    std::cerr << "boompi-aec-loop-hil: fixture must be 20 ms aligned, "
+                 "nonempty, and <= 1.4 s\n";
     return EXIT_FAILURE;
   }
 
-  boompi::config::VoiceClientConfig client_config;
-  std::string error;
-  if (!boompi::config::LoadVoiceClientConfigFromEnvironment(&client_config,
-                                                             &error)) {
-    std::cerr << "boompi-aec-loop-hil: configuration failed: " << error << '\n';
+  VoiceAudio voice;
+  if (!voice.Open(kVolume)) {
+    std::cerr << "boompi-aec-loop-hil: " << voice.last_error() << '\n';
     return EXIT_FAILURE;
   }
-
-  boompi::audio::AudioEngineConfig audio_config{};
-  audio_config.capture_pcm = client_config.capture_pcm;
-  audio_config.playback_pcm = client_config.playback_pcm;
-  audio_config.snowboy_resource = client_config.snowboy_resource_path;
-  audio_config.snowboy_model = client_config.snowboy_model_path;
-  audio_config.snowboy_sensitivity = client_config.snowboy_sensitivity;
-  audio_config.vad_min_dbfs = client_config.vad_min_dbfs;
-  audio_config.playback_gain =
-      static_cast<float>(client_config.volume_percent) *
-      client_config.speaker_gain_percent / 10000.0F;
-  audio_config.left_polarity = client_config.capture_left_polarity;
-  audio_config.right_polarity = client_config.capture_right_polarity;
-
-  boompi::audio::AudioEngine audio;
-  if (!audio.Open(audio_config)) {
-    std::cerr << "boompi-aec-loop-hil: audio open failed: "
-              << audio.last_error() << '\n';
-    return EXIT_FAILURE;
+  AudioEvent event{};
+  bool have_event = false;
+  std::uint64_t settle_wakes = 0U;
+  const auto settled_at = Clock::now() + std::chrono::seconds(5);
+  while (Clock::now() < settled_at) {
+    if (!Poll(&voice, &event, &have_event)) return EXIT_FAILURE;
+    if (have_event && event.kind == AudioEventKind::Wake) ++settle_wakes;
   }
 
-  boompi::audio::CaptureFrame frame{};
-  Metrics metrics{};
-  SignalSet quiet_signals{};
-  for (unsigned index = 0U; index < kSettleFrames; ++index) {
-    if (audio.Capture(&frame, std::chrono::milliseconds(200)) !=
-        boompi::audio::CaptureResult::kFrame) {
-      std::cerr << "boompi-aec-loop-hil: settle capture failed: "
-                << audio.last_error() << '\n';
-      return EXIT_FAILURE;
-    }
-    if (frame.discontinuity) {
-      std::cerr << "boompi-aec-loop-hil: capture discontinuity during settle\n";
-      return EXIT_FAILURE;
-    }
-    AppendSignals(frame, &quiet_signals);
-  }
-  if (!audio.BeginPlayback()) {
-    std::cerr << "boompi-aec-loop-hil: playback start failed: "
-              << audio.last_error() << '\n';
-    return EXIT_FAILURE;
-  }
-  const std::size_t fixture_frames = fixture.size() / kTtsFrameBytes;
-  const std::size_t playback_frames = fixture_frames * kPlaybackRepeats;
-  std::size_t next_fixture_frame = 0U;
-  const std::size_t initial_frames =
-      std::min(playback_frames, kPrequeueFrames);
-  for (; next_fixture_frame < initial_frames; ++next_fixture_frame) {
-    const QueueTtsResult queued = audio.QueueTts24k(
-        fixture.data() +
-            (next_fixture_frame % fixture_frames) * kTtsFrameBytes,
-        kTtsFrameBytes, next_fixture_frame);
-    if (queued != QueueTtsResult::kQueued) {
-      std::cerr << "boompi-aec-loop-hil: fixture queue failed; result="
-                << static_cast<unsigned>(queued) << '\n';
+  const std::size_t fixture_frames = fixture.size() / kFrameBytes;
+  const std::size_t total_frames = fixture_frames * kPlaybackRepeats;
+  std::size_t next = 0U;
+  const std::size_t initial = std::min(total_frames, kInitialQueueFrames);
+  for (; next < initial; ++next) {
+    if (!voice.Play(1U, Frame(fixture, next), kFrameBytes,
+                    static_cast<std::uint32_t>(next), next == 0U,
+                    next + 1U == total_frames)) {
+      std::cerr << "boompi-aec-loop-hil: " << voice.last_error() << '\n';
       return EXIT_FAILURE;
     }
   }
-  bool playback_ending = next_fixture_frame == playback_frames;
-  if (playback_ending && !audio.EndPlayback()) {
-    std::cerr << "boompi-aec-loop-hil: playback end failed: "
-              << audio.last_error() << '\n';
-    return EXIT_FAILURE;
-  }
 
-  bool saw_playback = false, saw_reference = false, probe_confirmed = false;
-  bool completed_score_window = false, completed_post_window = false;
-  unsigned post_frames = 0U, probe_frames = 0U, probe_near_frames = 0U, probe_cooldown_frames = 0U;
-  unsigned probe_attempts = 0U;
-  ProbeState probe_state = ProbeState::kIdle;
-  const auto reset_probe = [&](const bool cooldown) {
-    probe_frames = probe_near_frames = 0U; probe_state = ProbeState::kIdle;
-    probe_cooldown_frames = cooldown ? kBargeRetryCooldownFrames : 0U;
-    audio.SetPlaybackScale(1.0F);
-  };
-  std::uint32_t reference_timeline_frames = 0U, score_frame = 0U;
-  for (unsigned index = 0U; index < kMaximumCaptureFrames; ++index) {
-    if (next_fixture_frame < playback_frames) {
-      const QueueTtsResult queued = audio.QueueTts24k(
-          fixture.data() +
-              (next_fixture_frame % fixture_frames) * kTtsFrameBytes,
-          kTtsFrameBytes, next_fixture_frame);
-      if (queued != QueueTtsResult::kQueued) {
-        std::cerr
-            << "boompi-aec-loop-hil: streaming fixture queue failed; result="
-            << static_cast<unsigned>(queued) << '\n';
+  bool would_barge = false, playback_done = false;
+  auto next_send = Clock::now() + std::chrono::milliseconds(20);
+  const auto playback_limit = Clock::now() + std::chrono::seconds(5) +
+      std::chrono::milliseconds(total_frames * VoiceFrameContract::frame_ms);
+  // Poll是语义事件，不等于一帧。音源发送和总超时都使用真实墙钟。
+  while (Clock::now() < playback_limit && !playback_done) {
+    if (!Poll(&voice, &event, &have_event)) return EXIT_FAILURE;
+    if (have_event && event.kind == AudioEventKind::Barge) {
+      would_barge = true;
+      break;
+    }
+    if (have_event && event.kind == AudioEventKind::PlaybackDone) {
+      playback_done = event.generation == 1U;
+      continue;
+    }
+    if (next < total_frames && Clock::now() >= next_send) {
+      if (!voice.Play(1U, Frame(fixture, next), kFrameBytes,
+                      static_cast<std::uint32_t>(next), false,
+                      next + 1U == total_frames)) {
+        std::cerr << "boompi-aec-loop-hil: " << voice.last_error() << '\n';
         return EXIT_FAILURE;
       }
-      ++next_fixture_frame;
-      if (next_fixture_frame == playback_frames) {
-        playback_ending = true;
-        if (!audio.EndPlayback()) {
-          std::cerr << "boompi-aec-loop-hil: playback end failed: "
-                    << audio.last_error() << '\n';
-          return EXIT_FAILURE;
-        }
-      }
+      ++next;
+      next_send += std::chrono::milliseconds(20);
     }
-    const bool playing_before_capture = audio.playback_active();
-    if (audio.Capture(&frame, std::chrono::milliseconds(200)) !=
-        boompi::audio::CaptureResult::kFrame) {
-      std::cerr << "boompi-aec-loop-hil: capture failed: "
-                << audio.last_error() << '\n';
+  }
+
+  bool would_follow_up = false;
+  if (!would_barge && playback_done) {
+    if (!voice.Listen(true)) {
+      std::cerr << "boompi-aec-loop-hil: " << voice.last_error() << '\n';
       return EXIT_FAILURE;
     }
-    if (frame.discontinuity) {
-      std::cerr << "boompi-aec-loop-hil: capture discontinuity invalidated preadaptation\n";
-      return EXIT_FAILURE;
-    }
-    const bool playing = playing_before_capture || audio.playback_active();
-    saw_playback = saw_playback || playing;
-    if constexpr (BOOMPI_AEC_LOOP_ACTIVE_PROBE != 0) {
-      if (!audio.playback_done()) {
-        if (probe_state == ProbeState::kIdle) {
-          if (probe_cooldown_frames != 0U) --probe_cooldown_frames;
-          else if (!frame.near_voice) probe_near_frames = 0U;
-          else if (++probe_near_frames >= kBargeCandidateFrames) {
-            ++probe_attempts; probe_frames = probe_near_frames = 0U;
-            probe_state = ProbeState::kWaitReferenceLow; audio.SetPlaybackScale(0.0F);
-          }
-        } else if (probe_state == ProbeState::kWaitReferenceLow) {
-          if (++probe_frames > kBargeReferenceWaitFrames) {
-            reset_probe(true);
-          } else {
-            probe_near_frames = frame.reference_active ? 0U : probe_near_frames + 1U;
-            if (probe_near_frames >= kBargeReferenceLowFrames) {
-              probe_frames = probe_near_frames = 0U; probe_state = ProbeState::kClear;
-            }
-          }
-        } else if (probe_state == ProbeState::kClear) {
-          if (frame.reference_active) {
-            reset_probe(true);
-          } else if (++probe_frames >= kBargeEchoClearFrames) {
-            probe_frames = probe_near_frames = 0U; probe_state = ProbeState::kVerify;
-            if (!audio.ResetListener()) {
-              std::cerr << "boompi-aec-loop-hil: probe VAD reset failed\n";
-              return EXIT_FAILURE;
-            }
-          }
-        } else if (frame.reference_active || !frame.near_voice) {
-          reset_probe(true);
-        } else if (++probe_near_frames >= kBargeConfirmFrames) {
-          probe_confirmed = true; reset_probe(false);
-        }
-      } else if (probe_state != ProbeState::kIdle || probe_cooldown_frames != 0U) {
-        reset_probe(false);
-      }
-    }
-    if (playing) {
-      if (!saw_reference && HasReference(frame)) saw_reference = true;
-      if (saw_reference) {
-        const std::uint32_t score_begin = static_cast<std::uint32_t>(
-            fixture_frames * kPreadaptRepeats + kPreadaptGuardFrames);
-        if (reference_timeline_frames >= score_begin &&
-            score_frame < fixture_frames) {
-          ObservePlayback(frame, score_frame, &metrics);
-          ++score_frame;
-          completed_score_window = score_frame == fixture_frames;
-        }
-        ++reference_timeline_frames;
-      }
-      post_frames = 0U;
-    } else if (saw_playback) {
-      ObservePostPlayback(frame, &metrics);
-      if (++post_frames >= kPostPlaybackFrames) {
-        completed_post_window = true;
+    const auto post_limit = Clock::now() + std::chrono::seconds(1);
+    while (Clock::now() < post_limit) {
+      if (!Poll(&voice, &event, &have_event)) return EXIT_FAILURE;
+      if (have_event && event.kind == AudioEventKind::SpeechStart) {
+        would_follow_up = true;
         break;
       }
     }
+    voice.CancelInput();
   }
+  voice.Close();
 
-  const bool playback_failed = audio.playback_failed();
-  const std::string audio_error = audio.last_error();
-  audio.Close();
-  if (!saw_playback || !saw_reference || !playback_ending ||
-      !completed_score_window || !completed_post_window ||
-      playback_failed || metrics.playback_frames == 0U ||
-      metrics.reference_frames == 0U) {
-    std::cerr << "boompi-aec-loop-hil: playback failed or was not observed: "
-              << audio_error << '\n';
-    return EXIT_FAILURE;
-  }
-
-  double rms_dbfs = kDbfsFloor;
-  if (metrics.squared_sum != 0U && metrics.sample_count != 0U) {
-    const double rms = std::sqrt(static_cast<double>(metrics.squared_sum) /
-                                 static_cast<double>(metrics.sample_count));
-    rms_dbfs = 20.0 * std::log10(rms / 32768.0);
-  }
-  const bool would_barge = BOOMPI_AEC_LOOP_ACTIVE_PROBE != 0
-      ? probe_confirmed : metrics.maximum_near_run >= kBargeConfirmFrames;
-  const bool would_follow_up =
-      metrics.maximum_post_near_run >= kFollowUpConfirmFrames;
-  const Correlation mic_left =
-      BestCorrelation(metrics.signals[2U], metrics.signals[0U], 800);
-  const Correlation mic_right =
-      BestCorrelation(metrics.signals[2U], metrics.signals[1U], 800);
-  const Correlation processed =
-      BestCorrelation(metrics.signals[2U], metrics.signals[4U], 1200);
-  const Correlation reference_right =
-      BestCorrelation(metrics.signals[2U], metrics.signals[3U], 32);
-  std::cout << "AEC_LOOP_RESULT {\"reference_channels\":"
-            << 1
-            << ",\"active_probe\":" << BOOMPI_AEC_LOOP_ACTIVE_PROBE
-            << ",\"aec_metrics_valid\":"
-            << (BOOMPI_AEC_LOOP_ACTIVE_PROBE == 0 ? "true" : "false")
-            << ",\"stdt_enabled\":" << BOOMPI_ROCKCHIP_ENABLE_STDT
-            << ",\"delay_samples\":" << BOOMPI_ROCKCHIP_DELAY_SAMPLES
+  std::cout << "AEC_LOOP_RESULT {\"profile_fields\":6,\"volume_percent\":"
+            << static_cast<unsigned>(kVolume)
             << ",\"fixture_frames\":" << fixture_frames
-            << ",\"preadapt_repeats\":" << kPreadaptRepeats
-            << ",\"playback_frames\":" << metrics.playback_frames
-            << ",\"reference_frames\":" << metrics.reference_frames
-            << ",\"vad_frames\":" << metrics.vad_frames
-            << ",\"near_frames\":" << metrics.near_frames
-            << ",\"probe_attempts\":" << probe_attempts
-            << ",\"probe_confirmed\":" << (probe_confirmed ? "true" : "false")
-            << ",\"max_vad_run\":" << metrics.maximum_vad_run
-            << ",\"max_near_run\":" << metrics.maximum_near_run
-            << ",\"first_near_ms\":" << metrics.first_near_ms
-            << ",\"post_vad_frames\":" << metrics.post_vad_frames
-            << ",\"post_near_frames\":" << metrics.post_near_frames
-            << ",\"max_post_vad_run\":" << metrics.maximum_post_vad_run
-            << ",\"max_post_near_run\":" << metrics.maximum_post_near_run
-            << ",\"processed_peak\":" << metrics.peak
-            << ",\"processed_rms_dbfs\":" << rms_dbfs
-            << ",\"quiet_mic_left_mean\":" << Mean(quiet_signals[0U])
-            << ",\"quiet_mic_right_mean\":" << Mean(quiet_signals[1U])
-            << ",\"quiet_mic_left_ac_rms_dbfs\":"
-            << AcRmsDbfs(quiet_signals[0U])
-            << ",\"quiet_mic_right_ac_rms_dbfs\":"
-            << AcRmsDbfs(quiet_signals[1U])
-            << ",\"quiet_processed_mean\":" << Mean(quiet_signals[4U])
-            << ",\"quiet_processed_ac_rms_dbfs\":"
-            << AcRmsDbfs(quiet_signals[4U])
-            << ",\"mic_left_mean\":" << Mean(metrics.signals[0U])
-            << ",\"mic_right_mean\":" << Mean(metrics.signals[1U])
-            << ",\"mic_left_rms_dbfs\":" << RmsDbfs(metrics.signals[0U])
-            << ",\"mic_right_rms_dbfs\":" << RmsDbfs(metrics.signals[1U])
-            << ",\"mic_left_ac_rms_dbfs\":"
-            << AcRmsDbfs(metrics.signals[0U])
-            << ",\"mic_right_ac_rms_dbfs\":"
-            << AcRmsDbfs(metrics.signals[1U])
-            << ",\"ref_left_rms_dbfs\":" << RmsDbfs(metrics.signals[2U])
-            << ",\"ref_right_rms_dbfs\":" << RmsDbfs(metrics.signals[3U])
-            << ",\"processed_mean\":" << Mean(metrics.signals[4U])
-            << ",\"processed_ac_rms_dbfs\":"
-            << AcRmsDbfs(metrics.signals[4U])
-            << ",\"ref_lr_corr\":" << reference_right.value
-            << ",\"mic_left_ref_corr\":" << mic_left.value
-            << ",\"mic_left_ref_lag_ms\":"
-            << mic_left.lag_samples / 16.0
-            << ",\"mic_right_ref_corr\":" << mic_right.value
-            << ",\"mic_right_ref_lag_ms\":"
-            << mic_right.lag_samples / 16.0
-            << ",\"processed_ref_corr\":" << processed.value
-            << ",\"processed_ref_lag_ms\":"
-            << processed.lag_samples / 16.0
-            << ",\"capture_discontinuities\":" << metrics.discontinuities
+            << ",\"playback_frames\":" << total_frames
+            << ",\"settle_wakes\":" << settle_wakes
+            << ",\"playback_done\":" << (playback_done ? "true" : "false")
             << ",\"would_barge\":" << (would_barge ? "true" : "false")
             << ",\"would_follow_up\":"
-            << (would_follow_up ? "true" : "false")
-            << "}\n";
-  return EXIT_SUCCESS;
+            << (would_follow_up ? "true" : "false") << "}\n";
+  return playback_done && !would_barge && !would_follow_up
+             ? EXIT_SUCCESS
+             : EXIT_FAILURE;
 }

@@ -1,7 +1,7 @@
 include_guard(GLOBAL)
 
 # 板端只依赖已经在 BSP 上验证过的 3A 与 Snowboy 二进制。
-# 模型和运行参数由 /userdata/boompi/config/client.env 指定，不属于构建输入。
+# 模型和声学参数属于固定板级 profile，不属于学生配置或构建路径输入。
 set(BOOMPI_ROCKCHIP_3A_INCLUDE_DIR "" CACHE PATH
   "Directory containing rkaudio_preprocess.h")
 set(BOOMPI_ROCKCHIP_3A_AEC_LIBRARY "" CACHE FILEPATH

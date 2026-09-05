@@ -22,12 +22,6 @@ prepare() {
     device_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null) || fail 'cannot create device id'
     cat > "$CONF" <<EOF
 BOOMPI_DEVICE_ID=$device_id
-BOOMPI_VOLUME_PERCENT=60
-BOOMPI_SNOWBOY_SENSITIVITY=0.7
-BOOMPI_VAD_MIN_DBFS=-30
-BOOMPI_BARGE_MIN_DBFS=-25
-BOOMPI_CAPTURE_LEFT_POLARITY=1
-BOOMPI_CAPTURE_RIGHT_POLARITY=1
 EOF
     echo "boompi-clientctl: created $CONF"
   fi
@@ -38,7 +32,13 @@ load_config() {
   while IFS= read -r line || [ -n "$line" ]; do
     case $line in ''|'#'*) continue ;; *=*) ;; *) fail 'invalid config line' ;; esac
     name=${line%%=*}; value=${line#*=}
-    case $name in BOOMPI_*) export "$name=$value" ;; *) fail "invalid config key: $name" ;; esac
+    case $name in
+      BOOMPI_DEVICE_ID|BOOMPI_SERVER_IP|BOOMPI_SERVER_PORT|BOOMPI_SERVER_SPKI_SHA256)
+        export "$name=$value" ;;
+      BOOMPI_VOLUME_PERCENT|BOOMPI_SNOWBOY_SENSITIVITY|BOOMPI_VAD_MIN_DBFS|BOOMPI_BARGE_MIN_DBFS|BOOMPI_CAPTURE_LEFT_POLARITY|BOOMPI_CAPTURE_RIGHT_POLARITY)
+        echo "boompi-clientctl: legacy $name replaced by v2 board profile/UI setting" ;;
+      *) fail "invalid config key: $name" ;;
+    esac
   done < "$CONF"
 }
 running() {

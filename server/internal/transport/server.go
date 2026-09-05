@@ -15,15 +15,14 @@ import (
 )
 
 const (
-	defaultAddress       = ":17806"
-	defaultPath          = "/ws"
-	defaultPingInterval  = 10 * time.Second
-	defaultPongTimeout   = 30 * time.Second
-	maxPingInterval      = 10 * time.Second
-	maxPongTimeout       = 30 * time.Second
-	writeTimeout         = 5 * time.Second
-	sendQueueCapacity    = 16
-	receiveQueueCapacity = 32
+	defaultAddress      = ":17806"
+	defaultPath         = "/ws"
+	defaultPingInterval = 10 * time.Second
+	defaultPongTimeout  = 30 * time.Second
+	maxPingInterval     = 10 * time.Second
+	maxPongTimeout      = 30 * time.Second
+	writeTimeout        = 5 * time.Second
+	sendQueueCapacity   = 16
 )
 
 // Config contains the bounded network and lifetime settings owned by Server.

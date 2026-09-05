@@ -5,9 +5,12 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "boompi/audio/board_voice_profile.h"
+
 namespace boompi::platform::rv1106 {
 
-constexpr std::size_t kRockchipVoiceFrameSamples16k = 320U;
+inline constexpr std::size_t kRockchipVoiceFrameSamples16k =
+    audio::kVoiceFrameSamples;
 /// Rockchip 3A 对外统一使用 16 kHz/S16/20 ms，便于和 VAD、Snowboy 共用同一帧。
 using RockchipVoiceFrame16k =
     std::array<std::int16_t, kRockchipVoiceFrameSamples16k>;
@@ -33,7 +36,8 @@ class RockchipVoiceDsp final {
   /// 初始化失败后实例保持关闭；重复打开返回 false 且不改变已有句柄。Close 幂等释放
   /// 句柄、参数树和 FIFO 状态，可在初始化失败后调用。
   /// @return 完整初始化成功返回 true，已打开或任一步失败返回 false。
-  bool Open() noexcept;
+  bool Open(int delay_samples = audio::kBoardVoiceProfile.aec_delay_samples)
+      noexcept;
   void Close() noexcept;  ///< 幂等关闭，允许在 Open 失败后调用。
 
   /// @brief 将双麦与同步硬件参考送入组合 AEC/STDT/BF/ANR 路径。

@@ -213,6 +213,7 @@ func (s *voiceLoopHILSession) emit(ctx context.Context, event backend.Conversati
 
 func (s *voiceLoopHILSession) Cancel(ctx context.Context) error {
 	s.mu.Lock()
+	s.pendingBytes = 0
 	stop, done := s.responseStop, s.responseDone
 	if stop != nil {
 		stop()
@@ -230,6 +231,8 @@ func (s *voiceLoopHILSession) Cancel(ctx context.Context) error {
 }
 
 func (s *voiceLoopHILSession) Events() <-chan backend.ConversationEvent { return s.events }
+
+func (s *voiceLoopHILSession) DiscardLastResponse(context.Context) error { return nil }
 
 func (s *voiceLoopHILSession) Close() error {
 	s.closeOnce.Do(func() {

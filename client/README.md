@@ -1,75 +1,116 @@
-# boomPI 板端客户端
+# boomPI 客户端：教学版 v2
 
-`boompi-client` 是 RV1106 上唯一的产品进程。它直接调用已经验证的 ALSA、Rockchip 3A、Snowboy、WebRTC VAD、WebSocket++ 和 LVGL，不提供未使用的通用 backend 或插件框架。
+先读 `src/application/voice_client.cpp`。服务端是配套 EXE，学生只配置 Key；无需学习 Go 或云端 SDK。
 
-## 数据流
-
-```text
-ALSA 48 kHz [mic0,mic1,refL,refR]
-  → 16 kHz [mic0,mic1,refL]
-  → Rockchip AEC/BF/ANR
-  → Snowboy / VAD / 对话状态机
-  → WSS 16 kHz mono
-
-WSS 24 kHz mono
-  → 1.5 s 有界 TTS ring
-  → 48 kHz stereo ALSA playback
-```
-
-采集和播放分别由 `SCHED_FIFO 40`、`SCHED_FIFO 30` 的线程独占；设置失败会记录 warning 并继续。application actor 只处理会话状态，UI worker 只处理 LVGL/触摸，摄像头 worker 只处理 SC3336。
-
-小智页使用五个静态表情表示空闲、聆听、思考、说话和错误状态。它保留字幕、触摸唤醒/打断和音量交互，但不再包含动态语音球。
-
-## 配置
-
-安装后的配置为 `/userdata/boompi/config/client.env`，每行使用 `BOOMPI_NAME=value`，不要添加 `export`、引号或行尾注释。控制脚本会自动生成设备 UUID。
+## 一条主线
 
 ```text
-BOOMPI_DEVICE_ID=<自动生成>
-BOOMPI_VOLUME_PERCENT=60
-BOOMPI_SNOWBOY_SENSITIVITY=0.7
-BOOMPI_VAD_MIN_DBFS=-30
-BOOMPI_BARGE_MIN_DBFS=-25
-BOOMPI_CAPTURE_LEFT_POLARITY=1
-BOOMPI_CAPTURE_RIGHT_POLARITY=1
+Offline → Idle → Listening → Uploading → Waiting → Speaking
+                   ↑                            │
+                   └──── 物理播放完成后追问 ─────┘
+Speaking ── 确认近讲 ──→ Uploading（新 generation，撤回旧回答）
 ```
 
-VAD 门限用于常规说话，barge-in 门限用于播放期 AEC 后的近讲确认，两者不能合并。服务端地址和 SPKI 可留空，由 UDP 发现并在首次连接时保存。固定教学口令由客户端内部提供，不需要学生配置。
+- `VoiceApp::Run` 轮询网络、音频和 UI；`Enter` 是唯一状态赋值入口。
+- `OnAudio` 只理解 Wake、SpeechStart、Pcm、Barge、PlaybackDone、Fault。
+- `OnNetwork` 只理解 Online、Offline、Text、Audio、Done、Error。
+- `VoiceAudio` 拥有声学判定、500 ms pre-roll、32 帧打断历史和播放生命周期。
+- `VoiceLink` 拥有发现、TLS、握手、心跳、重连、协议与有界队列。
+- `DeviceUi::Show(UiView)` 发布一个固定大小的显示快照，`Poll` 返回触摸和音量动作。
 
-当前 BSP 固定使用 `hw:0,0`、`/userdata/boompi/models/common.res`、
-`/userdata/boompi/models/snowboy.umdl`、100% 板级增益和始终开启的 barge-in。
-旧配置文件中对应的环境变量会被忽略。需要固定服务端时，同时配置
-`BOOMPI_SERVER_IP`、`BOOMPI_SERVER_SPKI_SHA256`，端口可用
-`BOOMPI_SERVER_PORT` 覆盖默认值 `17806`。
+业务主线不读取 dBFS、硬件参考、SPKI 或握手状态。底层实现仍开放给进阶课程阅读。
 
-## 交叉构建
+## 阅读顺序
 
-先设置 `CMakePresets.json` 列出的外部依赖路径，再从仓库根目录执行：
+| 课程 | 源码入口 | 学生需要解释的事情 |
+| --- | --- | --- |
+| 1 | application/voice_client.cpp：Run、Enter、OnAudio | 一次发言如何进入上传，最后一帧如何结束 |
+| 2 | network/voice_codec.cpp 与 protocol-v2.md | START/END、generation、sequence 的用途 |
+| 3 | audio/voice_audio.cpp | 为什么保留句首；播放中近讲如何成为 Barge |
+| 4 | audio/audio_engine.cpp | 两条实时线程和固定容量队列的所有权 |
+| 5 | platform/rv1106/audio_backend.cpp | 48→16 kHz、3A、Snowboy、VAD 的先后关系 |
+| 6 | platform/rv1106/alsa_audio.cpp | Mode1 四通道、period、XRUN 与中断退出 |
+| 7 | ui/lvgl_screen.cpp、ui/device_ui.cpp | 页面、触摸、音量、摄像头资源的生命周期 |
+
+上述路径相对 `client/src/`。课程按同一份产品代码递进，不用宏拼出多个产品。
+
+## 运行与设置
 
 ```sh
-cmake --preset rv1106-release
-cmake --build --preset rv1106-release --parallel
-```
-
-工具链、sysroot、Rockchip 3A、Snowboy、WebRTC VAD、OpenSSL、Boost、LVGL 和 BSP 库必须与目标镜像 ABI 一致。外部二进制、模型和个人绝对路径不进入仓库。
-
-## 安装与运行
-
-Snowboy 的 `common.res`、模型文件属于外部资产，放在 `/userdata/boompi/models/`。
-
-```sh
-DESTDIR=/tmp/boompi-rootfs cmake --install build/rv1106-release
-boompi-clientctl update /tmp/boompi-client
 boompi-clientctl start
+boompi-clientctl status
 boompi-clientctl log
+boompi-clientctl stop
 ```
 
-管理入口：
+有线优先，Wi-Fi 为备用。无有线时运行 `boompi-clientctl provision`，或从 WiFi 页启动配网。
+
+学生无需配置声学环境变量。新生成的 `/userdata/boompi/config/client.env` 只包含自动 UUID：
 
 ```text
-boompi-clientctl start|stop|restart|status|log|update|provision
+BOOMPI_DEVICE_ID=<由脚本生成>
 ```
 
-Wi-Fi 首次配网以 root 运行 `boompi-clientctl provision`。客户端按“以太网优先、Wi-Fi 备用”选择网络；SSID 和密码不写入普通日志。
+音量只从 `ui.settings` 读取并在滑块释放时保存。旧 client.env 的音量/声学键会输出迁移提示，不再改变 profile。教师在共享课堂网络中应预置该组电脑的地址和 pin，避免首次发现邻组服务端：
 
-协议和取消语义见 [protocol-v1.md](../protocol/protocol-v1.md)，依赖边界见 [audio-backends.md](../docs/architecture/audio-backends.md)。
+```text
+BOOMPI_SERVER_IP=<该组电脑IPv4>
+BOOMPI_SERVER_PORT=17806
+BOOMPI_SERVER_SPKI_SHA256=<该电脑稳定SPKI>
+```
+
+地址和 pin 必须成对，`--check-config` 会拒绝非法 IPv4。发现本身没有认证，TLS 始终检查已保存的 SPKI。
+
+## 固定板级 profile
+
+`include/boompi/audio/board_voice_profile.h` 是维护者标定入口：
+
+- 左右麦极性 +1/+1；
+- Snowboy 0.7；
+- raw mic VAD -30 dBFS；
+- AEC 后 barge -25 dBFS；
+- AEC delay 0。
+
+20 ms、320/480/960 samples、PCM 路径和模型位置由固定帧契约推导/给出。学生不逐板调参。更换硬件或模型后由维护者重新验收整个 profile。
+
+采集保持 48 kHz / S16_LE / 4ch `[mic0,mic1,refL,refR]`，3A 输入为双麦+refL，上传 16 kHz mono；TTS 24 kHz mono 重采样到 48 kHz stereo。原有 AEC/VAD 标定默认值保留，声学效果仍需要真板验收。
+
+## 构建
+
+Host：
+
+```sh
+cmake --preset host-debug
+cmake --build --preset host-debug --parallel
+ctest --preset host-debug
+python3 scripts/verify_protocol_fixtures.py
+python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+```
+
+发布验收必须设置 `BOOMPI_REQUIRE_HOST_TRANSPORT_TEST=ON` 并安装 Host OpenSSL、Boost 1.83 与 cJSON，防止真实网络测试被跳过。
+
+教师准备一次 SDK 后，学生只设置根目录：
+
+```sh
+export BOOMPI_RV1106_SDK_ROOT=/absolute/path/to/teaching-sdk
+sh scripts/build_teaching_release.sh
+```
+
+SDK 根目录可以包含教师维护的 `boompi-sdk.cmake`，映射已有的 BOOMPI_* 路径；也可以使用以下布局：
+
+```text
+toolchain/bin/arm-rockchip830-linux-uclibcgnueabihf-{gcc,g++,readelf}
+sysroot/
+rockchip/include/ + rockchip/lib/{libaec_bf_process.so,librkaudio_common.so}
+snowboy/include/ + snowboy/lib/{libsnowboy-detect.a,libopenblas.a}
+webrtc/include/ + webrtc/lib/libwebrtc_vad.a
+boost/include/
+openssl/     # 匹配目标ABI的 OpenSSL 3.5.7 config package
+lvgl/        # LVGL 8.2
+```
+
+不把私有库或模型复制进 Git。Snowboy 旧 C++ ABI 仍仅限 bridge。脚本检查 ELF 后才生成 rootfs 安装目录，不会连接开发板。
+
+## v1 升级
+
+v2 客户端必须与同批 v2 服务端配套。旧 v1 程序留在基线快照/Git 历史，不能混用。首次更新前保留旧客户端、旧服务端、config.yaml 与 state；复用原有身份而非重新配对。协议详见 [protocol-v2.md](../protocol/protocol-v2.md)，人工验收见 [host-validation.md](../docs/test/host-validation.md)。

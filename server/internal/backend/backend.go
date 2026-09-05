@@ -37,6 +37,8 @@ type ConversationSession interface {
 	// queues; the session actor must never wait on an unbounded network write.
 	SendAudio(ctx context.Context, pcm []byte) error
 	Commit(ctx context.Context) error
+	// Cancel stops active work and clears incomplete input, preserving completed
+	// history. Retraction is explicit through CompletedResponseDiscarder.
 	Cancel(ctx context.Context) error
 	// Events returns one stable, provider-owned bounded channel. Cancel must fence the
 	// cancelled response before returning: already queued events may remain,

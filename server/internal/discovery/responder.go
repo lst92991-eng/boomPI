@@ -10,8 +10,8 @@ import (
 )
 
 const (
-	Request  = "BOOMPI_DISCOVER_V1"
-	Response = "BOOMPI_SERVER_V1"
+	Request  = "BOOMPI_DISCOVER_V2"
+	Response = "BOOMPI_SERVER_V2"
 )
 
 const maxDiscoveryRequestBytes = 64

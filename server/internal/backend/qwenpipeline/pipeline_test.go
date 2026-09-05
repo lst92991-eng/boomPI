@@ -217,7 +217,7 @@ func TestDiscardLastResponseRemovesOnlyMarkedCompletedPair(t *testing.T) {
 	}
 }
 
-func TestCancelRemovesResponseThatFinishedBeforePlaybackBargeIn(t *testing.T) {
+func TestCancelPreservesCompletedResponseUntilExplicitRetraction(t *testing.T) {
 	session := &Session{
 		history: []chatMessage{
 			{Role: "user", Content: "heard"},
@@ -228,6 +228,12 @@ func TestCancelRemovesResponseThatFinishedBeforePlaybackBargeIn(t *testing.T) {
 		lastResponseDiscardable: true,
 	}
 	if err := session.Cancel(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(session.history) != 4 {
+		t.Fatalf("Cancel must preserve completed history: %#v", session.history)
+	}
+	if err := session.DiscardLastResponse(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(session.history) != 2 || session.history[0].Content != "heard" ||

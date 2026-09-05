@@ -13,6 +13,9 @@ option(BOOMPI_STRICT_WARNINGS "Treat warnings in boomPI sources as errors" ON)
 option(BOOMPI_TARGET_RV1106 "Build for the RV1106 target environment" OFF)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/client/cmake/BoompiAudioVendorDependencies.cmake")
+if(BOOMPI_TARGET_RV1106)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/client/cmake/BoompiSdk.cmake")
+endif()
 boompi_configure_audio_vendor_dependencies()
 
 if(BOOMPI_BUILD_TESTS)

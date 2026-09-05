@@ -13,7 +13,7 @@
 
 #include "boompi/application/voice_client.h"
 #include "boompi/config/voice_client_config.h"
-#include "boompi/network/network_bootstrap.h"
+#include "boompi/network/voice_link.h"
 
 namespace {
 // POSIX signal handler 运行在异步信号上下文，只能修改可安全访问的标量。
@@ -35,7 +35,7 @@ int main(int argc, char* argv[]) {
     // 配网发生在语音配置加载之前，因此尚未配置服务端的设备也能保存 Wi-Fi。
     std::string ssid, password;
     if (!std::getline(std::cin, ssid) || !std::getline(std::cin, password) ||
-        !boompi::network::NetworkBootstrap::SaveWifi(ssid, password)) return EXIT_FAILURE;
+        !boompi::network::SaveWifi(ssid, password)) return EXIT_FAILURE;
     return EXIT_SUCCESS;
   }
   boompi::config::VoiceClientConfig config;
@@ -52,7 +52,11 @@ int main(int argc, char* argv[]) {
     return EXIT_SUCCESS;
   }
   // 两种常见停止请求共用同一条有序退出路径，析构顺序由 application 层掌控。
-  std::signal(SIGINT, Stop); std::signal(SIGTERM, Stop);
+  std::signal(SIGINT, Stop);
+  std::signal(SIGTERM, Stop);
+#if defined(SIGPIPE)
+  std::signal(SIGPIPE, SIG_IGN);
+#endif
   if (!boompi::application::RunVoiceClient(config, &g_stop, &error)) {
     std::cerr << "boompi-client: voice loop failed: " << error << '\n';
     return EXIT_FAILURE;

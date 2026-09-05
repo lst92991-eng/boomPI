@@ -7,10 +7,12 @@
 #include <cstdint>
 #include <string>
 
+#include "boompi/audio/board_voice_profile.h"
+
 namespace boompi::audio {
 
 /// 16 kHz 音频的 20 ms 帧长。整个客户端以这一个时间单位推进 VAD、唤醒和上传时序。
-constexpr std::size_t kVoiceFrameSamples16k = 320U;
+inline constexpr std::size_t kVoiceFrameSamples16k = kVoiceFrameSamples;
 using VoiceFrame16k = std::array<std::int16_t, kVoiceFrameSamples16k>;
 
 /// @brief 一帧经过双麦 3A、Snowboy 和 VAD 后交给 application 的结果。
@@ -65,14 +67,17 @@ enum class QueueTtsResult : std::uint8_t {
 /// 配置只在 `Open` 时复制；capture/playback 热路径不读取环境变量，也不创建 ALSA 或模型资源。
 struct AudioEngineConfig final {
   /// ALSA PCM 名称由板端配置给出，便于匹配不同镜像中的 card/device 编号。
-  std::string capture_pcm, playback_pcm;
+  std::string capture_pcm{kCapturePcm}, playback_pcm{kPlaybackPcm};
   /// Snowboy 模型资源在 Open 时交给旧 ABI bridge，实时线程只保留已创建句柄。
-  std::string snowboy_resource, snowboy_model, snowboy_sensitivity{"0.7"};
+  std::string snowboy_resource{kSnowboyResource};
+  std::string snowboy_model{kSnowboyModel};
+  std::string snowboy_sensitivity{kBoardVoiceProfile.wake_sensitivity};
   /// 默认播放增益与原始麦克风 VAD 准入门限；运行中音量可经原子值更新。
   float playback_gain{1.0F};
-  float vad_min_dbfs{-30.0F};
+  float vad_min_dbfs{kBoardVoiceProfile.vad_admission_dbfs};
   /// 麦克风焊接极性只能取 +1/-1；数字回采参考不应用此设置。
-  std::int8_t left_polarity{1}, right_polarity{1};
+  std::int8_t left_polarity{kBoardVoiceProfile.left_polarity};
+  std::int8_t right_polarity{kBoardVoiceProfile.right_polarity};
 };
 
 /// @brief 对话业务使用的音频门面。
@@ -108,10 +113,10 @@ class AudioEngine final {
                              std::size_t byte_count,
                              std::uint64_t sequence) noexcept;
 
-  /// @brief 开始新 TTS 流；先等采集线程在帧边界准备后端，再交给播放线程消费。
+  /// @brief 开始新 TTS 流；先等采集线程在帧边界武装 AEC 门控。
   ///
-  /// 必须先于首个 PCM 包调用。帧边界握手保证 capture 侧先武装 AEC 预热，随后播放
-  /// 线程才可能产生硬件参考，避免跨线程同时修改播放会话状态。
+  /// 必须先于首个 PCM 包调用。播放线程在首次渲染前准备自己的 PCM/重采样器，
+  /// 帧边界握手保证 capture 侧先武装 AEC，随后播放才可能产生硬件参考。
   bool BeginPlayback() noexcept;
 
   /// @brief 标记当前 TTS 已收完；播放线程会消费最后一个短帧、drain ALSA，再置完成状态。

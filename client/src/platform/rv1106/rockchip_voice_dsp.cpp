@@ -4,9 +4,6 @@
 #ifndef BOOMPI_ROCKCHIP_ENABLE_STDT
 #define BOOMPI_ROCKCHIP_ENABLE_STDT 1
 #endif
-#ifndef BOOMPI_ROCKCHIP_DELAY_SAMPLES
-#define BOOMPI_ROCKCHIP_DELAY_SAMPLES 0
-#endif
 #include <algorithm>
 #include <cstring>
 #include <cstdint>
@@ -50,17 +47,14 @@ static_assert(std::is_same<decltype(&rkaudio_preprocess_destory), DestroySignatu
 static_assert(kBeamformingFeatureMask ==
                   (BOOMPI_ROCKCHIP_ENABLE_STDT != 0 ? 1109 : 85),
               "validated Rockchip 3A profile changed");
-static_assert(BOOMPI_ROCKCHIP_DELAY_SAMPLES >= 0 &&
-                  BOOMPI_ROCKCHIP_DELAY_SAMPLES % 256 == 0,
-              "Rockchip fixed AEC delay must be a non-negative 256-sample multiple");
-
 void ReleaseParameters(RKAUDIOParam* const parameters) noexcept {
   // vendor deinit 释放各子参数树，外层 RKAUDIOParam 由本适配器负责 delete。
   if (parameters == nullptr) return;
   rkaudio_param_deinit(parameters); delete parameters;
 }
 
-bool PrepareParameters(RKAUDIOParam* const parameters) noexcept {
+bool PrepareParameters(RKAUDIOParam* const parameters,
+                       const int delay_samples) noexcept {
   // 参数树只在 Open 构造一次；实时 Process 仅使用已验证句柄，不进行配置或分配。
   parameters->model_en = kMainFeatureMask;
   parameters->read_size = kVendorBlockSamples;
@@ -75,7 +69,7 @@ bool PrepareParameters(RKAUDIOParam* const parameters) noexcept {
   aec->pos = 1;
   aec->model_aec_en = 0;
   aec->drop_ref_channel = 0;
-  aec->delay_len = BOOMPI_ROCKCHIP_DELAY_SAMPLES;
+  aec->delay_len = delay_samples;
 
   auto* const beamforming =
       static_cast<SKVPreprocessParam*>(parameters->bf_param);
@@ -119,13 +113,15 @@ RockchipVoiceDsp::~RockchipVoiceDsp() noexcept {
   Close();
 }
 
-bool RockchipVoiceDsp::Open() noexcept {
+bool RockchipVoiceDsp::Open(const int delay_samples) noexcept {
   // 重复 Open 通常代表所有权错误，保留现有资源并让调用方显式处理失败。
-  if (handle_ != nullptr || parameters_ != nullptr) return false;
+  if (handle_ != nullptr || parameters_ != nullptr || delay_samples < 0 ||
+      delay_samples % kVendorBlockSamples != 0)
+    return false;
 
   auto* const parameters = new (std::nothrow) RKAUDIOParam{};
   if (parameters == nullptr) return false;
-  if (!PrepareParameters(parameters)) {
+  if (!PrepareParameters(parameters, delay_samples)) {
     ReleaseParameters(parameters);
     return false;
   }

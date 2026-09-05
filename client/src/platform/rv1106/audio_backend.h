@@ -36,9 +36,10 @@ class AudioBackend final {
   /// @brief 清除 Snowboy/VAD 判定历史，保留 ALSA、重采样器和 3A 连续状态。
   bool ResetListener() noexcept;
 
-  /// @brief 由 capture 线程在帧边界复位播放重采样器并武装 AEC 预热。
-  /// application 通过 AudioEngine 的同步命令等待它完成；预热计数在 capture 侧检测到
-  /// 首个非静音 Mode1 reference 后才开始，因此网络首播蓄水时间不会被误算进预热。
+  /// @brief capture 在帧边界武装 AEC 门控，完成后才允许播放线程准备和渲染。
+  /// 预热计数等首个非静音 Mode1 reference 才开始，网络首播蓄水不会被计入。
+  bool ArmPlayback() noexcept;
+  /// @brief 播放线程在首帧前准备 PCM 和播放重采样器，全程不修改 capture 状态。
   bool PreparePlayback() noexcept;
   /// @brief 将一帧 24 kHz mono TTS 补齐、升采样、限幅并写入 48 kHz stereo ALSA。
   /// @param samples 有效 sample 数，允许 EOS 前最后一帧短于 480。

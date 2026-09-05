@@ -15,6 +15,12 @@ struct RenderCall final {
   float gain{0.0F};
 };
 
+enum class PlaybackBlock { kNone, kRender, kDrain };
+void BlockPlayback(PlaybackBlock stage) noexcept;
+void FailPlaybackPreparation() noexcept;
+bool WaitForPlaybackBlocked(std::chrono::milliseconds timeout) noexcept;
+bool PlaybackOwnerOrderIsValid() noexcept;
+
 void Reset() noexcept;
 void InjectPlaybackXruns(std::uint64_t count) noexcept;
 std::uint64_t PlaybackXrunsSnapshot() noexcept;
@@ -49,6 +55,7 @@ class AudioBackend final {
   bool ReadCapture20ms(bool* discontinuity) noexcept;
   bool ProcessCapture20ms(bool discontinuity, CaptureFrame* frame) noexcept;
   bool ResetListener() noexcept;
+  bool ArmPlayback() noexcept;
   bool PreparePlayback() noexcept;
   bool Render20ms(const std::int16_t* pcm24, std::size_t samples,
                   float gain) noexcept;

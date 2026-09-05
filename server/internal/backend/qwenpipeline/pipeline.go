@@ -66,7 +66,7 @@ func (b *Backend) Open(ctx context.Context, cfg backend.SessionConfig) (backend.
 		asrPreparing:  true,
 	}
 	// Provider setup is deliberately off the hello path. The device only waits
-	// five seconds for hello.ack, while a realtime ASR handshake may take ten;
+	// five seconds for ready, while a realtime ASR handshake may take ten;
 	// audio received before preparation completes uses the existing batch path.
 	session.launchRealtimeASRPreparation()
 	return session, nil
@@ -192,7 +192,6 @@ func (s *Session) Cancel(ctx context.Context) error {
 	s.mu.Lock()
 	cancel, done := s.activeCancel, s.activeDone
 	inputWasActive := len(s.pcm) != 0
-	discardCompletedResponse := !inputWasActive
 	var stream *asrRealtimeStream
 	if inputWasActive && !s.turnBatchOnly {
 		stream = s.asr
@@ -210,17 +209,11 @@ func (s *Session) Cancel(ctx context.Context) error {
 		stream.Close()
 	}
 	if cancel == nil || done == nil {
-		if discardCompletedResponse {
-			s.discardCompletedResponseIfNeeded()
-		}
 		return nil
 	}
 	cancel()
 	select {
 	case <-done:
-		if discardCompletedResponse {
-			s.discardCompletedResponseIfNeeded()
-		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

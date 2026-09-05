@@ -4,203 +4,152 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"os"
-	"path/filepath"
-	"reflect"
-	"runtime"
 	"strings"
 	"testing"
 )
 
-func TestControlEnvelopeRoundTrip(t *testing.T) {
-	want := ControlEnvelope{
-		Version: 1, Type: "turn.start", MessageID: "message-1", DeviceID: "00112233-4455-6677-8899-aabbccddeeff",
-		SessionID: 2, TurnID: 3, StreamID: 4, Epoch: 5,
-		Payload: json.RawMessage(`{"capabilities":["audio"]}`),
-	}
-	encoded, err := EncodeControl(want)
+func TestSharedV2GoldenFixtures(t *testing.T) {
+	data, err := os.ReadFile("../../../protocol/fixtures/protocol-v2-golden.json")
 	if err != nil {
-		t.Fatalf("EncodeControl() error = %v", err)
+		t.Fatal(err)
 	}
-	got, err := DecodeControl(encoded)
-	if err != nil {
-		t.Fatalf("DecodeControl() error = %v", err)
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("round trip = %#v", got)
-	}
-}
-
-func TestControlEnvelopeRejectsInvalidNumericFields(t *testing.T) {
-	for _, field := range []string{"version", "session_id", "turn_id", "stream_id", "epoch"} {
-		for _, value := range []string{"null", `"1"`, "1.0", "1e0", "1.5", "-1", "4294967296", "true"} {
-			t.Run(field+"_"+strings.NewReplacer(`"`, "quote", ".", "dot", "-", "negative").Replace(value), func(t *testing.T) {
-				data := controlJSONWithNumericField(field, value)
-				if _, err := DecodeControl(data); err == nil {
-					t.Fatalf("DecodeControl() accepted %s=%s", field, value)
-				}
-			})
-		}
-	}
-}
-
-func TestControlEnvelopeRejectsInvalidFieldTypes(t *testing.T) {
-	cases := [][]byte{
-		[]byte(`{"version":1,"type":1,"message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}}`),
-		[]byte(`{"version":1,"type":"hello","message_id":true,"device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}}`),
-		[]byte(`{"version":1,"type":"hello","message_id":"1","device_id":null,"session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}}`),
-		[]byte(`{"version":1,"type":"hello","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":[]}`),
-	}
-	for index, data := range cases {
-		if _, err := DecodeControl(data); err == nil {
-			t.Fatalf("DecodeControl() accepted invalid field type case %d", index)
-		}
-	}
-}
-
-func TestControlEnvelopeAcceptsMaximumUint32IDs(t *testing.T) {
-	data := []byte(`{"version":1,"type":"turn.start","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":4294967295,"turn_id":4294967295,"stream_id":4294967295,"epoch":4294967295,"payload":{}}`)
-	got, err := DecodeControl(data)
-	if err != nil {
-		t.Fatalf("DecodeControl() error = %v", err)
-	}
-	if got.SessionID != ^uint32(0) || got.TurnID != ^uint32(0) || got.StreamID != ^uint32(0) || got.Epoch != ^uint32(0) {
-		t.Fatalf("decoded IDs = %#v", got)
-	}
-}
-
-func TestControlEnvelopeRejectsUnknownField(t *testing.T) {
-	data := []byte(`{"version":1,"type":"hello","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":0,"payload":{},"extra":true}`)
-	if _, err := DecodeControl(data); err == nil {
-		t.Fatal("DecodeControl() unexpectedly accepted an unknown field")
-	}
-}
-
-func TestControlEnvelopeRejectsCaseInsensitiveFieldAlias(t *testing.T) {
-	data := []byte(`{"version":1,"type":"hello","TYPE":"turn.cancel","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}}`)
-	if _, err := DecodeControl(data); err == nil {
-		t.Fatal("DecodeControl() accepted a case-insensitive field alias")
-	}
-}
-
-func TestControlEnvelopeRejectsDuplicateKeysAndNonObjectPayload(t *testing.T) {
-	duplicates := [][]byte{
-		[]byte(`{"version":1,"type":"hello","type":"turn.start","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}}`),
-		[]byte(`{"version":1,"type":"hello","\u0074ype":"turn.start","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{}}`),
-		[]byte(`{"version":1,"type":"hello","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":0,"turn_id":0,"stream_id":0,"epoch":1,"payload":{"nested":{"key":1,"key":2}}}`),
-	}
-	for index, duplicate := range duplicates {
-		if _, err := DecodeControl(duplicate); err == nil {
-			t.Fatalf("DecodeControl() accepted duplicate case %d", index)
-		}
-	}
-	nonObject := ControlEnvelope{Version: 1, Type: "hello", MessageID: "1", DeviceID: "00112233-4455-6677-8899-aabbccddeeff", Payload: json.RawMessage(`[]`)}
-	if _, err := EncodeControl(nonObject); err == nil {
-		t.Fatal("EncodeControl() unexpectedly accepted an array payload")
-	}
-}
-
-func controlJSONWithNumericField(field, value string) []byte {
-	values := map[string]string{
-		"version": "1", "session_id": "0", "turn_id": "0", "stream_id": "0", "epoch": "1",
-	}
-	values[field] = value
-	return []byte(fmt.Sprintf(
-		`{"version":%s,"type":"hello","message_id":"1","device_id":"00112233-4455-6677-8899-aabbccddeeff","session_id":%s,"turn_id":%s,"stream_id":%s,"epoch":%s,"payload":{}}`,
-		values["version"], values["session_id"], values["turn_id"], values["stream_id"], values["epoch"],
-	))
-}
-
-func TestPCMHeaderRoundTrip(t *testing.T) {
-	device, err := ParseDeviceUUID("00112233-4455-6677-8899-aabbccddeeff")
-	if err != nil {
-		t.Fatalf("ParseDeviceUUID() error = %v", err)
-	}
-	want := PCMHeader{
-		Version: 1, Kind: AudioKindUplink, Flags: 2, AudioFormat: AudioFormatPCM16LE,
-		Channels: 1, SampleRateHz: 16000, PayloadLen: 640, Sequence: 7,
-		TimestampUS: 123456789, Epoch: 8, DeviceUUID: device, SessionID: 9, TurnID: 10, StreamID: 11,
-	}
-	encoded, err := want.MarshalBinary()
-	if err != nil {
-		t.Fatalf("MarshalBinary() error = %v", err)
-	}
-	if len(encoded) != PCMHeaderSize {
-		t.Fatalf("header length = %d", len(encoded))
-	}
-	got, err := ParsePCMHeader(encoded)
-	if err != nil {
-		t.Fatalf("ParsePCMHeader() error = %v", err)
-	}
-	if got != want {
-		t.Fatalf("round trip = %#v, want %#v", got, want)
-	}
-}
-
-func TestPCMFrameRejectsLengthMismatch(t *testing.T) {
-	device, err := ParseDeviceUUID("00112233-4455-6677-8899-aabbccddeeff")
-	if err != nil {
-		t.Fatalf("ParseDeviceUUID() error = %v", err)
-	}
-	header := PCMHeader{Version: 1, Kind: AudioKindDownlink, AudioFormat: AudioFormatPCM16LE, Channels: 1, SampleRateHz: 24000, PayloadLen: 10, Epoch: 1, DeviceUUID: device, SessionID: 1, TurnID: 1, StreamID: 1}
-	encoded, err := header.MarshalBinary()
-	if err != nil {
-		t.Fatalf("MarshalBinary() error = %v", err)
-	}
-	if _, _, err := ParsePCMFrame(encoded); err == nil {
-		t.Fatal("ParsePCMFrame() unexpectedly accepted a missing payload")
-	}
-}
-
-func TestGoldenFixture(t *testing.T) {
-	_, sourceFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller() could not locate the test source")
-	}
-	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..", ".."))
-	data, err := os.ReadFile(filepath.Join(repositoryRoot, "protocol", "fixtures", "protocol-v1-golden.json"))
-	if err != nil {
-		t.Fatalf("ReadFile() error = %v", err)
-	}
-	var fixture struct {
-		ControlFrames []struct {
-			WireText string `json:"wire_text"`
+	var fixtures struct {
+		Controls []struct {
+			Name     string
+			Wire     string `json:"wire_text"`
+			Expected json.RawMessage
 		} `json:"control_frames"`
-		AudioFrames []struct {
-			HeaderHex string `json:"header_hex"`
-			WireHex   string `json:"wire_hex"`
+		Audio []struct {
+			Name, Direction string
+			Wire            string `json:"wire_hex"`
+			Header          PCMHeader
 		} `json:"audio_frames"`
+		Invalid []string `json:"invalid_control_frames"`
 	}
-	if err := json.Unmarshal(data, &fixture); err != nil {
-		t.Fatalf("fixture JSON error = %v", err)
+	if err = json.Unmarshal(data, &fixtures); err != nil {
+		t.Fatal(err)
 	}
-	if len(fixture.ControlFrames) != 1 || len(fixture.AudioFrames) != 1 {
-		t.Fatalf("unexpected fixture cardinality: %#v", fixture)
+	for _, fixture := range fixtures.Controls {
+		t.Run(fixture.Name, func(t *testing.T) {
+			control, err := DecodeControl([]byte(fixture.Wire))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire, err := EncodeControl(control)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got, want any
+			_ = json.Unmarshal(wire, &got)
+			_ = json.Unmarshal(fixture.Expected, &want)
+			g, _ := json.Marshal(got)
+			w, _ := json.Marshal(want)
+			if !bytes.Equal(g, w) {
+				t.Fatalf("got %s, want %s", g, w)
+			}
+		})
 	}
-	if _, err := DecodeControl([]byte(fixture.ControlFrames[0].WireText)); err != nil {
-		t.Fatalf("DecodeControl(golden) error = %v", err)
+	for _, fixture := range fixtures.Audio {
+		t.Run(fixture.Name, func(t *testing.T) {
+			wire, err := hex.DecodeString(fixture.Wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			up := fixture.Direction == "uplink"
+			header, pcm, err := ParsePCMFrame(wire, up)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if header != fixture.Header {
+				t.Fatalf("header %+v, want %+v", header, fixture.Header)
+			}
+			encoded, err := EncodePCM(header, pcm, up)
+			if err != nil || !bytes.Equal(encoded, wire) {
+				t.Fatalf("round trip %v", err)
+			}
+		})
 	}
-	headerBytes, err := hex.DecodeString(fixture.AudioFrames[0].HeaderHex)
-	if err != nil {
-		t.Fatalf("DecodeString(header) error = %v", err)
+	for _, wire := range fixtures.Invalid {
+		if _, err := DecodeControl([]byte(wire)); err == nil {
+			t.Errorf("accepted %s", wire)
+		}
 	}
-	header, err := ParsePCMHeader(headerBytes)
-	if err != nil {
-		t.Fatalf("ParsePCMHeader(golden) error = %v", err)
+}
+
+func TestControlLimitsAndTypes(t *testing.T) {
+	for _, data := range [][]byte{
+		[]byte("[]"), []byte("{}"), []byte("null"),
+		[]byte("{\"type\":\"text\",\"generation\":1,\"text\":\"\xff\"}"),
+		[]byte("{\"type\":\"stop\",\"generation\":2,\"retract\":0}"),
+		[]byte("{\"type\":\"done\",\"generation\":-1}"),
+		[]byte("{\"type\":\"done\",\"generation\":\"1\"}"),
+		[]byte("{\"type\":\"error\",\"generation\":1,\"code\":\"Raw provider secret!\"}"),
+	} {
+		if _, err := DecodeControl(data); err == nil {
+			t.Errorf("accepted %q", data)
+		}
 	}
-	encoded, err := header.MarshalBinary()
-	if err != nil {
-		t.Fatalf("MarshalBinary(golden) error = %v", err)
+	for _, n := range []int{4096, 4097} {
+		_, err := EncodeControl(Control{Type: "text", Generation: 1, Text: strings.Repeat("x", n)})
+		if (err == nil) != (n == 4096) {
+			t.Fatalf("text length %d: %v", n, err)
+		}
 	}
-	if !bytes.Equal(encoded, headerBytes) {
-		t.Fatalf("encoded golden header does not match fixture")
+}
+
+func TestUnicodeEscapesAgreeWithBoard(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		valid bool
+	}{
+		{`\ud800`, false}, {`\udc00`, false}, {`\ud800\u0041`, false},
+		{`\ud83d\ude00`, true}, {`\\ud800`, true}, {`\u4f60\u597d`, true},
+	} {
+		wire := `{"type":"text","generation":1,"text":"` + tc.value + `"}`
+		_, err := DecodeControl([]byte(wire))
+		if (err == nil) != tc.valid {
+			t.Errorf("%s: %v", wire, err)
+		}
 	}
-	wireBytes, err := hex.DecodeString(fixture.AudioFrames[0].WireHex)
-	if err != nil {
-		t.Fatalf("DecodeString(wire) error = %v", err)
+}
+
+func TestPCMRejectsMalformedFrames(t *testing.T) {
+	valid, _ := EncodePCM(PCMHeader{Flags: 3, Generation: 1}, make([]byte, 640), true)
+	for _, mutate := range []func([]byte) []byte{
+		func(b []byte) []byte { return b[:15] },
+		func(b []byte) []byte { b[3] = '1'; return b },
+		func(b []byte) []byte { b[7] = 1; return b },
+		func(b []byte) []byte { b[5] = 8; return b },
+		func(b []byte) []byte { b[5] = 2; return b },
+		func(b []byte) []byte { b[11] = 0; return b },
+		func(b []byte) []byte { b[15] = 1; return b },
+		func(b []byte) []byte { return b[:len(b)-2] },
+	} {
+		if _, _, err := ParsePCMFrame(mutate(append([]byte(nil), valid...)), true); err == nil {
+			t.Fatal("accepted malformed PCM")
+		}
 	}
-	if _, payload, err := ParsePCMFrame(wireBytes); err != nil || len(payload) != 8 {
-		t.Fatalf("ParsePCMFrame(golden) payload=%d error=%v", len(payload), err)
+	for _, tc := range []struct {
+		flags uint16
+		size  int
+		valid bool
+	}{
+		{3, 2, true}, {3, 960, true}, {3, 962, false}, {1, 2, false}, {1, 960, true}, {7, 960, false}, {3, 0, false}, {3, 3, false},
+	} {
+		_, err := EncodePCM(PCMHeader{Flags: tc.flags, Generation: 1}, make([]byte, tc.size), false)
+		if (err == nil) != tc.valid {
+			t.Errorf("%+v: %v", tc, err)
+		}
 	}
+}
+
+func FuzzDecodeV2(f *testing.F) {
+	f.Add([]byte("{\"type\":\"ready\"}"))
+	f.Add([]byte("BPV2"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = DecodeControl(data)
+		_, _, _ = ParsePCMFrame(data, true)
+		_, _, _ = ParsePCMFrame(data, false)
+	})
 }

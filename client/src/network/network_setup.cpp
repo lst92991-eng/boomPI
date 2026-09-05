@@ -1,14 +1,15 @@
 /**
- * @file network_bootstrap.cpp
+ * @file network_setup.cpp
  * @brief RV1106 启动阶段的网卡建链、UDP 服务发现与配置持久化。
  *
  * 文件中的系统命令、DHCP 等待和配置写入都可能阻塞，只允许在应用启动线程
- * 或配网流程中执行。成功返回后，持久连接和协议收发全部交给 VoiceTransport。
+ * 或配网流程中执行。成功返回后，VoiceLink 的同一网络线程继续TLS/WSS建连。
  */
-#include "boompi/network/network_bootstrap.h"
+#include "voice_codec.h"
 
 #include "boompi/config/voice_client_config.h"
 
+#if defined(BOOMPI_TARGET_RV1106)
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <net/if.h>
@@ -22,8 +23,11 @@
 #include <cerrno>
 #include <cstdio>
 #include <fstream>
+#endif
 
 namespace boompi::network { namespace {
+
+#if defined(BOOMPI_TARGET_RV1106)
 
 /// 子进程等待每 100 ms 检查一次该标志，让关闭流程无需等待 DHCP 自然超时。
 bool StopRequested(const std::atomic<bool>* stop) {
@@ -41,11 +45,11 @@ bool IsText(const std::string& text, std::size_t minimum, std::size_t maximum) {
   return true;
 }
 
-/// v1 当前只支持 IPv4；SPKI 必须具有标准 SHA-256 Base64 形状才能进入 TLS 阶段。
-bool IsEndpoint(const NetworkBootstrapResult& server) {
+/// 当前只支持 IPv4；SPKI 必须具有标准 SHA-256 Base64 形状才能进入 TLS 阶段。
+bool IsEndpoint(const LinkConfig& server) {
   in_addr address{};
   return server.port != 0U &&
-         config::IsValidSpkiSha256(server.spki_sha256_base64) &&
+         config::IsValidSpkiSha256(server.spki) &&
          inet_pton(AF_INET, server.host.c_str(), &address) == 1;
 }
 
@@ -121,21 +125,21 @@ bool RunNetworkTool(bool start_wifi, const char* interface,
 }
 
 /// 缓存文件必须恰好包含 host、port、SPKI 三项，多余字段按损坏配置处理。
-bool LoadServer(NetworkBootstrapResult* output) {
+bool LoadServer(LinkConfig* output) {
   std::ifstream input(kServerConfig); unsigned port = 0; std::string extra;
-  if (!(input >> output->host >> port >> output->spki_sha256_base64) ||
+  if (!(input >> output->host >> port >> output->spki) ||
       (input >> extra) || port > 65535U) return false;
   output->port = static_cast<std::uint16_t>(port); return IsEndpoint(*output);
 }
 
 /**
- * @brief 在指定网卡上发送固定 v1 广播并解析一个服务端提示。
+ * @brief 在指定网卡上发送固定 v2 广播并解析一个服务端提示。
  *
  * SO_BINDTODEVICE 保证请求和响应走已选中的 eth0 或 wlan0。响应源地址成为 WSS
  * host，报文只携带端口和 SPKI。UDP 无认证能力，此处仅校验格式；真正的服务端
- * 身份在 VoiceTransport 的 TLS 握手中通过 SPKI 摘要确认。
+ * 身份在 VoiceLink 的 TLS 握手中通过 SPKI 摘要确认。
  */
-bool Discover(const char* interface, NetworkBootstrapResult* output) {
+bool Discover(const char* interface, LinkConfig* output) {
   const int fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) return false;
   const int enabled = 1; timeval timeout{0, 800000};
@@ -145,7 +149,7 @@ bool Discover(const char* interface, NetworkBootstrapResult* output) {
                        std::char_traits<char>::length(interface) + 1U) == 0;
   sockaddr_in target{}; target.sin_family = AF_INET;
   target.sin_port = htons(17807); target.sin_addr.s_addr = INADDR_BROADCAST;
-  constexpr char request[] = "BOOMPI_DISCOVER_V1";
+  constexpr char request[] = "BOOMPI_DISCOVER_V2";
   if (ok) ok = sendto(fd, request, sizeof(request) - 1U, 0,
                       reinterpret_cast<sockaddr*>(&target), sizeof(target)) >= 0;
   char response[96]{}; sockaddr_in peer{}; socklen_t peer_size = sizeof(peer);
@@ -154,17 +158,24 @@ bool Discover(const char* interface, NetworkBootstrapResult* output) {
   close(fd);
   if (bytes <= 0 || peer.sin_port != htons(17807)) return false;
   unsigned port = 0; char spki[45]{}, extra = '\0'; response[bytes] = '\0';
-  if (std::sscanf(response, "BOOMPI_SERVER_V1 %u %44s%c", &port, spki, &extra) != 2 ||
+  if (std::sscanf(response, "BOOMPI_SERVER_V2 %u %44s%c", &port, spki, &extra) != 2 ||
       port == 0U || port > 65535U) return false;
   char host[INET_ADDRSTRLEN]{};
   if (inet_ntop(AF_INET, &peer.sin_addr, host, sizeof(host)) == nullptr) return false;
   output->host = host; output->port = static_cast<std::uint16_t>(port);
-  output->spki_sha256_base64 = spki; return IsEndpoint(*output);
+  output->spki = spki; return IsEndpoint(*output);
 }
+
+bool SaveServer(const LinkConfig& server) {
+  if (!IsEndpoint(server) || (mkdir(kConfigDir, 0700) != 0 && errno != EEXIST)) return false;
+  return AtomicWrite(kServerConfig, server.host + " " + std::to_string(server.port) + " " + server.spki + "\n");
+}
+#endif
 
 }  // namespace
 
-bool NetworkBootstrap::SaveWifi(const std::string& ssid, const std::string& password) {
+bool SaveWifi(const std::string& ssid, const std::string& password) {
+#if defined(BOOMPI_TARGET_RV1106)
   if (!IsText(ssid, 1U, 32U) || !IsText(password, 8U, 63U)) return false;
   auto quote = [](const std::string& input) { std::string output;
     for (const char byte : input) { if (byte == '\\' || byte == '"') { output += '\\'; } output += byte; }
@@ -172,17 +183,17 @@ bool NetworkBootstrap::SaveWifi(const std::string& ssid, const std::string& pass
   // 转义后的凭据只写入 0600 文件；调用链也不能把原始 SSID/密码写入普通日志。
   return AtomicWrite(kWifiConfig, "# boomPI-managed\nctrl_interface=/var/run/wpa_supplicant\nnetwork={\n  ssid=\"" +
                      quote(ssid) + "\"\n  psk=\"" + quote(password) + "\"\n}\n");
+#else
+  (void)ssid;
+  (void)password;
+  return false;
+#endif
 }
 
-bool NetworkBootstrap::SaveServer(const NetworkBootstrapResult& server) {
-  if (!IsEndpoint(server) || (mkdir(kConfigDir, 0700) != 0 && errno != EEXIST)) return false;
-  return AtomicWrite(kServerConfig, server.host + " " + std::to_string(server.port) + " " + server.spki_sha256_base64 + "\n");
-}
-
-bool NetworkBootstrap::Start(const NetworkBootstrapResult* explicit_server,
-                             NetworkBootstrapResult* output,
-                             const std::atomic<bool>* stop) {
+bool detail::FindServer(const LinkConfig& configured, LinkConfig* output,
+                         const std::atomic<bool>* stop) {
   if (output == nullptr) return false;
+#if defined(BOOMPI_TARGET_RV1106)
   *output = {}; const char* selected = nullptr;
   // 以太网优先：有载波且已有地址时直接复用；仅在缺少地址时运行一次有界 DHCP。
   // 有线无法取得 IPv4 才进入 Wi-Fi 分支，确保插网线时的路径稳定且延迟最低。
@@ -202,22 +213,27 @@ bool NetworkBootstrap::Start(const NetworkBootstrapResult* explicit_server,
   }
   if (StopRequested(stop)) return false;
   // 显式地址只替代服务器查找；真实网卡和路由仍需先建立，随后直接交给 TLS。
-  if (explicit_server != nullptr) {
-    if (!IsEndpoint(*explicit_server)) return false;
-    *output = *explicit_server;
+  if (!configured.host.empty()) {
+    if (!IsEndpoint(configured)) return false;
+    *output = configured;
     return true;
   }
   // 发现结果与已保存 SPKI 一致时才更新地址，使 DHCP 导致的服务器 IP 变化可以
   // 自动恢复，同时阻止同一局域网里的陌生广播静默替换已经确认的服务端公钥。
   // 没收到广播时继续使用缓存；连接可达性和 pin 校验由后续 WSS 建连给出结论。
-  NetworkBootstrapResult saved{}, found{}; const bool have_saved = LoadServer(&saved);
+  LinkConfig saved{}, found{}; const bool have_saved = LoadServer(&saved);
   if (Discover(selected, &found) &&
-      (!have_saved || found.spki_sha256_base64 == saved.spki_sha256_base64) &&
-      NetworkBootstrap::SaveServer(found)) {
+      (!have_saved || found.spki == saved.spki) && SaveServer(found)) {
     *output = found; return true;
   }
   if (!have_saved) return false;
   *output = saved; return true;
+#else
+  // Host loopback exercises the production TLS/protocol path without touching NICs.
+  (void)stop;
+  *output = configured;
+  return !output->host.empty() && output->port != 0 && config::IsValidSpkiSha256(output->spki);
+#endif
 }
 
 }  // namespace boompi::network

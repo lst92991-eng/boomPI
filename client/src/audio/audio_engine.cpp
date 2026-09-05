@@ -17,13 +17,17 @@
 
 namespace boompi::audio { namespace {
 // 服务端 TTS 为 24 kHz mono，因此 480 samples 与上行 320 samples 同样表示 20 ms。
-constexpr std::size_t kTts24FrameSamples = 480U;
-constexpr std::size_t kTtsSlots = 75U;       // 75 × 20 ms = 1.5 s，下行抖动上限。
-constexpr std::size_t kInitialTtsSlots = 9U; // 首播累积 180 ms；EOS 短回复例外。
-constexpr std::size_t kRebufferTtsSlots = 2U;// 确认真欠载后积累 40 ms 再恢复。
+constexpr std::size_t kTts24FrameSamples = kTtsFrameSamples;
+constexpr std::size_t kTtsSlots =
+    VoiceFrameContract::FramesForMs(1500U);
+constexpr std::size_t kInitialTtsSlots =
+    VoiceFrameContract::FramesForMs(180U);
+constexpr std::size_t kRebufferTtsSlots =
+    VoiceFrameContract::FramesForMs(40U);
 // 短于 30 ms 的到包间隔波动由 ALSA 缓冲吸收，避免频繁停播造成周期性卡顿。
 constexpr auto kRebufferGrace = std::chrono::milliseconds(30);
-constexpr std::size_t kCaptureSlots = 4U;    // actor 最多落后 80 ms；再慢就显式断帧。
+constexpr std::size_t kCaptureSlots =
+    VoiceFrameContract::FramesForMs(80U);
 // 控制命令必须快速跨越下一个 20 ms 帧边界；100 ms 允许少量调度抖动并限制关停等待。
 constexpr auto kCaptureCommandTimeout = std::chrono::milliseconds(100);
 // capture 优先级更高，因为丢失硬件输入不可恢复；playback 数据仍可由环形缓冲吸收抖动。
@@ -57,7 +61,7 @@ struct AudioEngine::Impl final {
   // 控制命令由 application 发出，在 capture period 边界由 capture_thread 执行。
   // 这条单槽握手保证 Snowboy/VAD/后端状态始终只有采集线程写入。
   enum class CaptureCommand : std::uint8_t {
-    kNone, kResetListener, kPreparePlayback
+    kNone, kResetListener, kArmPlayback
   };
 
   // capture_thread 独占采集/3A，并在采集帧边界执行后端控制命令；
@@ -191,8 +195,8 @@ struct AudioEngine::Impl final {
     }
     const bool succeeded = command == CaptureCommand::kResetListener
                                ? backend.ResetListener()
-                               : command == CaptureCommand::kPreparePlayback
-                                     ? backend.PreparePlayback()
+                                : command == CaptureCommand::kArmPlayback
+                                      ? backend.ArmPlayback()
                                      : false;
     {
       std::lock_guard<std::mutex> lock(capture_mutex);
@@ -309,7 +313,9 @@ struct AudioEngine::Impl final {
   void PlaybackLoop() noexcept {
     SetRealtimePriority("boompi-playback", kPlaybackPriority);
     for (;;) {
-      TtsSlot slot{}; bool have_slot = false, finish = false, must_drop = false;
+      TtsSlot slot{};
+      bool have_slot = false, finish = false, must_drop = false;
+      bool prepare_failed = false;
       {
         std::unique_lock<std::mutex> lock(mutex);
         // 单次调度抖动不进入重缓冲；只有连续 30 ms 没有新 PCM 才重新蓄水。
@@ -338,7 +344,11 @@ struct AudioEngine::Impl final {
         });
         if (stop.load(std::memory_order_acquire)) break;
         must_drop = drop;
-        if (!must_drop && tts_count != 0U) {
+        // AEC 已经在 BeginPlayback 的 capture 握手中武装。播放资源始终由本线程
+        // 准备；和 drop 共用状态锁，避免 prepare 清除刚到达的取消请求。
+        if (!must_drop && !playback_started)
+          prepare_failed = !backend.PreparePlayback();
+        if (!must_drop && !prepare_failed && tts_count != 0U) {
           // 在锁内取走一个 slot，随后释放锁做重采样和 ALSA write，网络线程可继续入队。
           FinishRebufferInterval(Clock::now());
           rebuffering = false;
@@ -350,9 +360,9 @@ struct AudioEngine::Impl final {
           --tts_count;
           have_slot = true;
         }
-        finish = must_drop || (ending && tts_count == 0U);
+        finish = must_drop || prepare_failed || (ending && tts_count == 0U);
       }
-      bool failed = have_slot && !Render(slot);
+      bool failed = prepare_failed || (have_slot && !Render(slot));
       if (finish || failed) FinishPlayback(must_drop, failed);
     }
   }
@@ -476,9 +486,8 @@ bool AudioEngine::BeginPlayback() noexcept {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (impl_->active) return false;
   impl_->ClearQueue();
-  // application 在此等待 capture 线程于帧边界执行 prepare；
-  // 返回后才置 active，随后的渲染热路径只属于 playback 线程。
-  if (!impl_->RunCaptureCommand(Impl::CaptureCommand::kPreparePlayback))
+  // 先等 capture 在帧边界武装 AEC；置 active 后，播放线程才允许准备并渲染首帧。
+  if (!impl_->RunCaptureCommand(Impl::CaptureCommand::kArmPlayback))
     return false;
   impl_->ClearError();
   impl_->sequence_set = impl_->ending = impl_->drop = impl_->playback_started =

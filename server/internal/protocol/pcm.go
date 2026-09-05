@@ -1,163 +1,66 @@
 package protocol
 
 import (
-	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
-	"fmt"
 )
 
 const (
-	PCMHeaderSize        = 64
-	MaxPCMPayloadBytes   = 64 * 1024
-	AudioFormatPCM16LE   = 1
-	AudioKindUplink      = 1
-	AudioKindDownlink    = 2
-	PCMFlagStart         = uint16(0x0001)
-	PCMFlagEnd           = uint16(0x0002)
-	PCMFlagDiscontinuity = uint16(0x0004)
+	PCMHeaderSize             = 16
+	UplinkFrameBytes          = 640
+	DownlinkFrameBytes        = 960
+	PCMFlagStart       uint16 = 1
+	PCMFlagEnd         uint16 = 2
+	PCMFlagSupersede   uint16 = 4
 )
 
-var pcmMagic = [4]byte{'B', 'P', 'V', '1'}
-
-const allowedPCMFlags = PCMFlagStart | PCMFlagEnd | PCMFlagDiscontinuity
-
 type PCMHeader struct {
-	Version      uint8
-	Kind         uint8
-	Flags        uint16
-	AudioFormat  uint8
-	Channels     uint8
-	SampleRateHz uint32
-	PayloadLen   uint32
-	Sequence     uint32
-	TimestampUS  uint64
-	Epoch        uint32
-	DeviceUUID   [16]byte
-	SessionID    uint32
-	TurnID       uint32
-	StreamID     uint32
+	Flags      uint16
+	Generation uint32
+	Sequence   uint32
 }
 
-func (h PCMHeader) Validate() error {
-	if h.Version != Version {
-		return fmt.Errorf("unsupported PCM protocol version %d", h.Version)
+func (header PCMHeader) validate(payloadBytes int, uplink bool) error {
+	if header.Generation == 0 || header.Flags & ^uint16(7) != 0 || payloadBytes == 0 || payloadBytes%2 != 0 {
+		return errors.New("invalid PCM header or sample alignment")
 	}
-	if h.Kind != AudioKindUplink && h.Kind != AudioKindDownlink {
-		return errors.New("invalid PCM kind")
+	start := header.Flags&PCMFlagStart != 0
+	if start != (header.Sequence == 0) {
+		return errors.New("START must occur exactly at sequence zero")
 	}
-	if h.AudioFormat != AudioFormatPCM16LE {
-		return errors.New("unsupported PCM audio format")
+	if header.Flags&PCMFlagSupersede != 0 && (!uplink || !start) {
+		return errors.New("SUPERSEDE requires uplink START")
 	}
-	if h.Flags & ^allowedPCMFlags != 0 {
-		return errors.New("PCM flags contain reserved bits")
+	if uplink && payloadBytes != UplinkFrameBytes {
+		return errors.New("uplink frame must contain 20 ms of PCM")
 	}
-	if h.Channels != 1 {
-		return errors.New("PCM channels must be 1 in protocol v1")
-	}
-	if h.SampleRateHz < 8000 || h.SampleRateHz > 96000 {
-		return errors.New("PCM sample rate must be between 8000 and 96000 Hz")
-	}
-	if h.PayloadLen == 0 || h.PayloadLen > MaxPCMPayloadBytes {
-		return errors.New("PCM payload exceeds the maximum size")
-	}
-	if h.PayloadLen%uint32(h.Channels*2) != 0 {
-		return errors.New("PCM payload is not aligned to S16_LE samples")
-	}
-	if h.Epoch == 0 || h.SessionID == 0 || h.TurnID == 0 || h.StreamID == 0 {
-		return errors.New("active PCM identifiers must be nonzero")
-	}
-	if h.DeviceUUID == ([16]byte{}) {
-		return errors.New("PCM device UUID must be nonzero")
+	if !uplink && (payloadBytes > DownlinkFrameBytes || (header.Flags&PCMFlagEnd == 0 && payloadBytes != DownlinkFrameBytes)) {
+		return errors.New("downlink frame length is invalid")
 	}
 	return nil
 }
-func ParseDeviceUUID(value string) ([16]byte, error) {
-	var result [16]byte
-	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
-		return result, errors.New("must be a canonical UUID")
-	}
-	compact := value[0:8] + value[9:13] + value[14:18] + value[19:23] + value[24:36]
-	for _, current := range compact {
-		if !((current >= '0' && current <= '9') || (current >= 'a' && current <= 'f')) {
-			return result, errors.New("must use lowercase canonical UUID hexadecimal")
-		}
-	}
-	decoded, err := hex.DecodeString(compact)
-	if err != nil || len(decoded) != len(result) {
-		return result, errors.New("must be a canonical UUID")
-	}
-	copy(result[:], decoded)
-	if result == ([16]byte{}) {
-		return result, errors.New("must not be the nil UUID")
-	}
-	return result, nil
-}
 
-func (h PCMHeader) MarshalBinary() ([]byte, error) {
-	if err := h.Validate(); err != nil {
-		return nil, err
-	}
-	buffer := make([]byte, PCMHeaderSize)
-	copy(buffer[0:4], pcmMagic[:])
-	buffer[4] = h.Version
-	buffer[5] = h.Kind
-	binary.BigEndian.PutUint16(buffer[6:8], h.Flags)
-	binary.BigEndian.PutUint16(buffer[8:10], PCMHeaderSize)
-	buffer[10] = h.AudioFormat
-	buffer[11] = h.Channels
-	binary.BigEndian.PutUint32(buffer[12:16], h.SampleRateHz)
-	binary.BigEndian.PutUint32(buffer[16:20], h.PayloadLen)
-	binary.BigEndian.PutUint32(buffer[20:24], h.Sequence)
-	binary.BigEndian.PutUint64(buffer[24:32], h.TimestampUS)
-	binary.BigEndian.PutUint32(buffer[32:36], h.Epoch)
-	copy(buffer[36:52], h.DeviceUUID[:])
-	binary.BigEndian.PutUint32(buffer[52:56], h.SessionID)
-	binary.BigEndian.PutUint32(buffer[56:60], h.TurnID)
-	binary.BigEndian.PutUint32(buffer[60:64], h.StreamID)
-	return buffer, nil
-}
-
-func ParsePCMHeader(data []byte) (PCMHeader, error) {
-	if len(data) < PCMHeaderSize {
-		return PCMHeader{}, errors.New("PCM header is truncated")
-	}
-	if !bytes.Equal(data[0:4], pcmMagic[:]) {
-		return PCMHeader{}, errors.New("PCM magic does not match BPV1")
-	}
-	if binary.BigEndian.Uint16(data[8:10]) != PCMHeaderSize {
-		return PCMHeader{}, errors.New("PCM header length is not 64 bytes")
-	}
+func ParsePCMFrame(frame []byte, uplink bool) (PCMHeader, []byte, error) {
 	var header PCMHeader
-	header.Version = data[4]
-	header.Kind = data[5]
-	header.Flags = binary.BigEndian.Uint16(data[6:8])
-	header.AudioFormat = data[10]
-	header.Channels = data[11]
-	header.SampleRateHz = binary.BigEndian.Uint32(data[12:16])
-	header.PayloadLen = binary.BigEndian.Uint32(data[16:20])
-	header.Sequence = binary.BigEndian.Uint32(data[20:24])
-	header.TimestampUS = binary.BigEndian.Uint64(data[24:32])
-	header.Epoch = binary.BigEndian.Uint32(data[32:36])
-	copy(header.DeviceUUID[:], data[36:52])
-	header.SessionID = binary.BigEndian.Uint32(data[52:56])
-	header.TurnID = binary.BigEndian.Uint32(data[56:60])
-	header.StreamID = binary.BigEndian.Uint32(data[60:64])
-	if err := header.Validate(); err != nil {
-		return PCMHeader{}, err
+	if len(frame) < PCMHeaderSize || string(frame[:4]) != "BPV2" || binary.BigEndian.Uint16(frame[6:8]) != 0 {
+		return header, nil, errors.New("invalid BPV2 header")
 	}
-	return header, nil
-}
-
-func ParsePCMFrame(frame []byte) (PCMHeader, []byte, error) {
-	header, err := ParsePCMHeader(frame)
-	if err != nil {
-		return PCMHeader{}, nil, err
-	}
-	expected := PCMHeaderSize + int(header.PayloadLen)
-	if len(frame) != expected {
-		return PCMHeader{}, nil, fmt.Errorf("PCM frame length is %d, expected %d", len(frame), expected)
+	header = PCMHeader{Flags: binary.BigEndian.Uint16(frame[4:6]), Generation: binary.BigEndian.Uint32(frame[8:12]), Sequence: binary.BigEndian.Uint32(frame[12:16])}
+	if err := header.validate(len(frame)-PCMHeaderSize, uplink); err != nil {
+		return header, nil, err
 	}
 	return header, frame[PCMHeaderSize:], nil
+}
+
+func EncodePCM(header PCMHeader, pcm []byte, uplink bool) ([]byte, error) {
+	if err := header.validate(len(pcm), uplink); err != nil {
+		return nil, err
+	}
+	frame := make([]byte, PCMHeaderSize+len(pcm))
+	copy(frame, "BPV2")
+	binary.BigEndian.PutUint16(frame[4:6], header.Flags)
+	binary.BigEndian.PutUint32(frame[8:12], header.Generation)
+	binary.BigEndian.PutUint32(frame[12:16], header.Sequence)
+	copy(frame[PCMHeaderSize:], pcm)
+	return frame, nil
 }

@@ -1,6 +1,8 @@
 #include "audio_backend.h"
 #include "boompi/audio/audio_engine.h"
+#include "boompi/audio/voice_audio.h"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -17,6 +19,9 @@ using boompi::audio::AudioEngineConfig;
 using boompi::audio::CaptureFrame;
 using boompi::audio::CaptureResult;
 using boompi::audio::QueueTtsResult;
+using boompi::audio::AudioEvent;
+using boompi::audio::AudioEventKind;
+using boompi::audio::VoiceAudio;
 namespace fake = boompi::test::audio_backend;
 
 bool Check(const bool condition, const char* const message) {
@@ -73,6 +78,52 @@ std::vector<std::uint8_t> Pcm24(const std::size_t samples,
     bytes[2U * i + 1U] = static_cast<std::uint8_t>(bits >> 8U);
   }
   return bytes;
+}
+
+bool OpenVoice(VoiceAudio* const voice) {
+  fake::Reset();
+  return Check(voice->Open(60U), "VoiceAudio Open failed") &&
+         Check(fake::WaitForCaptureReads(1U, 500ms),
+               "VoiceAudio capture actor did not start");
+}
+
+bool BeginVoiceListen(VoiceAudio* const voice, const bool follow_up) {
+  auto listen = std::async(std::launch::async,
+                           [voice, follow_up] {
+                             return voice->Listen(follow_up);
+                           });
+  for (std::size_t attempt = 0U; attempt < 10U &&
+       listen.wait_for(0ms) != std::future_status::ready; ++attempt) {
+    fake::PushCapture(CaptureFrame{});
+    std::this_thread::sleep_for(5ms);
+  }
+  return Check(listen.wait_for(500ms) == std::future_status::ready,
+               "VoiceAudio Listen did not cross a capture boundary") &&
+         Check(listen.get(), "VoiceAudio Listen failed");
+}
+
+bool BeginVoicePlayback(VoiceAudio* const voice,
+                        const std::uint32_t generation,
+                        const std::vector<std::uint8_t>& pcm) {
+  auto play = std::async(std::launch::async,
+                         [voice, generation, &pcm] {
+                           return voice->Play(generation, pcm.data(), pcm.size(),
+                                              0U, true, false);
+                         });
+  for (std::size_t attempt = 0U; attempt < 20U &&
+       play.wait_for(0ms) != std::future_status::ready; ++attempt) {
+    fake::PushCapture(CaptureFrame{});
+    std::this_thread::sleep_for(5ms);
+  }
+  return Check(play.wait_for(500ms) == std::future_status::ready,
+               "VoiceAudio Play(start) did not complete") &&
+         Check(play.get(), "VoiceAudio Play(start) failed");
+}
+
+bool PollInjected(VoiceAudio* const voice, CaptureFrame frame,
+                  AudioEvent* const event) {
+  fake::PushCapture(frame);
+  return voice->Poll(event, 100ms);
 }
 
 bool QueueFrame(AudioEngine* const engine, const std::uint64_t sequence,
@@ -319,6 +370,216 @@ bool TestSuccessfulPlaybackClearsOldError() {
                           "dropped playback did not finish");
 }
 
+bool TestPlaybackOwnerOrder() {
+  AudioEngine engine;
+  if (!OpenEngine(&engine) || !PrimePlayback(&engine) || !engine.EndPlayback() ||
+      !Check(WaitForPlaybackDone(engine, 500ms), "playback did not drain"))
+    return false;
+  // 再开一轮，证明播放准备只发生一次，且每轮都在本轮 capture 武装之后。
+  return PrimePlayback(&engine) && engine.EndPlayback() &&
+      Check(WaitForPlaybackDone(engine, 500ms), "second playback did not drain") &&
+      Check(fake::PlaybackOwnerOrderIsValid(),
+            "capture arm or playback prepare/render/drain crossed its owner");
+}
+
+bool TestInterruptBlockedPlayback(fake::PlaybackBlock stage, bool close) {
+  AudioEngine engine;
+  if (!OpenEngine(&engine) || !BeginPlayback(&engine)) return false;
+  fake::BlockPlayback(stage);
+  // EOS 放行一个短回复，同时覆盖 render 与随后 drain 的阻塞位置。
+  if (!QueueFrame(&engine, 0U) || !engine.EndPlayback() ||
+      !Check(fake::WaitForPlaybackBlocked(500ms), "playback did not reach blocking I/O"))
+    return false;
+  const auto started = std::chrono::steady_clock::now();
+  if (close) engine.Close();
+  else engine.DropPlayback();
+  return Check(WaitForPlaybackDone(engine, 200ms), "interrupt did not release playback") &&
+      Check(std::chrono::steady_clock::now() - started < 250ms,
+            "drop/close waited for blocked playback") &&
+      Check(!engine.playback_failed(), "user interruption became playback failure") &&
+      Check(fake::PlaybackOwnerOrderIsValid(), "interruption changed playback owner");
+}
+
+bool TestPlaybackPrepareFailure() {
+  AudioEngine engine;
+  if (!OpenEngine(&engine) || !BeginPlayback(&engine)) return false;
+  fake::FailPlaybackPreparation();
+  for (std::uint64_t sequence = 0U; sequence < 9U; ++sequence) {
+    if (!QueueFrame(&engine, sequence)) return false;
+  }
+  // 服务端尚未发 EOS；本地准备失败必须立即通知 application，不能等待下行结束。
+  return Check(WaitForPlaybackDone(engine, 500ms) && engine.playback_failed(),
+               "playback preparation failure was not published") &&
+      Check(fake::RenderCallsSnapshot().empty(), "failed preparation still rendered PCM");
+}
+
+bool TestVoiceAudioPreRollOrder() {
+  VoiceAudio voice;
+  if (!OpenVoice(&voice) || !BeginVoiceListen(&voice, false)) return false;
+
+  AudioEvent event{};
+  for (std::int16_t id = 1; id <= 55; ++id) {
+    CaptureFrame frame{};
+    frame.pcm[0] = id;
+    frame.timestamp_us = static_cast<std::uint64_t>(id) * 20000U;
+    if (!Check(!PollInjected(&voice, frame, &event),
+               "pre-roll history emitted PCM before speech admission"))
+      return false;
+  }
+  CaptureFrame admitted{};
+  admitted.pcm[0] = 56;
+  admitted.timestamp_us = 56U * 20000U;
+  admitted.vad_now = admitted.vad_started = true;
+  if (!Check(PollInjected(&voice, admitted, &event) &&
+                 event.kind == AudioEventKind::SpeechStart,
+             "speech admission did not lead with SpeechStart"))
+    return false;
+
+  std::uint64_t previous_sequence = 0U;
+  for (std::int16_t expected = 32; expected <= 56; ++expected) {
+    if (!Check(voice.Poll(&event, 100ms) &&
+                   event.kind == AudioEventKind::Pcm,
+               "pre-roll PCM was missing") ||
+        !Check(event.pcm[0] == expected,
+               "pre-roll did not retain the newest contiguous 25 frames") ||
+        !Check(event.timestamp_us ==
+                   static_cast<std::uint64_t>(expected) * 20000U,
+               "pre-roll timestamp changed") ||
+        !Check(!event.end, "admission pre-roll acquired a false END"))
+      return false;
+    if (expected != 32 &&
+        !Check(event.sequence == previous_sequence + 1U,
+               "pre-roll capture sequence was not contiguous"))
+      return false;
+    previous_sequence = event.sequence;
+  }
+  voice.CancelInput();
+  voice.Close();
+  return true;
+}
+
+bool TestVoiceAudioFollowUpDropsOldEnd() {
+  VoiceAudio voice;
+  if (!OpenVoice(&voice) || !BeginVoiceListen(&voice, true)) return false;
+
+  AudioEvent event{};
+  for (std::int16_t id = 1; id <= 10; ++id) {
+    CaptureFrame frame{};
+    frame.pcm[0] = id;
+    frame.timestamp_us = static_cast<std::uint64_t>(id) * 20000U;
+    frame.near_voice = frame.vad_now = true;
+    if (!Check(!PollInjected(&voice, frame, &event),
+               "short follow-up was admitted before 400 ms"))
+      return false;
+  }
+  CaptureFrame old_end{};
+  old_end.pcm[0] = 11;
+  old_end.timestamp_us = 11U * 20000U;
+  old_end.vad_ended = true;
+  if (!Check(!PollInjected(&voice, old_end, &event),
+             "rejected short follow-up emitted an event"))
+    return false;
+
+  for (std::int16_t id = 100; id <= 119; ++id) {
+    CaptureFrame frame{};
+    frame.pcm[0] = id;
+    frame.timestamp_us = static_cast<std::uint64_t>(id) * 20000U;
+    frame.near_voice = frame.vad_now = true;
+    const bool have_event = PollInjected(&voice, frame, &event);
+    if (id != 119 &&
+        !Check(!have_event, "follow-up was admitted before 20 new frames"))
+      return false;
+    if (id == 119 &&
+        !Check(have_event && event.kind == AudioEventKind::SpeechStart,
+               "new follow-up was not admitted"))
+      return false;
+  }
+  for (std::int16_t expected = 100; expected <= 119; ++expected) {
+    if (!Check(voice.Poll(&event, 100ms) &&
+                   event.kind == AudioEventKind::Pcm,
+               "new follow-up PCM was missing") ||
+        !Check(event.pcm[0] == expected,
+               "old short utterance contaminated new follow-up") ||
+        !Check(!event.end, "old VAD END truncated the new follow-up"))
+      return false;
+  }
+  voice.CancelInput();
+  voice.Close();
+  return true;
+}
+
+bool DriveConfirmedBarge(VoiceAudio* const voice, AudioEvent* const event) {
+  std::int16_t id = 1;
+  auto drive = [&](const unsigned count, const bool reference,
+                   const bool near_voice) {
+    for (unsigned index = 0U; index < count; ++index, ++id) {
+      CaptureFrame frame{};
+      frame.pcm[0] = id;
+      frame.timestamp_us = static_cast<std::uint64_t>(id) * 20000U;
+      frame.reference_active = reference;
+      frame.near_voice = near_voice;
+      frame.vad_now = near_voice;
+      frame.voice_dbfs = -10.0F;
+      if (PollInjected(voice, frame, event)) return false;
+    }
+    return true;
+  };
+  if (!drive(6U, true, true) || !drive(3U, false, true) ||
+      !drive(3U, false, true))
+    return false;
+  for (unsigned index = 0U; index < 3U; ++index, ++id) {
+    CaptureFrame frame{};
+    frame.pcm[0] = id;
+    frame.timestamp_us = static_cast<std::uint64_t>(id) * 20000U;
+    frame.near_voice = frame.vad_now = true;
+    frame.voice_dbfs = -10.0F;
+    const bool have_event = PollInjected(voice, frame, event);
+    if (index != 2U && have_event) return false;
+    if (index == 2U)
+      return have_event && event->kind == AudioEventKind::Barge;
+  }
+  return false;
+}
+
+bool TestVoiceAudioBargeAndDropLifecycle() {
+  VoiceAudio voice;
+  if (!OpenVoice(&voice)) return false;
+  const auto pcm = Pcm24(480U, 1000);
+  if (!BeginVoicePlayback(&voice, 7U, pcm)) return false;
+  fake::BlockPlayback(fake::PlaybackBlock::kRender);
+  for (std::uint32_t sequence = 1U; sequence < 9U; ++sequence) {
+    if (!Check(voice.Play(7U, pcm.data(), pcm.size(), sequence, false,
+                          false),
+               "VoiceAudio could not fill the initial playback buffer"))
+      return false;
+  }
+  if (!Check(fake::WaitForPlaybackBlocked(500ms),
+             "playback did not enter the blocked render"))
+    return false;
+
+  AudioEvent event{};
+  if (!Check(DriveConfirmedBarge(&voice, &event),
+             "production barge detector did not confirm") ||
+      !Check(event.generation == 7U,
+             "Barge was not bound to the interrupted generation"))
+    return false;
+
+  // Application starts the superseding input from the queued PCM, then may
+  // cancel it locally. A subsequent response must not fail merely because the
+  // old playback thread is still completing its already-issued drop.
+  voice.CancelInput();
+  fake::BlockPlayback(fake::PlaybackBlock::kNone);
+  const auto started = std::chrono::steady_clock::now();
+  if (!BeginVoicePlayback(&voice, 8U, pcm)) return false;
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  if (!Check(elapsed < 250ms,
+             "drop-to-next-playback lifecycle was not bounded"))
+    return false;
+  voice.StopPlayback();
+  voice.Close();
+  return true;
+}
+
 }  // namespace
 
 int main(const int argc, char** const argv) {
@@ -342,6 +603,19 @@ int main(const int argc, char** const argv) {
     passed = TestSuccessfulOpenClearsOldError();
   else if (scenario == "playback-clears-error")
     passed = TestSuccessfulPlaybackClearsOldError();
+  else if (scenario == "playback-owner-order") passed = TestPlaybackOwnerOrder();
+  else if (scenario == "drop-blocked-render")
+    passed = TestInterruptBlockedPlayback(fake::PlaybackBlock::kRender, false);
+  else if (scenario == "drop-blocked-drain")
+    passed = TestInterruptBlockedPlayback(fake::PlaybackBlock::kDrain, false);
+  else if (scenario == "close-blocked-render")
+    passed = TestInterruptBlockedPlayback(fake::PlaybackBlock::kRender, true);
+  else if (scenario == "playback-prepare-failure") passed = TestPlaybackPrepareFailure();
+  else if (scenario == "voice-preroll") passed = TestVoiceAudioPreRollOrder();
+  else if (scenario == "voice-follow-up-boundary")
+    passed = TestVoiceAudioFollowUpDropsOldEnd();
+  else if (scenario == "voice-barge-lifecycle")
+    passed = TestVoiceAudioBargeAndDropLifecycle();
   else {
     std::fprintf(stderr, "unknown scenario: %s\n", scenario.c_str());
     return 2;
