@@ -1,14 +1,14 @@
 /**
  * @file voice_audio.cpp
- * @brief 将固定帧音频、VAD、pre-roll、播放和打断收敛成 application 语义事件。
+ * @brief 整理录音片段、缓存句首，并在播放中确认近讲打断。
  */
 #include "boompi/audio/voice_audio.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <new>
 #include <string>
 #include <thread>
@@ -18,27 +18,26 @@
 namespace boompi::audio {
 namespace {
 
-constexpr std::size_t kPreRollFrames =
-    VoiceFrameContract::FramesForMs(500U);
+constexpr std::size_t kPreRollFrames = VoiceFrameContract::FramesForMs(500U);
 constexpr std::size_t kBargeHistoryFrames = 32U;
-constexpr unsigned kVadStartFrames = static_cast<unsigned>(
-    VoiceFrameContract::FramesForMs(120U));
-constexpr unsigned kFollowUpFrames = static_cast<unsigned>(
-    VoiceFrameContract::FramesForMs(400U));
+constexpr unsigned kVadStartFrames =
+    static_cast<unsigned>(VoiceFrameContract::FramesForMs(120U));
+constexpr unsigned kFollowUpFrames =
+    static_cast<unsigned>(VoiceFrameContract::FramesForMs(400U));
 constexpr unsigned kBargeCandidateFrames = kVadStartFrames;
-constexpr unsigned kBargeReferenceLowFrames = static_cast<unsigned>(
-    VoiceFrameContract::FramesForMs(60U));
-constexpr unsigned kBargeReferenceWaitFrames = static_cast<unsigned>(
-    VoiceFrameContract::FramesForMs(300U));
-constexpr unsigned kBargeEchoClearFrames = static_cast<unsigned>(
-    VoiceFrameContract::FramesForMs(60U));
-constexpr unsigned kBargeConfirmFrames = static_cast<unsigned>(
-    VoiceFrameContract::FramesForMs(60U));
-constexpr unsigned kBargeRetryCooldownFrames = static_cast<unsigned>(
-    VoiceFrameContract::FramesForMs(300U));
-constexpr std::size_t kMaximumBargeProbeFrames =
-    kBargeCandidateFrames + kBargeReferenceWaitFrames +
-    kBargeEchoClearFrames + kBargeConfirmFrames;
+constexpr unsigned kBargeReferenceLowFrames =
+    static_cast<unsigned>(VoiceFrameContract::FramesForMs(60U));
+constexpr unsigned kBargeReferenceWaitFrames =
+    static_cast<unsigned>(VoiceFrameContract::FramesForMs(300U));
+constexpr unsigned kBargeEchoClearFrames =
+    static_cast<unsigned>(VoiceFrameContract::FramesForMs(60U));
+constexpr unsigned kBargeConfirmFrames =
+    static_cast<unsigned>(VoiceFrameContract::FramesForMs(60U));
+constexpr unsigned kBargeRetryCooldownFrames =
+    static_cast<unsigned>(VoiceFrameContract::FramesForMs(300U));
+constexpr std::size_t kMaximumBargeProbeFrames = kBargeCandidateFrames +
+                                                 kBargeReferenceWaitFrames +
+                                                 kBargeEchoClearFrames + kBargeConfirmFrames;
 constexpr std::size_t kEventSlots = 64U;
 constexpr unsigned kCaptureDrainPerPoll = 8U;
 constexpr auto kPlaybackStopWait = std::chrono::milliseconds(60);
@@ -87,27 +86,37 @@ struct VoiceAudio::Impl final {
     std::snprintf(error.data(), error.size(), "%s", why);
   }
 
-  void ClearError() noexcept { error.fill('\0'); }
+  void ClearError() noexcept {
+    error.fill('\0');
+  }
 
   void ClearEvents() noexcept {
-    for (auto& event : events) event = {};
+    for (auto& event : events) {
+      event = {};
+    }
     event_head = event_count = 0U;
   }
 
   void ClearHistory() noexcept {
-    for (auto& frame : history) frame = {};
+    for (auto& frame : history) {
+      frame = {};
+    }
     history_head = history_count = 0U;
   }
 
   bool PushEvent(const AudioEvent& event) noexcept {
-    if (event_count == events.size()) return false;
+    if (event_count == events.size()) {
+      return false;
+    }
     events[(event_head + event_count) % events.size()] = event;
     ++event_count;
     return true;
   }
 
   bool PopEvent(AudioEvent* const event) noexcept {
-    if (event == nullptr || event_count == 0U) return false;
+    if (event == nullptr || event_count == 0U) {
+      return false;
+    }
     *event = events[event_head];
     events[event_head] = {};
     event_head = (event_head + 1U) % events.size();
@@ -143,7 +152,9 @@ struct VoiceAudio::Impl final {
 
   void SaveHistory(const CaptureFrame& frame, const std::size_t limit) noexcept {
     const std::size_t bounded_limit = std::min(limit, history.size());
-    if (bounded_limit == 0U) return;
+    if (bounded_limit == 0U) {
+      return;
+    }
     if (history_count < bounded_limit) {
       history[(history_head + history_count) % history.size()] = frame;
       ++history_count;
@@ -174,15 +185,14 @@ struct VoiceAudio::Impl final {
     std::size_t send_count = history_count;
     bool ended = false;
     for (std::size_t offset = 0U; offset < history_count; ++offset) {
-      const CaptureFrame& frame =
-          history[(history_head + offset) % history.size()];
+      const CaptureFrame& frame = history[(history_head + offset) % history.size()];
       if (frame.vad_ended) {
         send_count = offset + 1U;
         ended = true;
         break;
       }
     }
-    const std::size_t required = 1U + send_count + (ended ? 1U : 0U);
+    const std::size_t required = 1U + send_count;
     if (required > events.size() - event_count) {
       ReportFault("voice event queue overflow", false);
       return false;
@@ -192,15 +202,12 @@ struct VoiceAudio::Impl final {
     start.generation = generation;
     static_cast<void>(PushEvent(start));
     for (std::size_t offset = 0U; offset < send_count; ++offset) {
-      const CaptureFrame& frame =
-          history[(history_head + offset) % history.size()];
-      static_cast<void>(PushEvent(PcmEvent(frame, ended && offset + 1U == send_count)));
+      const CaptureFrame& frame = history[(history_head + offset) % history.size()];
+      const bool last_frame = ended && offset + 1U == send_count;
+      static_cast<void>(PushEvent(PcmEvent(frame, last_frame)));
     }
     ClearHistory();
     if (ended) {
-      AudioEvent speech_end{};
-      speech_end.kind = AudioEventKind::SpeechEnd;
-      static_cast<void>(PushEvent(speech_end));
       input_state = InputState::kIdle;
     } else {
       input_state = InputState::kCapturing;
@@ -209,8 +216,7 @@ struct VoiceAudio::Impl final {
   }
 
   bool IsBargeVoice(const CaptureFrame& frame) const noexcept {
-    return frame.near_voice &&
-           frame.voice_dbfs >= kBoardVoiceProfile.barge_voice_dbfs;
+    return frame.near_voice && frame.voice_dbfs >= kBoardVoiceProfile.barge_voice_dbfs;
   }
 
   void RejectBarge() noexcept {
@@ -225,10 +231,10 @@ struct VoiceAudio::Impl final {
     playback_ending = false;
     ResetBargeProbe();
     barge_cooldown_frames = 0U;
-    static_cast<void>(QueueBufferedInput(AudioEventKind::Barge,
-                                        interrupted_generation));
+    static_cast<void>(QueueBufferedInput(AudioEventKind::Barge, interrupted_generation));
   }
 
+  /// 候选人声先触发短暂静音；硬件参考和房间尾音消退后仍有人声，才确认打断。
   void HandleBarge(const CaptureFrame& frame) noexcept {
     switch (barge_stage) {
       case BargeStage::kIdle:
@@ -240,7 +246,9 @@ struct VoiceAudio::Impl final {
           barge_stage_frames = 0U;
           return;
         }
-        if (++barge_stage_frames < kBargeCandidateFrames) return;
+        if (++barge_stage_frames < kBargeCandidateFrames) {
+          return;
+        }
         KeepNewestHistory(kBargeCandidateFrames);
         barge_stage_frames = 0U;
         barge_reference_low_frames = 0U;
@@ -253,10 +261,14 @@ struct VoiceAudio::Impl final {
           RejectBarge();
           return;
         }
-        barge_reference_low_frames = frame.reference_active
-                                         ? 0U
-                                         : barge_reference_low_frames + 1U;
-        if (barge_reference_low_frames < kBargeReferenceLowFrames) return;
+        if (frame.reference_active) {
+          barge_reference_low_frames = 0U;
+        } else {
+          ++barge_reference_low_frames;
+        }
+        if (barge_reference_low_frames < kBargeReferenceLowFrames) {
+          return;
+        }
         barge_stage_frames = 0U;
         barge_stage = BargeStage::kClear;
         return;
@@ -266,7 +278,9 @@ struct VoiceAudio::Impl final {
           RejectBarge();
           return;
         }
-        if (++barge_stage_frames < kBargeEchoClearFrames) return;
+        if (++barge_stage_frames < kBargeEchoClearFrames) {
+          return;
+        }
         barge_stage_frames = 0U;
         barge_stage = BargeStage::kVerify;
         return;
@@ -276,7 +290,9 @@ struct VoiceAudio::Impl final {
           RejectBarge();
           return;
         }
-        if (++barge_stage_frames >= kBargeConfirmFrames) ConfirmBarge();
+        if (++barge_stage_frames >= kBargeConfirmFrames) {
+          ConfirmBarge();
+        }
         return;
     }
   }
@@ -286,29 +302,30 @@ struct VoiceAudio::Impl final {
       ReportFault("voice event queue overflow", false);
       return;
     }
-    AudioEvent ended{};
-    ended.kind = AudioEventKind::SpeechEnd;
-    if (!PushEvent(ended)) {
-      ReportFault("voice event queue overflow", false);
-      return;
-    }
     input_state = InputState::kIdle;
     follow_up_frames = 0U;
     ClearHistory();
   }
 
+  void DiscardPlayback() noexcept {
+    engine.DropPlayback();
+    playback_generation = 0U;
+    playback_ending = false;
+    ResetBargeProbe();
+    ClearHistory();
+  }
+
   void HandleCapture(const CaptureFrame& frame) noexcept {
     if (frame.discontinuity) {
-      ReportFault(frame.actor_overrun ? "voice capture queue overrun"
-                                      : "voice capture discontinuity",
-                  false);
+      ReportFault(
+          frame.actor_overrun ? "voice capture queue overrun" : "voice capture discontinuity",
+          false);
       return;
     }
 
     if (playback_generation != 0U) {
       const std::size_t history_limit =
-          barge_stage == BargeStage::kIdle ? kPreRollFrames
-                                           : kBargeHistoryFrames;
+          barge_stage == BargeStage::kIdle ? kPreRollFrames : kBargeHistoryFrames;
       SaveHistory(frame, history_limit);
       HandleBarge(frame);
       return;
@@ -319,14 +336,17 @@ struct VoiceAudio::Impl final {
         if (frame.wake) {
           AudioEvent wake{};
           wake.kind = AudioEventKind::Wake;
-          if (!PushEvent(wake)) ReportFault("voice event queue overflow", false);
+          if (!PushEvent(wake)) {
+            ReportFault("voice event queue overflow", false);
+          }
         }
         return;
 
       case InputState::kListening:
         SaveHistory(frame, kPreRollFrames);
-        if (frame.vad_started)
+        if (frame.vad_started) {
           static_cast<void>(QueueBufferedInput(AudioEventKind::SpeechStart, 0U));
+        }
         return;
 
       case InputState::kFollowingUp:
@@ -356,7 +376,9 @@ struct VoiceAudio::Impl final {
   }
 
   void CheckPlaybackCompletion() noexcept {
-    if (playback_generation == 0U || !engine.playback_done()) return;
+    if (playback_generation == 0U || !engine.playback_done()) {
+      return;
+    }
     const std::uint32_t generation = playback_generation;
     playback_generation = 0U;
     const bool expected = playback_ending;
@@ -371,7 +393,9 @@ struct VoiceAudio::Impl final {
     AudioEvent done{};
     done.kind = AudioEventKind::PlaybackDone;
     done.generation = generation;
-    if (!PushEvent(done)) ReportFault("voice event queue overflow", false);
+    if (!PushEvent(done)) {
+      ReportFault("voice event queue overflow", false);
+    }
   }
 
   CaptureResult CaptureOnce(const std::chrono::milliseconds timeout) noexcept {
@@ -379,7 +403,9 @@ struct VoiceAudio::Impl final {
     const CaptureResult result = engine.Capture(&frame, timeout);
     if (result == CaptureResult::kFrame) {
       CheckPlaybackCompletion();
-      if (!fatal) HandleCapture(frame);
+      if (!fatal) {
+        HandleCapture(frame);
+      }
     } else if (result == CaptureResult::kFailed) {
       ReportFault("voice capture failed", true);
     }
@@ -387,11 +413,10 @@ struct VoiceAudio::Impl final {
   }
 
   void DrainReadyCapture() noexcept {
-    for (unsigned drained = 0U; drained < kCaptureDrainPerPoll && !fatal;
-         ++drained) {
-      if (CaptureOnce(std::chrono::milliseconds::zero()) !=
-          CaptureResult::kFrame)
+    for (unsigned drained = 0U; drained < kCaptureDrainPerPoll && !fatal; ++drained) {
+      if (CaptureOnce(std::chrono::milliseconds::zero()) != CaptureResult::kFrame) {
         break;
+      }
     }
   }
 
@@ -399,7 +424,9 @@ struct VoiceAudio::Impl final {
     const auto deadline = std::chrono::steady_clock::now() + kPlaybackStopWait;
     while (!engine.playback_done()) {
       DrainReadyCapture();
-      if (fatal || std::chrono::steady_clock::now() >= deadline) return false;
+      if (fatal || std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return true;
@@ -412,16 +439,19 @@ VoiceAudio::~VoiceAudio() noexcept {
 }
 
 bool VoiceAudio::Open(const std::uint8_t volume) {
-  if (impl_ == nullptr) impl_ = new (std::nothrow) Impl;
-  if (impl_ == nullptr) return false;
+  if (impl_ == nullptr) {
+    impl_ = new (std::nothrow) Impl;
+  }
+  if (impl_ == nullptr) {
+    return false;
+  }
   Close();
   impl_->ClearEvents();
   impl_->ClearHistory();
   impl_->fatal = false;
   impl_->ClearError();
   AudioEngineConfig config{};
-  config.playback_gain = static_cast<float>(std::min<std::uint8_t>(volume, 100U)) /
-                         100.0F;
+  config.playback_gain = static_cast<float>(std::min<std::uint8_t>(volume, 100U)) / 100.0F;
   if (!impl_->engine.Open(config)) {
     impl_->fatal = true;
     const std::string error = impl_->engine.last_error();
@@ -432,11 +462,11 @@ bool VoiceAudio::Open(const std::uint8_t volume) {
   return true;
 }
 
-bool VoiceAudio::Poll(AudioEvent* const event,
-                      const std::chrono::milliseconds timeout) {
+bool VoiceAudio::Poll(AudioEvent* const event, const std::chrono::milliseconds timeout) {
   if (impl_ == nullptr || !impl_->open || event == nullptr ||
-      timeout < std::chrono::milliseconds::zero())
+      timeout < std::chrono::milliseconds::zero()) {
     return false;
+  }
 
   impl_->CheckPlaybackCompletion();
   if (impl_->event_count != 0U) {
@@ -445,15 +475,17 @@ bool VoiceAudio::Poll(AudioEvent* const event,
   }
 
   const CaptureResult result = impl_->CaptureOnce(timeout);
-  if (result == CaptureResult::kFrame) impl_->DrainReadyCapture();
+  if (result == CaptureResult::kFrame) {
+    impl_->DrainReadyCapture();
+  }
   impl_->CheckPlaybackCompletion();
   return impl_->PopEvent(event);
 }
 
 bool VoiceAudio::Listen(const bool follow_up) {
-  if (impl_ == nullptr || !impl_->open || impl_->fatal ||
-      impl_->playback_generation != 0U)
+  if (impl_ == nullptr || !impl_->open || impl_->fatal || impl_->playback_generation != 0U) {
     return false;
+  }
   impl_->ClearEvents();
   impl_->DisarmInput();
   impl_->ResetBargeProbe();
@@ -463,22 +495,24 @@ bool VoiceAudio::Listen(const bool follow_up) {
     return false;
   }
   impl_->ClearError();
-  impl_->input_state = follow_up ? Impl::InputState::kFollowingUp
-                                 : Impl::InputState::kListening;
+  impl_->input_state =
+      follow_up ? Impl::InputState::kFollowingUp : Impl::InputState::kListening;
   return true;
 }
 
-bool VoiceAudio::Play(const std::uint32_t generation,
-                      const std::uint8_t* const pcm,
-                      const std::size_t bytes,
-                      const std::uint32_t sequence,
-                      const bool start,
+bool VoiceAudio::Play(const std::uint32_t generation, const std::uint8_t* const pcm,
+                      const std::size_t bytes, const std::uint32_t sequence, const bool start,
                       const bool end) {
-  if (impl_ == nullptr || !impl_->open || impl_->fatal || generation == 0U ||
-      pcm == nullptr || bytes == 0U || bytes > kTtsFrameSamples * 2U ||
-      (bytes & 1U) != 0U || (!end && bytes != kTtsFrameSamples * 2U) ||
-      (start != (sequence == 0U)))
+  if (impl_ == nullptr || !impl_->open || impl_->fatal || generation == 0U) {
     return false;
+  }
+  const bool invalid_pcm =
+      pcm == nullptr || bytes == 0U || bytes > kTtsFrameSamples * 2U || (bytes & 1U) != 0U;
+  const bool invalid_frame =
+      (!end && bytes != kTtsFrameSamples * 2U) || (start != (sequence == 0U));
+  if (invalid_pcm || invalid_frame) {
+    return false;
+  }
 
   if (start) {
     if (impl_->playback_generation != 0U || !impl_->WaitForPlaybackStop() ||
@@ -491,30 +525,20 @@ bool VoiceAudio::Play(const std::uint32_t generation,
     impl_->ResetBargeProbe();
     impl_->barge_cooldown_frames = 0U;
     impl_->ClearHistory();
-  } else if (generation != impl_->playback_generation ||
-             impl_->playback_ending) {
+  } else if (generation != impl_->playback_generation || impl_->playback_ending) {
     return false;
   }
 
-  const QueueTtsResult queued =
-      impl_->engine.QueueTts24k(pcm, bytes, sequence);
+  const QueueTtsResult queued = impl_->engine.QueueTts24k(pcm, bytes, sequence);
   if (queued != QueueTtsResult::kQueued) {
     impl_->SetError("voice playback queue rejected PCM");
-    impl_->engine.DropPlayback();
-    impl_->playback_generation = 0U;
-    impl_->playback_ending = false;
-    impl_->ResetBargeProbe();
-    impl_->ClearHistory();
+    impl_->DiscardPlayback();
     return false;
   }
   if (end) {
     if (!impl_->engine.EndPlayback()) {
       impl_->SetError("voice playback finish failed");
-      impl_->engine.DropPlayback();
-      impl_->playback_generation = 0U;
-      impl_->playback_ending = false;
-      impl_->ResetBargeProbe();
-      impl_->ClearHistory();
+      impl_->DiscardPlayback();
       return false;
     }
     impl_->playback_ending = true;
@@ -524,28 +548,30 @@ bool VoiceAudio::Play(const std::uint32_t generation,
 }
 
 void VoiceAudio::StopPlayback() {
-  if (impl_ == nullptr || !impl_->open) return;
-  impl_->engine.DropPlayback();
-  impl_->playback_generation = 0U;
-  impl_->playback_ending = false;
-  impl_->ResetBargeProbe();
+  if (impl_ == nullptr || !impl_->open) {
+    return;
+  }
+  impl_->DiscardPlayback();
   impl_->barge_cooldown_frames = 0U;
-  impl_->ClearHistory();
 }
 
 void VoiceAudio::CancelInput() {
-  if (impl_ == nullptr || !impl_->open) return;
+  if (impl_ == nullptr || !impl_->open) {
+    return;
+  }
   impl_->ClearEvents();
   impl_->DisarmInput();
-  // CancelInput 只取消当前上行。若正在播放，下一帧仍会自动进入同一个 barge 探针。
+  // 上行取消不影响正在播放的回复，后续采集帧仍可检测近讲打断。
   impl_->ResetBargeProbe();
   impl_->barge_cooldown_frames = 0U;
 }
 
 void VoiceAudio::SetVolume(const std::uint8_t volume) {
-  if (impl_ == nullptr || !impl_->open) return;
-  impl_->engine.SetPlaybackGain(
-      static_cast<float>(std::min<std::uint8_t>(volume, 100U)) / 100.0F);
+  if (impl_ == nullptr || !impl_->open) {
+    return;
+  }
+  impl_->engine.SetPlaybackGain(static_cast<float>(std::min<std::uint8_t>(volume, 100U)) /
+                                100.0F);
 }
 
 bool VoiceAudio::healthy() const {
@@ -553,20 +579,26 @@ bool VoiceAudio::healthy() const {
 }
 
 std::string VoiceAudio::last_error() const {
-  if (impl_ == nullptr) return "voice audio is not allocated";
-  if (impl_->error[0] != '\0') return impl_->error.data();
+  if (impl_ == nullptr) {
+    return "voice audio is not allocated";
+  }
+  if (impl_->error[0] != '\0') {
+    return impl_->error.data();
+  }
   return impl_->engine.last_error();
 }
 
 void VoiceAudio::Close() noexcept {
-  if (impl_ == nullptr) return;
+  if (impl_ == nullptr) {
+    return;
+  }
   impl_->engine.Close();
   impl_->ClearEvents();
   impl_->ClearHistory();
   impl_->input_state = Impl::InputState::kIdle;
   impl_->barge_stage = Impl::BargeStage::kIdle;
-  impl_->follow_up_frames = impl_->barge_stage_frames =
-      impl_->barge_reference_low_frames = impl_->barge_cooldown_frames = 0U;
+  impl_->follow_up_frames = impl_->barge_stage_frames = impl_->barge_reference_low_frames =
+      impl_->barge_cooldown_frames = 0U;
   impl_->playback_generation = 0U;
   impl_->playback_ending = false;
   impl_->open = false;

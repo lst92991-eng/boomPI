@@ -1,4 +1,4 @@
-/// @file application 与板级实时音频之间的固定帧、队列和播放生命周期契约。
+/// @file 采集帧、音频队列和播放生命周期。
 #pragma once
 
 #include <array>
@@ -15,20 +15,15 @@ namespace boompi::audio {
 inline constexpr std::size_t kVoiceFrameSamples16k = kVoiceFrameSamples;
 using VoiceFrame16k = std::array<std::int16_t, kVoiceFrameSamples16k>;
 
-/// @brief 一帧经过双麦 3A、Snowboy 和 VAD 后交给 application 的结果。
+/// @brief 一帧经过双麦 3A、Snowboy 和 VAD 后交给 VoiceAudio 的结果。
 ///
 /// 帧长固定为 20 ms/16 kHz/mono。`sequence` 在本进程内单调递增；一旦 ALSA、
-/// 采集或重采样失去连续性时，`discontinuity` 置位，application 必须取消当前轮次。
+/// 采集或重采样失去连续性时，`discontinuity` 置位，当前轮次必须取消。
 /// `near_voice` 来自 Rockchip 3A 后 WebRTC VAD，不读取 vendor `wakeup_status`；
 /// Mode1 参考首次出现后的 600 ms AEC 预热和自然播放结束后的 300 ms 尾音窗
 /// 会强制为 false。主动打断不复位正在进行的人声 VAD，保证短打断词仍能产生结束事件。
 struct CaptureFrame final {
   VoiceFrame16k pcm{};
-#ifdef BOOMPI_AEC_LOOP_DIAGNOSTICS
-  /// HIL 构建保存送入 3A 前的四个 16 kHz 平面，用来核对布线、极性和参考时序。
-  /// 产品构建不包含该字段，避免在实时路径额外复制 4 × 320 个 sample。
-  std::array<VoiceFrame16k, 4U> aec_input{};
-#endif
   /// `sequence` 标识 application 实际收到的处理帧；序号空洞表示队列边界已丢失连续性。
   std::uint64_t sequence{0U};
   /// 该 PCM 对应采集 period 结束时的 steady-clock 时间；随 3A 固定一帧延迟一起延后。
@@ -80,10 +75,10 @@ struct AudioEngineConfig final {
   std::int8_t right_polarity{kBoardVoiceProfile.right_polarity};
 };
 
-/// @brief 对话业务使用的音频门面。
+/// @brief 管理采集、播放两条线程及其有界队列。
 ///
-/// application 层只看到固定 20 ms 帧和播放控制。内部高优先级采集线程持续排空 ALSA 并执行 3A，
-/// 次高优先级播放线程消费有界 TTS 环形队列；两者通过固定容量队列与 application 交换数据。
+/// VoiceAudio 消费处理后的采集帧，并提交 TTS。高优先级采集线程持续读取 ALSA 并执行 3A，
+/// 次高优先级播放线程消费 TTS 环形队列。
 /// AEC 使用 Codec Mode1 同步采集的 REF-L；REF-R 仍保留在四通道采集数据中。Close 会先唤醒并 join
 /// 两条音频线程，随后才释放 platform 层的 ALSA、模型和 DSP。
 class AudioEngine final {
@@ -101,16 +96,14 @@ class AudioEngine final {
   ///
   /// 只能由 application actor 调用；超时不代表 ALSA 故障，调用者应借此观察
   /// stop flag。该边界保证 ALSA 阻塞时，进程仍能进入 Close 并调用 snd_pcm_abort。
-  CaptureResult Capture(CaptureFrame* frame,
-                        std::chrono::milliseconds timeout) noexcept;
+  CaptureResult Capture(CaptureFrame* frame, std::chrono::milliseconds timeout) noexcept;
 
   /// @brief 清空 Snowboy/VAD 的当前判定历史，不停止持续采集或 Rockchip 3A。
   bool ResetListener() noexcept;
 
   /// @brief 按服务端 sequence 把 little-endian 24 kHz mono PCM 复制到 1.5 秒有界环。
   /// @return 明确区分生命周期、容量、序号和参数错误；绝不覆盖尚未播放的帧。
-  QueueTtsResult QueueTts24k(const std::uint8_t* pcm_bytes,
-                             std::size_t byte_count,
+  QueueTtsResult QueueTts24k(const std::uint8_t* pcm_bytes, std::size_t byte_count,
                              std::uint64_t sequence) noexcept;
 
   /// @brief 开始新 TTS 流；先等采集线程在帧边界武装 AEC 门控。
@@ -130,7 +123,9 @@ class AudioEngine final {
 
   /// 三个查询都是无锁快照。`playback_active` 表示 BeginPlayback 已开始且 drain/drop 尚未完成，
   /// 不等同于扬声器此刻必然出声；用户主动 drop 不计为 `playback_failed`。
-  bool playback_active() const noexcept { return !playback_done(); }
+  bool playback_active() const noexcept {
+    return !playback_done();
+  }
   bool playback_done() const noexcept;
   bool playback_failed() const noexcept;
 

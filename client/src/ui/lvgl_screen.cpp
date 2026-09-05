@@ -8,14 +8,14 @@
  */
 #include "boompi/ui/lvgl_screen.h"
 
+#include <lvgl.h>
+
 #include <algorithm>
 #include <array>
 #include <cstring>
 #include <ctime>
 #include <new>
 #include <string>
-
-#include <lvgl.h>
 
 #include "twemoji_64.h"
 
@@ -46,12 +46,11 @@ const std::array<VoiceView, 7> kVoiceViews{{
     {"发生错误", "请检查网络后重试", &emoji_1f614_64},
 }};
 
-constexpr std::array<const char*, 4> kCameraStatus{{
-    "OFF", "START", "LIVE", "ERROR"}};
+constexpr std::array<const char*, 4> kCameraStatus{{"OFF", "START", "LIVE", "ERROR"}};
 
 /** @brief 统一创建固定尺寸文本，保证 320x240 各页面使用同一排版基线。 */
-lv_obj_t* Label(lv_obj_t* parent, const char* value, const lv_font_t* font,
-                std::uint32_t color, int x, int y, int width, int height) {
+lv_obj_t* Label(lv_obj_t* parent, const char* value, const lv_font_t* font, std::uint32_t color,
+                int x, int y, int width, int height) {
   lv_obj_t* label = lv_label_create(parent);
   lv_label_set_text(label, value);
   lv_obj_set_style_text_font(label, font, 0);
@@ -65,8 +64,7 @@ lv_obj_t* Label(lv_obj_t* parent, const char* value, const lv_font_t* font,
 /** @brief 在提交文本前查询 FreeType 字体能否解析指定 Unicode codepoint。 */
 bool HasGlyph(const lv_font_t* font, std::uint32_t codepoint) {
   lv_font_glyph_dsc_t glyph{};
-  return lv_font_get_glyph_dsc(font, &glyph, codepoint, 0U) &&
-         glyph.resolved_font != nullptr;
+  return lv_font_get_glyph_dsc(font, &glyph, codepoint, 0U) && glyph.resolved_font != nullptr;
 }
 
 /**
@@ -80,8 +78,9 @@ std::string SupportedText(const lv_font_t* font, const std::string& input) {
   for (std::uint32_t offset = 0U; offset < input.size();) {
     const std::uint32_t start = offset;
     const std::uint32_t codepoint = _lv_txt_encoded_next(input.c_str(), &offset);
-    if (codepoint == '\n' || (codepoint >= 0x20U && HasGlyph(font, codepoint)))
+    if (codepoint == '\n' || (codepoint >= 0x20U && HasGlyph(font, codepoint))) {
       output.append(input, start, offset - start);
+    }
   }
   return output;
 }
@@ -133,7 +132,9 @@ struct LvglScreen::Impl final {
 
   /** @brief 同步发布页面意图，value 仅用于 0..100 音量百分比。 */
   void Emit(Event event, std::uint8_t value = 0U) {
-    if (event_handler != nullptr) event_handler(event, value, event_data);
+    if (event_handler != nullptr) {
+      event_handler(event, value, event_data);
+    }
   }
 
   /**
@@ -231,14 +232,14 @@ struct LvglScreen::Impl final {
     Begin(Page::kOther);
     Header(kApps[index]);
     if (index == 3U) {
-      lv_obj_t* qr = lv_qrcode_create(lv_scr_act(), 104, lv_color_hex(0x08111C),
-                                      lv_color_hex(0xFFFFFF));
+      lv_obj_t* qr =
+          lv_qrcode_create(lv_scr_act(), 104, lv_color_hex(0x08111C), lv_color_hex(0xFFFFFF));
       constexpr char payload[] = "WIFI:T:WPA;S:boomPI-Setup;P:boompi-setup;;";
       lv_obj_set_pos(qr, 108, 48);
       lv_qrcode_update(qr, payload, sizeof(payload) - 1U);
       Label(lv_scr_act(), "boomPI-Setup", text_font, kText, 60, 166, 200, 24);
-      provision_info = Label(lv_scr_act(), "扫描二维码连接配网热点",
-                             text_font, kMuted, 30, 197, 260, 24);
+      provision_info =
+          Label(lv_scr_act(), "扫描二维码连接配网热点", text_font, kMuted, 30, 197, 260, 24);
       return;
     }
     page = Page::kClock;
@@ -253,28 +254,39 @@ struct LvglScreen::Impl final {
    * 已经位于摄像头页时不重复发 CameraOn，避免 UI worker 等待仍在运行的采集线程。
    */
   void ShowApp(std::size_t index) {
-    if (index >= kApps.size()) return;
+    if (index >= kApps.size()) {
+      return;
+    }
     const bool was_camera = page == Page::kCamera;
-    if (index == 0U)
+    if (index == 0U) {
       BuildVoice();
-    else if (index == 1U)
+    } else if (index == 1U) {
       BuildCamera();
-    else
+    } else {
       BuildOther(index);
-    if (was_camera && index != 1U) Emit(Event::kCameraOff);
-    if (!was_camera && index == 1U) Emit(Event::kCameraOn);
+    }
+    if (was_camera && index != 1U) {
+      Emit(Event::kCameraOff);
+    }
+    if (!was_camera && index == 1U) {
+      Emit(Event::kCameraOn);
+    }
   }
 
   /** @brief 保存全局音量并在语音页存在时同步滑块，关闭动画避免回调抖动。 */
   void SetVolume(std::uint8_t percent) {
     volume = std::min<std::uint8_t>(percent, 100U);
-    if (page != Page::kVoice) return;
+    if (page != Page::kVoice) {
+      return;
+    }
     lv_slider_set_value(slider, volume, LV_ANIM_OFF);
   }
 
   /** @brief 将当前语音状态和可选服务端字幕投影到既有控件。 */
   void RenderVoice() {
-    if (page != Page::kVoice) return;
+    if (page != Page::kVoice) {
+      return;
+    }
     const VoiceView& view = kVoiceViews[static_cast<std::size_t>(voice_state)];
     lv_img_set_src(face, view.face);
     lv_label_set_text_fmt(subtitle, "%s\n%s", view.title,
@@ -288,15 +300,15 @@ struct LvglScreen::Impl final {
    * 再 invalidate 控件，防止缓存继续显示上一帧或错误状态前的旧画面。
    */
   void RenderCamera() {
-    if (page != Page::kCamera) return;
+    if (page != Page::kCamera) {
+      return;
+    }
     if (camera_state == CameraStatus::kLive) {
       lv_obj_clear_flag(camera_image, LV_OBJ_FLAG_HIDDEN);
-      lv_label_set_text_fmt(camera_info, "LIVE %u.%u FPS",
-                            fps_tenths / 10U, fps_tenths % 10U);
+      lv_label_set_text_fmt(camera_info, "LIVE %u.%u FPS", fps_tenths / 10U, fps_tenths % 10U);
     } else {
       lv_obj_add_flag(camera_image, LV_OBJ_FLAG_HIDDEN);
-      lv_label_set_text(camera_info,
-                        kCameraStatus[static_cast<std::size_t>(camera_state)]);
+      lv_label_set_text(camera_info, kCameraStatus[static_cast<std::size_t>(camera_state)]);
     }
     lv_img_cache_invalidate_src(&camera_descriptor);
     lv_obj_invalidate(camera_image);
@@ -304,7 +316,9 @@ struct LvglScreen::Impl final {
 
   /** @brief 只在桌面更新本地时钟，避免已销毁 clock 指针被定时器访问。 */
   void UpdateClock() {
-    if (page != Page::kHome && page != Page::kClock) return;
+    if (page != Page::kHome && page != Page::kClock) {
+      return;
+    }
     const std::time_t now = std::time(nullptr);
     std::tm local{};
     localtime_r(&now, &local);
@@ -316,7 +330,9 @@ struct LvglScreen::Impl final {
     auto* self = static_cast<Impl*>(lv_event_get_user_data(event));
     const bool was_camera = self->page == Page::kCamera;
     self->BuildHome();
-    if (was_camera) self->Emit(Event::kCameraOff);
+    if (was_camera) {
+      self->Emit(Event::kCameraOff);
+    }
   }
 
   /**
@@ -328,16 +344,23 @@ struct LvglScreen::Impl final {
   static void AppClicked(lv_event_t* event) {
     auto* click = static_cast<AppClick*>(lv_event_get_user_data(event));
     click->owner->ShowApp(click->index);
-    if (click->index == 0U) click->owner->Emit(Event::kWake);
-    if (click->index == 3U) click->owner->Emit(Event::kProvision);
+    if (click->index == 0U) {
+      click->owner->Emit(Event::kWake);
+    }
+    if (click->index == 3U) {
+      click->owner->Emit(Event::kProvision);
+    }
   }
 
   /** @brief 仅在扬声器仍有有效回复时把表情点击解释为打断意图。 */
   static void FaceClicked(lv_event_t* event) {
     Impl* self = static_cast<Impl*>(lv_event_get_user_data(event));
     const bool speaking = self->voice_state == DeviceUiState::kSpeaking;
-    if (speaking) self->Emit(Event::kInterrupt);
-    else self->Emit(Event::kWake);
+    if (speaking) {
+      self->Emit(Event::kInterrupt);
+    } else {
+      self->Emit(Event::kWake);
+    }
   }
 
   /**
@@ -348,13 +371,13 @@ struct LvglScreen::Impl final {
    */
   static void SliderChanged(lv_event_t* event) {
     const lv_event_code_t code = lv_event_get_code(event);
-    const bool committed = code == LV_EVENT_RELEASED ||
-                           code == LV_EVENT_PRESS_LOST;
-    if (code != LV_EVENT_VALUE_CHANGED && !committed) return;
+    const bool committed = code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST;
+    if (code != LV_EVENT_VALUE_CHANGED && !committed) {
+      return;
+    }
     Impl* self = static_cast<Impl*>(lv_event_get_user_data(event));
     self->SetVolume(static_cast<std::uint8_t>(lv_slider_get_value(self->slider)));
-    const Event change = committed ? Event::kVolumeCommit
-                                   : Event::kVolumePreview;
+    const Event change = committed ? Event::kVolumeCommit : Event::kVolumePreview;
     self->Emit(change, self->volume);
   }
 };
@@ -362,7 +385,9 @@ struct LvglScreen::Impl final {
 bool LvglScreen::Create(const char* font_path) noexcept {
   Destroy();
   impl_ = new (std::nothrow) Impl;
-  if (impl_ == nullptr) return false;
+  if (impl_ == nullptr) {
+    return false;
+  }
   // FreeType 缓存规模固定，避免 64 MiB 板端内存因动态页面数量产生不可预测增长。
   if (font_path == nullptr || !lv_freetype_init(2, 4, 65536)) {
     delete impl_;
@@ -379,12 +404,13 @@ bool LvglScreen::Create(const char* font_path) noexcept {
   impl_->camera_descriptor.header.w = 320;
   impl_->camera_descriptor.header.h = 180;
   impl_->camera_descriptor.data_size = impl_->pixels.size() * sizeof(std::uint16_t);
-  impl_->camera_descriptor.data = reinterpret_cast<const std::uint8_t*>(
-      impl_->pixels.data());
+  impl_->camera_descriptor.data = reinterpret_cast<const std::uint8_t*>(impl_->pixels.data());
   // 分钟级 timer 只更新桌面时钟，首次内容由 BuildHome() 立即写入。
-  impl_->timer = lv_timer_create([](lv_timer_t* timer) {
-    static_cast<Impl*>(timer->user_data)->UpdateClock();
-  }, 60000, impl_);
+  impl_->timer = lv_timer_create(
+      [](lv_timer_t* timer) {
+        static_cast<Impl*>(timer->user_data)->UpdateClock();
+      },
+      60000, impl_);
   impl_->BuildHome();
   return true;
 }
@@ -403,14 +429,18 @@ void LvglScreen::SetVolume(std::uint8_t percent) noexcept {
 }
 
 void LvglScreen::SetProvisionMessage(const char* text, bool error) noexcept {
-  if (impl_ == nullptr || impl_->provision_info == nullptr) return;
+  if (impl_ == nullptr || impl_->provision_info == nullptr) {
+    return;
+  }
   lv_label_set_text(impl_->provision_info, text);
-  lv_obj_set_style_text_color(
-      impl_->provision_info, lv_color_hex(error ? 0xFF6B6B : kMuted), 0);
+  lv_obj_set_style_text_color(impl_->provision_info, lv_color_hex(error ? 0xFF6B6B : kMuted),
+                              0);
 }
 
 void LvglScreen::SetCameraStatus(CameraStatus state) noexcept {
-  if (impl_ == nullptr) return;
+  if (impl_ == nullptr) {
+    return;
+  }
   impl_->camera_state = state;
   if (state != CameraStatus::kLive) {
     // 错误或停止时清空旧像素，用户不会把冻结的最后一帧误认为实时画面。
@@ -422,28 +452,36 @@ void LvglScreen::SetCameraStatus(CameraStatus state) noexcept {
 
 void LvglScreen::SetCameraFrame(const std::uint16_t* pixels, std::size_t pixel_count,
                                 unsigned fps_tenths) noexcept {
-  if (impl_ == nullptr || pixels == nullptr ||
-      pixel_count != impl_->pixels.size()) return;
+  if (impl_ == nullptr || pixels == nullptr || pixel_count != impl_->pixels.size()) {
+    return;
+  }
   std::memcpy(impl_->pixels.data(), pixels, pixel_count * sizeof(pixels[0]));
   impl_->fps_tenths = fps_tenths;
   impl_->RenderCamera();
 }
 
 void LvglScreen::SetState(DeviceUiState state) noexcept {
-  if (impl_ == nullptr) return;
+  if (impl_ == nullptr) {
+    return;
+  }
   impl_->voice_state = state;
   const bool active = state >= DeviceUiState::kListening && state <= DeviceUiState::kHappy;
   // 语音从唤醒词启动时自动进入小智页；用户主动浏览其他页面时不强制抢占页面。
-  if (active && impl_->page == Impl::Page::kHome)
+  if (active && impl_->page == Impl::Page::kHome) {
     impl_->BuildVoice();
+  }
   impl_->RenderVoice();
 }
 
 void LvglScreen::SetText(std::string_view first, std::string_view second) noexcept {
-  if (impl_ == nullptr) return;
+  if (impl_ == nullptr) {
+    return;
+  }
   try {
     std::string text(first);
-    if (!text.empty() && !second.empty()) text.push_back('\n');
+    if (!text.empty() && !second.empty()) {
+      text.push_back('\n');
+    }
     text.append(second);
     impl_->subtitle_text = SupportedText(impl_->text_font, text);
   } catch (...) {
@@ -453,11 +491,17 @@ void LvglScreen::SetText(std::string_view first, std::string_view second) noexce
 }
 
 void LvglScreen::Destroy() noexcept {
-  if (impl_ == nullptr) return;
+  if (impl_ == nullptr) {
+    return;
+  }
   // timer 可能引用 Impl，必须先删除；字体在页面对象清空后才能安全释放。
-  if (impl_->timer != nullptr) lv_timer_del(impl_->timer);
+  if (impl_->timer != nullptr) {
+    lv_timer_del(impl_->timer);
+  }
   lv_obj_clean(lv_scr_act());
-  if (impl_->text_font != nullptr) lv_ft_font_destroy(impl_->text_font);
+  if (impl_->text_font != nullptr) {
+    lv_ft_font_destroy(impl_->text_font);
+  }
   lv_freetype_destroy();
   delete impl_;
   impl_ = nullptr;

@@ -1,3 +1,8 @@
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -12,11 +17,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
 #include <websocketpp/config/asio.hpp>
 #include <websocketpp/server.hpp>
 
@@ -34,23 +34,35 @@ using boompi::network::VoiceLink;
 constexpr char kDeviceId[] = "00112233-4455-4677-8899-aabbccddeeff";
 
 void Check(const bool condition, const char* const message) {
-  if (!condition) throw std::runtime_error(message);
+  if (!condition) {
+    throw std::runtime_error(message);
+  }
 }
 
 struct BioDelete final {
-  void operator()(BIO* value) const noexcept { BIO_free(value); }
+  void operator()(BIO* value) const noexcept {
+    BIO_free(value);
+  }
 };
 struct KeyContextDelete final {
-  void operator()(EVP_PKEY_CTX* value) const noexcept { EVP_PKEY_CTX_free(value); }
+  void operator()(EVP_PKEY_CTX* value) const noexcept {
+    EVP_PKEY_CTX_free(value);
+  }
 };
 struct KeyDelete final {
-  void operator()(EVP_PKEY* value) const noexcept { EVP_PKEY_free(value); }
+  void operator()(EVP_PKEY* value) const noexcept {
+    EVP_PKEY_free(value);
+  }
 };
 struct CertificateDelete final {
-  void operator()(X509* value) const noexcept { X509_free(value); }
+  void operator()(X509* value) const noexcept {
+    X509_free(value);
+  }
 };
 struct ExtensionDelete final {
-  void operator()(X509_EXTENSION* value) const noexcept { X509_EXTENSION_free(value); }
+  void operator()(X509_EXTENSION* value) const noexcept {
+    X509_EXTENSION_free(value);
+  }
 };
 
 struct TestIdentity final {
@@ -62,18 +74,19 @@ struct TestIdentity final {
 std::string BioText(BIO* const bio) {
   BUF_MEM* memory = nullptr;
   BIO_get_mem_ptr(bio, &memory);
-  if (memory == nullptr || memory->data == nullptr || memory->length == 0U)
+  if (memory == nullptr || memory->data == nullptr || memory->length == 0U) {
     throw std::runtime_error("OpenSSL produced empty PEM");
+  }
   return {memory->data, memory->length};
 }
 
 TestIdentity MakeTestIdentity() {
   std::unique_ptr<EVP_PKEY_CTX, KeyContextDelete> key_context(
       EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr));
-  Check(key_context != nullptr && EVP_PKEY_keygen_init(key_context.get()) == 1 &&
-            EVP_PKEY_CTX_set_ec_paramgen_curve_nid(
-                key_context.get(), NID_X9_62_prime256v1) == 1,
-        "could not initialize test TLS key");
+  Check(
+      key_context != nullptr && EVP_PKEY_keygen_init(key_context.get()) == 1 &&
+          EVP_PKEY_CTX_set_ec_paramgen_curve_nid(key_context.get(), NID_X9_62_prime256v1) == 1,
+      "could not initialize test TLS key");
   EVP_PKEY* raw_key = nullptr;
   Check(EVP_PKEY_keygen(key_context.get(), &raw_key) == 1 && raw_key != nullptr,
         "could not generate test TLS key");
@@ -87,23 +100,20 @@ TestIdentity MakeTestIdentity() {
             X509_set_pubkey(certificate.get(), key.get()) == 1,
         "could not initialize test TLS certificate");
   X509_NAME* const subject = X509_get_subject_name(certificate.get());
-  Check(subject != nullptr &&
-            X509_NAME_add_entry_by_txt(
-                subject, "CN", MBSTRING_ASC,
-                reinterpret_cast<const unsigned char*>("boompi loopback test"),
-                -1, -1, 0) == 1 &&
-            X509_set_issuer_name(certificate.get(), subject) == 1,
-        "could not name test TLS certificate");
+  Check(
+      subject != nullptr &&
+          X509_NAME_add_entry_by_txt(
+              subject, "CN", MBSTRING_ASC,
+              reinterpret_cast<const unsigned char*>("boompi loopback test"), -1, -1, 0) == 1 &&
+          X509_set_issuer_name(certificate.get(), subject) == 1,
+      "could not name test TLS certificate");
 
   X509V3_CTX extension_context{};
-  X509V3_set_ctx(&extension_context, certificate.get(), certificate.get(),
-                 nullptr, nullptr, 0);
+  X509V3_set_ctx(&extension_context, certificate.get(), certificate.get(), nullptr, nullptr, 0);
   const auto add_extension = [&](const int nid, const char* const value) {
     std::unique_ptr<X509_EXTENSION, ExtensionDelete> extension(
-        X509V3_EXT_conf_nid(nullptr, &extension_context, nid,
-                           const_cast<char*>(value)));
-    Check(extension != nullptr &&
-              X509_add_ext(certificate.get(), extension.get(), -1) == 1,
+        X509V3_EXT_conf_nid(nullptr, &extension_context, nid, const_cast<char*>(value)));
+    Check(extension != nullptr && X509_add_ext(certificate.get(), extension.get(), -1) == 1,
           "could not add test TLS extension");
   };
   add_extension(NID_basic_constraints, "critical,CA:FALSE");
@@ -116,8 +126,8 @@ TestIdentity MakeTestIdentity() {
   std::unique_ptr<BIO, BioDelete> key_bio(BIO_new(BIO_s_mem()));
   Check(certificate_bio != nullptr && key_bio != nullptr &&
             PEM_write_bio_X509(certificate_bio.get(), certificate.get()) == 1 &&
-            PEM_write_bio_PrivateKey(key_bio.get(), key.get(), nullptr, nullptr,
-                                     0, nullptr, nullptr) == 1,
+            PEM_write_bio_PrivateKey(key_bio.get(), key.get(), nullptr, nullptr, 0, nullptr,
+                                     nullptr) == 1,
         "could not encode test TLS identity");
 
   X509_PUBKEY* const public_key = X509_get_X509_PUBKEY(certificate.get());
@@ -125,12 +135,11 @@ TestIdentity MakeTestIdentity() {
   Check(public_key != nullptr && der_size > 0, "could not size test SPKI");
   std::vector<unsigned char> der(static_cast<std::size_t>(der_size));
   unsigned char* cursor = der.data();
-  Check(i2d_X509_PUBKEY(public_key, &cursor) == der_size,
-        "could not encode test SPKI");
+  Check(i2d_X509_PUBKEY(public_key, &cursor) == der_size, "could not encode test SPKI");
   std::array<unsigned char, 32> digest{};
   unsigned int digest_size = 0U;
-  Check(EVP_Digest(der.data(), der.size(), digest.data(), &digest_size,
-                   EVP_sha256(), nullptr) == 1 &&
+  Check(EVP_Digest(der.data(), der.size(), digest.data(), &digest_size, EVP_sha256(),
+                   nullptr) == 1 &&
             digest_size == digest.size(),
         "could not hash test SPKI");
   std::array<unsigned char, 45> encoded{};
@@ -185,28 +194,36 @@ class LoopbackServer final {
     });
     websocketpp::lib::error_code ec;
     server_.listen(websocketpp::lib::asio::ip::tcp::endpoint(
-        websocketpp::lib::asio::ip::address_v4::loopback(), 0), ec);
+                       websocketpp::lib::asio::ip::address_v4::loopback(), 0),
+                   ec);
     Check(!ec, "listen failed");
     websocketpp::lib::asio::error_code endpoint_error;
     port_ = server_.get_local_endpoint(endpoint_error).port();
     Check(!endpoint_error && port_, "port lookup failed");
     server_.start_accept(ec);
     Check(!ec, "accept failed");
-    thread_ = std::thread([this] { server_.run(); });
+    thread_ = std::thread([this] {
+      server_.run();
+    });
   }
 
   ~LoopbackServer() {
     server_.stop();
-    if (thread_.joinable()) thread_.join();
+    if (thread_.joinable()) {
+      thread_.join();
+    }
   }
 
-  LinkConfig Config() const { return {kDeviceId, "127.0.0.1", port_, identity_.spki_pin}; }
+  LinkConfig Config() const {
+    return {kDeviceId, "127.0.0.1", port_, identity_.spki_pin};
+  }
 
   void Send(std::string text, bool binary = false) {
     server_.get_io_service().post([this, text = std::move(text), binary] {
       websocketpp::lib::error_code ec;
-      server_.send(handle_, text, binary ? websocketpp::frame::opcode::binary :
-                   websocketpp::frame::opcode::text, ec);
+      server_.send(
+          handle_, text,
+          binary ? websocketpp::frame::opcode::binary : websocketpp::frame::opcode::text, ec);
     });
   }
 
@@ -237,13 +254,19 @@ class LoopbackServer final {
     });
     std::unique_lock<std::mutex> lock(mutex_);
     Check(changed_.wait_for(lock, std::chrono::seconds(2),
-          [this, pause] { return paused_ == pause; }), "could not change server read state");
+                            [this, pause] {
+                              return paused_ == pause;
+                            }),
+          "could not change server read state");
   }
 
   std::vector<CapturedMessage> WaitMessages(std::size_t count) {
     std::unique_lock<std::mutex> lock(mutex_);
     Check(changed_.wait_for(lock, std::chrono::seconds(3),
-          [this, count] { return messages_.size() >= count; }), "expected uplink messages missing");
+                            [this, count] {
+                              return messages_.size() >= count;
+                            }),
+          "expected uplink messages missing");
     return messages_;
   }
 
@@ -264,7 +287,9 @@ LinkEvent WaitEvent(VoiceLink& link, unsigned timeout_ms = 3000) {
   const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
   LinkEvent event;
   while (Clock::now() < deadline) {
-    if (link.Poll(&event)) return event;
+    if (link.Poll(&event)) {
+      return event;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   throw std::runtime_error("link event timeout");
@@ -279,14 +304,13 @@ void Open(VoiceLink& link, const LoopbackServer& server) {
 
 std::uint32_t Read32(const std::string& bytes, std::size_t offset) {
   const auto* p = reinterpret_cast<const unsigned char*>(bytes.data() + offset);
-  return (static_cast<std::uint32_t>(p[0]) << 24U) |
-         (static_cast<std::uint32_t>(p[1]) << 16U) |
+  return (static_cast<std::uint32_t>(p[0]) << 24U) | (static_cast<std::uint32_t>(p[1]) << 16U) |
          (static_cast<std::uint32_t>(p[2]) << 8U) | p[3];
 }
 
 // Independent server-side wire fixture: test never calls the production encoder.
-std::string Audio(std::uint32_t generation, std::uint32_t sequence,
-                  unsigned flags, std::size_t samples = 480) {
+std::string Audio(std::uint32_t generation, std::uint32_t sequence, unsigned flags,
+                  std::size_t samples = 480) {
   std::string frame(16 + samples * 2, '\0');
   frame.replace(0, 4, "BPV2");
   frame[5] = static_cast<char>(flags);
@@ -312,16 +336,17 @@ void BasicWireAndClose() {
   Open(link, server);
   Upload(link, 1);
   const auto messages = server.WaitMessages(2);
-  Check(messages[0].payload == "{\"type\":\"hello\",\"device_id\":\"" +
-      std::string(kDeviceId) + "\",\"token\":\"boompi-teaching-shared-token-v1-2026\"}", "hello schema mismatch");
+  Check(messages[0].payload == "{\"type\":\"hello\",\"device_id\":\"" + std::string(kDeviceId) +
+                                   "\",\"token\":\"boompi-teaching-shared-token-v1-2026\"}",
+        "hello schema mismatch");
   const auto& wire = messages[1].payload;
-  Check(messages[1].opcode == websocketpp::frame::opcode::binary &&
-      wire.size() == 656 && wire.substr(0, 4) == "BPV2" && wire[5] == 3 &&
-      Read32(wire, 8) == 1 && Read32(wire, 12) == 0 &&
-      static_cast<unsigned char>(wire[16]) == 0x34 &&
-      static_cast<unsigned char>(wire[17]) == 0x12 &&
-      static_cast<unsigned char>(wire[18]) == 0xfe &&
-      static_cast<unsigned char>(wire[19]) == 0xff, "PCM wire contract mismatch");
+  Check(messages[1].opcode == websocketpp::frame::opcode::binary && wire.size() == 656 &&
+            wire.substr(0, 4) == "BPV2" && wire[5] == 3 && Read32(wire, 8) == 1 &&
+            Read32(wire, 12) == 0 && static_cast<unsigned char>(wire[16]) == 0x34 &&
+            static_cast<unsigned char>(wire[17]) == 0x12 &&
+            static_cast<unsigned char>(wire[18]) == 0xfe &&
+            static_cast<unsigned char>(wire[19]) == 0xff,
+        "PCM wire contract mismatch");
   server.Send("{\"type\":\"text\",\"generation\":1,\"text\":\"你好\"}");
   server.Send(Audio(1, 0, 1), true);
   server.Send(Audio(1, 1, 2, 7), true);
@@ -329,9 +354,13 @@ void BasicWireAndClose() {
   auto event = WaitEvent(link);
   Check(event.kind == LinkEventKind::Text && event.text == "你好", "text lost");
   event = WaitEvent(link);
-  Check(event.kind == LinkEventKind::Audio && event.start && !event.end && event.audio_size == 960, "first audio lost");
+  Check(event.kind == LinkEventKind::Audio && event.start && !event.end &&
+            event.audio_size == 960,
+        "first audio lost");
   event = WaitEvent(link);
-  Check(event.kind == LinkEventKind::Audio && !event.start && event.end && event.audio_size == 14, "tail audio lost");
+  Check(
+      event.kind == LinkEventKind::Audio && !event.start && event.end && event.audio_size == 14,
+      "tail audio lost");
   Check(WaitEvent(link).kind == LinkEventKind::Done, "done missing");
   const auto close_started = Clock::now();
   link.Close();
@@ -347,35 +376,39 @@ void GenerationFence() {
   server.WaitMessages(2);
   Upload(link, 2, true);
   const auto wire = server.WaitMessages(3);
-  Check(wire[2].payload[5] == 7 && Read32(wire[2].payload, 8) == 2, "supersede START flags wrong");
+  Check(wire[2].payload[5] == 7 && Read32(wire[2].payload, 8) == 2,
+        "supersede START flags wrong");
   server.Send("{\"type\":\"text\",\"generation\":1,\"text\":\"stale\"}");
   server.Send(Audio(1, 0, 3), true);
   server.Send("{\"type\":\"done\",\"generation\":1}");
   server.Send("{\"type\":\"text\",\"generation\":2,\"text\":\"new\"}");
   server.Send("{\"type\":\"done\",\"generation\":2}");
   auto event = WaitEvent(link);
-  Check(event.kind == LinkEventKind::Text && event.generation == 2 && event.text == "new", "old generation leaked");
+  Check(event.kind == LinkEventKind::Text && event.generation == 2 && event.text == "new",
+        "old generation leaked");
   Check(WaitEvent(link).kind == LinkEventKind::Done, "text-only done missing");
   Check(link.Stop(3, true), "STOP rejected");
   const auto stopped = server.WaitMessages(4);
-  Check(stopped[3].payload == "{\"type\":\"stop\",\"generation\":3,\"retract\":true}", "STOP schema mismatch");
+  Check(stopped[3].payload == "{\"type\":\"stop\",\"generation\":3,\"retract\":true}",
+        "STOP schema mismatch");
   server.Send("{\"type\":\"done\",\"generation\":2}");
   Upload(link, 4);
   server.WaitMessages(5);
   server.Send("{\"type\":\"done\",\"generation\":4}");
   event = WaitEvent(link);
-  Check(event.kind == LinkEventKind::Done && event.generation == 4, "STOP retired generation revived");
+  Check(event.kind == LinkEventKind::Done && event.generation == 4,
+        "STOP retired generation revived");
 }
 
 void RejectBrokenWire() {
   const std::vector<std::vector<std::pair<std::string, bool>>> cases{
-    {{Audio(1, 0, 1), true}, {Audio(1, 2, 2), true}},
-    {{Audio(1, 0, 1), true}, {"{\"type\":\"done\",\"generation\":1}", false}},
-    {{Audio(1, 0, 3), true}, {Audio(1, 1, 2), true}},
-    {{"{\"type\":\"text\",\"generation\":2,\"text\":\"future\"}", false}},
-    {{"{\"type\":\"ready\"}", false}},
-    {{"{\"type\":\"text\",\"generation\":1,\"generation\":1,\"text\":\"duplicate\"}", false}},
-    {{Audio(1, 0, 1, 1), true}},
+      {{Audio(1, 0, 1), true}, {Audio(1, 2, 2), true}},
+      {{Audio(1, 0, 1), true}, {"{\"type\":\"done\",\"generation\":1}", false}},
+      {{Audio(1, 0, 3), true}, {Audio(1, 1, 2), true}},
+      {{"{\"type\":\"text\",\"generation\":2,\"text\":\"future\"}", false}},
+      {{"{\"type\":\"ready\"}", false}},
+      {{"{\"type\":\"text\",\"generation\":1,\"generation\":1,\"text\":\"duplicate\"}", false}},
+      {{Audio(1, 0, 1, 1), true}},
   };
   for (const auto& messages : cases) {
     LoopbackServer server;
@@ -383,10 +416,13 @@ void RejectBrokenWire() {
     Open(link, server);
     Upload(link, 1);
     server.WaitMessages(2);
-    for (const auto& message : messages) server.Send(message.first, message.second);
+    for (const auto& message : messages) {
+      server.Send(message.first, message.second);
+    }
     bool offline = false;
-    for (unsigned i = 0; i < 3 && !offline; ++i)
+    for (unsigned i = 0; i < 3 && !offline; ++i) {
       offline = WaitEvent(link).kind == LinkEventKind::Offline;
+    }
     Check(offline, "invalid wire did not close the connection");
   }
 }
@@ -398,7 +434,8 @@ void TlsFailureAndReconnect() {
   config.spki[0] = config.spki[0] == 'A' ? 'B' : 'A';
   Check(wrong_pin.Open(config), "TLS failure did not start");
   auto event = WaitEvent(wrong_pin);
-  Check(event.kind == LinkEventKind::Offline && event.code == "tls_connect", "pin mismatch not reported");
+  Check(event.kind == LinkEventKind::Offline && event.code == "tls_connect",
+        "pin mismatch not reported");
   wrong_pin.Close();
 
   VoiceLink link;
@@ -418,7 +455,10 @@ void BoundedQueuesAndSupersede() {
   const auto started = Clock::now();
   for (unsigned i = 0; i < 200000; ++i) {
     const auto result = link.SendAudio(1, pcm.data(), i == 0, false, false);
-    if (result == SendResult::Backpressure) { full = true; break; }
+    if (result == SendResult::Backpressure) {
+      full = true;
+      break;
+    }
     Check(result == SendResult::Ok, "burst input failed before capacity");
   }
   Check(full && Clock::now() - started < std::chrono::milliseconds(250),
@@ -433,11 +473,13 @@ void BoundedQueuesAndSupersede() {
 
   // Input START alone is queued; enough output to overflow the application's receive queue.
   Upload(link, 4);
-  for (unsigned i = 0; i < 65; ++i)
+  for (unsigned i = 0; i < 65; ++i) {
     server.Send("{\"type\":\"text\",\"generation\":4,\"text\":\"x\"}");
+  }
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   const auto offline = WaitEvent(link);
-  Check(offline.kind == LinkEventKind::Offline && offline.code == "inbound_overflow", "receive overflow was hidden");
+  Check(offline.kind == LinkEventKind::Offline && offline.code == "inbound_overflow",
+        "receive overflow was hidden");
 }
 
 void HandshakeTimeout() {
@@ -445,7 +487,8 @@ void HandshakeTimeout() {
   VoiceLink link;
   Check(link.Open(server.Config()), "no-ready Open rejected");
   const auto event = WaitEvent(link, 6500);
-  Check(event.kind == LinkEventKind::Offline && event.code == "hello_timeout", "missing ready was not bounded");
+  Check(event.kind == LinkEventKind::Offline && event.code == "hello_timeout",
+        "missing ready was not bounded");
 }
 
 void PendingRetirementKeepsMeaning() {
@@ -460,7 +503,8 @@ void PendingRetirementKeepsMeaning() {
   Upload(link, 3);
   auto messages = server.WaitMessages(4);
   Check(messages[2].payload == "{\"type\":\"stop\",\"generation\":2,\"retract\":true}" &&
-        Read32(messages[3].payload, 8) == 3, "normal START erased pending history retraction");
+            Read32(messages[3].payload, 8) == 3,
+        "normal START erased pending history retraction");
 
   // START|SUPERSEDE has the same history side effect as a retracting STOP.
   // A quick stop must not discard it while purging old PCM.
@@ -469,8 +513,9 @@ void PendingRetirementKeepsMeaning() {
   Upload(link, 6);
   messages = server.WaitMessages(7);
   Check(messages[4].payload[5] == 7 && Read32(messages[4].payload, 8) == 4 &&
-        messages[5].payload == "{\"type\":\"stop\",\"generation\":5,\"retract\":false}" &&
-        Read32(messages[6].payload, 8) == 6, "new fence erased supersede history retraction");
+            messages[5].payload == "{\"type\":\"stop\",\"generation\":5,\"retract\":false}" &&
+            Read32(messages[6].payload, 8) == 6,
+        "new fence erased supersede history retraction");
 
   // Pause the real TLS reader, so the small receive window blocks socket writes.
   // Preserve STOP and supersede in order while ordinary queued PCM is retired.
@@ -483,9 +528,11 @@ void PendingRetirementKeepsMeaning() {
     if (result == SendResult::Disconnected) {
       const auto failure = WaitEvent(link);
       throw std::runtime_error("slow reader disconnected before backpressure at " +
-          std::to_string(i) + ": " + failure.code);
+                               std::to_string(i) + ": " + failure.code);
     }
-    if (!full) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (!full) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
   }
   Check(full, "slow reader did not fill bounded queue");
   const auto fence_started = Clock::now();
@@ -505,19 +552,37 @@ void PendingRetirementKeepsMeaning() {
       // The protocol then requires explicit failure, never silent marker loss.
       const auto failure = WaitEvent(link);
       Check(failure.kind == LinkEventKind::Offline &&
-            (failure.code == "send_timeout" || failure.code == "uplink_timeout") &&
-            Clock::now() - fence_started < std::chrono::seconds(2),
+                (failure.code == "send_timeout" || failure.code == "uplink_timeout") &&
+                Clock::now() - fence_started < std::chrono::seconds(2),
             "blocked retirement did not report bounded send failure");
       return;
     }
-    if (message.opcode == websocketpp::frame::opcode::binary && Read32(message.payload, 8) == 7) continue;
-    if (stage == 0 && message.payload != "{\"type\":\"stop\",\"generation\":8,\"retract\":true}")
-      throw std::runtime_error("blocked STOP order: opcode=" + std::to_string(message.opcode) +
-          (message.opcode == websocketpp::frame::opcode::binary ?
-           ", generation=" + std::to_string(Read32(message.payload, 8)) : ", text=" + message.payload));
-    if (stage == 1) Check(message.opcode == websocketpp::frame::opcode::binary && message.payload[5] == 7 && Read32(message.payload, 8) == 9, "blocked supersede erased");
-    if (stage == 2) Check(message.payload == "{\"type\":\"stop\",\"generation\":10,\"retract\":false}", "blocked second STOP erased");
-    if (stage == 3) Check(message.opcode == websocketpp::frame::opcode::binary && Read32(message.payload, 8) == 11, "new input overtook retirements");
+    if (message.opcode == websocketpp::frame::opcode::binary &&
+        Read32(message.payload, 8) == 7) {
+      continue;
+    }
+    if (stage == 0 &&
+        message.payload != "{\"type\":\"stop\",\"generation\":8,\"retract\":true}") {
+      throw std::runtime_error(
+          "blocked STOP order: opcode=" + std::to_string(message.opcode) +
+          (message.opcode == websocketpp::frame::opcode::binary
+               ? ", generation=" + std::to_string(Read32(message.payload, 8))
+               : ", text=" + message.payload));
+    }
+    if (stage == 1) {
+      Check(message.opcode == websocketpp::frame::opcode::binary && message.payload[5] == 7 &&
+                Read32(message.payload, 8) == 9,
+            "blocked supersede erased");
+    }
+    if (stage == 2) {
+      Check(message.payload == "{\"type\":\"stop\",\"generation\":10,\"retract\":false}",
+            "blocked second STOP erased");
+    }
+    if (stage == 3) {
+      Check(message.opcode == websocketpp::frame::opcode::binary &&
+                Read32(message.payload, 8) == 11,
+            "new input overtook retirements");
+    }
     ++stage;
   }
 }
@@ -533,17 +598,24 @@ void ExternalServerSmoke(const char* host, const char* port, const char* pin) {
         "server accepted wrong pin");
   bad_link.Close();
   VoiceLink link;
-  Check(link.Open(config) && WaitEvent(link).kind == LinkEventKind::Online, "server did not become ready");
+  Check(link.Open(config) && WaitEvent(link).kind == LinkEventKind::Online,
+        "server did not become ready");
   std::array<std::int16_t, 320> pcm{};
   pcm[0] = 0x0807;
-  Check(link.SendAudio(1, pcm.data(), true, true, false) == SendResult::Ok, "smoke input rejected");
+  Check(link.SendAudio(1, pcm.data(), true, true, false) == SendResult::Ok,
+        "smoke input rejected");
   bool have_text = false, have_audio = false, done = false;
   for (unsigned i = 0; i < 8 && !done; ++i) {
     const auto event = WaitEvent(link);
-    if (event.kind == LinkEventKind::Text) have_text = event.text == "你好";
-    else if (event.kind == LinkEventKind::Audio) have_audio = event.start && event.end && event.audio_size == 4;
-    else if (event.kind == LinkEventKind::Done) done = true;
-    else throw std::runtime_error("smoke received failure");
+    if (event.kind == LinkEventKind::Text) {
+      have_text = event.text == "你好";
+    } else if (event.kind == LinkEventKind::Audio) {
+      have_audio = event.start && event.end && event.audio_size == 4;
+    } else if (event.kind == LinkEventKind::Done) {
+      done = true;
+    } else {
+      throw std::runtime_error("smoke received failure");
+    }
   }
   Check(have_text && have_audio && done, "server did not complete expected reply");
   std::cout << "WSS_SMOKE_OK\n";
@@ -553,7 +625,10 @@ void ExternalServerSmoke(const char* host, const char* port, const char* pin) {
 
 int main(int argc, char** argv) {
   try {
-    if (argc == 4) { ExternalServerSmoke(argv[1], argv[2], argv[3]); return EXIT_SUCCESS; }
+    if (argc == 4) {
+      ExternalServerSmoke(argv[1], argv[2], argv[3]);
+      return EXIT_SUCCESS;
+    }
     BasicWireAndClose();
     GenerationFence();
     RejectBrokenWire();

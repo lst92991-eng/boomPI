@@ -25,14 +25,10 @@ void Reset() noexcept;
 void InjectPlaybackXruns(std::uint64_t count) noexcept;
 std::uint64_t PlaybackXrunsSnapshot() noexcept;
 void PushCapture(const audio::CaptureFrame& frame) noexcept;
-bool WaitForCaptureReads(std::size_t count,
-                         std::chrono::milliseconds timeout) noexcept;
-bool WaitForProcessedFrames(std::size_t count,
-                            std::chrono::milliseconds timeout) noexcept;
-bool WaitForRenderCalls(std::size_t count,
-                        std::chrono::milliseconds timeout) noexcept;
-bool WaitForCaptureInterrupts(std::size_t count,
-                              std::chrono::milliseconds timeout) noexcept;
+bool WaitForCaptureReads(std::size_t count, std::chrono::milliseconds timeout) noexcept;
+bool WaitForProcessedFrames(std::size_t count, std::chrono::milliseconds timeout) noexcept;
+bool WaitForRenderCalls(std::size_t count, std::chrono::milliseconds timeout) noexcept;
+bool WaitForCaptureInterrupts(std::size_t count, std::chrono::milliseconds timeout) noexcept;
 std::vector<RenderCall> RenderCallsSnapshot();
 
 }  // namespace boompi::test::audio_backend
@@ -57,8 +53,7 @@ class AudioBackend final {
   bool ResetListener() noexcept;
   bool ArmPlayback() noexcept;
   bool PreparePlayback() noexcept;
-  bool Render20ms(const std::int16_t* pcm24, std::size_t samples,
-                  float gain) noexcept;
+  bool Render20ms(const std::int16_t* pcm24, std::size_t samples, float gain) noexcept;
   bool DrainPlayback() noexcept;
   void DropPlayback() noexcept;
   void InterruptCapture() noexcept;

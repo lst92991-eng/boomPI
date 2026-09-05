@@ -11,7 +11,7 @@ Offline → Idle → Listening → Uploading → Waiting → Speaking
 Speaking ── 确认近讲 ──→ Uploading（新 generation，撤回旧回答）
 ```
 
-- `VoiceApp::Run` 轮询网络、音频和 UI；`Enter` 是唯一状态赋值入口。
+- `VoiceApp::Run` 初始化模块后依次处理超时、网络、音频和 UI；`Enter` 同步修改状态、计时和显示。
 - `OnAudio` 只理解 Wake、SpeechStart、Pcm、Barge、PlaybackDone、Fault。
 - `OnNetwork` 只理解 Online、Offline、Text、Audio、Done、Error。
 - `VoiceAudio` 拥有声学判定、500 ms pre-roll、32 帧打断历史和播放生命周期。
@@ -33,6 +33,18 @@ Speaking ── 确认近讲 ──→ Uploading（新 generation，撤回旧回
 | 7 | ui/lvgl_screen.cpp、ui/device_ui.cpp | 页面、触摸、音量、摄像头资源的生命周期 |
 
 上述路径相对 `client/src/`。课程按同一份产品代码递进，不用宏拼出多个产品。
+
+读正常问答时，先顺着 `OnAudio → SendInputFrame → OnNetwork → PlayReplyFrame`。
+需要了解异常再看 `HandleAudioFault`、`StopTurn` 和 `OnTimeout`。主状态中不处理声学门限和TLS细节。
+
+采集端从 `AudioBackend::ProcessCapture20ms` 向下看：修正极性、重采样、3A、语音判定和发布。
+`audio_format.h` 定义帧格式，`board_voice_profile.h` 保存板级标定，公开音频接口只依赖前者。
+
+平台选择放在CMake。板端编译真实网卡操作和Linux线程调度；Host回归从 `tests/support/` 选择替身。
+产品源码不再用条件编译混合测试实现，STDT和AEC delay沿用固定profile。
+
+本项目用根目录 `.clang-format` 统一排版：每行一个语句，条件和循环带大括号，常用列宽96。
+注释说明线程归属、硬件时序、数据单位和异常原因；能从代码直接看出的赋值和调用不逐行复述。
 
 ## 运行与设置
 

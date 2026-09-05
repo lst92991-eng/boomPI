@@ -1,12 +1,9 @@
 /// @file 对匹配 BSP 的 librkaudio 3A ABI 做固定参数、固定帧适配。
 #include "boompi/platform/rv1106/rockchip_voice_dsp.h"
 
-#ifndef BOOMPI_ROCKCHIP_ENABLE_STDT
-#define BOOMPI_ROCKCHIP_ENABLE_STDT 1
-#endif
 #include <algorithm>
-#include <cstring>
 #include <cstdint>
+#include <cstring>
 #include <new>
 #include <type_traits>
 
@@ -24,13 +21,11 @@ constexpr int kReferenceChannels = 1;
 constexpr int kVendorBlockSamples = 256;
 constexpr int kVendorInputShorts =
     kVendorBlockSamples * (kMicrophoneChannels + kReferenceChannels);
-constexpr int kVendorOutputBytes =
-    kVendorBlockSamples * static_cast<int>(sizeof(std::int16_t));
+constexpr int kVendorOutputBytes = kVendorBlockSamples * static_cast<int>(sizeof(std::int16_t));
 constexpr int kMainFeatureMask = RKAUDIO_EN_AEC | RKAUDIO_EN_BF;
 // BF 参数树承载 FastAEC、残余回声抑制、降噪、去混响和双讲保护的组合开关。
 constexpr int kBeamformingFeatureMask =
-    EN_Fastaec | EN_AES | EN_Anr | EN_Dereverberation |
-    (BOOMPI_ROCKCHIP_ENABLE_STDT != 0 ? EN_STDT : 0);
+    EN_Fastaec | EN_AES | EN_Anr | EN_Dereverberation | EN_STDT;
 
 using InitSignature = void* (*)(int, int, int, int, RKAUDIOParam*);
 using ProcessSignature = int (*)(void*, short*, short*, int, int*);
@@ -44,35 +39,38 @@ static_assert(std::is_same<decltype(&rkaudio_preprocess_short), ProcessSignature
               "unexpected rkaudio_preprocess_short signature");
 static_assert(std::is_same<decltype(&rkaudio_preprocess_destory), DestroySignature>::value,
               "unexpected rkaudio_preprocess_destory signature");
-static_assert(kBeamformingFeatureMask ==
-                  (BOOMPI_ROCKCHIP_ENABLE_STDT != 0 ? 1109 : 85),
-              "validated Rockchip 3A profile changed");
+static_assert(kBeamformingFeatureMask == 1109, "validated Rockchip 3A profile changed");
 void ReleaseParameters(RKAUDIOParam* const parameters) noexcept {
   // vendor deinit 释放各子参数树，外层 RKAUDIOParam 由本适配器负责 delete。
-  if (parameters == nullptr) return;
-  rkaudio_param_deinit(parameters); delete parameters;
+  if (parameters == nullptr) {
+    return;
+  }
+  rkaudio_param_deinit(parameters);
+  delete parameters;
 }
 
-bool PrepareParameters(RKAUDIOParam* const parameters,
-                       const int delay_samples) noexcept {
+bool PrepareParameters(RKAUDIOParam* const parameters, const int delay_samples) noexcept {
   // 参数树只在 Open 构造一次；实时 Process 仅使用已验证句柄，不进行配置或分配。
   parameters->model_en = kMainFeatureMask;
   parameters->read_size = kVendorBlockSamples;
   parameters->aec_param = rkaudio_aec_param_init();
   parameters->bf_param = rkaudio_preprocess_param_init();
   parameters->rx_param = nullptr;
-  if (parameters->aec_param == nullptr || parameters->bf_param == nullptr) return false;
+  if (parameters->aec_param == nullptr || parameters->bf_param == nullptr) {
+    return false;
+  }
 
   auto* const aec = static_cast<SKVAECParameter*>(parameters->aec_param);
-  if (aec->delay_para == nullptr) return false;
+  if (aec->delay_para == nullptr) {
+    return false;
+  }
   // Mode1 的 mic/reference 位于同一采集 period，硬回采不启用软件延迟估计。
   aec->pos = 1;
   aec->model_aec_en = 0;
   aec->drop_ref_channel = 0;
   aec->delay_len = delay_samples;
 
-  auto* const beamforming =
-      static_cast<SKVPreprocessParam*>(parameters->bf_param);
+  auto* const beamforming = static_cast<SKVPreprocessParam*>(parameters->bf_param);
   beamforming->model_bf_en = kBeamformingFeatureMask;
   beamforming->Targ = 4;
   beamforming->ref_pos = 1;
@@ -89,8 +87,7 @@ bool PrepareParameters(RKAUDIOParam* const parameters,
   dtd->ksiThd_high = 0.70F;
   dtd->ksiThd_low = 0.50F;
 
-  auto* const dereverb =
-      static_cast<RKAudioDereverbParam*>(beamforming->dereverb_para);
+  auto* const dereverb = static_cast<RKAudioDereverbParam*>(beamforming->dereverb_para);
   dereverb->curveLg = 20;
   dereverb->T60 = 0.4F;
 
@@ -116,19 +113,21 @@ RockchipVoiceDsp::~RockchipVoiceDsp() noexcept {
 bool RockchipVoiceDsp::Open(const int delay_samples) noexcept {
   // 重复 Open 通常代表所有权错误，保留现有资源并让调用方显式处理失败。
   if (handle_ != nullptr || parameters_ != nullptr || delay_samples < 0 ||
-      delay_samples % kVendorBlockSamples != 0)
+      delay_samples % kVendorBlockSamples != 0) {
     return false;
+  }
 
   auto* const parameters = new (std::nothrow) RKAUDIOParam{};
-  if (parameters == nullptr) return false;
+  if (parameters == nullptr) {
+    return false;
+  }
   if (!PrepareParameters(parameters, delay_samples)) {
     ReleaseParameters(parameters);
     return false;
   }
 
   void* const handle = rkaudio_preprocess_init(
-      kSampleRateHz, kBitsPerSample, kMicrophoneChannels,
-      kReferenceChannels, parameters);
+      kSampleRateHz, kBitsPerSample, kMicrophoneChannels, kReferenceChannels, parameters);
   if (handle == nullptr) {
     ReleaseParameters(parameters);
     return false;
@@ -154,16 +153,21 @@ void RockchipVoiceDsp::Close() noexcept {
   ResetFifos(false);
 }
 
-bool RockchipVoiceDsp::Process(
-    const RockchipVoiceFrame16k& mic_left,
-    const RockchipVoiceFrame16k& mic_right,
-    const RockchipVoiceFrame16k& reference_left,
-    RockchipVoiceFrame16k* const output) noexcept {
-  if (output == nullptr) return false;
+bool RockchipVoiceDsp::Process(const RockchipVoiceFrame16k& mic_left,
+                               const RockchipVoiceFrame16k& mic_right,
+                               const RockchipVoiceFrame16k& reference_left,
+                               RockchipVoiceFrame16k* const output) noexcept {
+  if (output == nullptr) {
+    return false;
+  }
   output->fill(0);
-  if (!is_open()) return false;
+  if (!is_open()) {
+    return false;
+  }
   // 正常状态最多保留 255 个输入 frame，再追加 320 frame 必须能装入固定 FIFO。
-  if (input_count_ > kInputFifoFrames - kRockchipVoiceFrameSamples16k) return false;
+  if (input_count_ > kInputFifoFrames - kRockchipVoiceFrameSamples16k) {
+    return false;
+  }
   // REF-R 在调用本 API 前已经丢弃；vendor 永远只看到双麦和一个同步参考。
   for (std::size_t i = 0U; i < kRockchipVoiceFrameSamples16k; ++i) {
     const std::size_t base = (input_count_ + i) * kVendorInputChannels;
@@ -177,22 +181,25 @@ bool RockchipVoiceDsp::Process(
     int wakeup_status = 0;
     const int result = rkaudio_preprocess_short(
         handle_, reinterpret_cast<short*>(input_fifo_.data()),
-        reinterpret_cast<short*>(vendor_output_.data()), kVendorInputShorts,
-        &wakeup_status);
+        reinterpret_cast<short*>(vendor_output_.data()), kVendorInputShorts, &wakeup_status);
     if (result != kVendorOutputBytes ||
         output_count_ > kOutputFifoSamples - kVendorBlockSamples) {
       // vendor 返回长度或 FIFO 不变量失效后，继续处理会错位整个音频时间轴。
-      Close(); return false;
+      Close();
+      return false;
     }
     input_count_ -= kVendorBlockSamples;
-    std::memmove(input_fifo_.data(), input_fifo_.data() +
-                     kVendorBlockSamples * kVendorInputChannels,
+    std::memmove(input_fifo_.data(),
+                 input_fifo_.data() + kVendorBlockSamples * kVendorInputChannels,
                  input_count_ * kVendorInputChannels * sizeof(std::int16_t));
     std::copy_n(vendor_output_.data(), kVendorBlockSamples,
                 output_fifo_.data() + output_count_);
     output_count_ += kVendorBlockSamples;
   }
-  if (output_count_ < output->size()) { Close(); return false; }
+  if (output_count_ < output->size()) {
+    Close();
+    return false;
+  }
   // 每次对外稳定取出 320 samples；prime 的静音使输入、输出始终保持固定 20 ms 延迟。
   std::copy_n(output_fifo_.data(), output->size(), output->data());
   output_count_ -= output->size();

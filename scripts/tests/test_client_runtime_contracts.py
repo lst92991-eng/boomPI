@@ -42,28 +42,30 @@ class ClientRuntimeContracts(unittest.TestCase):
         self.assertIn("cancel_saved_child", start)
 
     def test_camera_source_and_display_are_capped_at_five_fps(self):
-        source = self.read("client/src/ui/device_ui.cpp")
+        source = self.read("client/src/ui/camera_capture.cpp")
+        header = self.read("client/src/ui/camera_capture.h")
         command_start = source.index("constexpr char kCameraCommand[]")
         command_end = source.index(";", command_start)
         command = source[command_start:command_end]
-        self.assertIn("constexpr unsigned kCameraFps = 5U;", source)
+        self.assertIn("constexpr unsigned kTargetFps = 5U;", header)
         self.assertNotIn("--set-parm", command)
         self.assertIn("不支持 VIDIOC_S_PARM", source)
         self.assertNotIn("-re -f rawvideo", source)
         self.assertIn("-framerate 25", source)
         self.assertIn("fps=5,scale=320:180", source)
-        self.assertIn("if (camera_frame_ready) ++dropped_frames", source)
+        self.assertIn("++dropped_frames;", source)
 
     def test_camera_error_discards_pixels_and_reports_load(self):
-        device = self.read("client/src/ui/device_ui.cpp")
+        camera = self.read("client/src/ui/camera_capture.cpp")
         screen = self.read("client/src/ui/lvgl_screen.cpp")
-        error_start = device.index("void CameraError")
-        error_end = device.index("bool TakeCameraFrame", error_start)
-        error_path = device[error_start:error_end]
-        self.assertIn("camera_frame_ready = false", error_path)
-        self.assertIn("camera_frame.fill(0U)", error_path)
-        self.assertIn("pipeline_fps=%u.%u", device)
-        self.assertIn("load1=%.2f", device)
+        error_start = camera.index("void CameraCapture::Fail")
+        error_end = camera.index("bool CameraCapture::TakeFrame", error_start)
+        error_path = camera[error_start:error_end]
+        self.assertIn("ClearFrame();", error_path)
+        self.assertIn("frame_ready_ = false", camera)
+        self.assertIn("frame_.fill(0U)", camera)
+        self.assertIn("pipeline_fps=%u.%u", camera)
+        self.assertIn("load1=%.2f", camera)
         self.assertIn("lv_obj_add_flag(camera_image, LV_OBJ_FLAG_HIDDEN)", screen)
 
 

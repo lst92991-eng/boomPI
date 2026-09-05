@@ -36,7 +36,7 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
       BOOMPI_HOST_CJSON_INCLUDE_DIR AND BOOMPI_HOST_CJSON_LIBRARY)
     add_executable(boompi_voice_transport_loopback_test
       tests/voice_transport_loopback_test.cpp src/network/voice_link.cpp
-      src/network/voice_codec.cpp src/network/network_setup.cpp
+      src/network/voice_codec.cpp tests/support/network_setup.cpp
       src/config/voice_client_config.cpp)
     add_executable(boompi_protocol_json_test tests/protocol_json_contract.cpp
       src/network/voice_codec.cpp src/config/voice_client_config.cpp)
@@ -60,7 +60,8 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
 
   if(UNIX)
     add_executable(boompi_audio_engine_harness tests/audio_engine_harness_test.cpp
-      tests/support/audio_backend.cpp src/audio/audio_engine.cpp src/audio/voice_audio.cpp)
+      tests/support/audio_backend.cpp tests/support/audio_thread.cpp
+      src/audio/audio_engine.cpp src/audio/voice_audio.cpp)
     boompi_test_options(boompi_audio_engine_harness)
     target_include_directories(boompi_audio_engine_harness BEFORE PRIVATE tests/support)
     target_link_libraries(boompi_audio_engine_harness PRIVATE Threads::Threads)
@@ -78,7 +79,7 @@ if(BOOMPI_TARGET_RV1106 AND BOOMPI_BUILD_AEC_LOOP_HIL)
   add_executable(boompi_aec_loop_hil tests/hil/aec_loop_hil.cpp
     src/audio/audio_engine.cpp src/audio/voice_audio.cpp
     src/platform/rv1106/audio_backend.cpp src/platform/rv1106/alsa_audio.cpp
-    src/platform/rv1106/rockchip_voice_dsp.cpp)
+    src/platform/rv1106/rockchip_voice_dsp.cpp src/platform/rv1106/audio_thread.cpp)
   boompi_test_options(boompi_aec_loop_hil)
   target_include_directories(boompi_aec_loop_hil PRIVATE src/platform/rv1106)
   target_include_directories(boompi_aec_loop_hil SYSTEM PRIVATE

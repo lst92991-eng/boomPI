@@ -9,7 +9,8 @@
 
 namespace boompi::platform::rv1106 {
 
-using audio::AudioEngineConfig; using audio::CaptureFrame;
+using audio::AudioEngineConfig;
+using audio::CaptureFrame;
 
 /// @brief RV1106 同步音频后端，由 AudioEngine 的两条实时线程直接调用。
 ///
@@ -18,7 +19,8 @@ using audio::AudioEngineConfig; using audio::CaptureFrame;
 /// 类内不创建线程或队列，调用顺序和线程所有权由 AudioEngine 保证。
 class AudioBackend final {
  public:
-  AudioBackend() noexcept = default; ~AudioBackend() noexcept;
+  AudioBackend() noexcept = default;
+  ~AudioBackend() noexcept;
   AudioBackend(const AudioBackend&) = delete;
   AudioBackend& operator=(const AudioBackend&) = delete;
 
@@ -43,8 +45,7 @@ class AudioBackend final {
   bool PreparePlayback() noexcept;
   /// @brief 将一帧 24 kHz mono TTS 补齐、升采样、限幅并写入 48 kHz stereo ALSA。
   /// @param samples 有效 sample 数，允许 EOS 前最后一帧短于 480。
-  bool Render20ms(const std::int16_t* pcm24, std::size_t samples,
-                  float gain) noexcept;
+  bool Render20ms(const std::int16_t* pcm24, std::size_t samples, float gain) noexcept;
   /// @brief 自然播放结束：等待 ALSA 播完已提交数据，再恢复到 prepared 状态。
   bool DrainPlayback() noexcept;
   /// @brief 主动打断：立即丢弃 ALSA 中尚未播放的数据并记录参考尾音已经结束。

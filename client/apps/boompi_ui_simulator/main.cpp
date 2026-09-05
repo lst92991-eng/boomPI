@@ -7,6 +7,7 @@
  * 在没有开发板时检查 320x240 排版。整个程序单线程调用 LVGL，符合板端所有权约束。
  */
 #include <SDL.h>
+#include <lvgl.h>
 
 #include <algorithm>
 #include <array>
@@ -16,8 +17,6 @@
 #include <cstring>
 #include <string>
 #include <thread>
-
-#include <lvgl.h>
 
 #include "boompi/ui/lvgl_screen.h"
 
@@ -63,9 +62,8 @@ void ReadPointer(lv_indev_drv_t*, lv_indev_data_t* data) {
  * 写入的半成品；像素掩码与板端 RGB565 布局保持一致。
  */
 bool SaveFrame(const std::string& directory) {
-  SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(
-      g_frame.data(), kWidth, kHeight, 16, kWidth * 2,
-      0xF800, 0x07E0, 0x001F, 0);
+  SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(g_frame.data(), kWidth, kHeight, 16,
+                                                  kWidth * 2, 0xF800, 0x07E0, 0x001F, 0);
   if (surface == nullptr) {
     return false;
   }
@@ -100,20 +98,17 @@ int main(int argc, char** argv) {
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
     return 1;
   }
-  SDL_Window* window = SDL_CreateWindow(
-      "boomPI LVGL 320x240", SDL_WINDOWPOS_CENTERED,
-      SDL_WINDOWPOS_CENTERED, kWidth * 2, kHeight * 2,
-      // 导出预览时隐藏窗口，CI 或远程 VM 仍可复用同一渲染路径。
-      preview_dir.empty() ? SDL_WINDOW_SHOWN : SDL_WINDOW_HIDDEN);
+  SDL_Window* window =
+      SDL_CreateWindow("boomPI LVGL 320x240", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                       kWidth * 2, kHeight * 2,
+                       // 导出预览时隐藏窗口，CI 或远程 VM 仍可复用同一渲染路径。
+                       preview_dir.empty() ? SDL_WINDOW_SHOWN : SDL_WINDOW_HIDDEN);
   SDL_Renderer* renderer =
-      window == nullptr
-          ? nullptr
-          : SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-  SDL_Texture* texture =
-      renderer == nullptr
-          ? nullptr
-          : SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB565,
-                              SDL_TEXTUREACCESS_STREAMING, kWidth, kHeight);
+      window == nullptr ? nullptr : SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+  SDL_Texture* texture = renderer == nullptr
+                             ? nullptr
+                             : SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB565,
+                                                 SDL_TEXTUREACCESS_STREAMING, kWidth, kHeight);
   if (preview_dir.empty() && texture == nullptr) {
     return 2;
   }
@@ -142,9 +137,9 @@ int main(int argc, char** argv) {
     return 3;
   }
   constexpr std::array states{
-      boompi::ui::DeviceUiState::kIdle, boompi::ui::DeviceUiState::kListening,
+      boompi::ui::DeviceUiState::kIdle,     boompi::ui::DeviceUiState::kListening,
       boompi::ui::DeviceUiState::kThinking, boompi::ui::DeviceUiState::kSpeaking,
-      boompi::ui::DeviceUiState::kHappy, boompi::ui::DeviceUiState::kOffline,
+      boompi::ui::DeviceUiState::kHappy,    boompi::ui::DeviceUiState::kOffline,
       boompi::ui::DeviceUiState::kError};
   std::size_t state = 0;
   auto apply_state = [&] {

@@ -6,7 +6,7 @@
 main → VoiceApp（唯一六状态）
          ├─ VoiceAudio → AudioEngine → RV1106 ALSA / 3A / Snowboy / VAD
          ├─ VoiceLink  → network_setup + WSS + v2 codec
-         └─ DeviceUi   → LVGL / SPI / GT911 / camera
+         └─ DeviceUi   → LVGL / SPI / GT911 + CameraCapture
 ```
 
 application 是唯一 generation 分配者；网络线程只校验 wire 顺序并过滤旧代。音频只决定“是否为近讲、是否结束、是否物理播完”，不决定网络轮次或追问窗口。UI 显示快照不复制对话状态。
@@ -20,3 +20,5 @@ v2 每个连接只有一个活动 generation。首 PCM 的 START 创建轮次，
 API Key 只在服务端；TLS身份与SPKI继续复用。教学口令仅适用于可信局域网，发现并不认证。默认不保存原始PCM或完整对话。
 
 课程入口见 [客户端README](../../client/README.md)，实现记录见 [teaching-refactor.md](teaching-refactor.md)。Host 测试、真板 ABI 与真人声学分别验收，不能互相替代。
+
+产品源码和Host替身由CMake选源，业务与驱动中不混合平台条件分支。本轮整理和统计见 [readability-cleanup.md](readability-cleanup.md)。

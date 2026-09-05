@@ -1,7 +1,8 @@
-/// @file RV1106 唯一 ALSA PCM 实现；只处理声卡格式、完整 period I/O 和中断。
+/// @file RV1106 声卡配置、完整 period I/O 和中断。
 #pragma once
 
 #include <alsa/asoundlib.h>
+
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -14,7 +15,9 @@ namespace boompi::platform::rv1106 {
 class AlsaAudio final {
  public:
   AlsaAudio() noexcept = default;
-  ~AlsaAudio() noexcept { Close(); }
+  ~AlsaAudio() noexcept {
+    Close();
+  }
   AlsaAudio(const AlsaAudio&) = delete;
   AlsaAudio& operator=(const AlsaAudio&) = delete;
 
@@ -24,7 +27,7 @@ class AlsaAudio final {
   bool WritePlayback(const std::int16_t* stereo, std::size_t frames) noexcept;
   bool DrainPlayback() noexcept;
   void DropPlayback() noexcept;
-  // 唯一允许跨 owner 的 PCM 操作：让 read/write/drain 返回，以便线程退出或完成取消。
+  // 这两个操作可由其他线程调用，让 read/write/drain 返回以便退出或取消。
   void InterruptCapture() noexcept;
   void InterruptPlayback() noexcept;
   bool playback_interrupted() const noexcept;

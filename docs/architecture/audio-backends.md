@@ -27,7 +27,7 @@ ALSA 头和句柄留在板级私有边界，application 只使用 `VoiceAudio`�
 | playback | 48 kHz / S16_LE | 2 | `960 / 3840` frames |
 
 capture 布局固定为 `[mic0,mic1,refL,refR]`。TTS mono 被复制到左右声道，因此两个参考高度
-相关；产品 AEC 只消费 `refL`，`refR` 只保留给 HIL 诊断。
+相关；产品 AEC 只消费 `refL`。ALSA仍读取四通道，应用不再额外复制一份HIL诊断平面。
 
 开始播放分两步：capture 线程在帧边界 `ArmPlayback`，只武装 AEC 参考/预热判定；
 playback 线程随后 `PreparePlayback`，准备 PCM 并复位播放重采样器，再消费 TTS。
@@ -44,7 +44,7 @@ output = 16 kHz / S16 / mono
 vendor 每块处理 256 samples，产品每帧 320 samples。`RockchipVoiceDsp` 用固定 FIFO 对齐，
 因此输出比采集固定延迟一帧；发布给 application 的 monotonic timestamp 同步补偿这帧延迟。
 
-当前 board_voice_profile.h 保持 AEC + BF、FastAEC、AES、ANR、去混响和 STDT，固定 delay 为 0；vendor AGC
+当前3A配置保持 AEC + BF、FastAEC、AES、ANR、去混响和 STDT，board_voice_profile.h 中 delay 为 0；vendor AGC
 关闭。公开 ABI 没有可靠 DTD 事件，因此打断仍使用 3A 后 PCM 的 VAD 和 `voice_dbfs`。
 
 ## Snowboy ABI
@@ -72,6 +72,8 @@ Host 配置不读取私有 SDK。推荐教师提供一个 BOOMPI_RV1106_SDK_ROOT
 CMake 只检查路径、头文件、库文件和目标版本，不维护开发机文件哈希清单。私有路径从环境变量
 或 Git 忽略的 `CMakeUserPresets.json` 注入，不写入仓库。模型、vendor 库和 BSP 资产未经许可
 不得重新分发。
+
+Host回归编译tests/support/audio_thread.cpp，使用普通线程；板端由platform/rv1106/audio_thread.cpp设置SCHED_FIFO。实际是否获得40/30优先级，仍需在板端读取线程策略。
 
 Host 测试只能证明状态和数据 packing，交叉构建只能证明 ABI；Mode1 布局、AEC、自激和最终
 声学效果必须在目标板验证。命令见 [验证入口](../test/host-validation.md)。

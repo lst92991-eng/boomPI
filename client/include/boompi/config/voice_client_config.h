@@ -12,6 +12,5 @@ struct VoiceClientConfig final {
 };
 bool IsValidDeviceId(const std::string& value) noexcept;
 bool IsValidSpkiSha256(const std::string& value) noexcept;
-bool LoadVoiceClientConfigFromEnvironment(VoiceClientConfig* output,
-                                          std::string* error);
+bool LoadVoiceClientConfigFromEnvironment(VoiceClientConfig* output, std::string* error);
 }  // namespace boompi::config

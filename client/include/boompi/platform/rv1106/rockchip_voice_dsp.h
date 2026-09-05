@@ -9,17 +9,15 @@
 
 namespace boompi::platform::rv1106 {
 
-inline constexpr std::size_t kRockchipVoiceFrameSamples16k =
-    audio::kVoiceFrameSamples;
+inline constexpr std::size_t kRockchipVoiceFrameSamples16k = audio::kVoiceFrameSamples;
 /// Rockchip 3A 对外统一使用 16 kHz/S16/20 ms，便于和 VAD、Snowboy 共用同一帧。
-using RockchipVoiceFrame16k =
-    std::array<std::int16_t, kRockchipVoiceFrameSamples16k>;
+using RockchipVoiceFrame16k = std::array<std::int16_t, kRockchipVoiceFrameSamples16k>;
 
-/// @brief 当前板卡唯一的 Rockchip 语音 3A 适配器。
+/// @brief Rockchip 语音 3A 参数配置及 256/320 sample 分块转换。
 ///
 /// capture/DSP 主线程独占本对象，并传入同一个 Codec Mode1 period 的 20 ms 平面。
 /// vendor 输入固定为 `[mic-left,mic-right,ref-left]`，每个 sample 只处理一次。
-/// Codec Mode1 仍采集 ref-right，但它只用于 HIL 观察，不进入产品 DSP API。
+/// Codec Mode1 仍采集 ref-right，因左右播放内容相同，只使用 ref-left。
 ///
 /// 产品帧是 320 samples，vendor 每次只吃 256 samples。两个固定 FIFO 跨调用拼接，
 /// 不补零、不丢输入；Open 先放入一帧静音输出，所以稳定后每次 Process 恰好返回
@@ -36,8 +34,7 @@ class RockchipVoiceDsp final {
   /// 初始化失败后实例保持关闭；重复打开返回 false 且不改变已有句柄。Close 幂等释放
   /// 句柄、参数树和 FIFO 状态，可在初始化失败后调用。
   /// @return 完整初始化成功返回 true，已打开或任一步失败返回 false。
-  bool Open(int delay_samples = audio::kBoardVoiceProfile.aec_delay_samples)
-      noexcept;
+  bool Open(int delay_samples = audio::kBoardVoiceProfile.aec_delay_samples) noexcept;
   void Close() noexcept;  ///< 幂等关闭，允许在 Open 失败后调用。
 
   /// @brief 将双麦与同步硬件参考送入组合 AEC/STDT/BF/ANR 路径。
@@ -48,13 +45,13 @@ class RockchipVoiceDsp final {
   /// @param output 非空输出帧。除空指针错误外，函数先清零该帧；成功时写入 320 samples。
   /// @return FIFO 或 backend 处理失败时实例会自动 Close，调用方必须重新 Open；参数错误、
   ///         未打开状态不会改变实例生命周期。
-  bool Process(
-      const RockchipVoiceFrame16k& mic_left,
-      const RockchipVoiceFrame16k& mic_right,
-      const RockchipVoiceFrame16k& reference_left,
-      RockchipVoiceFrame16k* output) noexcept;
+  bool Process(const RockchipVoiceFrame16k& mic_left, const RockchipVoiceFrame16k& mic_right,
+               const RockchipVoiceFrame16k& reference_left,
+               RockchipVoiceFrame16k* output) noexcept;
   /// @brief 返回调用线程观察到的句柄状态；本类不提供跨线程同步。
-  bool is_open() const noexcept { return handle_ != nullptr; }
+  bool is_open() const noexcept {
+    return handle_ != nullptr;
+  }
 
  private:
   static constexpr std::size_t kVendorBlockSamples = 256U;
@@ -71,8 +68,7 @@ class RockchipVoiceDsp final {
   void* handle_{nullptr};
   void* parameters_{nullptr};
   /// 输入按 `[mic-left,mic-right,ref-left]` 逐 sample 交错保存。
-  std::array<std::int16_t, kInputFifoFrames * kVendorInputChannels>
-      input_fifo_{};
+  std::array<std::int16_t, kInputFifoFrames * kVendorInputChannels> input_fifo_{};
   std::array<std::int16_t, kOutputFifoSamples> output_fifo_{};
   std::array<std::int16_t, kVendorBlockSamples> vendor_output_{};
   std::size_t input_count_{0U};

@@ -7,7 +7,8 @@
 #include <thread>
 #include <utility>
 
-namespace boompi::test::audio_backend { namespace {
+namespace boompi::test::audio_backend {
+namespace {
 
 struct SharedState final {
   std::mutex mutex;
@@ -42,15 +43,17 @@ bool WaitUntil(Predicate predicate, std::chrono::milliseconds timeout) noexcept 
 
 bool WaitInPlayback(PlaybackBlock stage, std::unique_lock<std::mutex>& lock) {
   auto& state = State();
-  state.owner_order_valid &= state.playback_prepared &&
-      state.playback_thread == std::this_thread::get_id();
+  state.owner_order_valid &=
+      state.playback_prepared && state.playback_thread == std::this_thread::get_id();
   if (state.playback_block == stage) {
     state.playback_blocked = true;
     state.condition.notify_all();
     // 测试本身也有截止时间：若产品漏掉 interrupt，报告失败而不是挂死测试进程。
     if (!state.condition.wait_for(lock, std::chrono::seconds(1), [&state] {
-      return !state.open || state.playback_interrupted;
-    })) return false;
+          return !state.open || state.playback_interrupted;
+        })) {
+      return false;
+    }
   }
   return !state.playback_interrupted;
 }
@@ -90,14 +93,18 @@ void FailPlaybackPreparation() noexcept {
 }
 
 bool WaitForPlaybackBlocked(std::chrono::milliseconds timeout) noexcept {
-  return WaitUntil([] { return State().playback_blocked; }, timeout);
+  return WaitUntil(
+      [] {
+        return State().playback_blocked;
+      },
+      timeout);
 }
 
 bool PlaybackOwnerOrderIsValid() noexcept {
   auto& state = State();
   std::lock_guard<std::mutex> lock(state.mutex);
   return state.owner_order_valid && state.prepared_sessions != 0U &&
-      state.armed_sessions == state.prepared_sessions;
+         state.armed_sessions == state.prepared_sessions;
 }
 
 void InjectPlaybackXruns(const std::uint64_t count) noexcept {
@@ -123,24 +130,38 @@ void PushCapture(const audio::CaptureFrame& frame) noexcept {
 
 bool WaitForCaptureReads(const std::size_t count,
                          const std::chrono::milliseconds timeout) noexcept {
-  return WaitUntil([count] { return State().capture_reads >= count; }, timeout);
+  return WaitUntil(
+      [count] {
+        return State().capture_reads >= count;
+      },
+      timeout);
 }
 
 bool WaitForProcessedFrames(const std::size_t count,
                             const std::chrono::milliseconds timeout) noexcept {
-  return WaitUntil([count] { return State().processed_frames >= count; }, timeout);
+  return WaitUntil(
+      [count] {
+        return State().processed_frames >= count;
+      },
+      timeout);
 }
 
 bool WaitForRenderCalls(const std::size_t count,
                         const std::chrono::milliseconds timeout) noexcept {
-  return WaitUntil([count] { return State().render_calls.size() >= count; },
-                   timeout);
+  return WaitUntil(
+      [count] {
+        return State().render_calls.size() >= count;
+      },
+      timeout);
 }
 
 bool WaitForCaptureInterrupts(const std::size_t count,
                               const std::chrono::milliseconds timeout) noexcept {
-  return WaitUntil([count] { return State().capture_interrupts >= count; },
-                   timeout);
+  return WaitUntil(
+      [count] {
+        return State().capture_interrupts >= count;
+      },
+      timeout);
 }
 
 std::vector<RenderCall> RenderCallsSnapshot() {
@@ -164,8 +185,12 @@ AudioBackend::~AudioBackend() noexcept {
 }
 
 bool AudioBackend::Open(const AudioEngineConfig&) noexcept {
-  if (impl_ == nullptr) impl_ = new (std::nothrow) Impl;
-  if (impl_ == nullptr) return false;
+  if (impl_ == nullptr) {
+    impl_ = new (std::nothrow) Impl;
+  }
+  if (impl_ == nullptr) {
+    return false;
+  }
   auto& state = test::audio_backend::State();
   {
     std::lock_guard<std::mutex> lock(state.mutex);
@@ -177,17 +202,20 @@ bool AudioBackend::Open(const AudioEngineConfig&) noexcept {
 }
 
 bool AudioBackend::ReadCapture20ms(bool* const discontinuity) noexcept {
-  if (impl_ == nullptr || discontinuity == nullptr) return false;
+  if (impl_ == nullptr || discontinuity == nullptr) {
+    return false;
+  }
   auto& state = test::audio_backend::State();
   std::unique_lock<std::mutex> lock(state.mutex);
   state.capture_thread = std::this_thread::get_id();
   ++state.capture_reads;
   state.condition.notify_all();
   state.condition.wait(lock, [&state] {
-    return !state.open || state.capture_interrupted ||
-           !state.capture_frames.empty();
+    return !state.open || state.capture_interrupted || !state.capture_frames.empty();
   });
-  if (!state.open || state.capture_interrupted) return false;
+  if (!state.open || state.capture_interrupted) {
+    return false;
+  }
   impl_->pending = state.capture_frames.front();
   state.capture_frames.pop_front();
   impl_->has_pending = true;
@@ -197,7 +225,9 @@ bool AudioBackend::ReadCapture20ms(bool* const discontinuity) noexcept {
 
 bool AudioBackend::ProcessCapture20ms(const bool discontinuity,
                                       CaptureFrame* const frame) noexcept {
-  if (impl_ == nullptr || frame == nullptr || !impl_->has_pending) return false;
+  if (impl_ == nullptr || frame == nullptr || !impl_->has_pending) {
+    return false;
+  }
   *frame = impl_->pending;
   frame->discontinuity = discontinuity;
   impl_->has_pending = false;
@@ -210,7 +240,9 @@ bool AudioBackend::ProcessCapture20ms(const bool discontinuity,
   return true;
 }
 
-bool AudioBackend::ResetListener() noexcept { return true; }
+bool AudioBackend::ResetListener() noexcept {
+  return true;
+}
 bool AudioBackend::ArmPlayback() noexcept {
   auto& state = test::audio_backend::State();
   std::lock_guard<std::mutex> lock(state.mutex);
@@ -224,17 +256,18 @@ bool AudioBackend::PreparePlayback() noexcept {
   std::lock_guard<std::mutex> lock(state.mutex);
   state.playback_thread = std::this_thread::get_id();
   state.owner_order_valid &= state.playback_thread != state.capture_thread &&
-      state.armed_sessions == state.prepared_sessions + 1U;
+                             state.armed_sessions == state.prepared_sessions + 1U;
   ++state.prepared_sessions;
   state.playback_prepared = !state.fail_playback_preparation;
   state.playback_interrupted = false;
   return state.playback_prepared;
 }
 
-bool AudioBackend::Render20ms(const std::int16_t* const pcm24,
-                              const std::size_t samples,
+bool AudioBackend::Render20ms(const std::int16_t* const pcm24, const std::size_t samples,
                               const float gain) noexcept {
-  if (pcm24 == nullptr || samples == 0U) return false;
+  if (pcm24 == nullptr || samples == 0U) {
+    return false;
+  }
   test::audio_backend::RenderCall call;
   call.pcm.assign(pcm24, pcm24 + samples);
   call.gain = gain;
@@ -242,8 +275,10 @@ bool AudioBackend::Render20ms(const std::int16_t* const pcm24,
   {
     std::unique_lock<std::mutex> lock(state.mutex);
     state.render_calls.push_back(std::move(call));
-    if (!test::audio_backend::WaitInPlayback(
-            test::audio_backend::PlaybackBlock::kRender, lock)) return false;
+    if (!test::audio_backend::WaitInPlayback(test::audio_backend::PlaybackBlock::kRender,
+                                             lock)) {
+      return false;
+    }
   }
   state.condition.notify_all();
   // The board backend advances one 20 ms ALSA period per call. Giving the
@@ -256,8 +291,7 @@ bool AudioBackend::Render20ms(const std::int16_t* const pcm24,
 bool AudioBackend::DrainPlayback() noexcept {
   auto& state = test::audio_backend::State();
   std::unique_lock<std::mutex> lock(state.mutex);
-  return test::audio_backend::WaitInPlayback(
-      test::audio_backend::PlaybackBlock::kDrain, lock);
+  return test::audio_backend::WaitInPlayback(test::audio_backend::PlaybackBlock::kDrain, lock);
 }
 void AudioBackend::DropPlayback() noexcept {
   auto& state = test::audio_backend::State();
@@ -288,7 +322,9 @@ void AudioBackend::InterruptPlayback() noexcept {
 std::uint64_t AudioBackend::playback_xruns() const noexcept {
   return test::audio_backend::PlaybackXrunsSnapshot();
 }
-std::string AudioBackend::last_error() const { return {}; }
+std::string AudioBackend::last_error() const {
+  return {};
+}
 
 void AudioBackend::Close() noexcept {
   auto& state = test::audio_backend::State();

@@ -35,7 +35,12 @@ class LvglScreen final {
    * 摄像头和配网事件只表达意图，具体进程与设备资源由 DeviceUi 管理。
    */
   enum class Event : std::uint8_t {
-    kWake, kInterrupt, kProvision, kCameraOn, kCameraOff, kVolumePreview,
+    kWake,
+    kInterrupt,
+    kProvision,
+    kCameraOn,
+    kCameraOff,
+    kVolumePreview,
     kVolumeCommit,
   };
   using EventHandler = void (*)(Event event, std::uint8_t value, void* data);
@@ -66,7 +71,8 @@ class LvglScreen final {
    * @param count 必须等于 320*180，防止页面读取尺寸不匹配的缓冲区。
    * @param fps_tenths 以 0.1 FPS 为单位，避免浮点格式化进入板端 UI。
    */
-  void SetCameraFrame(const std::uint16_t* pixels, std::size_t count, unsigned fps_tenths) noexcept;
+  void SetCameraFrame(const std::uint16_t* pixels, std::size_t count,
+                      unsigned fps_tenths) noexcept;
 
   /** @brief 更新语音表情；活跃状态可以自动从桌面进入小智页。 */
   void SetState(DeviceUiState state) noexcept;

@@ -9,10 +9,8 @@
 
 namespace boompi::platform::rv1106 {
 namespace {
-constexpr std::size_t kCaptureChannels =
-    audio::VoiceFrameContract::capture_channels;
-constexpr std::size_t kPlaybackChannels =
-    audio::VoiceFrameContract::playback_channels;
+constexpr std::size_t kCaptureChannels = audio::VoiceFrameContract::capture_channels;
+constexpr std::size_t kPlaybackChannels = audio::VoiceFrameContract::playback_channels;
 constexpr std::size_t kCapture48Frames = audio::kCaptureFrameSamples;
 // 四通道双 period 已占 15,360 字节，不能靠放大缓冲绕开采集线程的实时要求。
 constexpr snd_pcm_uframes_t kCaptureBufferPeriods = 2U;
@@ -23,13 +21,13 @@ constexpr const char* kLoopbackMode = "Mode1";
 int OpenPcmHandle(const std::string& name, snd_pcm_stream_t stream,
                   snd_pcm_t** output) noexcept {
   // 禁止 ALSA plug 层静默改采样率、通道和格式；硬件契约不匹配时立即暴露错误。
-  constexpr int flags = SND_PCM_NO_AUTO_RESAMPLE | SND_PCM_NO_AUTO_CHANNELS |
-                        SND_PCM_NO_AUTO_FORMAT;
+  constexpr int flags =
+      SND_PCM_NO_AUTO_RESAMPLE | SND_PCM_NO_AUTO_CHANNELS | SND_PCM_NO_AUTO_FORMAT;
   return snd_pcm_open(output, name.c_str(), stream, flags);
 }
 
-int ConfigurePcm(snd_pcm_t* pcm, snd_pcm_stream_t stream,
-                 unsigned channels, const char** stage) noexcept {
+int ConfigurePcm(snd_pcm_t* pcm, snd_pcm_stream_t stream, unsigned channels,
+                 const char** stage) noexcept {
   // capture/playback 共用 48 kHz/S16_LE/20 ms period，只有通道数与缓冲 period 数不同。
   // 每一步更新 stage，使初始化失败日志能指向准确的 ALSA 协商阶段。
   snd_pcm_hw_params_t* hw = nullptr;
@@ -37,8 +35,7 @@ int ConfigurePcm(snd_pcm_t* pcm, snd_pcm_stream_t stream,
   unsigned rate = audio::VoiceFrameContract::capture_rate_hz;
   snd_pcm_uframes_t period = kCapture48Frames;
   const snd_pcm_uframes_t buffer_periods =
-      stream == SND_PCM_STREAM_CAPTURE ? kCaptureBufferPeriods
-                                       : kPlaybackBufferPeriods;
+      stream == SND_PCM_STREAM_CAPTURE ? kCaptureBufferPeriods : kPlaybackBufferPeriods;
   unsigned period_count = static_cast<unsigned>(buffer_periods);
   snd_pcm_uframes_t buffer = buffer_periods * kCapture48Frames;
   int direction = 0;
@@ -46,8 +43,7 @@ int ConfigurePcm(snd_pcm_t* pcm, snd_pcm_stream_t stream,
   int rc = snd_pcm_hw_params_any(pcm, hw);
   if (rc >= 0) {
     *stage = "ALSA interleaved access";
-    rc = snd_pcm_hw_params_set_access(
-        pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+    rc = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
   }
   if (rc >= 0) {
     *stage = "ALSA S16 format";
@@ -63,14 +59,12 @@ int ConfigurePcm(snd_pcm_t* pcm, snd_pcm_stream_t stream,
   }
   if (rc >= 0) {
     *stage = "ALSA period size";
-    rc = snd_pcm_hw_params_set_period_size_near(
-        pcm, hw, &period, &direction);
+    rc = snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, &direction);
   }
   direction = 0;
   if (rc >= 0) {
     *stage = "ALSA period count";
-    rc = snd_pcm_hw_params_set_periods_near(
-        pcm, hw, &period_count, &direction);
+    rc = snd_pcm_hw_params_set_periods_near(pcm, hw, &period_count, &direction);
   }
   if (rc >= 0) {
     *stage = "ALSA buffer size";
@@ -80,14 +74,14 @@ int ConfigurePcm(snd_pcm_t* pcm, snd_pcm_stream_t stream,
     *stage = "ALSA apply hw params";
     rc = snd_pcm_hw_params(pcm, hw);
   }
-  if (rc < 0) return rc;
+  if (rc < 0) {
+    return rc;
+  }
   if (period != kCapture48Frames || period_count != buffer_periods ||
       buffer != buffer_periods * kCapture48Frames) {
     // *_near 允许驱动协商相邻值；产品算法依赖严格 20 ms，协商结果必须再次验证。
-    std::fprintf(stderr,
-                 "boompi-client: ALSA negotiated period=%lu periods=%u buffer=%lu\n",
-                 static_cast<unsigned long>(period),
-                 period_count,
+    std::fprintf(stderr, "boompi-client: ALSA negotiated period=%lu periods=%u buffer=%lu\n",
+                 static_cast<unsigned long>(period), period_count,
                  static_cast<unsigned long>(buffer));
     *stage = "ALSA exact period/buffer contract";
     return -EINVAL;
@@ -96,12 +90,17 @@ int ConfigurePcm(snd_pcm_t* pcm, snd_pcm_stream_t stream,
   snd_pcm_sw_params_alloca(&sw);
   *stage = "ALSA current software params";
   rc = snd_pcm_sw_params_current(pcm, sw);
-  if (rc >= 0) rc = snd_pcm_sw_params_set_avail_min(pcm, sw, kCapture48Frames);
+  if (rc >= 0) {
+    rc = snd_pcm_sw_params_set_avail_min(pcm, sw, kCapture48Frames);
+  }
   // capture 有一个 frame 即启动；playback 先在内核积累 60 ms，降低首播 XRUN 概率。
-  const snd_pcm_uframes_t start =
-      stream == SND_PCM_STREAM_CAPTURE ? 1U : 3U * kCapture48Frames;
-  if (rc >= 0) rc = snd_pcm_sw_params_set_start_threshold(pcm, sw, start);
-  if (rc >= 0) rc = snd_pcm_sw_params(pcm, sw);
+  const snd_pcm_uframes_t start = stream == SND_PCM_STREAM_CAPTURE ? 1U : 3U * kCapture48Frames;
+  if (rc >= 0) {
+    rc = snd_pcm_sw_params_set_start_threshold(pcm, sw, start);
+  }
+  if (rc >= 0) {
+    rc = snd_pcm_sw_params(pcm, sw);
+  }
   if (rc >= 0) {
     *stage = "ALSA PCM prepare";
     rc = snd_pcm_prepare(pcm);
@@ -121,13 +120,14 @@ int OpenLoopbackControl(int card, snd_ctl_t** control, snd_ctl_elem_id_t* id,
   std::array<char, 24U> name{};
   std::snprintf(name.data(), name.size(), "hw:%d", card);
   int rc = snd_ctl_open(control, name.data(), 0);
-  if (rc < 0) return rc;
+  if (rc < 0) {
+    return rc;
+  }
   SetLoopbackId(id);
   snd_ctl_elem_info_set_id(info, id);
   rc = snd_ctl_elem_info(*control, info);
-  if (rc >= 0 &&
-      (snd_ctl_elem_info_get_type(info) != SND_CTL_ELEM_TYPE_ENUMERATED ||
-       snd_ctl_elem_info_get_count(info) != 1U)) {
+  if (rc >= 0 && (snd_ctl_elem_info_get_type(info) != SND_CTL_ELEM_TYPE_ENUMERATED ||
+                  snd_ctl_elem_info_get_count(info) != 1U)) {
     rc = -EINVAL;
   }
   if (rc < 0) {
@@ -137,25 +137,27 @@ int OpenLoopbackControl(int card, snd_ctl_t** control, snd_ctl_elem_id_t* id,
   return rc;
 }
 
-int ReadLoopbackValue(snd_ctl_t* control, snd_ctl_elem_id_t* id,
-                      unsigned* output) noexcept {
+int ReadLoopbackValue(snd_ctl_t* control, snd_ctl_elem_id_t* id, unsigned* output) noexcept {
   snd_ctl_elem_value_t* value = nullptr;
   snd_ctl_elem_value_alloca(&value);
   snd_ctl_elem_value_set_id(value, id);
   const int rc = snd_ctl_elem_read(control, value);
-  if (rc >= 0) *output = snd_ctl_elem_value_get_enumerated(value, 0U);
+  if (rc >= 0) {
+    *output = snd_ctl_elem_value_get_enumerated(value, 0U);
+  }
   return rc;
 }
 
-int WriteLoopbackValue(snd_ctl_t* control, snd_ctl_elem_id_t* id,
-                       unsigned target) noexcept {
+int WriteLoopbackValue(snd_ctl_t* control, snd_ctl_elem_id_t* id, unsigned target) noexcept {
   snd_ctl_elem_value_t* value = nullptr;
   snd_ctl_elem_value_alloca(&value);
   snd_ctl_elem_value_set_id(value, id);
   snd_ctl_elem_value_set_enumerated(value, 0U, target);
   int rc = snd_ctl_elem_write(control, value);
   unsigned actual = target;
-  if (rc >= 0) rc = ReadLoopbackValue(control, id, &actual);
+  if (rc >= 0) {
+    rc = ReadLoopbackValue(control, id, &actual);
+  }
   return rc >= 0 && actual != target ? -EIO : rc;
 }
 
@@ -164,7 +166,9 @@ int ConfigureLoopbackMode1(snd_pcm_t* capture) noexcept {
   snd_pcm_info_t* pcm_info = nullptr;
   snd_pcm_info_alloca(&pcm_info);
   int rc = snd_pcm_info(capture, pcm_info);
-  if (rc < 0) return rc;
+  if (rc < 0) {
+    return rc;
+  }
   const int card = snd_pcm_info_get_card(pcm_info);
   snd_ctl_t* control = nullptr;
   snd_ctl_elem_id_t* id = nullptr;
@@ -172,20 +176,28 @@ int ConfigureLoopbackMode1(snd_pcm_t* capture) noexcept {
   snd_ctl_elem_id_alloca(&id);
   snd_ctl_elem_info_alloca(&info);
   rc = OpenLoopbackControl(card, &control, id, info);
-  if (rc < 0) return rc;
+  if (rc < 0) {
+    return rc;
+  }
   const unsigned items = snd_ctl_elem_info_get_items(info);
   unsigned target = items;
   for (unsigned item = 0U; item < items && rc >= 0; ++item) {
     snd_ctl_elem_info_set_item(info, item);
     rc = snd_ctl_elem_info(control, info);
-    if (rc >= 0 &&
-        std::strcmp(snd_ctl_elem_info_get_item_name(info), kLoopbackMode) == 0)
+    if (rc >= 0 && std::strcmp(snd_ctl_elem_info_get_item_name(info), kLoopbackMode) == 0) {
       target = item;
+    }
   }
-  if (rc >= 0 && target == items) rc = -ENOENT;
+  if (rc >= 0 && target == items) {
+    rc = -ENOENT;
+  }
   unsigned current = target;
-  if (rc >= 0) rc = ReadLoopbackValue(control, id, &current);
-  if (rc >= 0 && current != target) rc = WriteLoopbackValue(control, id, target);
+  if (rc >= 0) {
+    rc = ReadLoopbackValue(control, id, &current);
+  }
+  if (rc >= 0 && current != target) {
+    rc = WriteLoopbackValue(control, id, target);
+  }
   snd_ctl_close(control);
   return rc;
 }
@@ -239,22 +251,27 @@ bool AlsaAudio::Open(const std::string& capture_name,
   return true;
 }
 
-bool AlsaAudio::ReadCapture20ms(
-    std::int16_t* const output, bool* const discontinuity) noexcept {
-  if (capture_pcm_ == nullptr || output == nullptr || discontinuity == nullptr)
+bool AlsaAudio::ReadCapture20ms(std::int16_t* const output,
+                                bool* const discontinuity) noexcept {
+  if (capture_pcm_ == nullptr || output == nullptr || discontinuity == nullptr) {
     return false;
+  }
   *discontinuity = false;
   std::size_t offset = 0U;
   while (offset < kCapture48Frames) {
     // readi 可能被信号打断或只返回部分 period；只有收齐 960 frame 才交给 DSP。
-    const snd_pcm_sframes_t rc = snd_pcm_readi(capture_pcm_,
-        output + kCaptureChannels * offset, kCapture48Frames - offset);
+    const snd_pcm_sframes_t rc = snd_pcm_readi(capture_pcm_, output + kCaptureChannels * offset,
+                                               kCapture48Frames - offset);
     if (rc > 0) {
       offset += static_cast<std::size_t>(rc);
       continue;
     }
-    if (capture_interrupted_.load(std::memory_order_acquire)) return false;
-    if (rc == -EINTR) continue;
+    if (capture_interrupted_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    if (rc == -EINTR) {
+      continue;
+    }
     if (rc == -EPIPE || rc == -ESTRPIPE) {
       const int recovered = snd_pcm_recover(capture_pcm_, static_cast<int>(rc), 1);
       if (recovered < 0) {
@@ -273,20 +290,25 @@ bool AlsaAudio::ReadCapture20ms(
   return true;
 }
 
-bool AlsaAudio::WritePlayback(
-    const std::int16_t* stereo, std::size_t frames) noexcept {
+bool AlsaAudio::WritePlayback(const std::int16_t* stereo, std::size_t frames) noexcept {
   std::size_t offset = 0U;
   while (offset < frames) {
     // ALSA 允许部分写入；offset 保证每个 sample 只进入硬件时间线一次。
-    if (playback_interrupted_.load(std::memory_order_acquire)) return false;
-    const snd_pcm_sframes_t rc = snd_pcm_writei(playback_pcm_,
-        stereo + 2U * offset, frames - offset);
+    if (playback_interrupted_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    const snd_pcm_sframes_t rc =
+        snd_pcm_writei(playback_pcm_, stereo + 2U * offset, frames - offset);
     if (rc > 0) {
       offset += static_cast<std::size_t>(rc);
       continue;
     }
-    if (playback_interrupted_.load(std::memory_order_acquire)) return false;
-    if (rc == -EINTR) continue;
+    if (playback_interrupted_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    if (rc == -EINTR) {
+      continue;
+    }
     if (rc == -EPIPE || rc == -ESTRPIPE) {
       const int recovered = snd_pcm_recover(playback_pcm_, static_cast<int>(rc), 1);
       if (recovered < 0) {
@@ -325,33 +347,51 @@ void AlsaAudio::ClearError() noexcept {
 
 bool AlsaAudio::DrainPlayback() noexcept {
   const int drained = snd_pcm_drain(playback_pcm_);
-  if (drained < 0 && !playback_interrupted()) SetError("ALSA playback drain", drained);
+  if (drained < 0 && !playback_interrupted()) {
+    SetError("ALSA playback drain", drained);
+  }
   const int prepared = snd_pcm_prepare(playback_pcm_);
-  if (prepared < 0 && !playback_interrupted()) SetError("ALSA playback prepare", prepared);
+  if (prepared < 0 && !playback_interrupted()) {
+    SetError("ALSA playback prepare", prepared);
+  }
   return drained >= 0 && prepared >= 0;
 }
 
 void AlsaAudio::DropPlayback() noexcept {
-  if (playback_pcm_ == nullptr) return;
+  if (playback_pcm_ == nullptr) {
+    return;
+  }
   const int dropped = snd_pcm_drop(playback_pcm_);
   const int prepared = snd_pcm_prepare(playback_pcm_);
-  if (dropped < 0 && dropped != -EBADFD) SetError("ALSA playback drop", dropped);
-  if (prepared < 0) SetError("ALSA playback prepare", prepared);
+  if (dropped < 0 && dropped != -EBADFD) {
+    SetError("ALSA playback drop", dropped);
+  }
+  if (prepared < 0) {
+    SetError("ALSA playback prepare", prepared);
+  }
 }
 
 void AlsaAudio::InterruptCapture() noexcept {
-  if (capture_pcm_ == nullptr) return;
+  if (capture_pcm_ == nullptr) {
+    return;
+  }
   capture_interrupted_.store(true, std::memory_order_release);
   const int aborted = snd_pcm_abort(capture_pcm_);
-  if (aborted < 0) SetError("ALSA capture interrupt", aborted);
+  if (aborted < 0) {
+    SetError("ALSA capture interrupt", aborted);
+  }
 }
 
 void AlsaAudio::InterruptPlayback() noexcept {
-  if (playback_pcm_ == nullptr) return;
+  if (playback_pcm_ == nullptr) {
+    return;
+  }
   // 先发布 interrupted，再解除阻塞；调用方因此不会把用户取消误判为硬件故障。
   playback_interrupted_.store(true, std::memory_order_release);
   const int dropped = snd_pcm_drop(playback_pcm_);
-  if (dropped < 0 && dropped != -EBADFD) SetError("ALSA playback interrupt", dropped);
+  if (dropped < 0 && dropped != -EBADFD) {
+    SetError("ALSA playback interrupt", dropped);
+  }
 }
 
 bool AlsaAudio::playback_interrupted() const noexcept {
@@ -369,8 +409,12 @@ std::string AlsaAudio::last_error() const {
 
 void AlsaAudio::Close() noexcept {
   // Mode1 是板卡运行状态，退出无需切回会破坏四通道布局的默认模式。
-  if (capture_pcm_ != nullptr) snd_pcm_close(capture_pcm_);
-  if (playback_pcm_ != nullptr) snd_pcm_close(playback_pcm_);
+  if (capture_pcm_ != nullptr) {
+    snd_pcm_close(capture_pcm_);
+  }
+  if (playback_pcm_ != nullptr) {
+    snd_pcm_close(playback_pcm_);
+  }
   capture_pcm_ = playback_pcm_ = nullptr;
 }
 

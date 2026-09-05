@@ -14,6 +14,7 @@ class DeviceUi final {
   void Show(const UiView& view) noexcept;
   bool Poll(UiAction* action) noexcept;
   void Close() noexcept;
+
  private:
   struct Impl;
   Impl* impl_{nullptr};

@@ -1,0 +1,14 @@
+BasedOnStyle: Google
+Standard: c++17
+IndentWidth: 2
+ColumnLimit: 96
+PointerAlignment: Left
+DerivePointerAlignment: false
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortLambdasOnASingleLine: Empty
+InsertBraces: true
