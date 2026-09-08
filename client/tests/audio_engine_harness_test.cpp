@@ -186,7 +186,7 @@ bool TestRebufferAfterConfirmedGap() {
     return false;
   }
 
-  std::this_thread::sleep_for(60ms);
+  std::this_thread::sleep_for(500ms);
   if (!QueueFrame(&engine, 9U)) {
     return false;
   }
@@ -210,7 +210,7 @@ bool TestEndPlaybackShortTail() {
     return false;
   }
 
-  std::this_thread::sleep_for(60ms);
+  std::this_thread::sleep_for(500ms);
   if (!QueueFrame(&engine, 9U, 240U)) {
     return false;
   }
