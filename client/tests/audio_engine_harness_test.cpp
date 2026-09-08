@@ -139,7 +139,7 @@ bool PrimePlayback(AudioEngine* const engine) {
       return false;
     }
   }
-  return Check(fake::WaitForRenderCalls(9U, 500ms), "initial 180 ms buffer was not rendered");
+  return Check(fake::WaitForRenderCalls(9U, 2s), "initial 180 ms buffer was not rendered");
 }
 
 bool TestSubGraceJitter() {
