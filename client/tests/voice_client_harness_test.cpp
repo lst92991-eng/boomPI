@@ -147,7 +147,10 @@ bool VoiceAudio::healthy() const {
 std::string VoiceAudio::last_error() const {
   return "scripted audio error";
 }
-void VoiceAudio::Close() noexcept {}
+void VoiceAudio::Close() noexcept {
+  // Host 替身没有后端资源，但仍走生产类的 PImpl 生命周期边界。
+  impl_ = nullptr;
+}
 }  // namespace boompi::audio
 namespace boompi::network {
 class VoiceLink::Impl {};
@@ -198,7 +201,10 @@ bool DeviceUi::Poll(UiAction* action) noexcept {
   harness::state.action.reset();
   return true;
 }
-void DeviceUi::Close() noexcept {}
+void DeviceUi::Close() noexcept {
+  // Host 替身没有 UI worker，但仍走生产类的 PImpl 生命周期边界。
+  impl_ = nullptr;
+}
 }  // namespace boompi::ui
 
 int main() {
