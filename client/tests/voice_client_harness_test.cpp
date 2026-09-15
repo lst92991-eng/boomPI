@@ -193,6 +193,7 @@ bool DeviceUi::PollAction(UiAction* action) noexcept {
   return true;
 }
 void DeviceUi::Close() noexcept {
+  impl_ = nullptr;
   ++harness::state.closes;
 }
 }  // namespace boompi::ui
