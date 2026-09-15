@@ -113,13 +113,13 @@ void speech_samples() {
   speech::reset();
   std::vector<int> delivered;
   bool started = false, ended = false;
-  for (int id = 0; id < 65; ++id) {
+  for (int id = 0; id < 75; ++id) {
     audio::CaptureFrame frame;
     frame.pcm.fill(static_cast<std::int16_t>(id));
-    frame.vad_now = id >= 20 && id < 30;
+    frame.vad_now = id >= 20 && id < 40;
     const auto result = speech::update(frame);
     if (result.start) {
-      require(!started && id == 25, "more than one onset or wrong current frame");
+      require(!started && id == 34, "more than one onset or wrong current frame");
       started = true;
     }
     for (std::size_t i = 0; i < result.count; ++i) {
@@ -127,9 +127,9 @@ void speech_samples() {
     }
     ended = result.end;
   }
-  require(started && ended && delivered.size() == 64, "pre-roll or tail missing");
-  for (int id = 1; id <= 64; ++id) {
-    require(delivered[id - 1] == id, "pre-roll/current/tail duplicated or skipped");
+  require(started && ended && delivered.size() == 65, "pre-roll or tail missing");
+  for (int id = 10; id <= 74; ++id) {
+    require(delivered[id - 10] == id, "pre-roll/current/tail duplicated or skipped");
   }
 }
 void capture_boundaries() {

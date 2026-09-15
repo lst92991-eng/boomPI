@@ -4,7 +4,7 @@
 
 namespace boompi::speech {
 namespace {
-constexpr unsigned kStartFrames = 120 / audio::kFrameMs;
+constexpr unsigned kStartFrames = 300 / audio::kFrameMs;
 constexpr unsigned kEndFrames = 700 / audio::kFrameMs;
 constexpr unsigned kMaxFrames = 60000 / audio::kFrameMs;
 std::array<audio::VoiceFrame16k, kPreRollFrames> history;

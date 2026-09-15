@@ -59,12 +59,12 @@ void question() {
   auto wake = sound(0, false);
   wake.wake = true;
   tick(wake);
-  for (int id = 1; id <= 41; ++id) {
-    tick(sound(id, id <= 6));
+  for (int id = 1; id <= 50; ++id) {
+    tick(sound(id, id <= 15));
   }
-  require(state.starts == 1 && state.ends == 1 && state.samples.size() == 41,
+  require(state.starts == 1 && state.ends == 1 && state.samples.size() == 50,
           "START/PCM/END not delivered once");
-  for (int id = 1; id <= 41; ++id) {
+  for (int id = 1; id <= 50; ++id) {
     require(state.samples[id - 1] == id, "application duplicated or omitted current/tail PCM");
   }
 }
@@ -221,36 +221,36 @@ int main() {
     state.output = playback::State::Drained;
     tick();
     require(state.view.state == ui::DeviceUiState::Listening, "drain did not start follow-up");
-    for (int id = 42; id <= 82; ++id) {
-      tick(sound(id, id <= 47));
+    for (int id = 51; id <= 100; ++id) {
+      tick(sound(id, id <= 65));
     }
-    require(state.starts == 2 && state.ends == 2 && state.samples.size() == 82,
+    require(state.starts == 2 && state.ends == 2 && state.samples.size() == 100,
             "follow-up did not reuse the same speech path");
     open();
     question();
     network(LinkEventKind::Audio);
-    for (int id = 100; id < 141; ++id) {
-      tick(sound(id, id < 106));
+    for (int id = 100; id < 150; ++id) {
+      tick(sound(id, id < 115));
     }
     require(state.supersede && state.drops == 1 && state.starts == 2 && state.ends == 2,
             "same spoken sentence did not replace playback");
     require(
-        state.samples[41] == 100 && state.samples.back() == 140 && state.samples.size() == 82,
+        state.samples[50] == 100 && state.samples.back() == 149 && state.samples.size() == 100,
         "barge sentence lost its beginning or tail");
     open();
     question();
     network(LinkEventKind::Audio);
     network(LinkEventKind::Done);
-    for (int id = 100; id < 105; ++id) {
+    for (int id = 100; id < 114; ++id) {
       tick(sound(id, true));
     }
     state.output = playback::State::Drained;
-    tick(sound(105, true));
-    for (int id = 106; id < 141; ++id) {
+    tick(sound(114, true));
+    for (int id = 115; id < 150; ++id) {
       tick(sound(id, false));
     }
-    require(state.starts == 2 && !state.supersede && state.samples.size() == 82 &&
-                state.samples[41] == 100,
+    require(state.starts == 2 && !state.supersede && state.samples.size() == 100 &&
+                state.samples[50] == 100,
             "natural drain cleared a sentence that already started");
     state.action = ui::UiAction{ui::UiActionKind::Interrupt, 60};
     tick();
@@ -263,10 +263,10 @@ int main() {
     wake.wake = true;
     tick(wake);
     state.fail_send = true;
-    for (int id = 0; id < 6; ++id) {
+    for (int id = 0; id < 15; ++id) {
       tick(sound(id, true));
     }
-    require(state.cancels == 2 && !state.uploading && state.samples.size() == 82,
+    require(state.cancels == 2 && !state.uploading && state.samples.size() == 100,
             "backpressure skipped PCM and continued uploading");
     App_Close();
     return 0;
