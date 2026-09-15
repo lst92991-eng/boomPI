@@ -5,6 +5,10 @@
  * 模拟器只替换显示 flush 和 pointer 输入端口，页面构建、事件规则、字体过滤与摄像头
  * 占位图仍使用生产代码。它既可打开交互窗口，也可无窗口导出 frame.bmp，方便学生
  * 在没有开发板时检查 320x240 排版。整个程序单线程调用 LVGL，符合板端所有权约束。
+ *
+ * 跟读入口：main 注册 Flush/ReadPointer → screen.Create → SDL 事件循环 →
+ * lv_timer_handler → 页面回调/Flush → SDL 纹理或 BMP。这里不启动应用模块或 DeviceUi，
+ * 也不注册业务 EventHandler，因此点击能切换页面，外部唤醒、配网和真实摄像头不会执行。
  */
 #include <SDL.h>
 #include <lvgl.h>
@@ -77,6 +81,13 @@ bool SaveFrame(const std::string& directory) {
 
 }  // namespace
 
+/**
+ * @brief 启动交互式页面模拟器，或持续导出供观察的 frame.bmp。
+ *
+ * --preview-dir 指向已存在且可写的输出目录；--font 指定 CJK 字体；--demo-voice
+ * 自动轮换显示状态；--demo-app 0..3 分别打开小智、摄像头、时间和 Wi-Fi 页面。
+ * 预览模式同样持续运行，不是生成一张图片后自动退出；返回非零表示初始化或导出失败。
+ */
 int main(int argc, char** argv) {
   std::string preview_dir;
   bool demo_voice = false;
@@ -137,19 +148,20 @@ int main(int argc, char** argv) {
     return 3;
   }
   constexpr std::array states{
-      boompi::ui::DeviceUiState::kIdle,     boompi::ui::DeviceUiState::kListening,
-      boompi::ui::DeviceUiState::kThinking, boompi::ui::DeviceUiState::kSpeaking,
-      boompi::ui::DeviceUiState::kHappy,    boompi::ui::DeviceUiState::kOffline,
-      boompi::ui::DeviceUiState::kError};
+      boompi::ui::DeviceUiState::Idle,     boompi::ui::DeviceUiState::Listening,
+      boompi::ui::DeviceUiState::Thinking, boompi::ui::DeviceUiState::Speaking,
+      boompi::ui::DeviceUiState::Happy,    boompi::ui::DeviceUiState::Offline,
+      boompi::ui::DeviceUiState::Error};
   std::size_t state = 0;
+  // 仅模拟 application 的显示投影，state 下标不是产品状态机或音频轮次。
   auto apply_state = [&] {
     screen.SetState(states[state]);
-    if (states[state] == boompi::ui::DeviceUiState::kSpeaking) {
+    if (states[state] == boompi::ui::DeviceUiState::Speaking) {
       // 保留三个曾导致板端 LVGL 崩溃的 emoji 作为固定回归样本；页面需要过滤缺失字形
       // 并继续绘制剩余文字。
-      screen.SetText("当然可以，正在为你查询。😅", "北京今天适合外出。😄😂");
+      screen.SetText("当然可以，正在为你查询。😅\n北京今天适合外出。😄😂");
     } else {
-      screen.SetText({}, {});
+      screen.SetText({});
     }
   };
   if (demo_voice) {
@@ -157,8 +169,8 @@ int main(int argc, char** argv) {
     apply_state();
   } else if (demo_app >= 0 && demo_app < 4) {
     constexpr std::array pages{
-        boompi::ui::LvglScreen::Page::kVoice, boompi::ui::LvglScreen::Page::kCamera,
-        boompi::ui::LvglScreen::Page::kClock, boompi::ui::LvglScreen::Page::kWifi};
+        boompi::ui::LvglScreen::Page::Voice, boompi::ui::LvglScreen::Page::Camera,
+        boompi::ui::LvglScreen::Page::Clock, boompi::ui::LvglScreen::Page::Wifi};
     screen.OpenApp(pages[static_cast<std::size_t>(demo_app)]);
   }
   auto next_state = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -190,6 +202,7 @@ int main(int argc, char** argv) {
       apply_state();
       next_state = started + std::chrono::seconds(2);
     }
+    // 模拟器按目标 16 ms 步长推进 LVGL；真实板端 Run 用 steady_clock 实际经过时间。
     lv_tick_inc(16);
     lv_timer_handler();
     if (texture != nullptr && g_frame_dirty) {

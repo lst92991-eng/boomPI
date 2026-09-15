@@ -6,10 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/lst92991-eng/boomPI/server/internal/backend"
 )
 
@@ -57,16 +63,15 @@ func TestOpenReturnsBeforeRealtimeASRPreparation(t *testing.T) {
 	}
 
 	session := result.session.(*Session)
-	if err := session.SendAudio(context.Background(), []byte{0, 0}); err != nil {
-		t.Fatalf("SendAudio() error = %v", err)
+	inputCtx, cancelInput := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancelInput()
+	if err := session.SendAudio(inputCtx, []byte{0, 0}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unprepared realtime ASR must fail within input deadline: %v", err)
 	}
-	session.mu.Lock()
-	batchOnly := session.turnBatchOnly
-	session.mu.Unlock()
-	if !batchOnly {
-		t.Fatal("first turn did not select batch fallback while realtime ASR was preparing")
+	if session.inputBytes != 0 {
+		t.Fatal("failed input was counted as accepted")
 	}
-	if err := session.Cancel(context.Background()); err != nil {
+	if err := session.Cancel(context.Background(), false); err != nil {
 		t.Fatalf("Cancel() error = %v", err)
 	}
 	if err := session.Close(); err != nil {
@@ -167,7 +172,7 @@ func TestEmitErrorLogsOnlySafeClassification(t *testing.T) {
 	}
 	select {
 	case event := <-session.events:
-		if event.Type != backend.EventError || !errors.Is(event.Err, original) {
+		if event.Type != backend.EventError || event.ResponseID != "response-safe" || !errors.Is(event.Err, original) {
 			t.Fatalf("error event = %+v, want original provider error", event)
 		}
 	default:
@@ -175,15 +180,14 @@ func TestEmitErrorLogsOnlySafeClassification(t *testing.T) {
 	}
 }
 
-func TestDiscardLastResponseKeepsPreviousPairWhileCurrentResponseIsIncomplete(t *testing.T) {
+func TestCancelRetractKeepsPreviousPairWhileCurrentResponseIsIncomplete(t *testing.T) {
 	session := &Session{history: []chatMessage{
 		{Role: "user", Content: "previous"},
 		{Role: "assistant", Content: "previous answer"},
 	}, lastResponseDiscardable: true}
-	if err := session.SendAudio(context.Background(), []byte{0, 0}); err != nil {
-		t.Fatal(err)
-	}
-	if err := session.DiscardLastResponse(context.Background()); err != nil {
+	session.inputBytes = 2
+	session.lastResponseDiscardable = false
+	if err := session.Cancel(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if len(session.history) != 2 || session.history[0].Content != "previous" ||
@@ -192,14 +196,14 @@ func TestDiscardLastResponseKeepsPreviousPairWhileCurrentResponseIsIncomplete(t 
 	}
 }
 
-func TestDiscardLastResponseRemovesOnlyMarkedCompletedPair(t *testing.T) {
+func TestCancelRetractRemovesOnlyMarkedCompletedPair(t *testing.T) {
 	session := &Session{history: []chatMessage{
 		{Role: "user", Content: "first"},
 		{Role: "assistant", Content: "answer"},
 		{Role: "user", Content: "completed"},
 		{Role: "assistant", Content: "completed answer"},
 	}, lastResponseDiscardable: true}
-	if err := session.DiscardLastResponse(context.Background()); err != nil {
+	if err := session.Cancel(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if len(session.history) != 2 || session.history[0].Content != "first" ||
@@ -209,7 +213,7 @@ func TestDiscardLastResponseRemovesOnlyMarkedCompletedPair(t *testing.T) {
 	if session.lastResponseDiscardable {
 		t.Fatal("discardable marker remained set after deletion")
 	}
-	if err := session.DiscardLastResponse(context.Background()); err != nil {
+	if err := session.Cancel(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if len(session.history) != 2 {
@@ -227,13 +231,13 @@ func TestCancelPreservesCompletedResponseUntilExplicitRetraction(t *testing.T) {
 		},
 		lastResponseDiscardable: true,
 	}
-	if err := session.Cancel(context.Background()); err != nil {
+	if err := session.Cancel(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(session.history) != 4 {
 		t.Fatalf("Cancel must preserve completed history: %#v", session.history)
 	}
-	if err := session.DiscardLastResponse(context.Background()); err != nil {
+	if err := session.Cancel(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if len(session.history) != 2 || session.history[0].Content != "heard" ||
@@ -244,14 +248,14 @@ func TestCancelPreservesCompletedResponseUntilExplicitRetraction(t *testing.T) {
 
 func TestCancelDuringNewInputKeepsPreviousCompletedResponse(t *testing.T) {
 	session := &Session{
-		pcm: []byte{0, 0},
+		inputBytes: 2,
 		history: []chatMessage{
 			{Role: "user", Content: "heard"},
 			{Role: "assistant", Content: "heard answer"},
 		},
 		lastResponseDiscardable: true,
 	}
-	if err := session.Cancel(context.Background()); err != nil {
+	if err := session.Cancel(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(session.history) != 2 {
@@ -353,7 +357,7 @@ func TestClearConversationCommandClearsHistoryAndConfirmsLocally(t *testing.T) {
 			t.Fatalf("confirmation text = %q", event.Text)
 		}
 		if event.Type == backend.EventAudio &&
-			(event.SampleRateHz != 24000 || !bytes.Equal(event.PCM, synthesizer.pcm)) {
+			(event.SampleRateHz != 16000 || !bytes.Equal(event.PCM, synthesizer.pcm)) {
 			t.Fatalf("confirmation audio = rate %d pcm %v", event.SampleRateHz, event.PCM)
 		}
 	}
@@ -425,5 +429,175 @@ func TestClearConversationCommandMatching(t *testing.T) {
 			t.Errorf("isClearConversationCommand(%q) = %t, want %t",
 				testCase.transcript, got, testCase.want)
 		}
+	}
+}
+
+func TestPipelineASRFailureIsReportedWithoutBatchRetry(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = serveRealtimeASRWithResult(w, r, true) }))
+	defer server.Close()
+	cfg := Config{APIKey: "test-key", Region: RegionChinaBeijing, ASRModel: realtimeASRModelName, ReasoningModel: "test", ReasoningEffort: "none", TTSModel: "cosyvoice-v3-flash", TTSVoice: "longxiaochun_v3", SearchMode: "off", Timeout: time.Second, QueueSize: 8}
+	provider, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.openASR = func(ctx context.Context, c Config) (*asrRealtimeStream, error) {
+		return openRealtimeASRAt(ctx, c, strings.Replace(server.URL, "http://", "ws://", 1))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	raw, err := provider.Open(ctx, backend.SessionConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := raw.(*Session)
+	defer session.Close()
+	session.http.client = &http.Client{Transport: rejectPipelineHTTP{t}}
+	for _, frame := range [][]byte{{1, 2, 3, 4}, {5, 6, 7, 8}} {
+		if err := session.SendAudio(ctx, frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if session.inputBytes != 8 {
+		t.Fatalf("accepted input byte count: %d", session.inputBytes)
+	}
+	if err := session.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var id string
+	for {
+		select {
+		case event := <-session.Events():
+			switch event.Type {
+			case backend.EventStarted:
+				id = event.ResponseID
+			case backend.EventError:
+				if id == "" || event.ResponseID != id {
+					t.Fatal("ASR error lost response ownership")
+				}
+				return
+			default:
+				t.Fatalf("unexpected event after ASR failure: %+v", event)
+			}
+		case <-ctx.Done():
+			t.Fatal("ASR failure did not finish the turn")
+		}
+	}
+}
+
+type rejectPipelineHTTP struct{ t *testing.T }
+
+func (r rejectPipelineHTTP) RoundTrip(*http.Request) (*http.Response, error) {
+	r.t.Error("ASR failure invoked HTTP fallback or LLM")
+	return nil, errors.New("unexpected HTTP")
+}
+
+func TestCanceledCommitLeavesInputAvailableForCancellation(t *testing.T) {
+	session := &Session{inputBytes: 640}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := session.Commit(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled END: %v", err)
+	}
+	if session.inputBytes != 640 || session.activeDone != nil {
+		t.Fatal("canceled END started a response")
+	}
+}
+
+// Keep old cloud Close in progress to expose any premature close(done).
+type gatedASRCloseConn struct {
+	net.Conn
+	entered chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (c *gatedASRCloseConn) Close() error {
+	c.once.Do(func() { close(c.entered) })
+	<-c.release
+	return c.Conn.Close()
+}
+
+func TestCancelBeforeStartedDeliveryPreparesASRBeforeNextInput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	closeEntered, releaseClose := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseClose) }) }
+	defer release()
+	var opened atomic.Int32
+	provider := &Backend{config: Config{Timeout: time.Second, QueueSize: 8}}
+	provider.openASR = func(ctx context.Context, c Config) (*asrRealtimeStream, error) {
+		dialer := *websocket.DefaultDialer
+		if opened.Add(1) == 1 {
+			dialer.NetDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
+				if err != nil {
+					return nil, err
+				}
+				return &gatedASRCloseConn{Conn: conn, entered: closeEntered, release: releaseClose}, nil
+			}
+		}
+		conn, _, err := dialer.DialContext(ctx, strings.Replace(server.URL, "http://", "ws://", 1), nil)
+		if err != nil {
+			return nil, err
+		}
+		return &asrRealtimeStream{config: c, connection: conn}, nil
+	}
+	raw, err := provider.Open(ctx, backend.SessionConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := raw.(*Session)
+	defer func() { release(); session.Close() }()
+	if err := session.SendAudio(ctx, []byte{1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	// No receiver: EventStarted must remain blocked until cancellation.
+	for i := 0; i < cap(session.events); i++ {
+		session.events <- backend.ConversationEvent{}
+	}
+	if err := session.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	canceled := make(chan error, 1)
+	go func() { canceled <- session.Cancel(ctx, false) }()
+	select {
+	case <-closeEntered:
+	case <-ctx.Done():
+		t.Fatal("old ASR did not enter cleanup")
+	}
+	select {
+	case err := <-canceled:
+		t.Fatalf("Cancel returned before old ASR cleanup: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	release()
+	select {
+	case err := <-canceled:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Cancel did not finish")
+	}
+	// Submit immediately when Cancel returns: either await the new preconnect or use it.
+	if err := session.SendAudio(ctx, []byte{2, 0}); err != nil {
+		t.Fatalf("next input lost its ASR preparation: %v", err)
+	}
+	if session.inputBytes != 2 {
+		t.Fatalf("next input count=%d", session.inputBytes)
 	}
 }

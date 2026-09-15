@@ -1,6 +1,10 @@
 # 客户端分关复现实验
 
+逐步阅读现有代码可先打开[客户端源码逻辑链阅读索引](client-source-reading.md)，按一次正常问答及插话、异常、UI 分支跟踪函数调用。
+
 目标不是先读完所有文件，而是每次实现一段行为，并用可重复的结果证明它正确。服务端只作为配套程序配置，不纳入逐行课程。
+
+音频模块现已按显式输入输出串联，先读[一帧音频的数据流](audio-pipeline.md)，再进入下面第3、4、7关。
 
 ## 当前提供什么
 
@@ -18,7 +22,7 @@
 
 ## 环境与统一命令
 
-推荐Linux Host或Windows上的WSL。需要CMake、C++17编译器和Python 3.9以上；第2/5关还需要Host OpenSSL、Boost 1.83及cJSON开发文件。这里只运行本地测试，不调用云端API、不需要云端Key，也不会连接开发板。
+推荐Linux Host或Windows上的WSL。需要CMake、C++17编译器和Python 3.9以上；Host配置还需要libswresample/libavutil开发文件以执行真实音频转换。第2/5关需要Host OpenSSL、Boost 1.83及cJSON开发文件。这里只运行本地测试，不调用云端API、不需要云端Key，也不会连接开发板。
 
 在仓库根目录配置一次：
 
@@ -47,7 +51,7 @@ python3 scripts/teaching_lab.py 3 --build-dir build/lesson-host --dry-run
 
 源码：`client/include/boompi/config/voice_client_config.h`、`client/src/config/voice_client_config.cpp`。
 
-实现顺序：先写有最大值的`ParseDecimal`，再组合`IsIpv4`；接着检查UUID和pin的编码形式；最后在`LoadVoiceClientConfigFromEnvironment`中表达必填、缺省和成对字段关系。`ReadEnvironment`和标准库作为支持代码。
+实现顺序：先写有最大值的`ParseDecimal`，再组合`IsIpv4`；接着检查UUID和pin的编码形式；最后在`LoadClientConfig`中表达必填、缺省和成对字段关系。`ReadEnvironment`和标准库作为支持代码。
 
 ```sh
 python3 scripts/teaching_lab.py 1
@@ -63,13 +67,13 @@ python3 scripts/teaching_lab.py 1
 
 源码：`client/include/boompi/audio/audio_format.h`、`client/src/network/voice_codec.h/.cpp`；契约见[协议v2](../../protocol/protocol-v2.md)。
 
-先根据采样率推导20ms的320/480/960样本；再写整数读写，最后实现`EncodeAudio`、`DecodeAudio`。严格JSON校验先作为已给出的支持代码，理解二进制格式后再回看转义、重复键和类型检查。
+先根据采样率推导20ms的320/960样本；再写整数读写，最后实现`EncodeAudio`、`DecodeAudio`。严格JSON校验先作为已给出的支持代码，理解二进制格式后再回看转义、重复键和类型检查。
 
 ```sh
 python3 scripts/teaching_lab.py 2
 ```
 
-检查名虽然叫`protocol-json-contract`，也会读取共享fixture逐字节比对音频编码和解码。上行PCM必须640字节，下行非末帧必须960字节；头部大端，PCM小端。
+检查名虽然叫`protocol-json-contract`，也会读取共享fixture逐字节比对音频编码和解码。上行PCM必须640字节，下行非末帧必须640字节；头部大端，PCM小端。
 
 自行解释：`generation`为什么不是设备ID？`sequence`为什么不能代替generation？常见错误是把320个样本当320字节，或把flags偏移4/5误读成两个独立字段。
 
@@ -77,17 +81,17 @@ python3 scripts/teaching_lab.py 2
 
 **本关新增概念：** 有界环、单生产者/消费者、准备/播放/收尾。
 
-源码：`client/src/audio/audio_engine.cpp`与公开头。硬件替身在`client/tests/support/audio_backend.cpp`，只在Host测试中选入；本关真实执行产品队列和线程代码，不打开ALSA设备。
+源码：`client/src/audio/audio_tasks.cpp`与公开头。硬件替身在`client/tests/support/audio_pipeline.cpp`，只在Host测试中选入；本关真实执行产品队列和线程代码，不打开ALSA设备。
 
-先复现`ClearQueue`与`QueueTts24k`，再看`BeginPlayback`、`EndPlayback`，最后顺着`PlaybackLoop`理解取帧与结束。
+先按数据流说明复现`AudioConverter`并运行新增的`pipeline-format`，再复现`ClearPlaybackQueue`与`QueueReplyFrame`，随后看`BeginPlayback`、`EndPlayback`，最后顺着`PlaySpeakerTask`理解取帧与结束。
 
-当前契约是一包一槽：1～480样本，短帧只能是最后一包，后面不允许继续追加。队列满必须拒绝，不能覆盖尚未播放的槽。使用槽数定位入队位置，样本数只表示实际音频容量与水位。
+当前契约是一包一槽：1～320样本，短帧只能是最后一包，后面不允许继续追加。队列满必须拒绝，不能覆盖尚未播放的槽。使用槽数定位入队位置，有效样本数仅保留在槽中，不再维护第二份总样本水位计数。
 
 ```sh
 python3 scripts/teaching_lab.py 3
 ```
 
-本关检查队列边界、短尾帧、采集准备与播放准备次序，以及采集/控制/退出的有界等待。应能验证1样本和完整480样本的回答都能结束、481样本被拒绝、75槽容量满时返回背压。
+本关检查队列边界、短尾帧、采集准备与播放准备次序，以及采集/控制/退出的有界等待。应能验证1样本和完整320样本的回答都能结束、321样本被拒绝、75槽容量满时返回背压。
 
 常见错误：收到END立即置完成、把短帧当损坏数据、结束前清空剩余音频、删除采集帧边界的AEC准备握手。先理解这些约束，再读锁与条件变量的具体次序；不要用直接跨线程调用后端替代握手。
 
@@ -95,9 +99,9 @@ python3 scripts/teaching_lab.py 3
 
 **本关新增概念：** 历史帧、开口/结束边沿、首次听音与追问。
 
-源码：`client/src/audio/voice_audio.cpp`。先写`SaveHistory`、`QueueBufferedInput`，再看`HandleCapture`中的听音/采集分支和`FinishInput`。
+先看`speech_detector.cpp`中`Detect`和`GateNearVoice`，用`pipeline-detection`验证输入到判定结果。然后进入`client/src/audio/voice_audio.cpp`：写`SaveHistory`、`EmitBufferedSpeech`，再看`ProcessListeningFrame`中的听音/采集分支和句尾处理。
 
-`VoiceAudio::Process`既推进采集帧处理，也返回语义事件，并非单纯读取邮箱。应用必须持续调用；20ms参数只限制一次底层等待，不保证整个调用总耗时不超过20ms。
+`VoiceAudio::ProcessEvents`既推进采集帧处理，也返回语义事件，并非单纯读取邮箱。应用必须持续调用；20ms参数只限制一次底层等待，不保证整个调用总耗时不超过20ms。
 
 ```sh
 python3 scripts/teaching_lab.py 4
@@ -127,23 +131,23 @@ python3 scripts/teaching_lab.py 5
 
 源码：`client/src/application/voice_client.cpp`，入口`client/apps/boompi_client/main.cpp`。
 
-复现顺序为`Enter`、`WaitForSpeech`、`BeginUpload`、`SendInputFrame`、`OnAudio`、`OnNetwork`。先手写一张六态转换表，再实现对应分支。不要增加第二个状态机来重复表达同一业务。
+复现顺序为`App_Enter`、`App_WaitForSpeech`、`App_BeginUpload`、`App_UploadSpeechFrame`、`App_ReadSpeechAndUpload`、`App_ReceiveReplyAndPlayAudio`。先手写一张六态转换表，再实现对应分支。不要增加第二个状态机来重复表达同一业务。
 
 ```sh
 python3 scripts/teaching_lab.py 6
 ```
 
-应用harness直接包含生产VoiceApp，只替换模块I/O和时钟。它验证完整业务，不意味着只写完正常路径就能通过全部检查。
+应用 harness 链接生产应用模块，只替换模块I/O和时钟。它验证完整业务，不意味着只写完正常路径就能通过全部检查。
 
 应能沿日志解释Offline→Idle→Listening→Uploading→Waiting→Speaking→追问。音频END和网络Done均不能提前结束Speaking；只有当前generation的PlaybackDone可以开启音频回答后的追问。纯文本没有声卡完成事件，处理方式不同。
 
-`StopAndListen`的名字表示停止后还会重新听音；`ReplyHistory::Keep/Retract`表示是否撤回未听完的回答。常见错误是旧轮完成改变新轮状态，或者停止命令失败后仍显示正常追问。
+`App_StopAndListen`的名字表示停止后还会重新听音；`ReplyHistory::Keep/Retract`表示是否撤回未听完的回答。常见错误是旧轮完成改变新轮状态，或者停止命令失败后仍显示正常追问。
 
 ## 07 插话：从“停声音”到“真正开始新问题”
 
 **本关新增概念：** 回声与近讲、主动停止、跨线程迟到结果。
 
-源码：`VoiceAudio::HandleBarge/ConfirmBarge`、应用`StopAndListen`以及网络`AdvanceLocked`。这是进阶关，不要求第一次学录放音时同时掌握。
+源码：`VoiceAudio::ProcessBargeFrame/ConfirmBarge`、应用`App_StopAndListen`以及网络`AdvanceLocked`。这是进阶关，不要求第一次学录放音时同时掌握。
 
 先在纸上走一遍候选人声→临时静音→等待低参考→清尾音→确认。再追确认后的顺序：停旧播放，交出保留PCM，应用分配新generation，首帧带START|SUPERSEDE。
 
@@ -185,7 +189,7 @@ python3 scripts/verify_protocol_fixtures.py
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 ```
 
-第9关要求全部22个既有CTest都存在并通过。Windows原生Host只有部分目标，完整关卡请在Linux/WSL完成，不能把两个Windows测试通过描述成全部客户端验证通过。
+第9关要求当前全部24个CTest都存在并通过（含两个直接验证音频处理模块的场景）。Windows原生Host只有部分目标，完整关卡请在Linux/WSL完成，不能把两个Windows测试通过描述成全部客户端验证通过。
 
 然后由教师准备匹配RV1106 GCC/uClibc工具链、sysroot和依赖库，按既有`build_teaching_release.sh`交叉构建并检查ELF。没有匹配SDK时停止在“Host已验证”，不能交付伪装成板端产物的Host程序。
 

@@ -36,15 +36,19 @@ func (p *fakeProvider) SendAudio(ctx context.Context, pcm []byte) error {
 	}
 }
 func (p *fakeProvider) Commit(context.Context) error { p.committed.Add(1); return nil }
-func (p *fakeProvider) Cancel(ctx context.Context) error {
+func (p *fakeProvider) Cancel(ctx context.Context, retract bool) error {
 	if p.cancelHook != nil {
-		return p.cancelHook(ctx)
+		if err := p.cancelHook(ctx); err != nil {
+			return err
+		}
+	}
+	if retract {
+		p.discarded.Add(1)
 	}
 	return nil
 }
-func (p *fakeProvider) DiscardLastResponse(context.Context) error { p.discarded.Add(1); return nil }
-func (p *fakeProvider) Events() <-chan backend.ConversationEvent  { return p.events }
-func (p *fakeProvider) Close() error                              { p.once.Do(func() { close(p.events) }); return nil }
+func (p *fakeProvider) Events() <-chan backend.ConversationEvent { return p.events }
+func (p *fakeProvider) Close() error                             { p.once.Do(func() { close(p.events) }); return nil }
 func submit(t *testing.T, a *Actor, generation, sequence uint32, flags uint16) {
 	t.Helper()
 	if err := a.Submit(protocol.PCMHeader{Generation: generation, Sequence: sequence, Flags: flags}, make([]byte, 640)); err != nil {

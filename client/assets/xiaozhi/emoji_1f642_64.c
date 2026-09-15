@@ -1,4 +1,10 @@
 // Generated from the CC BY 4.0 Twemoji PNG; see NOTICE.md.
+/**
+ * @file emoji_1f642_64.c
+ * @brief 小智空闲及回答完成状态共用的静态微笑，来源与授权见 NOTICE.md。
+ *
+ * LvglScreen 的状态表引用下方描述符；像素数组为离线转换结果，不在运行期修改。
+ */
 #include <lvgl.h>
 
 static const LV_ATTRIBUTE_MEM_ALIGN unsigned char emoji_1f642_64_map[] = {
@@ -516,6 +522,7 @@ static const LV_ATTRIBUTE_MEM_ALIGN unsigned char emoji_1f642_64_map[] = {
   0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
 };
 
+/** @brief LVGL 的 64x64 真彩色带 alpha 描述符，引用本文件静态像素，生命周期覆盖整个进程。 */
 const lv_img_dsc_t emoji_1f642_64 = {
   .header.always_zero = 0,
   .header.reserved = 0,

@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,49 +46,6 @@ func newHTTPClients(config Config) *httpClients {
 	// deadline bounds first response latency; provider activity and the device
 	// watchdog bound stalls while allowing a healthy long answer to continue.
 	return &httpClients{config: config, client: &http.Client{Transport: transport}}
-}
-
-func (c *httpClients) transcribe(ctx context.Context, pcm []byte) (string, error) {
-	requestCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
-	defer cancel()
-	wav, err := pcm16MonoWAV(pcm, 16000)
-	if err != nil {
-		return "", err
-	}
-	dataURI := "data:audio/wav;base64," + base64.StdEncoding.EncodeToString(wav)
-	payload := struct {
-		Model      string `json:"model"`
-		Messages   []any  `json:"messages"`
-		Stream     bool   `json:"stream"`
-		ASROptions any    `json:"asr_options"`
-	}{
-		Model: c.config.ASRModel,
-		Messages: []any{map[string]any{
-			"role": "user",
-			"content": []any{map[string]any{
-				"type":        "input_audio",
-				"input_audio": map[string]any{"data": dataURI},
-			}},
-		}},
-		Stream: false,
-		ASROptions: map[string]any{
-			"language": "zh", "enable_itn": true,
-		},
-	}
-	var response struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := c.postJSON(requestCtx, c.config.compatibleBaseURL()+"/chat/completions", payload, &response); err != nil {
-		return "", fmt.Errorf("Qwen ASR: %w", err)
-	}
-	if len(response.Choices) == 0 || strings.TrimSpace(response.Choices[0].Message.Content) == "" {
-		return "", errors.New("Qwen ASR returned no transcript")
-	}
-	return strings.TrimSpace(response.Choices[0].Message.Content), nil
 }
 
 func (c *httpClients) completeStream(
@@ -335,69 +290,4 @@ func providerHTTPError(response *http.Response) error {
 	_ = json.Unmarshal(encoded, &providerError)
 	return fmt.Errorf("HTTP %d provider_code=%q provider_message=%q",
 		response.StatusCode, providerError.Error.Code, providerError.Error.Message)
-}
-
-func (c *httpClients) postJSON(ctx context.Context, endpoint string, input, output any) error {
-	body, err := json.Marshal(input)
-	if err != nil {
-		return err
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Authorization", "Bearer "+c.config.APIKey)
-	request.Header.Set("Content-Type", "application/json")
-	response, err := c.client.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	limited := io.LimitReader(response.Body, maxProviderResponseBytes+1)
-	encoded, err := io.ReadAll(limited)
-	if err != nil {
-		return err
-	}
-	if len(encoded) > maxProviderResponseBytes {
-		return errors.New("provider response exceeded size limit")
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		var providerError struct {
-			Error struct {
-				Code    string `json:"code"`
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		_ = json.Unmarshal(encoded, &providerError)
-		return fmt.Errorf("HTTP %d provider_code=%q provider_message=%q", response.StatusCode, providerError.Error.Code, providerError.Error.Message)
-	}
-	if err := json.Unmarshal(encoded, output); err != nil {
-		return fmt.Errorf("decode provider response: %w", err)
-	}
-	return nil
-}
-
-func pcm16MonoWAV(pcm []byte, sampleRate uint32) ([]byte, error) {
-	if len(pcm) == 0 || len(pcm)%2 != 0 || sampleRate == 0 {
-		return nil, errors.New("PCM must contain whole 16-bit mono samples")
-	}
-	if uint64(len(pcm)) > uint64(^uint32(0))-36 {
-		return nil, errors.New("PCM is too large for a WAV container")
-	}
-	wav := make([]byte, 44+len(pcm))
-	copy(wav[0:4], "RIFF")
-	binary.LittleEndian.PutUint32(wav[4:8], uint32(len(pcm)+36))
-	copy(wav[8:12], "WAVE")
-	copy(wav[12:16], "fmt ")
-	binary.LittleEndian.PutUint32(wav[16:20], 16)
-	binary.LittleEndian.PutUint16(wav[20:22], 1)
-	binary.LittleEndian.PutUint16(wav[22:24], 1)
-	binary.LittleEndian.PutUint32(wav[24:28], sampleRate)
-	binary.LittleEndian.PutUint32(wav[28:32], sampleRate*2)
-	binary.LittleEndian.PutUint16(wav[32:34], 2)
-	binary.LittleEndian.PutUint16(wav[34:36], 16)
-	copy(wav[36:40], "data")
-	binary.LittleEndian.PutUint32(wav[40:44], uint32(len(pcm)))
-	copy(wav[44:], pcm)
-	return wav, nil
 }

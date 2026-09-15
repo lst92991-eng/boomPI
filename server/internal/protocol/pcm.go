@@ -8,7 +8,7 @@ import (
 const (
 	PCMHeaderSize             = 16
 	UplinkFrameBytes          = 640
-	DownlinkFrameBytes        = 960
+	DownlinkFrameBytes        = 640
 	PCMFlagStart       uint16 = 1
 	PCMFlagEnd         uint16 = 2
 	PCMFlagSupersede   uint16 = 4

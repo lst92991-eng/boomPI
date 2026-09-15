@@ -2,7 +2,7 @@
 
 ## 版本配套
 
-本次客户端与服务端只有v2协议，必须成套使用。旧版服务端不能与新客户端互通。源码基线已保存于本地 `build/teaching-baseline-20260905`，原有 `v1.0.0` tag 保持不变。
+客户端与服务端只有 v2 / 16 kHz 配套协议，hello/ready 均声明 `sample_rate:16000`，必须成套使用。旧 24 kHz 服务端不能与新客户端互通。`v1.0.0` tag 保持不变；当前重构起点和结果见[2026-09-15记录](refactor-handoff-20260915.md)。
 
 服务端产物：`build/teaching-v2-release/boompi-server.exe`。Windows上可以双击，首次配置Key；原有config.yaml和state应保留在用户可访问的私有目录。不要把Key或TLS私钥打包发出。
 
@@ -20,7 +20,9 @@ go vet ./...
 go test -race ./...
 ```
 
-Host真实传输测试需要OpenSSL、Boost1.83和cJSON。Windows/macOS缺依赖时默认会跳过网络测试；发布验收应在Linux强制启用。C++应用测试直接执行生产VoiceApp，用可控时钟和假I/O验证六状态；VoiceAudio测试直接执行生产语义判定和音频线程，只替换硬件输入输出。
+Host真实传输测试需要OpenSSL、Boost和cJSON。缺依赖时默认会跳过网络测试；发布验收应在Linux强制启用。C++应用测试直接执行生产App_Process，用可控时钟和假I/O验证状态转移。VoiceAudio线程测试替换整个AudioPipeline；转换器、DSP适配和检测器另用模块测试执行真实生产源。生产AudioPipeline与ALSA只做host严格编译，不能把这称为实际声卡路径运行通过。
+
+Host音频harness还直接验证AudioConverter、SpeechDetector和RockchipVoiceDsp的分块/metadata适配，需libswresample/libavutil开发文件。厂商处理、WebRTC分类和Snowboy命中使用测试专属C替身，不代表实际声学效果；新增pipeline-format和pipeline-detection后完整Linux CTest为24项。Windows与WSL必须使用不同构建目录。
 
 C++与Go联测可在server目录运行：
 
@@ -46,7 +48,7 @@ sh scripts/build_teaching_release.sh
 2. 确认新客户端确实经过上述交叉构建和ELF检查。
 3. 将新客户端及当前client/scripts里的控制/配网脚本成套安装；保留模型、字体和板级库。
 4. 确认v2服务端已启动，客户端 `--check-config` 通过，再手工启动客户端。
-5. 日志应出现 `state=offline → idle → listening → uploading → waiting → speaking`；声学参数由board_voice_profile.h决定，旧env声学键仅报迁移提示。
+5. 观察 UI 的离线、待机、聆听、思考和播放变化，并检查故障阶段提示；正常流程不逐轮打印状态。声学参数由board_voice_profile.h决定，旧env声学键仅报迁移提示。
 
 ## 真人验收
 
@@ -56,6 +58,8 @@ sh scripts/build_teaching_release.sh
 | --- | --- |
 | 唤醒后正常问答 | 一次发言只创建一个generation；句首和尾字完整 |
 | 长回答 | 连续播放，无周期性静音、未解释的断帧或溢出 |
+| 极短回答 | 短包可启动，末尾采样不丢；DONE 与 PlaybackDone 都完成后才追问 |
+| 上传 END 后触屏停止 | 仍能撤回等待中的回答，迟到音频不播放 |
 | 播放中短句打断 | 旧声音停止，新问题立即开始上传且回答正确，无需再说一遍 |
 | 长句打断 | 旧字幕/声音/done不混入新回答 |
 | 尾播阶段触屏停止 | 本地声音停止，服务端撤回未听完回答；后续提问可用 |

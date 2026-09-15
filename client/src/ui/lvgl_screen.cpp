@@ -5,6 +5,10 @@
  * 本文件只描述页面结构、显示状态和用户事件，不执行 GPIO、网络、文件或摄像头
  * I/O。调用者必须在单一 LVGL 所有者线程中调用全部接口，事件回调也会同步运行在
  * 该线程。这样页面代码可以脱离 BSP 在 SDL 中复现，同时维持板端线程边界清晰。
+ *
+ * 从 Create() 建立字体与桌面读起：Build* 负责控件树，SetState/SetText 等只更新显示
+ * 投影，Render* 把投影写到活动页面。输入由 AppClicked/FaceClicked/SliderChanged
+ * 转成 Event，交给 DeviceUi；Begin() 删除旧控件后，其他页面的控件访问由 page 检查保护。
  */
 #include "boompi/ui/lvgl_screen.h"
 
@@ -27,15 +31,16 @@ constexpr std::uint32_t kText = 0xF3F6FA;
 constexpr std::uint32_t kMuted = 0x8492A6;
 constexpr std::uint32_t kBlue = 0x4DA6FF;
 using Page = LvglScreen::Page;
+/** @brief 桌面按钮的标题及目标页面，点击数据独立于绘制位置。 */
 struct AppEntry {
   const char* title;
   Page page;
 };
 // 排列顺序只影响桌面位置，事件直接携带页面身份。
-constexpr std::array<AppEntry, 4> kApps{{{"小智", Page::kVoice},
-                                         {"摄像头", Page::kCamera},
-                                         {"时间", Page::kClock},
-                                         {"WiFi", Page::kWifi}}};
+constexpr std::array<AppEntry, 4> kApps{{{"小智", Page::Voice},
+                                         {"摄像头", Page::Camera},
+                                         {"时间", Page::Clock},
+                                         {"WiFi", Page::Wifi}}};
 
 /** @brief 把 application 状态映射成静态表情与默认文案，页面不复制业务状态机。 */
 struct VoiceView final {
@@ -44,6 +49,7 @@ struct VoiceView final {
   const lv_img_dsc_t* face;
 };
 
+// 下标与 DeviceUiState 的枚举次序保持一致；都是静态资源，不按音频振幅驱动动画。
 const std::array<VoiceView, 7> kVoiceViews{{
     {"随时可以说话", "说出唤醒词开始对话", &emoji_1f642_64},
     {"正在聆听", "我在听，请继续", &emoji_1f62f_64},
@@ -104,15 +110,23 @@ lv_font_t* LoadFont(const char* path, std::uint16_t size) {
 
 }  // namespace
 
+/**
+ * @brief 页面对象树和绘制所需投影的持有者，只在 LVGL 所有者线程访问。
+ *
+ * page 控制哪些成员指针仍指向活动控件；voice_state/subtitle_text/volume 跨页面保留，
+ * 返回语音页时可重建当前内容。摄像头描述符引用本对象内的固定数组，不引用生产者帧。
+ */
 struct LvglScreen::Impl final {
   static constexpr std::size_t kPixelCount = 320U * 180U;
 
+  /** @brief 为每个桌面按钮提供稳定的 user_data，生命周期长于该按钮对象。 */
   struct AppClick final {
     Impl* owner;
     Page page;
   };
 
-  // 所有 lv_obj_t/lv_timer_t 指针仅在 LVGL 所有者线程访问，页面切换后按 Begin() 重置。
+  // 所有 lv_obj_t/lv_timer_t 指针仅在 LVGL 所有者线程访问；Begin 清对象树，Build*
+  // 重建所需控件。
   std::array<AppClick, kApps.size()> app_clicks{};
   lv_obj_t* clock{};
   lv_obj_t* face{};
@@ -123,15 +137,15 @@ struct LvglScreen::Impl final {
   lv_obj_t* camera_info{};
   lv_timer_t* timer{};
   lv_font_t* text_font{};
-  // 事件回调同步转交给 DeviceUi；回调内不得长期阻塞 LVGL timer handler。
+  // 事件同步转交给 DeviceUi；配网启动、音量提交和停摄像头均在调用栈内完成，会占用 UI 时间。
   EventHandler event_handler{};
   void* event_data{};
   lv_img_dsc_t camera_descriptor{};
   // 页面持有自己的 RGB565 副本，camera worker 的缓冲区生命周期不会泄漏进 LVGL。
   std::array<std::uint16_t, kPixelCount> pixels{};
   std::string subtitle_text;
-  Page page{Page::kHome};
-  DeviceUiState voice_state{DeviceUiState::kIdle};
+  Page page{Page::Home};
+  DeviceUiState voice_state{DeviceUiState::Idle};
   CameraStatus camera_state{CameraStatus::Stopped};
   unsigned fps_tenths{};
   std::uint8_t volume{60U};
@@ -168,7 +182,7 @@ struct LvglScreen::Impl final {
 
   /** @brief 重建桌面对象树，并为每个按钮绑定稳定存储的页面上下文。 */
   void BuildHome() {
-    Begin(Page::kHome);
+    Begin(Page::Home);
     Label(lv_scr_act(), "boomPI", text_font, kText, 10, 8, 80, 24);
     clock = Label(lv_scr_act(), "", text_font, kText, 235, 8, 70, 24);
     for (std::size_t index = 0U; index < kApps.size(); ++index) {
@@ -191,7 +205,7 @@ struct LvglScreen::Impl final {
    * 再提交持久化。页面重建会恢复 Impl 中保存的状态、字幕和音量。
    */
   void BuildVoice() {
-    Begin(Page::kVoice);
+    Begin(Page::Voice);
     Header("小智");
     face = lv_img_create(lv_scr_act());
     lv_img_set_zoom(face, 328);
@@ -217,7 +231,7 @@ struct LvglScreen::Impl final {
    * DeviceUi camera worker；camera_descriptor 始终引用本对象拥有的像素数组。
    */
   void BuildCamera() {
-    Begin(Page::kCamera);
+    Begin(Page::Camera);
     camera_state = CameraStatus::Starting;
     Header("SC3336");
     camera_info = Label(lv_scr_act(), "", text_font, kBlue, 160, 7, 152, 24);
@@ -235,7 +249,7 @@ struct LvglScreen::Impl final {
    * 页面文字只显示过程结果，绝不接收或记录用户 Wi-Fi 密码。
    */
   void BuildWifi() {
-    Begin(Page::kWifi);
+    Begin(Page::Wifi);
     Header("WiFi");
     lv_obj_t* qr =
         lv_qrcode_create(lv_scr_act(), 104, lv_color_hex(0x08111C), lv_color_hex(0xFFFFFF));
@@ -247,8 +261,9 @@ struct LvglScreen::Impl final {
         Label(lv_scr_act(), "扫描二维码连接配网热点", text_font, kMuted, 30, 197, 260, 24);
   }
 
+  /** @brief 创建时钟页后立即填入本地时间，之后复用分钟定时器更新。 */
   void BuildClock() {
-    Begin(Page::kClock);
+    Begin(Page::Clock);
     Header("时间");
     clock = Label(lv_scr_act(), "", text_font, kText, 30, 105, 260, 30);
     UpdateClock();
@@ -257,42 +272,42 @@ struct LvglScreen::Impl final {
   /**
    * @brief 根据明确的页面身份切换，并发布摄像头资源边界事件。
    *
-   * CameraOn/CameraOff 紧跟页面切换，使进入页面才占用 ISP，离开页面立即释放；
+   * CameraOn/CameraOff 紧跟页面切换，使进入页面才启动采集，离开页面同步请求停止并回收；
    * 已经位于摄像头页时不重复发 CameraOn，避免 UI worker 等待仍在运行的采集线程。
    */
   void ShowApp(Page next) {
-    const bool was_camera = page == Page::kCamera;
+    const bool was_camera = page == Page::Camera;
     switch (next) {
-      case Page::kHome:
+      case Page::Home:
         BuildHome();
         break;
-      case Page::kVoice:
+      case Page::Voice:
         BuildVoice();
         break;
-      case Page::kCamera:
+      case Page::Camera:
         BuildCamera();
         break;
-      case Page::kClock:
+      case Page::Clock:
         BuildClock();
         break;
-      case Page::kWifi:
+      case Page::Wifi:
         BuildWifi();
         break;
       default:
         return;
     }
-    if (was_camera && next != Page::kCamera) {
-      Emit(Event::kCameraOff);
+    if (was_camera && next != Page::Camera) {
+      Emit(Event::CameraOff);
     }
-    if (!was_camera && next == Page::kCamera) {
-      Emit(Event::kCameraOn);
+    if (!was_camera && next == Page::Camera) {
+      Emit(Event::CameraOn);
     }
   }
 
   /** @brief 保存全局音量并在语音页存在时同步滑块，关闭动画避免回调抖动。 */
   void SetVolume(std::uint8_t percent) {
     volume = std::min<std::uint8_t>(percent, 100U);
-    if (page != Page::kVoice) {
+    if (page != Page::Voice) {
       return;
     }
     lv_slider_set_value(slider, volume, LV_ANIM_OFF);
@@ -300,7 +315,7 @@ struct LvglScreen::Impl final {
 
   /** @brief 将当前语音状态和可选服务端字幕投影到既有控件。 */
   void RenderVoice() {
-    if (page != Page::kVoice) {
+    if (page != Page::Voice) {
       return;
     }
     const VoiceView& view = kVoiceViews[static_cast<std::size_t>(voice_state)];
@@ -316,7 +331,7 @@ struct LvglScreen::Impl final {
    * 再 invalidate 控件，防止缓存继续显示上一帧或错误状态前的旧画面。
    */
   void RenderCamera() {
-    if (page != Page::kCamera) {
+    if (page != Page::Camera) {
       return;
     }
     if (camera_state == CameraStatus::Live) {
@@ -332,7 +347,7 @@ struct LvglScreen::Impl final {
 
   /** @brief 只在桌面和时钟页更新本地时钟，避免已销毁 clock 指针被定时器访问。 */
   void UpdateClock() {
-    if (page != Page::kHome && page != Page::kClock) {
+    if (page != Page::Home && page != Page::Clock) {
       return;
     }
     const std::time_t now = std::time(nullptr);
@@ -344,7 +359,7 @@ struct LvglScreen::Impl final {
   /** @brief 返回桌面，并在离开摄像头页后立即请求释放采集资源。 */
   static void BackClicked(lv_event_t* event) {
     auto* self = static_cast<Impl*>(lv_event_get_user_data(event));
-    self->ShowApp(Page::kHome);
+    self->ShowApp(Page::Home);
   }
 
   /**
@@ -356,30 +371,29 @@ struct LvglScreen::Impl final {
   static void AppClicked(lv_event_t* event) {
     auto* click = static_cast<AppClick*>(lv_event_get_user_data(event));
     click->owner->ShowApp(click->page);
-    if (click->page == Page::kVoice) {
-      click->owner->Emit(Event::kWake);
+    if (click->page == Page::Voice) {
+      click->owner->Emit(Event::Wake);
     }
-    if (click->page == Page::kWifi) {
-      click->owner->Emit(Event::kProvision);
+    if (click->page == Page::Wifi) {
+      click->owner->Emit(Event::Provision);
     }
   }
 
-  /** @brief 仅在扬声器仍有有效回复时把表情点击解释为打断意图。 */
+  /**
+   * @brief 页面投影为 Speaking 时发布打断，否则发布唤醒，最终是否执行由 application 决定。
+   *
+   * 页面没有读取扬声器或 generation；快照滞后时，application 仍以自己的当前状态判定。
+   */
   static void FaceClicked(lv_event_t* event) {
     Impl* self = static_cast<Impl*>(lv_event_get_user_data(event));
-    const bool speaking = self->voice_state == DeviceUiState::kSpeaking;
-    if (speaking) {
-      self->Emit(Event::kInterrupt);
-    } else {
-      self->Emit(Event::kWake);
-    }
+    self->Emit(self->voice_state == DeviceUiState::Speaking ? Event::Interrupt : Event::Wake);
   }
 
   /**
    * @brief 区分连续音量预览与手势结束后的持久化提交。
    *
-   * VALUE_CHANGED 可以让用户即时听到增益变化；RELEASED/PRESS_LOST 每次手势只产生
-   * 一次 commit，使 DeviceUi 能把闪存写入频率限制到实际操作次数。
+   * VALUE_CHANGED 发布最新音量用于实时增益；RELEASED/PRESS_LOST 发布 commit，
+   * 让 DeviceUi 在手势结束时写设置。本回调按收到的结束事件提交，不额外维护去重状态。
    */
   static void SliderChanged(lv_event_t* event) {
     const lv_event_code_t code = lv_event_get_code(event);
@@ -389,11 +403,16 @@ struct LvglScreen::Impl final {
     }
     Impl* self = static_cast<Impl*>(lv_event_get_user_data(event));
     self->SetVolume(static_cast<std::uint8_t>(lv_slider_get_value(self->slider)));
-    const Event change = committed ? Event::kVolumeCommit : Event::kVolumePreview;
+    const Event change = committed ? Event::VolumeCommit : Event::VolumePreview;
     self->Emit(change, self->volume);
   }
 };
 
+/**
+ * @brief 建立页面共享资源和桌面；字体必须先准备好，之后所有 Label 才能安全使用它。
+ *
+ * 图像描述符在创建期绑定固定内存，后续每帧只复制像素；定时器借用 Impl，销毁时需先删除。
+ */
 bool LvglScreen::Create(const char* font_path) noexcept {
   Destroy();
   impl_ = new (std::nothrow) Impl;
@@ -417,7 +436,7 @@ bool LvglScreen::Create(const char* font_path) noexcept {
   impl_->camera_descriptor.header.h = 180;
   impl_->camera_descriptor.data_size = impl_->pixels.size() * sizeof(std::uint16_t);
   impl_->camera_descriptor.data = reinterpret_cast<const std::uint8_t*>(impl_->pixels.data());
-  // 分钟级 timer 只更新桌面时钟，首次内容由 BuildHome() 立即写入。
+  // 分钟级 timer 更新桌面或时钟页；首次内容由对应 Build* 立即写入，不等待首个周期。
   impl_->timer = lv_timer_create(
       [](lv_timer_t* timer) {
         static_cast<Impl*>(timer->user_data)->UpdateClock();
@@ -427,19 +446,23 @@ bool LvglScreen::Create(const char* font_path) noexcept {
   return true;
 }
 
+/** @brief 已创建页面的程序化切换入口，资源事件与桌面导航共用 ShowApp。 */
 void LvglScreen::OpenApp(Page page) noexcept {
   impl_->ShowApp(page);
 }
 
+/** @brief 保存宿主回调及借用上下文，Emit 在同一 UI 调用栈中使用它们。 */
 void LvglScreen::SetEventHandler(EventHandler handler, void* data) noexcept {
   impl_->event_handler = handler;
   impl_->event_data = data;
 }
 
+/** @brief application 快照或模拟器写入音量投影，页面不在这里持久化设置。 */
 void LvglScreen::SetVolume(std::uint8_t percent) noexcept {
   impl_->SetVolume(percent);
 }
 
+/** @brief 子进程结果到达时更新仍存在的配网页，离页后忽略该结果显示。 */
 void LvglScreen::SetProvisionMessage(const char* text, bool error) noexcept {
   if (impl_ == nullptr || impl_->provision_info == nullptr) {
     return;
@@ -449,6 +472,7 @@ void LvglScreen::SetProvisionMessage(const char* text, bool error) noexcept {
                               0);
 }
 
+/** @brief 切换预览阶段；非 Live 清空像素和 FPS，防止把冻结图像当作正常视频。 */
 void LvglScreen::SetCameraStatus(CameraStatus state) noexcept {
   if (impl_ == nullptr) {
     return;
@@ -462,6 +486,7 @@ void LvglScreen::SetCameraStatus(CameraStatus state) noexcept {
   impl_->RenderCamera();
 }
 
+/** @brief 校验固定尺寸后复制完整像素，RenderCamera 负责使图片缓存和控件脏区失效。 */
 void LvglScreen::SetCameraFrame(const std::uint16_t* pixels, std::size_t pixel_count,
                                 unsigned fps_tenths) noexcept {
   if (impl_ == nullptr || pixels == nullptr || pixel_count != impl_->pixels.size()) {
@@ -472,36 +497,34 @@ void LvglScreen::SetCameraFrame(const std::uint16_t* pixels, std::size_t pixel_c
   impl_->RenderCamera();
 }
 
+/** @brief 保存 application 的显示投影，仅从桌面自动进入语音页，不执行任何业务迁移。 */
 void LvglScreen::SetState(DeviceUiState state) noexcept {
   if (impl_ == nullptr) {
     return;
   }
   impl_->voice_state = state;
-  const bool active = state >= DeviceUiState::kListening && state <= DeviceUiState::kHappy;
+  const bool active = state >= DeviceUiState::Listening && state <= DeviceUiState::Happy;
   // 语音从唤醒词启动时自动进入小智页；用户主动浏览其他页面时不强制抢占页面。
-  if (active && impl_->page == Page::kHome) {
+  if (active && impl_->page == Page::Home) {
     impl_->BuildVoice();
   }
   impl_->RenderVoice();
 }
 
-void LvglScreen::SetText(std::string_view first, std::string_view second) noexcept {
+// 字体缺失字符整码点过滤；分配失败回到默认提示。
+void LvglScreen::SetText(std::string_view text) noexcept {
   if (impl_ == nullptr) {
     return;
   }
   try {
-    std::string text(first);
-    if (!text.empty() && !second.empty()) {
-      text.push_back('\n');
-    }
-    text.append(second);
-    impl_->subtitle_text = SupportedText(impl_->text_font, text);
+    impl_->subtitle_text = SupportedText(impl_->text_font, std::string(text));
   } catch (...) {
     impl_->subtitle_text.clear();
   }
   impl_->RenderVoice();
 }
 
+/** @brief 宿主停完外部生产者后销毁页面资源，活动 display 仍须有效直到本函数返回。 */
 void LvglScreen::Destroy() noexcept {
   if (impl_ == nullptr) {
     return;

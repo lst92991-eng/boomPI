@@ -15,17 +15,19 @@ func TestLiveIntelligencePipeline(t *testing.T) {
 		t.Skip("set BOOMPI_LIVE_QWEN=1 to run the paid provider test")
 	}
 	config := Config{
-		APIKey:          os.Getenv("DASHSCOPE_API_KEY"),
-		WorkspaceID:     os.Getenv("DASHSCOPE_WORKSPACE_ID"),
-		Region:          RegionChinaBeijing,
-		ASRModel:        "qwen3-asr-flash",
-		ReasoningModel:  "qwen3.7-max",
-		ReasoningEffort: "medium",
-		TTSModel:        "qwen3-tts-flash-realtime",
-		TTSVoice:        "Cherry",
-		SearchMode:      "auto",
-		Timeout:         90 * time.Second,
-		QueueSize:       64,
+		APIKey:           os.Getenv("DASHSCOPE_API_KEY"),
+		WorkspaceID:      os.Getenv("DASHSCOPE_WORKSPACE_ID"),
+		Region:           RegionChinaBeijing,
+		ASRModel:         "qwen3-asr-flash-realtime",
+		ReasoningModel:   "qwen3.7-max",
+		ReasoningEffort:  "medium",
+		TTSModel:         "cosyvoice-v3-flash",
+		TTSVoice:         "longxiaochun_v3",
+		SearchMode:       "auto",
+		Timeout:          90 * time.Second,
+		QueueSize:        64,
+		MaxTurns:         20,
+		MaxContextTokens: 24_000,
 	}
 	if err := config.validate(); err != nil {
 		t.Fatal(err)
@@ -49,14 +51,6 @@ func TestLiveIntelligencePipeline(t *testing.T) {
 		t.Fatal("question TTS returned no PCM")
 	}
 
-	http := newHTTPClients(config)
-	transcript, err := http.transcribe(ctx, questionPCM)
-	if err != nil {
-		t.Fatalf("transcribe question: %v", err)
-	}
-	if !strings.Contains(transcript, "柯西") {
-		t.Fatalf("unexpected transcript: %q", transcript)
-	}
 	provider, err := New(config)
 	if err != nil {
 		t.Fatal(err)
@@ -106,6 +100,6 @@ completed:
 	if answerBytes == 0 {
 		t.Fatal("answer TTS returned no PCM")
 	}
-	t.Logf("pipeline passed: transcript=%q answer_runes=%d answer_pcm_bytes=%d first_text=%s first_audio=%s total=%s",
-		transcript, len([]rune(answer.String())), answerBytes, firstText, firstAudio, time.Since(started))
+	t.Logf("pipeline passed: answer_runes=%d answer_pcm_bytes=%d first_text=%s first_audio=%s total=%s",
+		len([]rune(answer.String())), answerBytes, firstText, firstAudio, time.Since(started))
 }

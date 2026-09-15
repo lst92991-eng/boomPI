@@ -118,12 +118,14 @@ add_executable(boompi_client
   apps/boompi_client/main.cpp
   src/application/voice_client.cpp
   src/audio/voice_audio.cpp
-  src/audio/audio_engine.cpp
+  src/audio/audio_tasks.cpp
   src/config/voice_client_config.cpp
   src/network/network_setup.cpp
   src/network/voice_link.cpp
   src/network/voice_codec.cpp
-  src/platform/rv1106/audio_backend.cpp
+  src/platform/rv1106/audio_pipeline.cpp
+  src/platform/rv1106/audio_converter.cpp
+  src/platform/rv1106/speech_detector.cpp
   src/platform/rv1106/audio_thread.cpp
   src/platform/rv1106/alsa_audio.cpp
   src/platform/rv1106/rockchip_voice_dsp.cpp

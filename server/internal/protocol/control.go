@@ -17,6 +17,7 @@ const MaxTextBytes = 4096
 // Control is the complete v2 JSON vocabulary. Each message has one exact shape.
 type Control struct {
 	Type       string `json:"type"`
+	SampleRate int    `json:"sample_rate,omitempty"`
 	DeviceID   string `json:"device_id,omitempty"`
 	Token      string `json:"token,omitempty"`
 	Generation uint32 `json:"generation,omitempty"`
@@ -60,11 +61,12 @@ func DecodeControl(data []byte) (Control, error) {
 	want := []string{"type"}
 	switch result.Type {
 	case "hello":
-		want = append(want, "device_id", "token")
+		want = append(want, "device_id", "token", "sample_rate")
 		if !ValidDeviceID(result.DeviceID) || len(result.Token) == 0 || len(result.Token) > 256 {
 			return result, errors.New("invalid hello identity")
 		}
 	case "ready":
+		want = append(want, "sample_rate")
 	case "text":
 		want = append(want, "generation", "text")
 		if len(result.Text) == 0 || len(result.Text) > MaxTextBytes {
@@ -89,6 +91,9 @@ func DecodeControl(data []byte) (Control, error) {
 		if fields[key] == nil {
 			return result, errors.New("missing control field")
 		}
+	}
+	if (result.Type == "hello" || result.Type == "ready") && result.SampleRate != 16000 {
+		return result, errors.New("sample_rate must be 16000; update client and server together")
 	}
 	if fields["generation"] != nil && result.Generation == 0 {
 		return result, errors.New("generation must be nonzero")

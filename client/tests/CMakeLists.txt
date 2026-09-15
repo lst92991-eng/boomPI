@@ -22,8 +22,9 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
   boompi_test_options(boompi_voice_client_config_test)
   add_test(NAME voice-client-config-contract COMMAND boompi_voice_client_config_test)
 
-  # 此文件包含实际 application 源，只将时钟和两个模块的 I/O 替换为脚本。
-  add_executable(boompi_voice_client_harness tests/voice_client_harness_test.cpp)
+  # 链接实际应用源；测试只提供模块 I/O 与时钟，不再包含生产 .cpp 文件。
+  add_executable(boompi_voice_client_harness tests/voice_client_harness_test.cpp
+    src/application/voice_client.cpp src/config/voice_client_config.cpp)
   boompi_test_options(boompi_voice_client_harness)
   target_link_libraries(boompi_voice_client_harness PRIVATE Threads::Threads)
   add_test(NAME voice-client-behavior COMMAND boompi_voice_client_harness)
@@ -59,17 +60,41 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
   endif()
 
   if(UNIX)
+    # 编译真实声卡与流水线胶水；厂商算法仅借用现有测试声明，不声称验证厂商 ABI。
+    find_package(ALSA REQUIRED)
+    add_library(boompi_audio_platform_compile OBJECT
+      src/audio/audio_tasks.cpp
+      src/platform/rv1106/audio_pipeline.cpp
+      src/platform/rv1106/alsa_audio.cpp
+      src/platform/rv1106/audio_thread.cpp)
+    boompi_test_options(boompi_audio_platform_compile)
+    target_include_directories(boompi_audio_platform_compile PRIVATE
+      src/platform/rv1106 tests/support)
+    target_link_libraries(boompi_audio_platform_compile PRIVATE ALSA::ALSA Threads::Threads)
+
+    # 模块回归使用真实重采样库；缺依赖时配置失败，不把未运行的场景报告成通过。
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(BOOMPI_HOST_AUDIO REQUIRED IMPORTED_TARGET libswresample libavutil)
     add_executable(boompi_audio_engine_harness tests/audio_engine_harness_test.cpp
-      tests/support/audio_backend.cpp tests/support/audio_thread.cpp
-      src/audio/audio_engine.cpp src/audio/voice_audio.cpp)
+      tests/audio_pipeline_test.cpp
+      tests/support/audio_pipeline.cpp tests/support/audio_thread.cpp
+      src/audio/audio_tasks.cpp src/audio/voice_audio.cpp
+      src/platform/rv1106/audio_converter.cpp src/platform/rv1106/speech_detector.cpp
+      src/platform/rv1106/rockchip_voice_dsp.cpp)
     boompi_test_options(boompi_audio_engine_harness)
     target_include_directories(boompi_audio_engine_harness BEFORE PRIVATE tests/support)
-    target_link_libraries(boompi_audio_engine_harness PRIVATE Threads::Threads)
+    target_include_directories(boompi_audio_engine_harness PRIVATE src/platform/rv1106)
+    # BSP使用的旧FFmpeg接口在Host FFmpeg 6中标记deprecated；仅此源允许该兼容警告。
+    set_source_files_properties(src/platform/rv1106/audio_converter.cpp PROPERTIES
+      COMPILE_OPTIONS "-Wno-error=deprecated-declarations")
+    target_link_libraries(boompi_audio_engine_harness PRIVATE Threads::Threads
+      PkgConfig::BOOMPI_HOST_AUDIO)
     foreach(scenario IN ITEMS sub-grace-jitter confirmed-gap short-tail
         bounded-close bounded-capture bounded-command reset-preserves-pcm
         queue-results open-clears-error playback-clears-error
         playback-owner-order playback-prepare-failure drop-blocked-render drop-blocked-drain
-        close-blocked-render voice-preroll voice-follow-up-boundary voice-barge-lifecycle)
+        close-blocked-render voice-preroll voice-follow-up-boundary voice-barge-lifecycle
+        pipeline-format pipeline-detection)
       add_test(NAME audio-engine-${scenario} COMMAND boompi_audio_engine_harness ${scenario})
     endforeach()
   endif()
@@ -77,8 +102,9 @@ endif()
 
 if(BOOMPI_TARGET_RV1106 AND BOOMPI_BUILD_AEC_LOOP_HIL)
   add_executable(boompi_aec_loop_hil tests/hil/aec_loop_hil.cpp
-    src/audio/audio_engine.cpp src/audio/voice_audio.cpp
-    src/platform/rv1106/audio_backend.cpp src/platform/rv1106/alsa_audio.cpp
+    src/audio/audio_tasks.cpp src/audio/voice_audio.cpp
+    src/platform/rv1106/audio_pipeline.cpp src/platform/rv1106/alsa_audio.cpp
+    src/platform/rv1106/audio_converter.cpp src/platform/rv1106/speech_detector.cpp
     src/platform/rv1106/rockchip_voice_dsp.cpp src/platform/rv1106/audio_thread.cpp)
   boompi_test_options(boompi_aec_loop_hil)
   target_include_directories(boompi_aec_loop_hil PRIVATE src/platform/rv1106)

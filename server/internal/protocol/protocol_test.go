@@ -135,7 +135,7 @@ func TestPCMRejectsMalformedFrames(t *testing.T) {
 		size  int
 		valid bool
 	}{
-		{3, 2, true}, {3, 960, true}, {3, 962, false}, {1, 2, false}, {1, 960, true}, {7, 960, false}, {3, 0, false}, {3, 3, false},
+		{3, 2, true}, {3, 640, true}, {3, 962, false}, {1, 2, false}, {1, 640, true}, {7, 640, false}, {3, 0, false}, {3, 3, false},
 	} {
 		_, err := EncodePCM(PCMHeader{Flags: tc.flags, Generation: 1}, make([]byte, tc.size), false)
 		if (err == nil) != tc.valid {

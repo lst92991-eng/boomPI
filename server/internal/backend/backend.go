@@ -38,20 +38,13 @@ type ConversationSession interface {
 	SendAudio(ctx context.Context, pcm []byte) error
 	Commit(ctx context.Context) error
 	// Cancel stops active work and clears incomplete input, preserving completed
-	// history. Retraction is explicit through CompletedResponseDiscarder.
-	Cancel(ctx context.Context) error
+	// history unless retract explicitly removes the most recent unheard response.
+	Cancel(ctx context.Context, retract bool) error
 	// Events returns one stable, provider-owned bounded channel. Cancel must fence the
 	// cancelled response before returning: already queued events may remain,
 	// but the provider must not enqueue more events for that response.
 	Events() <-chan ConversationEvent
 	Close() error
-}
-
-// CompletedResponseDiscarder is an optional provider capability used when
-// playback is cancelled after inference has already committed the assistant
-// response to provider-side conversation history.
-type CompletedResponseDiscarder interface {
-	DiscardLastResponse(ctx context.Context) error
 }
 
 type ConversationBackend interface {

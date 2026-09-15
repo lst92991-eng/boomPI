@@ -11,9 +11,9 @@ import (
 
 func TestDefaultsKeepTeachingAudioParameters(t *testing.T) {
 	cfg := Defaults()
-	if cfg.DiscoveryPort != 17807 || cfg.ASRModel != "qwen3-asr-flash" ||
+	if cfg.DiscoveryPort != 17807 || cfg.ASRModel != "qwen3-asr-flash-realtime" ||
 		cfg.ReasoningModel != "qwen3.6-flash" || cfg.ReasoningEffort != "none" ||
-		cfg.TTSModel != "qwen3-tts-flash-realtime" || cfg.TTSVoice != "Cherry" {
+		cfg.TTSModel != "cosyvoice-v3-flash" || cfg.TTSVoice != "longxiaochun_v3" {
 		t.Fatalf("unexpected teaching defaults: %+v", cfg)
 	}
 	if cfg.HeartbeatInterval != 10*time.Second || cfg.ConnectionTimeout != 30*time.Second ||
@@ -63,7 +63,7 @@ func TestLoadExampleUsesCurrentPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(example) error = %v", err)
 	}
-	if cfg.ReasoningEffort != "none" || cfg.SearchMode != "off" || cfg.TTSVoice != "Cherry" {
+	if cfg.ReasoningEffort != "none" || cfg.SearchMode != "off" || cfg.TTSVoice != "longxiaochun_v3" {
 		t.Fatalf("example changed runtime parameters: %+v", cfg)
 	}
 }
@@ -145,4 +145,19 @@ func writeConfig(t *testing.T, content string) string {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 	return path
+}
+
+func TestOldAudioProviderSettingsRequireExplicitMaintenance(t *testing.T) {
+	for _, change := range []func(*Config){
+		func(c *Config) { c.ASRModel = "qwen3-asr-flash" },
+		func(c *Config) { c.TTSModel = "qwen3-tts-flash-realtime" },
+		func(c *Config) { c.TTSVoice = "Cherry" },
+	} {
+		cfg := Defaults()
+		cfg.Credentials = Credentials{apiKey: "test-key"}
+		change(&cfg)
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("old provider settings passed validation")
+		}
+	}
 }

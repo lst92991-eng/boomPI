@@ -1,29 +1,15 @@
 #pragma once
 
-/**
- * @file voice_client.h
- * @brief 启动对话主循环并管理音频、网络和显示的生命周期。
- */
-
-#include <csignal>
-#include <string>
+#include <chrono>
 
 #include "boompi/config/voice_client_config.h"
 
-namespace boompi::application {
+// 默认使用系统单调时钟；可控时钟仅供主机验证使用，不是学生配置项。
+using AppReadClock = std::chrono::steady_clock::time_point (*)();
 
-/**
- * @brief 运行板端语音应用，直到收到退出信号或出现不可恢复错误。
- *
- * 调用线程处理对话状态；其他线程通过音频/网络队列和UI快照交付结果。
- * 函数返回前会停止并回收所有工作线程。
- *
- * @param config 启动阶段完成校验、运行期间保持只读的板端配置。
- * @param stop 可选停止标志；信号处理器只需将其置位，函数会在正常线程中有序退出。
- * @param error 可选错误输出；失败时返回适合普通日志的阶段说明。
- * @return 正常停止时返回 true，初始化或运行中出现不可恢复错误时返回 false。
- */
-bool RunVoiceClient(const config::VoiceClientConfig& config,
-                    const volatile std::sig_atomic_t* stop, std::string* error);
-
-}  // namespace boompi::application
+// 本程序只有一份应用状态。由 main 按 Init → Process → Close 调用，重新 Init 前先 Close。
+bool App_Init(const boompi::config::VoiceClientConfig& config,
+              AppReadClock clock = &std::chrono::steady_clock::now);
+bool App_Process();                   // 执行一轮问答处理；失败返回 false。
+void App_Close() noexcept;            // 停线程、关设备；可重复调用。
+const char* App_GetError() noexcept;  // 错误文本保留到下一次 Init。

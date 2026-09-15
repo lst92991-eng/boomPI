@@ -8,7 +8,7 @@
 
 - 双麦、单参考 Rockchip 3A；
 - Snowboy 唤醒、WebRTC VAD、500 ms pre-roll；
-- 持久 WSS、Qwen ASR/对话/流式 TTS；
+- 持久 WSS、Qwen ASR/对话、CosyVoice 16 kHz 流式 TTS；
 - 播放中打断旧回复并立即提交新 generation，三秒追问；
 - LVGL 320×240 桌面、静态小智表情、字幕、触摸和音量；
 - 以太网优先、Wi-Fi 配网和 SC3336 本地预览。
@@ -48,10 +48,14 @@ capture:  48 kHz / S16_LE / 4 ch / 20 ms
 layout:   [mic0,mic1,refL,refR]
 3A input: 16 kHz [mic0,mic1,refL]
 3A output:16 kHz mono
-TTS:      24 kHz mono → 48 kHz stereo playback
+TTS:      16 kHz mono → 48 kHz stereo playback
 ```
 
 TTS 左右声道相同，所以 `refR` 不进入 Rockchip 3A。四通道原始采集仍保留给硬件诊断。vendor AGC 关闭，避免与硬件/数字增益叠加。
+
+以上声卡参数是当前实现契约，不代表本轮完成真板验收。全链 16 kHz 是目标；在 Codec、I2S/TDM、驱动、Mode1 回采和同时录放音得到匹配真板证据前，保留底层 48 kHz 适配。数字回采点与增益/延迟仍需 BSP 及测量证据。
+
+3A 使用 `rkaudio_preprocess_init/short/destory` 与 `RKAUDIOParam` 参数树；当前按 256 点 vendor 块衔接 320 点交付，不与 RKAP/.bin API 混用，也不把功能位顺序当作闭源执行顺序。20 ms 是当前业务与网络单位，不要求 vendor 块或未来 ALSA period 与它相等。
 
 默认参数：
 
@@ -123,16 +127,33 @@ Snowboy bridge 单独使用旧 C++ ABI；不得把 `_GLIBCXX_USE_CXX11_ABI=0` �
 
 ## 9. 代码和体量
 
+用户于 2026-09-14 提供 [XIAOZHI_CODE](https://github.com/lst92991-eng/XIAOZHI_CODE) 和 [vscode_motor_gateway](https://github.com/lst92991-eng/vscode_motor_gateway) 作为教学风格参考。具体入口、版本和观察见 [样例分析](docs/architecture/client-readability-refactor.md)。后续重构先对照其 App_Application、App_Audio、App_task 的真实业务流程：
+
+- XIAOZHI_CODE 只参考实际语音业务代码；排除 test/text、演示入口、测试图像/动画（含夹在 App_Display 内的 TestImage 代码）、生成资源及构建输出。先筛选业务调用链，不依据目录叫 App 就把测试实现纳入风格依据。
+- 让初始化顺序和任务内“读取 → 处理 → 交付”可见。函数名说明模块、动作和必要的数据去向；不能只用主函数行数、短名字或把代码移到别处来判断可读性。
+- 允许简短中文步骤注释帮助初学者跟读；同一事实只解释一次，避免长段接口说明反复遮住代码。
+- 保持现有模块内命名一致；模仿样例时不增加 App_* 转发外壳或机械复制目录。普通函数或简洁类按实际责任选用，官方 C++ 库及其必需边界继续保留。
+- 样例的芯片、RTOS、音频编码、阻塞方式和算法参数不直接移植到 RV1106。原功能、库不可修改、学生零声学校准以及每次公共接口变更汇报等约定继续有效。
+
+- 当前应用层采用普通函数模块：App_Init、App_Process、App_Close、App_GetError；main 显式呈现配置、初始化、循环和退出。应用状态在实现文件中由主线程管理，不再使用 VoiceApp 类；底层音频和网络类保留。
+- AudioTasks 管理两个音频线程，Start/Stop 负责启停；ReadProcessedFrame/QueueReplyFrame 分别取录音和提交回复。内部任务函数先展开数据处理步骤，再放支持函数，不增加只转发的外壳。
+- 官方源码、第三方库源码和库二进制不修改；兼容问题只在自有桥接、调用和构建配置中解决。
+- 学生侧不设置声学校准参数。必要硬件事实与三项已验证声学常量保留在内部 `client/src/platform/rv1106/board_voice_profile.h`，不通过公共音频配置对象传递。
+- 新增、重命名或删除跨模块接口时，逐项汇报用途、输入输出、调用方和旧接口去向。优先复用，不新增通用框架。
+- 应用模块普通函数使用 App_ 前缀；其他类的公共操作与查询使用 PascalCase，布尔查询使用 Is/Has/Was，字段沿用 snake_case；枚举项使用 PascalCase，常量保留 k 前缀。第三方/C ABI 命名遵循原契约。
+- 音频结果通过 ProcessEvents 直接返回整批事件，开始事件先于句首 PCM；停止或句尾后放弃本批剩余项，不恢复同线程的第二份事件队列。
+- VoiceLink 直接复用 VoiceClientConfig；原子变量默认采用标准内存顺序，只有测量证明有必要时再引入显式内存顺序优化。
+- 正常流程不逐轮打印状态与统计；错误和必要的恢复提示保留在实际负责的边界。删除仅为已移除日志服务的计数状态。
 - C++17 与 `gofmt`；数值名带单位，例如 `*_ms`、`*_frames`、`*_dbfs`。
-- 注释解释硬件事实、并发所有权、时序和“为什么”，不逐行翻译代码。
+- 注释解释硬件事实、并发所有权、时序和“为什么”；教学主流程允许简短步骤注释，避免给每条显然赋值附上重复说明。
 - 错误必须指出阶段且不输出 secret；返回值不能混合背压、断线和协议错误。
 - 头文件只暴露必要边界，不跨层 include 私有 vendor 头。
 - 不用压缩排版、合并语句或生成代码伪造低行数。
-- 客户端教学胶水以约 2500 ELOC 为方向；完整第一方客户端（含私有驱动和UI）以约4200 ELOC为评审目标，资源、测试和第三方单列。使用 scripts/measure_client.py 诚实统计，不通过移动目录或压行达标。
-- 声学参数仅由 board_voice_profile.h 的维护者profile拥有，学生配置不包含门限、极性或模型路径。VoiceApp不读取dBFS/reference或处理hello/heartbeat。
+- 不以预估行数作为验收配额。固定实际起始提交和工作区快照，使用 scripts/measure_client.py 统计相同范围的生产代码，头文件、测试、资源与第三方单列；不能通过移动目录、压行或省略异常行为达标。
+- 声学参数仅由 board_voice_profile.h 的维护者profile拥有，学生配置不包含门限、极性或模型路径。应用模块不读取dBFS/reference或处理hello/heartbeat。
 - 产品源码与Host替身由CMake选源，不在业务、网络或音频算法中插入平台/测试条件编译。第三方库和外部库配置按各自要求保留。
 - 使用根目录.clang-format；一行一个语句，条件和循环带大括号。复杂判定可提取有明确含义的小函数，不新增通用框架。
-- 注释用自然中文说明线程归属、硬件时序、单位、失败后果；不重复宣传“唯一边界”或逐行翻译显然的代码。
+- 注释使用自然中文；步骤注释服务于数据流阅读，约束注释说明线程、时序、单位与失败后果，不重复宣传“唯一边界”。
 
 ## 10. 完成标准
 

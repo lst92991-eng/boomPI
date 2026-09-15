@@ -1,5 +1,9 @@
 /** @file display_touch.cpp
  * @brief ST7789P3 横屏刷写和 GT911 触摸。板级引脚、寄存器与恢复时序集中在此。
+ *
+ * Open 在 UI worker 启动前配置资源；运行期 LVGL Flush/ReadInput 同步进入本端口。
+ * 显示故障返回 false 让 DeviceUi 结束 UI，触摸故障则按连续失败预算尝试恢复，
+ * 最终可禁用触摸并保留显示。硬件等待和 Linux I/O 不进入采集/播放实时线程。
  */
 #include "display_touch.h"
 
@@ -49,6 +53,7 @@ bool WriteAll(int fd, const void* source, std::size_t bytes) {
   return true;
 }
 
+/** @brief 打开一个 sysfs 属性完成文本写入后关闭 fd，失败由初始化调用方处理。 */
 bool WriteText(const std::string& path, const std::string& text, int flags = O_WRONLY) {
   const int fd = open(path.c_str(), flags | O_CLOEXEC, 0644);
   if (fd < 0) {
@@ -81,6 +86,7 @@ int OpenGpio(int number) {
   return open((base + "/value").c_str(), O_WRONLY | O_CLOEXEC);
 }
 
+/** @brief 复用 sysfs value fd 时先回到文件开头，避免上次写入留下的偏移影响后续电平设置。 */
 bool SetGpio(int fd, bool high) {
   const char value = high ? '1' : '0';
   return fd >= 0 && lseek(fd, 0, SEEK_SET) == 0 && WriteAll(fd, &value, 1U);
@@ -88,6 +94,11 @@ bool SetGpio(int fd, bool high) {
 
 }  // namespace
 
+/**
+ * @brief 建立 mode 0、8 bit SPI 通道，再按显示→触摸顺序初始化。
+ *
+ * 任一阶段失败都统一 Close；回读速率是驱动接受的配置值，不等于逻辑分析仪实测时钟。
+ */
 bool DisplayTouch::Open() {
   Close();
   spi = open("/dev/spidev0.0", O_RDWR | O_CLOEXEC);
@@ -107,6 +118,7 @@ bool DisplayTouch::Open() {
   return true;
 }
 
+/** @brief UI 已停用端口后熄背光并关闭长期 fd，保留已导出的 GPIO 节点供下次启动复用。 */
 void DisplayTouch::Close() noexcept {
   SetGpio(backlight, false);
   const int descriptors[] = {touch, spi, data_command, panel_reset, backlight};
@@ -125,8 +137,8 @@ void DisplayTouch::Close() noexcept {
 /**
  * @brief 按 ST7789P3 的 D/C 时序发送一条命令及可选 payload。
  *
- * D/C 拉低覆盖命令字节，payload 发送前再拉高；整个调用只在 UI worker 中发生，
- * 因而 GPIO 电平和 SPI 字节流不会被其他页面更新交叉打断。
+ * D/C 拉低覆盖命令字节，payload 发送前再拉高；初始化由 Open 的调用线程顺序完成，
+ * 运行期仅在 UI worker 中调用，二者不重叠，GPIO 电平和 SPI 字节流不会交叉打断。
  */
 bool DisplayTouch::Command(std::uint8_t command, const std::uint8_t* data, std::size_t bytes) {
   if (!SetGpio(data_command, false) || !WriteAll(spi, &command, 1U)) {
@@ -182,8 +194,8 @@ bool DisplayTouch::Flush(const lv_area_t& area, const lv_color_t* pixels) {
  * @brief 按上电时序复位并初始化 ST7789P3 面板。
  *
  * 背光先保持关闭，避免复位和寄存器配置期间显示随机显存；RESET 的两个 100 ms
- * 窗口以及 Sleep Out 后的 120 ms 来自控制器上电要求。只有 Display On 成功后才
- * 点亮背光，因此 Open() 的成功意味着用户能够看到完整初始化后的页面。
+ * 窗口以及 Sleep Out 后的 120 ms 是当前初始化序列使用的等待值。只有 Display On
+ * 成功后才点亮背光；此时仅面板就绪，页面还需由之后启动的 UI worker 构建和刷入。
  */
 bool DisplayTouch::InitPanel() {
   if ((data_command = OpenGpio(kDataCommandGpio)) < 0 ||
@@ -274,7 +286,8 @@ bool DisplayTouch::InitTouch() {
  * @brief 使用一次 I2C_RDWR combined transfer 读取 GT911 寄存器。
  *
  * 寄存器地址为大端 16 位，write/read 两条 message 之间保持 repeated-start，避免
- * STOP 让控制器丢失当前地址。调用方与恢复逻辑都属于 UI worker，无需额外锁。
+ * 两次独立 ioctl 之间插入其他传输。Open 初次试读完成后才启动 UI worker，运行期
+ * 的读取与恢复又在同一 worker 顺序执行，因此这里无需额外锁。
  */
 bool DisplayTouch::ReadTouch(std::uint16_t address, std::uint8_t* data, std::size_t size) {
   std::uint8_t reg[] = {static_cast<std::uint8_t>(address >> 8U),
@@ -298,6 +311,7 @@ bool DisplayTouch::ClearTouchStatus() {
  *
  * 单次瞬态错误只释放按压状态；连续三次后最多复位两轮，每轮间隔两秒。耗尽预算
  * 后保持显示可用并禁用触摸，错误会在日志中明确暴露，音频和页面刷新可以继续。
+ * 一次成功读写或恢复成功会重置计数；上限约束的是连续故障过程，而非设备终身次数。
  */
 void DisplayTouch::TouchFailed(const char* stage) {
   pointer_pressed = false;
@@ -353,6 +367,7 @@ void DisplayTouch::PollTouch() {
     TouchFailed("status read");
     return;
   }
+  // ready 未置位表示暂无新的坐标报告，不等同于释放；保留前次按压状态等待有效报告。
   if ((status & 0x80U) == 0U) {
     touch_failures = 0U;
     touch_recovery_attempts = 0U;
@@ -383,6 +398,7 @@ void DisplayTouch::PollTouch() {
   touch_recovery_attempts = 0U;
 }
 
+/** @brief 把端口缓存转换为 LVGL pointer 数据，LVGL 再据此判断点击、拖动和释放事件。 */
 void DisplayTouch::ReadInput(lv_indev_data_t* data) {
   PollTouch();
   data->point.x = static_cast<lv_coord_t>(pointer_x);

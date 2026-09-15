@@ -1,6 +1,11 @@
 /**
  * @file camera_capture.cpp
  * @brief SC3336 外部转换管线和最新帧交接。
+ *
+ * DeviceUi 收到 CameraOn 后启动本对象；worker fork shell 承载 v4l2-ctl → ffmpeg，
+ * 从 stdout 累积一帧 320x180 RGB565 后才发布。UI 变慢时允许覆盖未消费预览帧，
+ * 这种取最新帧语义只服务本地视频预览，与不能静默丢失 PCM 的语音链路不同。
+ * CameraOff/关闭 UI → Stop → 终止进程组 → worker 回收管线 → join → 清空帧槽。
  */
 #include "camera_capture.h"
 
@@ -20,7 +25,6 @@ namespace {
 
 constexpr std::size_t kFrameBytes =
     CameraCapture::kWidth * CameraCapture::kHeight * sizeof(std::uint16_t);
-constexpr auto kReportPeriod = std::chrono::seconds(5);
 
 // video14 不支持 VIDIOC_S_PARM。管线必须持续读取 25 FPS，再由 ffmpeg 丢帧，
 // 否则 5 FPS 的页面消费速度会反向堵住摄像头驱动。
@@ -33,46 +37,7 @@ constexpr char kCameraCommand[] =
     "-vf 'fps=5,scale=320:180:flags=fast_bilinear' "
     "-pix_fmt rgb565le -f rawvideo pipe:1 2>/run/boompi-camera-ffmpeg.log";
 
-unsigned FpsTenths(const std::uint64_t frames,
-                   const std::chrono::milliseconds elapsed) noexcept {
-  if (elapsed.count() <= 0) {
-    return 0U;
-  }
-  return static_cast<unsigned>(frames * 10000U / static_cast<std::uint64_t>(elapsed.count()));
-}
-
-void LogStats(const std::uint64_t pipeline_frames, const std::uint64_t displayed_frames,
-              const std::uint64_t dropped_frames,
-              const std::chrono::milliseconds frame_span) noexcept {
-  // 帧率按首尾帧之间的区间计算，不把进程启动时间算进稳定吞吐。
-  const unsigned pipeline_fps =
-      FpsTenths(pipeline_frames > 0U ? pipeline_frames - 1U : 0U, frame_span);
-  const unsigned display_fps =
-      FpsTenths(displayed_frames > 0U ? displayed_frames - 1U : 0U, frame_span);
-  float load_one = 0.0F;
-  std::FILE* load = std::fopen("/proc/loadavg", "r");
-  const bool have_load = load != nullptr && std::fscanf(load, "%f", &load_one) == 1;
-  if (load != nullptr) {
-    std::fclose(load);
-  }
-
-  if (have_load) {
-    std::fprintf(stderr,
-                 "boompi-ui: camera target_fps=%u pipeline_fps=%u.%u "
-                 "display_fps=%u.%u dropped=%llu load1=%.2f\n",
-                 CameraCapture::kTargetFps, pipeline_fps / 10U, pipeline_fps % 10U,
-                 display_fps / 10U, display_fps % 10U,
-                 static_cast<unsigned long long>(dropped_frames), load_one);
-    return;
-  }
-  std::fprintf(stderr,
-               "boompi-ui: camera target_fps=%u pipeline_fps=%u.%u "
-               "display_fps=%u.%u dropped=%llu load1=unavailable\n",
-               CameraCapture::kTargetFps, pipeline_fps / 10U, pipeline_fps % 10U,
-               display_fps / 10U, display_fps % 10U,
-               static_cast<unsigned long long>(dropped_frames));
-}
-
+/** @brief 解码 waitpid 状态，区分正常退出、信号终止和无法取得子进程状态。 */
 void LogExit(const int status) noexcept {
   if (status < 0) {
     std::fprintf(stderr, "boompi-ui: camera process status unavailable\n");
@@ -85,6 +50,11 @@ void LogExit(const int status) noexcept {
 
 }  // namespace
 
+/**
+ * @brief 回收直接子进程；尚未退出时向其独立进程组发送终止信号，超时再升级。
+ * waitpid 只观察组长。组长已退出时直接返回，不再向进程组发信号，因此返回成功
+ * 不证明所有后代进程都已退出；调用者不能把它当成整个进程组的完成确认。
+ */
 int StopUiProcessGroup(const pid_t child) noexcept {
   if (child <= 0) {
     return -1;
@@ -121,12 +91,15 @@ CameraCapture::~CameraCapture() noexcept {
   Stop();
 }
 
+/** @brief 使尚未消费的像素失效；即使工作线程同时交帧，也不会复制到半清空数组。 */
 void CameraCapture::ClearFrame() noexcept {
   std::lock_guard<std::mutex> lock(frame_mutex_);
   frame_ready_ = false;
   frame_.fill(0U);
 }
 
+/** @brief 失败只发布诊断及 Error；CapturePreviewTask() 已取得的 fd 和进程仍在其退出路径回收。
+ */
 void CameraCapture::Fail(const char* const reason) noexcept {
   std::fprintf(stderr, "boompi-ui: camera %s\n", reason);
   ClearFrame();
@@ -134,6 +107,7 @@ void CameraCapture::Fail(const char* const reason) noexcept {
   ui_wake_.notify_one();
 }
 
+/** @brief UI worker 消费容量为一帧的槽位，复制完成后才清 ready，锁外绘图。 */
 bool CameraCapture::TakeFrame(Frame* const output) noexcept {
   if (output == nullptr) {
     return false;
@@ -147,26 +121,30 @@ bool CameraCapture::TakeFrame(Frame* const output) noexcept {
   return true;
 }
 
-void CameraCapture::MarkDisplayed() noexcept {
-  displayed_frames_.fetch_add(1U);
-}
+/** @brief 累计交给页面的帧数，与管线收到帧数比较来定位消费速度。 */
 
+/** @brief 进入页面时重置统计和状态，异步启动采集；调用方必须避免重复启动活跃 worker。 */
 void CameraCapture::Start() noexcept {
   if (worker_.joinable()) {
     worker_.join();
   }
   ClearFrame();
-  displayed_frames_.store(0U);
   stop_.store(false);
   status_.store(CameraStatus::Starting);
   ui_wake_.notify_one();
   try {
-    worker_ = std::thread(&CameraCapture::Run, this);
+    worker_ = std::thread(&CameraCapture::CapturePreviewTask, this);
   } catch (...) {
     Fail("worker could not start");
   }
 }
 
+/**
+ * @brief 离页时先请求停读，再终止子进程组，使管道唤醒并让 worker 回收直接子进程。
+ *
+ * 100 ms 后若 child_ 尚未被 worker 清除则升级 SIGKILL；join 后再清空共享帧，
+ * 防止清空后仍有旧线程写回像素。尚未 fork 的启动阶段也由 stop_ 控制后续退出。
+ */
 void CameraCapture::Stop() noexcept {
   stop_.store(true);
   const pid_t child = child_.load();
@@ -185,12 +163,20 @@ void CameraCapture::Stop() noexcept {
   ui_wake_.notify_one();
 }
 
-void CameraCapture::Run() noexcept {
+/**
+ * @brief camera worker 按“创建管线 → 完整帧拼装 → 发布 → 退出清理”顺序运行。
+ *
+ * 首帧预留 2 s 给外部工具启动，此后每得到完整帧重新给 1 s 期限；收到部分字节
+ * 不续期，避免管线只吐出残片却一直占用预览。错误上报 UI，当前实例不自动重启。
+ */
+void CameraCapture::CapturePreviewTask() noexcept {
+  // 1. 启动摄像头转换管线，通过 stdout 接收固定大小的像素帧。
   int output[2]{};
   if (pipe(output) != 0) {
     Fail("pipe failed");
     return;
   }
+  // stdout 是唯一像素通道，工具诊断转入 /run 下的独立日志，避免文本混进定长帧。
   const pid_t child = fork();
   if (child == 0) {
     close(output[0]);
@@ -211,19 +197,16 @@ void CameraCapture::Run() noexcept {
   static_cast<void>(setpgid(child, child));
   child_.store(child);
 
+  // 此数组只有 camera worker 写；read 允许短读，used 达到完整帧字节数后才共享。
   Frame captured{};
   auto* bytes = reinterpret_cast<std::uint8_t*>(captured.data());
   std::size_t used = 0U;
   auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  auto report_at = std::chrono::steady_clock::now() + kReportPeriod;
-  auto first_frame_at = std::chrono::steady_clock::time_point{};
-  auto last_frame_at = std::chrono::steady_clock::time_point{};
-  std::uint64_t pipeline_frames = 0U;
-  std::uint64_t dropped_frames = 0U;
   const char* failure = nullptr;
   bool have_frame = false;
 
   while (!stop_.load()) {
+    // 2. 等待像素数据；部分读取继续拼接，完整帧到达前不更新画面。
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
       failure = have_frame ? "frame timeout" : "first frame timeout";
@@ -261,17 +244,11 @@ void CameraCapture::Run() noexcept {
       continue;
     }
 
+    // 3. 交付最新完整帧，通知显示任务。
     const auto frame_ready_at = std::chrono::steady_clock::now();
-    ++pipeline_frames;
-    if (pipeline_frames == 1U) {
-      first_frame_at = frame_ready_at;
-    }
-    last_frame_at = frame_ready_at;
     {
       std::lock_guard<std::mutex> lock(frame_mutex_);
-      if (frame_ready_) {
-        ++dropped_frames;
-      }
+      // 预览只保留最新一帧，页面变慢时不会累积旧画面。
       frame_ = captured;
       frame_ready_ = true;
     }
@@ -280,23 +257,16 @@ void CameraCapture::Run() noexcept {
     used = 0U;
     have_frame = true;
     deadline = frame_ready_at + std::chrono::seconds(1);
-    if (frame_ready_at >= report_at) {
-      LogStats(pipeline_frames, displayed_frames_.load(), dropped_frames,
-               std::chrono::duration_cast<std::chrono::milliseconds>(last_frame_at -
-                                                                     first_frame_at));
-      report_at = frame_ready_at + kReportPeriod;
-    }
   }
 
+  // 4. 关闭管道、回收子进程；只有非主动退出才显示故障。
   close(output[0]);
   if (!stop_.load() && failure != nullptr) {
     Fail(failure);
   }
-  LogExit(StopUiProcessGroup(child));
-  if (pipeline_frames != 0U) {
-    LogStats(
-        pipeline_frames, displayed_frames_.load(), dropped_frames,
-        std::chrono::duration_cast<std::chrono::milliseconds>(last_frame_at - first_frame_at));
+  const int exit_status = StopUiProcessGroup(child);
+  if (!stop_.load()) {
+    LogExit(exit_status);
   }
   child_.store(-1);
 }

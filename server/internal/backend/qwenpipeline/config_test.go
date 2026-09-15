@@ -5,18 +5,18 @@ import (
 )
 
 func TestChinaBeijingEndpoints(t *testing.T) {
-	public := Config{Region: RegionChinaBeijing, TTSModel: "qwen3-tts-flash-realtime"}
+	public := Config{ASRModel: realtimeASRModelName, Region: RegionChinaBeijing, TTSModel: "cosyvoice-v3-flash"}
 	if got, want := public.compatibleBaseURL(), "https://dashscope.aliyuncs.com/compatible-mode/v1"; got != want {
 		t.Fatalf("public compatibleBaseURL() = %q, want %q", got, want)
 	}
 	if got, want := public.asrRealtimeURL(), "wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=qwen3-asr-flash-realtime"; got != want {
 		t.Fatalf("public asrRealtimeURL() = %q, want %q", got, want)
 	}
-	if got, want := public.ttsURL(), "wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=qwen3-tts-flash-realtime"; got != want {
+	if got, want := public.ttsURL(), "wss://dashscope.aliyuncs.com/api-ws/v1/inference"; got != want {
 		t.Fatalf("public ttsURL() = %q, want %q", got, want)
 	}
 
-	workspace := Config{Region: RegionChinaBeijing, WorkspaceID: "ws-test_123"}
+	workspace := Config{ASRModel: realtimeASRModelName, Region: RegionChinaBeijing, WorkspaceID: "ws-test_123"}
 	if got, want := workspace.compatibleBaseURL(), "https://ws-test_123.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"; got != want {
 		t.Fatalf("workspace compatibleBaseURL() = %q, want %q", got, want)
 	}

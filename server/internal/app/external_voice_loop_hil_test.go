@@ -21,7 +21,7 @@ import (
 
 const (
 	voiceLoopHILPrefix     = "BOOMPI_EXTERNAL_VOICE_LOOP_HIL"
-	voiceLoopHILSampleRate = 24_000
+	voiceLoopHILSampleRate = 16_000
 	voiceLoopHILTonePeak   = 1_500
 )
 
@@ -211,7 +211,7 @@ func (s *voiceLoopHILSession) emit(ctx context.Context, event backend.Conversati
 	}
 }
 
-func (s *voiceLoopHILSession) Cancel(ctx context.Context) error {
+func (s *voiceLoopHILSession) Cancel(ctx context.Context, retract bool) error {
 	s.mu.Lock()
 	s.pendingBytes = 0
 	stop, done := s.responseStop, s.responseDone
@@ -232,11 +232,9 @@ func (s *voiceLoopHILSession) Cancel(ctx context.Context) error {
 
 func (s *voiceLoopHILSession) Events() <-chan backend.ConversationEvent { return s.events }
 
-func (s *voiceLoopHILSession) DiscardLastResponse(context.Context) error { return nil }
-
 func (s *voiceLoopHILSession) Close() error {
 	s.closeOnce.Do(func() {
-		_ = s.Cancel(context.Background())
+		_ = s.Cancel(context.Background(), false)
 		close(s.events)
 	})
 	return nil

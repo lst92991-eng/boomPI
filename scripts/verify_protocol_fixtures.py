@@ -9,8 +9,8 @@ from pathlib import Path
 
 HEADER = struct.Struct(">4sHHII")
 SHAPES = {
-    "hello": {"type", "device_id", "token"},
-    "ready": {"type"},
+    "hello": {"type", "device_id", "token", "sample_rate"},
+    "ready": {"type", "sample_rate"},
     "text": {"type", "generation", "text"},
     "done": {"type", "generation"},
     "error": {"type", "generation", "code"},
@@ -37,6 +37,9 @@ def decode_control(wire):
         generation = value["generation"]
         if type(generation) is not int or not 1 <= generation < 2**32:
             raise ValueError("invalid generation")
+    if "sample_rate" in value:
+        if type(value["sample_rate"]) is not int or value["sample_rate"] != 16000:
+            raise ValueError("both directions require 16 kHz PCM")
     if value["type"] == "hello":
         identity = value["device_id"]
         if not isinstance(identity, str) or str(uuid.UUID(identity)) != identity:
@@ -70,7 +73,7 @@ def validate_audio(item):
         assert not flags & 4 or flags & 1
     else:
         assert item["direction"] == "downlink" and not flags & 4
-        assert len(payload) <= 960 and (flags & 2 or len(payload) == 960)
+        assert len(payload) <= 640 and (flags & 2 or len(payload) == 640)
 
 
 def main():

@@ -1,6 +1,10 @@
 # boomPI 客户端：教学版 v2
 
+从 [main](apps/boompi_client/main.cpp) 的四个中文步骤开始阅读：LoadClientConfig、App_Init、循环 App_Process、App_Close。命令行辅助功能和信号处理的定义在本文件下方。完整调用路径见[源码阅读索引](../docs/teaching/client-source-reading.md)，本次接口变化与验证范围见[可读性重构记录](../docs/architecture/client-readability-refactor.md)。
+
 教学复现先从[分关实验](../docs/teaching/README.md)开始：配置、固定帧、播放队列、语句输入、WSS、六态问答、插话、界面，最后完成真板验收。每关复用真实产品源码和已有测试，不用课程宏拼出多个产品。
+
+音频可以直接从[顺序数据流](../docs/teaching/audio-pipeline.md)进入：`RawCaptureFrame → CaptureChannels → CleanAudioFrame → CaptureFrame → AudioEvent`。各处理模块显式接收上一阶段输出，播放是另一条独立链。
 
 这是一份源码上的递进补写实验，不是已经导出的独立阶段源码快照。已有基础、只想先理解完整业务时，再读 `src/application/voice_client.cpp`。服务端是配套 EXE，学生只配置 Key；无需学习 Go 或云端 SDK。
 
@@ -18,36 +22,36 @@ Offline → Idle → Listening → Uploading → Waiting → Speaking
 Speaking ── 确认近讲 ──→ Uploading（新 generation，撤回旧回答）
 ```
 
-- `VoiceApp::Run` 初始化模块后依次处理超时、网络、音频和 UI；`Enter` 同步修改状态、计时和显示。
-- `OnAudio` 只理解 Wake、SpeechStart、Pcm、Barge、PlaybackDone、Fault。
-- `OnNetwork` 只理解 Online、Offline、Text、Audio、Done、Error。
-- `VoiceAudio` 拥有声学判定、500 ms pre-roll、32 帧打断历史和播放生命周期。
+- `App_Init` 初始化模块，main 循环调用 `App_Process`；每轮依次处理超时、网络、音频和 UI；`App_Enter` 同步修改状态、计时和显示。
+- `App_ReadSpeechAndUpload` 直接取录音结果，在同一函数中处理开口、PCM 上传与句尾。
+- `App_ReceiveReplyAndPlayAudio` 直接取服务器消息，校验轮次、显示文字或排队播放。
+- `VoiceAudio` 整理语句、500 ms pre-roll、32 帧打断历史和播放生命周期；`ProcessListeningFrame`与播放期间的插话控制分开阅读。
 - `VoiceLink` 拥有发现、TLS、握手、心跳、重连、协议与有界队列。
-- `DeviceUi::Show(UiView)` 发布一个固定大小的显示快照，`Poll` 返回触摸和音量动作。
+- `DeviceUi::Show(UiView)` 发布一个固定大小的显示快照，`PollAction` 返回触摸和音量动作。
 
 业务主线不读取 dBFS、硬件参考、SPKI 或握手状态。底层实现仍开放给进阶课程阅读。
 
-`VoiceAudio::Process`明确承担采集判定的推进职责；不是只读取一个事件。`ListenMode::Wake/FollowUp`区分两种听音方式；`StopAndListen`表示停止当前轮后继续等追问。固定20ms的下行音频一包入一个播放槽，仅末帧允许不足一槽，不再提供任意长度跨槽拼包。
+`VoiceAudio::ProcessEvents(events, timeout)`推进采集判定，直接返回一批“开始事件＋PCM”；应用中的 for 循环按序处理，停止或句尾后丢弃本批剩余项。`ListenMode::Wake/FollowUp`区分两种听音方式；`App_StopAndListen`表示停止当前轮后继续等追问。固定20ms的下行音频一包入一个播放槽，仅末帧允许不足一槽，不再提供任意长度跨槽拼包。
 
 ## 阅读顺序
 
 | 课程 | 源码入口 | 学生需要解释的事情 |
 | --- | --- | --- |
-| 1 | application/voice_client.cpp：Run、Enter、OnAudio | 一次发言如何进入上传，最后一帧如何结束 |
+| 1 | application/voice_client.cpp：Init、App_Process、App_ReadSpeechAndUpload | 一次发言如何进入上传，最后一帧如何结束 |
 | 2 | network/voice_codec.cpp 与 protocol-v2.md | START/END、generation、sequence 的用途 |
 | 3 | audio/voice_audio.cpp | 为什么保留句首；播放中近讲如何成为 Barge |
-| 4 | audio/audio_engine.cpp | 两条实时线程和固定容量队列的所有权 |
-| 5 | platform/rv1106/audio_backend.cpp | 48→16 kHz、3A、Snowboy、VAD 的先后关系 |
+| 4 | audio/audio_tasks.cpp | 两条实时线程和固定容量队列的所有权 |
+| 5 | platform/rv1106/audio_pipeline.cpp | 48→16 kHz、3A、Snowboy、VAD 的先后关系 |
 | 6 | platform/rv1106/alsa_audio.cpp | Mode1 四通道、period、XRUN 与中断退出 |
 | 7 | ui/lvgl_screen.cpp、ui/device_ui.cpp | 页面、音量、摄像头资源的生命周期 |
 | 8 | platform/rv1106/display_touch.cpp | SPI屏幕、I²C触摸、复位与故障恢复 |
 
 上述路径相对 `client/src/`。课程按同一份产品代码递进，不用宏拼出多个产品。
 
-读正常问答时，先顺着 `OnAudio → SendInputFrame → OnNetwork → PlayReplyFrame`。
-需要了解异常再看 `HandleAudioFault`、`StopAndListen` 和 `OnTimeout`。主状态中不处理声学门限和TLS细节。
+读正常问答时，先顺着 `App_ReadSpeechAndUpload → App_UploadSpeechFrame → App_ReceiveReplyAndPlayAudio → App_QueueReplyAudio`。
+需要了解异常再看 `App_HandleAudioFault`、`App_StopAndListen` 和 `App_CheckTimeout`。主状态中不处理声学门限和TLS细节。入口中的 `App_Init → 循环 App_Process → App_Close` 明确显示生命周期。
 
-采集端从 `AudioBackend::ProcessCapture20ms` 向下看：修正极性、重采样、3A、语音判定和发布。
+采集端从 `AudioPipeline::ProcessCapture20ms` 向下看：`AudioConverter`转换原始帧，`RockchipVoiceDsp`输出PCM和对齐元数据，`SpeechDetector`输出检测结果，最后由引擎发布。各步都有明确输入输出，不共享一组可随意修改的工作数组。
 `audio_format.h` 定义帧格式，`board_voice_profile.h` 保存板级标定，公开音频接口只依赖前者。
 
 平台选择放在CMake。板端编译真实网卡操作和Linux线程调度；Host回归从 `tests/support/` 选择替身。
@@ -83,9 +87,9 @@ BOOMPI_SERVER_SPKI_SHA256=<该电脑稳定SPKI>
 
 地址和 pin 必须成对，`--check-config` 会拒绝非法 IPv4。发现本身没有认证，TLS 始终检查已保存的 SPKI。
 
-## 固定板级 profile
+## 内部板级预置
 
-`include/boompi/audio/board_voice_profile.h` 是维护者标定入口：
+`src/platform/rv1106/board_voice_profile.h` 只由内部实现引用。学生侧没有声学校准项；以下已验证常量按硬件事实和声学预置分组：
 
 - 左右麦极性 +1/+1；
 - Snowboy 0.7；
@@ -93,9 +97,9 @@ BOOMPI_SERVER_SPKI_SHA256=<该电脑稳定SPKI>
 - AEC 后 barge -25 dBFS；
 - AEC delay 0。
 
-20 ms、320/480/960 samples、PCM 路径和模型位置由固定帧契约推导/给出。学生不逐板调参。更换硬件或模型后由维护者重新验收整个 profile。
+网络每 20 ms 双向均为 320 samples，声卡当前每通道 960 samples；PCM 路径和模型位置由维护者预置。vendor 256 点块独立适配，不能把这些粒度混为一条约束。学生不逐板调参。更换硬件或模型后由维护者重新验收整个 profile。
 
-采集保持 48 kHz / S16_LE / 4ch `[mic0,mic1,refL,refR]`，3A 输入为双麦+refL，上传 16 kHz mono；TTS 24 kHz mono 重采样到 48 kHz stereo。原有 AEC/VAD 标定默认值保留，声学效果仍需要真板验收。
+采集保持 48 kHz / S16_LE / 4ch `[mic0,mic1,refL,refR]`，3A 输入为双麦+refL，上传和 TTS 均为 16 kHz mono；仅在声卡边界转成 48 kHz stereo。hello/ready 均必须声明 `sample_rate:16000`，旧 24 kHz 服务端不能配套。原有 AEC/VAD 默认值保留，整板 16 kHz 能力、声学效果和新 TTS 实际体验仍需要真板验收。
 
 ## 构建
 

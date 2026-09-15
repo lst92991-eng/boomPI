@@ -1,3 +1,12 @@
+/**
+ * @file protocol_json_contract.cpp
+ * @brief 直接调用产品编解码器，验证 v2 JSON 拒绝规则和跨语言共享字节样本。
+ *
+ * main 的 cases 覆盖合法控制帧、歧义数字/字符串、重复字段及长度边界；传入 fixture
+ * 路径时再由 SharedFixtures 将产品编码结果逐字节对照 protocol/fixtures 下的金样。
+ * 此测试不建网络连接，也不检查跨帧顺序；TLS、generation 隔离和发送队列另见
+ * voice_transport_loopback_test.cpp。
+ */
 #include <cjson/cJSON.h>
 
 #include <algorithm>
@@ -15,18 +24,21 @@
 
 namespace {
 
+/// @brief 用异常保留具体 fixture 名和失败阶段，让主入口统一打印并返回非零退出码。
 void Check(bool condition, const std::string& message) {
   if (!condition) {
     throw std::runtime_error(message);
   }
 }
 
+/// @brief 读取测试样本元数据字符串；这是测试文件读取器，不是产品控制帧解码器。
 std::string Field(const cJSON* object, const char* key) {
   const auto* item = cJSON_GetObjectItemCaseSensitive(object, key);
   Check(cJSON_IsString(item) && item->valuestring, std::string("fixture string: ") + key);
   return item->valuestring;
 }
 
+/// @brief 拒绝样本元数据的缺失、非有限数或越界整数，避免错误 fixture 伪装成产品失败。
 std::uint32_t Number(const cJSON* object, const char* key) {
   const auto* item = cJSON_GetObjectItemCaseSensitive(object, key);
   Check(cJSON_IsNumber(item) && std::isfinite(item->valuedouble) && item->valuedouble >= 0 &&
@@ -36,6 +48,7 @@ std::uint32_t Number(const cJSON* object, const char* key) {
   return static_cast<std::uint32_t>(item->valuedouble);
 }
 
+/// @brief 把共享金样中的小写十六进制恢复成原始字节，保留 NUL 及任意非文本 PCM。
 std::string HexBytes(const std::string& hex) {
   Check(hex.size() % 2 == 0, "fixture hex has odd length");
   std::string bytes;
@@ -49,6 +62,12 @@ std::string HexBytes(const std::string& hex) {
   return bytes;
 }
 
+/**
+ * @brief 读取 v2 金样后分方向验证：下行解码字段，上行编码字节。
+ *
+ * 先校验 fixture 自身头部和负载能重组为 wire，再交给产品函数，避免把自相矛盾的
+ * 样本作为预期值。最低样本数保证没有因路径或筛选错误而空跑通过。
+ */
 void SharedFixtures(const char* path) {
   using namespace boompi::network;
   std::ifstream input(path, std::ios::binary);
@@ -67,7 +86,7 @@ void SharedFixtures(const char* path) {
   for (const auto* item = controls->child; item; item = item->next) {
     const auto* expected = cJSON_GetObjectItemCaseSensitive(item, "expected");
     const auto type = Field(expected, "type");
-    // HELLO/STOP are uplink controls covered by the real TLS smoke test.
+    // hello/stop 属于上行控制，由真实 TLS 回环测试检查；下行解码器应拒绝这两种类型。
     if (type == "hello" || type == "stop") {
       continue;
     }
@@ -104,8 +123,9 @@ void SharedFixtures(const char* path) {
           name + ": inconsistent fixture bytes");
     const auto direction = Field(item, "direction");
     if (direction == "uplink") {
-      Check(payload.size() == detail::kUplinkBytes, name + ": uplink size mismatch");
-      std::array<std::int16_t, detail::kUplinkBytes / 2> pcm{};
+      Check(payload.size() == detail::kPcmBytes, name + ": uplink size mismatch");
+      std::array<std::int16_t, detail::kPcmBytes / 2> pcm{};
+      // 金样 PCM 为小端字节；显式还原有符号 sample，避免依赖测试主机端序或对齐。
       for (std::size_t i = 0; i < pcm.size(); ++i) {
         const auto value =
             static_cast<unsigned char>(payload[2 * i]) |
@@ -113,6 +133,7 @@ void SharedFixtures(const char* path) {
         pcm[i] = static_cast<std::int16_t>(value < 32768 ? static_cast<int>(value)
                                                          : static_cast<int>(value) - 65536);
       }
+      // 预期 wire 来自独立共享金样，不用生产编码器输出反过来构造自己的期望。
       const auto encoded =
           detail::EncodeAudio(generation, sequence, pcm.data(), (flags & 1U) != 0,
                               (flags & 2U) != 0, (flags & 4U) != 0);
@@ -137,6 +158,7 @@ void SharedFixtures(const char* path) {
             << " uplink, " << downlink_count << " downlink passed\n";
 }
 
+/// @brief 将生产解码器的“返回/抛异常”转换为数据表可比较的接受结果。
 bool Accepted(const std::string& json) {
   try {
     (void)boompi::network::detail::DecodeText(json);
@@ -148,17 +170,24 @@ bool Accepted(const std::string& json) {
 
 }  // namespace
 
+/**
+ * @brief 运行拒绝规则矩阵，可选再读共享 fixture；任一差异最终返回非零状态。
+ *
+ * 字面反斜杠 u0000 可以作为正文，真正转义 NUL 必须拒绝；生成 invalid_utf8 与
+ * embedded_nul 则覆盖源码字符串字面量难以直观看出的原始字节错误。
+ */
 int main(int argc, char** argv) {
   if (argc > 2) {
     std::cerr << "usage: protocol-json-test [shared-fixture.json]\n";
     return 1;
   }
-  const std::string ready = R"({"type":"ready"})";
+  const std::string ready = R"({"type":"ready","sample_rate":16000})";
   const std::string text = R"({"type":"text","generation":1,"text":"你好"})";
   std::string invalid_utf8 = text;
   invalid_utf8.insert(invalid_utf8.find("你好"), "\xc3\x28", 2);
   std::string embedded_nul = text;
   embedded_nul.insert(embedded_nul.find("你好"), 1, '\0');
+  // 第一段列合法值，随后依次覆盖对象形状、代号表示法、文本/错误码和长度上限。
   const std::vector<std::pair<std::string, bool>> cases{
       {ready, true},
       {ready + " \n\t", true},
@@ -169,6 +198,13 @@ int main(int argc, char** argv) {
       {R"({"type":"text","generation":1,"text":"\ud83d\ude42"})", true},
       {R"([])", false},
       {R"({"type":1})", false},
+      {R"({"type":"ready"})", false},
+      {R"({"type":"ready","sample_rate":24000})", false},
+      {R"({"type":"ready","sample_rate":"16000"})", false},
+      {R"({"type":"ready","sample_rate":true})", false},
+      {R"({"type":"ready","sample_rate":16000.0})", false},
+      {R"({"type":"ready","sample_rate":16e3})", false},
+      {R"({"type":"ready","sample_rate":16000,"sample_rate":16000})", false},
       {R"({"type":"ready","extra":0})", false},
       {R"({"type":"ready","type":"ready"})", false},
       {R"({"type":"ready","\u0074ype":"ready"})", false},

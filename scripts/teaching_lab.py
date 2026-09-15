@@ -18,6 +18,7 @@ AUDIO_CASES = (
     "playback-prepare-failure", "drop-blocked-render", "drop-blocked-drain",
     "close-blocked-render", "voice-preroll", "voice-follow-up-boundary",
     "voice-barge-lifecycle",
+    "pipeline-format", "pipeline-detection",
 )
 ALL_TESTS = (
     "voice-client-config-contract", "protocol-json-contract",
@@ -30,12 +31,13 @@ LESSONS = {
         ("voice-client-config-contract",)),
     2: ("固定音频帧与协议", ("boompi_protocol_json_test",),
         ("protocol-json-contract",)),
-    3: ("播放队列与线程生命周期", ("boompi_audio_engine_harness",),
+    3: ("音频转换与播放队列", ("boompi_audio_engine_harness",),
         tuple("audio-engine-" + name for name in (
+            "pipeline-format",
             "queue-results", "short-tail", "playback-owner-order",
             "bounded-capture", "bounded-command", "bounded-close"))),
     4: ("开口、句首与追问输入", ("boompi_audio_engine_harness",),
-        ("audio-engine-voice-preroll", "audio-engine-voice-follow-up-boundary")),
+        ("audio-engine-pipeline-detection", "audio-engine-voice-preroll", "audio-engine-voice-follow-up-boundary")),
     5: ("真实本机WSS连接", ("boompi_voice_transport_loopback_test",),
         ("voice-transport-loopback",)),
     6: ("六态问答与异常路径", ("boompi_voice_client_harness",),

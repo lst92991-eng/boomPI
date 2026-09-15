@@ -3,21 +3,19 @@ package qwenpipeline
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
 	"github.com/gorilla/websocket"
 )
 
-// DashScope counts CJK characters as two units and other characters as one.
-// Keep some headroom below the provider's 2,000-unit fragment limit.
 const (
 	maxTTSFragmentUnits         = 1600
 	maxTTSPCMDeltaBytes         = 64 * 1024
@@ -35,14 +33,10 @@ func newTTSClient(config Config) *ttsClient {
 	return &ttsClient{config: config, dialer: dialer}
 }
 
-func (c *ttsClient) synthesizeStream(
-	ctx context.Context,
-	fragments <-chan string,
-	emit func([]byte) error,
-) error {
+func (c *ttsClient) synthesizeStream(ctx context.Context, fragments <-chan string, emit func([]byte) error) error {
 	header := make(http.Header)
 	header.Set("Authorization", "Bearer "+c.config.APIKey)
-	if strings.TrimSpace(c.config.WorkspaceID) != "" {
+	if c.config.WorkspaceID != "" {
 		header.Set("X-DashScope-WorkSpace", c.config.WorkspaceID)
 	}
 	connection, response, err := c.dialer.DialContext(ctx, c.config.ttsURL(), header)
@@ -50,136 +44,135 @@ func (c *ttsClient) synthesizeStream(
 		response.Body.Close()
 	}
 	if err != nil {
-		return fmt.Errorf("connect Qwen TTS: %w", err)
+		return fmt.Errorf("connect CosyVoice TTS: %w", err)
 	}
 	defer connection.Close()
-	watchDone := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = connection.Close()
-		case <-watchDone:
-		}
-	}()
-	defer close(watchDone)
 	return c.synthesizeConnectedStream(ctx, connection, fragments, emit)
 }
 
-func (c *ttsClient) synthesizeConnectedStream(
-	ctx context.Context,
-	connection *websocket.Conn,
-	fragments <-chan string,
-	emit func([]byte) error,
-) error {
+// 一轮合成独占一个连接；取消发送官方 directive 并有界关闭连接，不复用旧任务。
+// task-finished 只表示云端音频全部交付，扬声器尾播由客户端自行确认。
+func (c *ttsClient) synthesizeConnectedStream(ctx context.Context, connection *websocket.Conn, fragments <-chan string, emit func([]byte) error) error {
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	connection.SetReadLimit(maxTTSWebSocketMessageBytes)
-	if err := c.waitFor(ctx, connection, "session.created", nil); err != nil {
-		return err
+	taskID := eventID()
+	// 取消与正常文本共用写锁。150 ms 后强制关闭，即使云端不读也不会拖住新轮。
+	var writeMu sync.Mutex
+	write := func(action string, payload any) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if err := streamCtx.Err(); err != nil {
+			return err
+		}
+		return c.writeTask(connection, taskID, action, payload)
 	}
-	update := map[string]any{
-		"event_id": eventID(),
-		"type":     "session.update",
-		"session": map[string]any{
-			"voice": c.config.TTSVoice, "mode": "server_commit",
-			"language_type": "Chinese", "response_format": "pcm",
-			"sample_rate": 24000,
-		},
-	}
-	if err := c.writeJSON(connection, update); err != nil {
-		return err
-	}
-	if err := c.waitFor(ctx, connection, "session.updated", nil); err != nil {
-		return err
-	}
-
-	streamCtx, cancelStream := context.WithCancel(ctx)
-	defer cancelStream()
-	writerDone := make(chan error, 1)
+	watchStop, watchDone := make(chan struct{}), make(chan struct{})
 	go func() {
-		err := c.writeServerCommitText(streamCtx, connection, fragments)
-		writerDone <- err
-		if err != nil {
+		defer close(watchDone)
+		select {
+		case <-ctx.Done():
+			forceClose := time.AfterFunc(150*time.Millisecond, func() { _ = connection.Close() })
+			writeMu.Lock()
+			_ = connection.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+			_ = connection.WriteJSON(taskMessage(taskID, "finish-task", map[string]any{
+				"input": map[string]any{"directive": "cancel"},
+			}))
+			writeMu.Unlock()
+			_ = connection.Close()
+			forceClose.Stop()
+		case <-watchStop:
+		}
+	}()
+	defer func() {
+		if ctx.Err() != nil {
+			<-watchDone
+		}
+		close(watchStop)
+		_ = connection.Close()
+		<-watchDone
+	}()
+	if err := write("run-task", map[string]any{
+		"task_group": "audio", "task": "tts", "function": "SpeechSynthesizer",
+		"model": c.config.TTSModel, "input": map[string]any{},
+		"parameters": map[string]any{
+			"text_type": "PlainText", "voice": c.config.TTSVoice,
+			"format": "pcm", "sample_rate": ttsSampleRateHz,
+		},
+	}); err != nil {
+		return err
+	}
+	kind, pcm, err := c.readTask(streamCtx, connection, taskID)
+	if err != nil {
+		return err
+	}
+	if kind != "task-started" {
+		return errors.New("CosyVoice TTS did not start the task")
+	}
+	writerDone := make(chan struct{})
+	var writerErr error
+	go func() {
+		err := c.writeText(streamCtx, write, fragments)
+		writerErr = err
+		defer close(writerDone)
+		if err != nil && ctx.Err() == nil {
 			_ = connection.Close()
 		}
 	}()
-
-	sawCompletedResponse := false
+	// 必须等写线程退出后才释放本轮，错误和取消都不能遗留文本生产者。
+	defer func() {
+		cancel()
+		if ctx.Err() != nil {
+			<-watchDone
+		}
+		_ = connection.Close()
+		<-writerDone
+	}()
 	audioBytes := 0
 	for {
-		var event struct {
-			Type  string `json:"type"`
-			Delta string `json:"delta"`
-			Error struct {
-				Code    string `json:"code"`
-				Message string `json:"message"`
-			} `json:"error"`
-			Response struct {
-				Status string `json:"status"`
-			} `json:"response"`
-		}
-		if err := c.readJSON(ctx, connection, &event); err != nil {
-			select {
-			case writerErr := <-writerDone:
-				if writerErr != nil {
-					return writerErr
-				}
-			default:
-			}
+		kind, pcm, err = c.readTask(streamCtx, connection, taskID)
+		if err != nil {
 			return err
 		}
-		switch event.Type {
-		case "response.audio.delta":
-			pcm, err := base64.StdEncoding.DecodeString(event.Delta)
-			if err != nil || len(pcm) == 0 || len(pcm)%2 != 0 || len(pcm) > maxTTSPCMDeltaBytes {
-				return errors.New("Qwen TTS returned invalid PCM")
-			}
+		switch kind {
+		case "audio":
 			if err := emit(pcm); err != nil {
 				return err
 			}
 			audioBytes += len(pcm)
-		case "response.done":
-			if event.Response.Status != "completed" {
-				return fmt.Errorf("Qwen TTS response status is %q", event.Response.Status)
-			}
-			sawCompletedResponse = true
-		case "session.finished":
+		case "task-finished":
+			// 服务端不能在 finish-task 发出前声称完成；此时 writer 必须已结束。
 			select {
-			case err := <-writerDone:
-				if err != nil {
-					return err
+			case <-writerDone:
+				if writerErr != nil {
+					return writerErr
 				}
 			case <-ctx.Done():
 				return ctx.Err()
-			}
-			if !sawCompletedResponse {
-				return errors.New("Qwen TTS session finished without a completed response")
+			case <-time.After(c.config.Timeout):
+				return errors.New("CosyVoice TTS finished before text input ended")
 			}
 			if audioBytes == 0 {
-				return errors.New("Qwen TTS session finished without PCM audio")
+				return errors.New("CosyVoice TTS returned no audio")
 			}
 			return nil
-		case "error":
-			return fmt.Errorf("Qwen TTS error code=%q message=%q", event.Error.Code, event.Error.Message)
+		case "result-generated":
+			// 句子元信息不承载 PCM；音频在接下来的 binary 消息中。
+		default:
+			return errors.New("CosyVoice TTS returned an unexpected event")
 		}
 	}
 }
 
-// writeServerCommitText streams each available text delta immediately. In
-// server_commit mode DashScope decides when enough context exists to begin
-// synthesis; sending client-side commit events would split one answer into
-// multiple audio responses and introduce audible gaps between them.
-func (c *ttsClient) writeServerCommitText(
-	ctx context.Context,
-	connection *websocket.Conn,
-	fragments <-chan string,
-) error {
+func (c *ttsClient) writeText(ctx context.Context, write func(string, any) error, fragments <-chan string) error {
 	synthesized := false
 	filter := newTTSTextFilter()
 	appendText := func(text string) error {
 		if strings.TrimSpace(text) == "" {
 			return nil
 		}
-		if err := c.writeJSON(connection, map[string]any{
-			"event_id": eventID(), "type": "input_text_buffer.append", "text": text,
+		if err := write("continue-task", map[string]any{
+			"input": map[string]any{"text": text},
 		}); err != nil {
 			return err
 		}
@@ -196,24 +189,65 @@ func (c *ttsClient) writeServerCommitText(
 					return err
 				}
 				if !synthesized {
-					return errors.New("Qwen TTS input text is empty")
+					return errors.New("CosyVoice TTS input text is empty")
 				}
-				return c.writeJSON(connection, map[string]any{
-					"event_id": eventID(), "type": "session.finish",
-				})
+				return write("finish-task", map[string]any{"input": map[string]any{}})
 			}
-			if fragment == "" {
-				continue
-			}
-			text := filter.Write(fragment)
-			if text == "" {
-				continue
-			}
-			if err := appendText(text); err != nil {
+			if err := appendText(filter.Write(fragment)); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+func (c *ttsClient) writeTask(connection *websocket.Conn, taskID, action string, payload any) error {
+	if err := connection.SetWriteDeadline(time.Now().Add(c.config.Timeout)); err != nil {
+		return err
+	}
+	return connection.WriteJSON(taskMessage(taskID, action, payload))
+}
+
+func taskMessage(taskID, action string, payload any) map[string]any {
+	return map[string]any{
+		"header":  map[string]any{"action": action, "task_id": taskID, "streaming": "duplex"},
+		"payload": payload,
+	}
+}
+
+func (c *ttsClient) readTask(ctx context.Context, connection *websocket.Conn, taskID string) (string, []byte, error) {
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(c.config.Timeout)); err != nil {
+		return "", nil, err
+	}
+	kind, data, err := connection.ReadMessage()
+	if ctx.Err() != nil {
+		return "", nil, ctx.Err()
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	if kind == websocket.BinaryMessage {
+		if len(data) == 0 || len(data)%2 != 0 || len(data) > maxTTSPCMDeltaBytes {
+			return "", nil, errors.New("CosyVoice TTS returned invalid PCM")
+		}
+		return "audio", data, nil
+	}
+	var event struct {
+		Header struct {
+			Event     string `json:"event"`
+			TaskID    string `json:"task_id"`
+			ErrorCode string `json:"error_code"`
+		} `json:"header"`
+	}
+	if kind != websocket.TextMessage || json.Unmarshal(data, &event) != nil || event.Header.TaskID != taskID {
+		return "", nil, errors.New("CosyVoice TTS returned invalid task event")
+	}
+	if event.Header.Event == "task-failed" {
+		return "", nil, fmt.Errorf("CosyVoice TTS provider_code=%q", event.Header.ErrorCode)
+	}
+	return event.Header.Event, nil, nil
 }
 
 func ttsRuneUnits(r rune) int {
@@ -223,59 +257,13 @@ func ttsRuneUnits(r rune) int {
 	return 1
 }
 
-func (c *ttsClient) waitFor(ctx context.Context, connection *websocket.Conn, wanted string, output any) error {
-	for {
-		var raw json.RawMessage
-		if err := c.readJSON(ctx, connection, &raw); err != nil {
-			return err
-		}
-		var envelope struct {
-			Type  string `json:"type"`
-			Error struct {
-				Code    string `json:"code"`
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if err := json.Unmarshal(raw, &envelope); err != nil {
-			return err
-		}
-		if envelope.Type == "error" {
-			return fmt.Errorf("Qwen TTS error code=%q message=%q", envelope.Error.Code, envelope.Error.Message)
-		}
-		if envelope.Type != wanted {
-			continue
-		}
-		if output != nil {
-			return json.Unmarshal(raw, output)
-		}
-		return nil
-	}
-}
-
-func (c *ttsClient) writeJSON(connection *websocket.Conn, value any) error {
-	if err := connection.SetWriteDeadline(time.Now().Add(c.config.Timeout)); err != nil {
-		return err
-	}
-	return connection.WriteJSON(value)
-}
-
-func (c *ttsClient) readJSON(ctx context.Context, connection *websocket.Conn, output any) error {
-	if err := connection.SetReadDeadline(time.Now().Add(c.config.Timeout)); err != nil {
-		return err
-	}
-	if err := connection.ReadJSON(output); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return err
-	}
-	return nil
-}
-
 func eventID() string {
 	var value [16]byte
 	if _, err := rand.Read(value[:]); err != nil {
-		return fmt.Sprintf("event-%d", time.Now().UnixNano())
+		panic("system random source unavailable")
 	}
-	return "event-" + hex.EncodeToString(value[:])
+	value[6] = (value[6] & 0x0f) | 0x40
+	value[8] = (value[8] & 0x3f) | 0x80
+	encoded := hex.EncodeToString(value[:])
+	return encoded[:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:]
 }

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"strings"
 	"time"
 )
@@ -77,5 +76,8 @@ func (c Config) compatibleBaseURL() string {
 }
 
 func (c Config) ttsURL() string {
-	return "wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=" + url.QueryEscape(c.TTSModel)
+	if c.WorkspaceID != "" {
+		return "wss://" + c.WorkspaceID + ".cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"
+	}
+	return "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 }

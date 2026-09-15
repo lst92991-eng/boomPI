@@ -30,10 +30,10 @@ func TestRealtimeASRStreamsAudioBeforeCommit(t *testing.T) {
 		t.Fatalf("open realtime ASR: %v", err)
 	}
 	defer stream.Close()
-	if err := stream.Append([]byte{1, 2, 3, 4}); err != nil {
+	if err := stream.Append(ctx, []byte{1, 2, 3, 4}); err != nil {
 		t.Fatalf("append first PCM: %v", err)
 	}
-	if err := stream.Append([]byte{5, 6, 7, 8}); err != nil {
+	if err := stream.Append(ctx, []byte{5, 6, 7, 8}); err != nil {
 		t.Fatalf("append second PCM: %v", err)
 	}
 	transcript, err := stream.Commit(ctx)
@@ -92,6 +92,10 @@ func TestRealtimeASRHandshakeObservesContextCancellation(t *testing.T) {
 }
 
 func serveRealtimeASR(response http.ResponseWriter, request *http.Request) error {
+	return serveRealtimeASRWithResult(response, request, false)
+}
+
+func serveRealtimeASRWithResult(response http.ResponseWriter, request *http.Request, fail bool) error {
 	if request.Header.Get("Authorization") != "Bearer test-key" ||
 		request.Header.Get("OpenAI-Beta") != "realtime=v1" {
 		return fmt.Errorf("unexpected authentication headers")
@@ -154,6 +158,9 @@ func serveRealtimeASR(response http.ResponseWriter, request *http.Request) error
 	}); err != nil {
 		return err
 	}
+	if fail {
+		return connection.WriteJSON(map[string]any{"type": "conversation.item.input_audio_transcription.failed", "error": map[string]any{"code": "test_failure"}})
+	}
 	if err := connection.WriteJSON(map[string]any{
 		"type":       "conversation.item.input_audio_transcription.completed",
 		"transcript": "测试成功",
@@ -161,4 +168,35 @@ func serveRealtimeASR(response http.ResponseWriter, request *http.Request) error
 		return err
 	}
 	return connection.WriteJSON(map[string]any{"type": "session.finished"})
+}
+
+func TestRealtimeASRRejectsInputAfterCommitAndHonorsCanceledAppend(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = serveRealtimeASR(w, r) }))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stream, err := openRealtimeASRAt(ctx, Config{APIKey: "test-key", Timeout: time.Second}, strings.Replace(server.URL, "http://", "ws://", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	stopped, stop := context.WithCancel(ctx)
+	stop()
+	if err := stream.Append(stopped, []byte{9, 0}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled append: %v", err)
+	}
+	for _, frame := range [][]byte{{1, 2, 3, 4}, {5, 6, 7, 8}} {
+		if err := stream.Append(ctx, frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := stream.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Append(ctx, []byte{9, 0}); err == nil {
+		t.Fatal("accepted audio after END")
+	}
+	if _, err := stream.Commit(ctx); err == nil {
+		t.Fatal("accepted a second END")
+	}
 }

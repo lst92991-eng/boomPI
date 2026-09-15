@@ -1,11 +1,19 @@
-/// @file Mode1 声卡配置及 ALSA period 读写；语音算法和重采样不进入本模块。
+/**
+ * @file alsa_audio.cpp
+ * @brief Mode1 声卡配置及 ALSA period 读写、恢复和中断。
+ *
+ * 启动先查询真实 card → 找到 Mode1 mixer 枚举 → 切换并重新 open → 严格协商 PCM。
+ * 运行时输入交给 AudioPipeline 做转换/3A，输出已经由后端完成双声道复制。
+ * 采集恢复必须报告断点；播放恢复记录 XRUN 并续写剩余部分，不回放已接收的前缀。
+ */
 #include "alsa_audio.h"
 
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 
-#include "boompi/audio/board_voice_profile.h"
+#include "board_voice_profile.h"
+#include "boompi/audio/audio_format.h"
 
 namespace boompi::platform::rv1106 {
 namespace {
@@ -18,6 +26,7 @@ constexpr snd_pcm_uframes_t kPlaybackBufferPeriods = 4U;
 constexpr const char* kLoopbackControl = "I2STDM Digital Loopback Mode";
 constexpr const char* kLoopbackMode = "Mode1";
 
+/** @brief 打开硬件格式直通 PCM；返回 ALSA 状态码，句柄由 AlsaAudio 生命周期负责。 */
 int OpenPcmHandle(const std::string& name, snd_pcm_stream_t stream,
                   snd_pcm_t** output) noexcept {
   // 禁止 ALSA plug 层静默改采样率、通道和格式；硬件契约不匹配时立即暴露错误。
@@ -26,10 +35,15 @@ int OpenPcmHandle(const std::string& name, snd_pcm_stream_t stream,
   return snd_pcm_open(output, name.c_str(), stream, flags);
 }
 
+/**
+ * @brief 固定硬件格式、period、buffer 与启动门限，协商偏离契约则拒绝运行。
+ * @param stage 输出失败阶段的静态文本，供 Open 与 ALSA 错误码一起写诊断。
+ * @return 非负为成功，负值保留 ALSA 错误语义。
+ */
 int ConfigurePcm(snd_pcm_t* pcm, snd_pcm_stream_t stream, unsigned channels,
                  const char** stage) noexcept {
   // capture/playback 共用 48 kHz/S16_LE/20 ms period，只有通道数与缓冲 period 数不同。
-  // 每一步更新 stage，使初始化失败日志能指向准确的 ALSA 协商阶段。
+  // 按硬件格式、缓冲、软件门限三组推进，短路后保留首个 ALSA 错误。
   snd_pcm_hw_params_t* hw = nullptr;
   snd_pcm_hw_params_alloca(&hw);
   unsigned rate = audio::VoiceFrameContract::capture_rate_hz;
@@ -39,73 +53,41 @@ int ConfigurePcm(snd_pcm_t* pcm, snd_pcm_stream_t stream, unsigned channels,
   unsigned period_count = static_cast<unsigned>(buffer_periods);
   snd_pcm_uframes_t buffer = buffer_periods * kCapture48Frames;
   int direction = 0;
-  *stage = "ALSA hw params any";
-  int rc = snd_pcm_hw_params_any(pcm, hw);
-  if (rc >= 0) {
-    *stage = "ALSA interleaved access";
-    rc = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
-  }
-  if (rc >= 0) {
-    *stage = "ALSA S16 format";
-    rc = snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE);
-  }
-  if (rc >= 0) {
-    *stage = "ALSA channel count";
-    rc = snd_pcm_hw_params_set_channels(pcm, hw, channels);
-  }
-  if (rc >= 0) {
-    *stage = "ALSA 48 kHz rate";
-    rc = snd_pcm_hw_params_set_rate(pcm, hw, rate, 0);
-  }
-  if (rc >= 0) {
-    *stage = "ALSA period size";
-    rc = snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, &direction);
+  *stage = "ALSA hardware format and buffer";
+  int rc = 0;
+  if ((rc = snd_pcm_hw_params_any(pcm, hw)) < 0 ||
+      (rc = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0 ||
+      (rc = snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE)) < 0 ||
+      (rc = snd_pcm_hw_params_set_channels(pcm, hw, channels)) < 0 ||
+      (rc = snd_pcm_hw_params_set_rate(pcm, hw, rate, 0)) < 0 ||
+      (rc = snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, &direction)) < 0) {
+    return rc;
   }
   direction = 0;
-  if (rc >= 0) {
-    *stage = "ALSA period count";
-    rc = snd_pcm_hw_params_set_periods_near(pcm, hw, &period_count, &direction);
-  }
-  if (rc >= 0) {
-    *stage = "ALSA buffer size";
-    rc = snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer);
-  }
-  if (rc >= 0) {
-    *stage = "ALSA apply hw params";
-    rc = snd_pcm_hw_params(pcm, hw);
-  }
-  if (rc < 0) {
+  if ((rc = snd_pcm_hw_params_set_periods_near(pcm, hw, &period_count, &direction)) < 0 ||
+      (rc = snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer)) < 0 ||
+      (rc = snd_pcm_hw_params(pcm, hw)) < 0) {
     return rc;
   }
   if (period != kCapture48Frames || period_count != buffer_periods ||
       buffer != buffer_periods * kCapture48Frames) {
     // *_near 允许驱动协商相邻值；产品算法依赖严格 20 ms，协商结果必须再次验证。
-    std::fprintf(stderr, "boompi-client: ALSA negotiated period=%lu periods=%u buffer=%lu\n",
-                 static_cast<unsigned long>(period), period_count,
-                 static_cast<unsigned long>(buffer));
     *stage = "ALSA exact period/buffer contract";
     return -EINVAL;
   }
   snd_pcm_sw_params_t* sw = nullptr;
   snd_pcm_sw_params_alloca(&sw);
-  *stage = "ALSA current software params";
-  rc = snd_pcm_sw_params_current(pcm, sw);
-  if (rc >= 0) {
-    rc = snd_pcm_sw_params_set_avail_min(pcm, sw, kCapture48Frames);
-  }
-  // capture 有一个 frame 即启动；playback 先在内核积累 60 ms，降低首播 XRUN 概率。
+  *stage = "ALSA software threshold";
+  // 采集收到一个 frame 即启动；播放先在声卡中积累 60 ms。
   const snd_pcm_uframes_t start = stream == SND_PCM_STREAM_CAPTURE ? 1U : 3U * kCapture48Frames;
-  if (rc >= 0) {
-    rc = snd_pcm_sw_params_set_start_threshold(pcm, sw, start);
+  if ((rc = snd_pcm_sw_params_current(pcm, sw)) < 0 ||
+      (rc = snd_pcm_sw_params_set_avail_min(pcm, sw, kCapture48Frames)) < 0 ||
+      (rc = snd_pcm_sw_params_set_start_threshold(pcm, sw, start)) < 0 ||
+      (rc = snd_pcm_sw_params(pcm, sw)) < 0) {
+    return rc;
   }
-  if (rc >= 0) {
-    rc = snd_pcm_sw_params(pcm, sw);
-  }
-  if (rc >= 0) {
-    *stage = "ALSA PCM prepare";
-    rc = snd_pcm_prepare(pcm);
-  }
-  return rc;
+  *stage = "ALSA PCM prepare";
+  return snd_pcm_prepare(pcm);
 }
 
 void SetLoopbackId(snd_ctl_elem_id_t* id) noexcept {
@@ -114,6 +96,7 @@ void SetLoopbackId(snd_ctl_elem_id_t* id) noexcept {
   snd_ctl_elem_id_set_name(id, kLoopbackControl);
 }
 
+/** @brief 打开指定 card 的 Mode1 控件并校验形状；失败时关闭 control 防止泄漏。 */
 int OpenLoopbackControl(int card, snd_ctl_t** control, snd_ctl_elem_id_t* id,
                         snd_ctl_elem_info_t* info) noexcept {
   // Mode1 必须是单值枚举控件；布局异常时拒绝继续，避免把未知通道送入 AEC。
@@ -137,6 +120,7 @@ int OpenLoopbackControl(int card, snd_ctl_t** control, snd_ctl_elem_id_t* id,
   return rc;
 }
 
+/// 只在读取成功时写出枚举值，调用方不能把默认值误当成设备已确认的模式。
 int ReadLoopbackValue(snd_ctl_t* control, snd_ctl_elem_id_t* id, unsigned* output) noexcept {
   snd_ctl_elem_value_t* value = nullptr;
   snd_ctl_elem_value_alloca(&value);
@@ -148,6 +132,7 @@ int ReadLoopbackValue(snd_ctl_t* control, snd_ctl_elem_id_t* id, unsigned* outpu
   return rc;
 }
 
+/** @brief 写 mixer 后读回校验；写入返回成功但实际模式不符时转成 -EIO。 */
 int WriteLoopbackValue(snd_ctl_t* control, snd_ctl_elem_id_t* id, unsigned target) noexcept {
   snd_ctl_elem_value_t* value = nullptr;
   snd_ctl_elem_value_alloca(&value);
@@ -161,6 +146,7 @@ int WriteLoopbackValue(snd_ctl_t* control, snd_ctl_elem_id_t* id, unsigned targe
   return rc >= 0 && actual != target ? -EIO : rc;
 }
 
+/** @brief 由采集 PCM 找到同一张声卡并设置 Mode1；所有路径在返回前释放 control。 */
 int ConfigureLoopbackMode1(snd_pcm_t* capture) noexcept {
   // 先从已打开 PCM 查询真实声卡，再按枚举文本选择 Mode1，兼容枚举序号变化。
   snd_pcm_info_t* pcm_info = nullptr;
@@ -204,9 +190,10 @@ int ConfigureLoopbackMode1(snd_pcm_t* capture) noexcept {
 
 }  // namespace
 
-void AlsaAudio::SetError(const char* stage, int code) noexcept {
+bool AlsaAudio::Fail(const char* stage, int code) noexcept {
   std::lock_guard<std::mutex> lock(error_mutex_);
   std::snprintf(error_.data(), error_.size(), "%s: %s", stage, snd_strerror(code));
+  return false;
 }
 
 bool AlsaAudio::Open(const std::string& capture_name,
@@ -239,13 +226,11 @@ bool AlsaAudio::Open(const std::string& capture_name,
   }
   if (rc < 0) {
     Close();
-    SetError(stage, rc);
-    return false;
+    return Fail(stage, rc);
   }
 
-  capture_interrupted_.store(false, std::memory_order_release);
-  playback_interrupted_.store(false, std::memory_order_release);
-  playback_xruns_.store(0U, std::memory_order_release);
+  capture_interrupted_.store(false);
+  playback_interrupted_.store(false);
   std::lock_guard<std::mutex> lock(error_mutex_);
   error_.fill('\0');
   return true;
@@ -266,7 +251,7 @@ bool AlsaAudio::ReadCapture20ms(std::int16_t* const output,
       offset += static_cast<std::size_t>(rc);
       continue;
     }
-    if (capture_interrupted_.load(std::memory_order_acquire)) {
+    if (capture_interrupted_.load()) {
       return false;
     }
     if (rc == -EINTR) {
@@ -275,8 +260,7 @@ bool AlsaAudio::ReadCapture20ms(std::int16_t* const output,
     if (rc == -EPIPE || rc == -ESTRPIPE) {
       const int recovered = snd_pcm_recover(capture_pcm_, static_cast<int>(rc), 1);
       if (recovered < 0) {
-        SetError("ALSA capture recovery", recovered);
-        return false;
+        return Fail("ALSA capture recovery", recovered);
       }
       std::fprintf(stderr, "boompi-client: ALSA capture discontinuity recovered; error=%s\n",
                    snd_strerror(static_cast<int>(rc)));
@@ -284,8 +268,7 @@ bool AlsaAudio::ReadCapture20ms(std::int16_t* const output,
       *discontinuity = true;
       continue;
     }
-    SetError("ALSA capture read", static_cast<int>(rc));
-    return false;
+    return Fail("ALSA capture read", static_cast<int>(rc));
   }
   return true;
 }
@@ -294,7 +277,7 @@ bool AlsaAudio::WritePlayback(const std::int16_t* stereo, std::size_t frames) no
   std::size_t offset = 0U;
   while (offset < frames) {
     // ALSA 允许部分写入；offset 保证每个 sample 只进入硬件时间线一次。
-    if (playback_interrupted_.load(std::memory_order_acquire)) {
+    if (playback_interrupted_.load()) {
       return false;
     }
     const snd_pcm_sframes_t rc =
@@ -303,7 +286,7 @@ bool AlsaAudio::WritePlayback(const std::int16_t* stereo, std::size_t frames) no
       offset += static_cast<std::size_t>(rc);
       continue;
     }
-    if (playback_interrupted_.load(std::memory_order_acquire)) {
+    if (playback_interrupted_.load()) {
       return false;
     }
     if (rc == -EINTR) {
@@ -312,10 +295,8 @@ bool AlsaAudio::WritePlayback(const std::int16_t* stereo, std::size_t frames) no
     if (rc == -EPIPE || rc == -ESTRPIPE) {
       const int recovered = snd_pcm_recover(playback_pcm_, static_cast<int>(rc), 1);
       if (recovered < 0) {
-        SetError("ALSA playback recovery", recovered);
-        return false;
+        return Fail("ALSA playback recovery", recovered);
       }
-      playback_xruns_.fetch_add(1U, std::memory_order_relaxed);
       // snd_pcm_writei 已接受的前缀已经进入同一条媒体时间线。恢复后只续写剩余
       // 样本；从零重写会在一次 20 ms 帧内制造可听见的重复前缀。
       std::fprintf(stderr,
@@ -324,8 +305,7 @@ bool AlsaAudio::WritePlayback(const std::int16_t* stereo, std::size_t frames) no
                    snd_strerror(static_cast<int>(rc)), offset);
       continue;
     }
-    SetError("ALSA playback write", static_cast<int>(rc));
-    return false;
+    return Fail("ALSA playback write", static_cast<int>(rc));
   }
   return true;
 }
@@ -333,10 +313,9 @@ bool AlsaAudio::WritePlayback(const std::int16_t* stereo, std::size_t frames) no
 bool AlsaAudio::PreparePlayback() noexcept {
   const int prepared = snd_pcm_prepare(playback_pcm_);
   if (prepared < 0) {
-    SetError("ALSA playback prepare", prepared);
-    return false;
+    return Fail("ALSA playback prepare", prepared);
   }
-  playback_interrupted_.store(false, std::memory_order_release);
+  playback_interrupted_.store(false);
   return true;
 }
 
@@ -346,15 +325,12 @@ void AlsaAudio::ClearError() noexcept {
 }
 
 bool AlsaAudio::DrainPlayback() noexcept {
+  // END表示不再写入；等待尾音，下一轮仅在PreparePlayback中准备一次。
   const int drained = snd_pcm_drain(playback_pcm_);
-  if (drained < 0 && !playback_interrupted()) {
-    SetError("ALSA playback drain", drained);
+  if (drained < 0 && !WasPlaybackInterrupted()) {
+    Fail("ALSA playback drain", drained);
   }
-  const int prepared = snd_pcm_prepare(playback_pcm_);
-  if (prepared < 0 && !playback_interrupted()) {
-    SetError("ALSA playback prepare", prepared);
-  }
-  return drained >= 0 && prepared >= 0;
+  return drained >= 0;
 }
 
 void AlsaAudio::DropPlayback() noexcept {
@@ -362,12 +338,9 @@ void AlsaAudio::DropPlayback() noexcept {
     return;
   }
   const int dropped = snd_pcm_drop(playback_pcm_);
-  const int prepared = snd_pcm_prepare(playback_pcm_);
+  // 此处由播放线程收尾；下一轮只在PreparePlayback准备，避免重复初始化与取消交错。
   if (dropped < 0 && dropped != -EBADFD) {
-    SetError("ALSA playback drop", dropped);
-  }
-  if (prepared < 0) {
-    SetError("ALSA playback prepare", prepared);
+    Fail("ALSA playback drop", dropped);
   }
 }
 
@@ -375,10 +348,11 @@ void AlsaAudio::InterruptCapture() noexcept {
   if (capture_pcm_ == nullptr) {
     return;
   }
-  capture_interrupted_.store(true, std::memory_order_release);
+  // 先记录退出意图，再 abort 正在等待的 readi；Close 在读线程退出后才释放句柄。
+  capture_interrupted_.store(true);
   const int aborted = snd_pcm_abort(capture_pcm_);
   if (aborted < 0) {
-    SetError("ALSA capture interrupt", aborted);
+    Fail("ALSA capture interrupt", aborted);
   }
 }
 
@@ -387,22 +361,18 @@ void AlsaAudio::InterruptPlayback() noexcept {
     return;
   }
   // 先发布 interrupted，再解除阻塞；调用方因此不会把用户取消误判为硬件故障。
-  playback_interrupted_.store(true, std::memory_order_release);
+  playback_interrupted_.store(true);
   const int dropped = snd_pcm_drop(playback_pcm_);
   if (dropped < 0 && dropped != -EBADFD) {
-    SetError("ALSA playback interrupt", dropped);
+    Fail("ALSA playback interrupt", dropped);
   }
 }
 
-bool AlsaAudio::playback_interrupted() const noexcept {
-  return playback_interrupted_.load(std::memory_order_acquire);
+bool AlsaAudio::WasPlaybackInterrupted() const noexcept {
+  return playback_interrupted_.load();
 }
 
-std::uint64_t AlsaAudio::playback_xruns() const noexcept {
-  return playback_xruns_.load(std::memory_order_acquire);
-}
-
-std::string AlsaAudio::last_error() const {
+std::string AlsaAudio::LastError() const {
   std::lock_guard<std::mutex> lock(error_mutex_);
   return error_.data();
 }

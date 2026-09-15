@@ -17,32 +17,18 @@ import (
 
 const (
 	realtimeASRModelName       = "qwen3-asr-flash-realtime"
-	realtimeASRQueueFrames     = 32 // A bounded 640 ms bridge at 20 ms/frame.
 	realtimeASRMaxMessageBytes = 256 * 1024
 )
 
 const realtimeASRConnectTimeout = 10 * time.Second
 
-var errRealtimeASRBackpressure = errors.New("Qwen realtime ASR queue is full")
-
-type realtimeASRCommand struct {
-	audio  []byte
-	finish bool
-}
-
-// asrRealtimeStream owns one provider session and therefore one utterance.
-// Device audio enters a bounded queue so a slow provider write never blocks
-// the device WebSocket reader or grows memory without limit.
+// 每轮一个云端连接；Actor 顺序调用 Append，Commit 接续读取最终结果。
+// 网络写入服从调用方期限，不再拥有另一份 PCM 队列或 writer goroutine。
 type asrRealtimeStream struct {
 	config     Config
 	connection *websocket.Conn
-	commands   chan realtimeASRCommand
-	stopped    chan struct{}
-	writerDone chan error
-
-	mu           sync.Mutex
-	finishQueued bool
-	closeOnce    sync.Once
+	finished   bool
+	closeOnce  sync.Once
 }
 
 type realtimeASREvent struct {
@@ -105,9 +91,6 @@ func openRealtimeASRAt(ctx context.Context, config Config, endpoint string) (*as
 	stream := &asrRealtimeStream{
 		config:     setupConfig,
 		connection: connection,
-		commands:   make(chan realtimeASRCommand, realtimeASRQueueFrames),
-		stopped:    make(chan struct{}),
-		writerDone: make(chan error, 1),
 	}
 	connection.SetReadLimit(realtimeASRMaxMessageBytes)
 	if err := stream.waitFor(connectCtx, "session.created"); err != nil {
@@ -127,7 +110,7 @@ func openRealtimeASRAt(ctx context.Context, config Config, endpoint string) (*as
 			"turn_detection": nil,
 		},
 	}
-	if err := stream.writeJSON(update); err != nil {
+	if err := stream.writeJSON(connectCtx, update); err != nil {
 		stream.Close()
 		return nil, err
 	}
@@ -136,70 +119,44 @@ func openRealtimeASRAt(ctx context.Context, config Config, endpoint string) (*as
 		return nil, err
 	}
 	stream.config = config
-	go stream.writeLoop()
 	return stream, nil
 }
 
 func (c Config) asrRealtimeURL() string {
 	if strings.TrimSpace(c.WorkspaceID) == "" {
 		return fmt.Sprintf("wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=%s",
-			url.QueryEscape(realtimeASRModelName))
+			url.QueryEscape(c.ASRModel))
 	}
 	return fmt.Sprintf("wss://%s.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime?model=%s",
-		c.WorkspaceID, url.QueryEscape(realtimeASRModelName))
+		c.WorkspaceID, url.QueryEscape(c.ASRModel))
 }
 
-func (s *asrRealtimeStream) Append(pcm []byte) error {
+func (s *asrRealtimeStream) Append(ctx context.Context, pcm []byte) error {
 	if len(pcm) == 0 || len(pcm)%2 != 0 {
 		return errors.New("realtime ASR PCM must contain whole 16-bit samples")
 	}
-	s.mu.Lock()
-	finished := s.finishQueued
-	s.mu.Unlock()
-	if finished {
+	if s.finished {
 		return errors.New("realtime ASR input is already committed")
 	}
-	copyPCM := append([]byte(nil), pcm...)
-	select {
-	case s.commands <- realtimeASRCommand{audio: copyPCM}:
-		return nil
-	case err := <-s.writerDone:
-		if err == nil {
-			err = errors.New("realtime ASR writer stopped")
-		}
-		return err
-	case <-s.stopped:
-		return errors.New("realtime ASR stream is closed")
-	default:
-		return errRealtimeASRBackpressure
-	}
+	return s.writeJSON(ctx, map[string]any{
+		"event_id": eventID(), "type": "input_audio_buffer.append",
+		"audio": base64.StdEncoding.EncodeToString(pcm),
+	})
 }
 
 func (s *asrRealtimeStream) Commit(ctx context.Context) (string, error) {
 	if ctx == nil {
 		return "", errors.New("context is required")
 	}
-	s.mu.Lock()
-	if s.finishQueued {
-		s.mu.Unlock()
+	if s.finished {
 		return "", errors.New("realtime ASR input is already committed")
 	}
-	s.finishQueued = true
-	s.mu.Unlock()
-
-	select {
-	case s.commands <- realtimeASRCommand{finish: true}:
-	case err := <-s.writerDone:
-		if err == nil {
-			err = errors.New("realtime ASR writer ended before commit")
+	s.finished = true
+	for _, kind := range []string{"input_audio_buffer.commit", "session.finish"} {
+		if err := s.writeJSON(ctx, map[string]any{"event_id": eventID(), "type": kind}); err != nil {
+			return "", err
 		}
-		return "", err
-	case <-ctx.Done():
-		return "", ctx.Err()
-	case <-s.stopped:
-		return "", errors.New("realtime ASR stream is closed")
 	}
-
 	watchDone := make(chan struct{})
 	go func() {
 		select {
@@ -214,13 +171,7 @@ func (s *asrRealtimeStream) Commit(ctx context.Context) (string, error) {
 	for {
 		event, err := s.readEvent(ctx)
 		if err != nil {
-			select {
-			case writerErr := <-s.writerDone:
-				if writerErr != nil {
-					return "", writerErr
-				}
-			default:
-			}
+
 			return "", err
 		}
 		switch event.Type {
@@ -234,45 +185,6 @@ func (s *asrRealtimeStream) Commit(ctx context.Context) (string, error) {
 				return "", errors.New("Qwen realtime ASR returned no transcript")
 			}
 			return transcript, nil
-		}
-	}
-}
-
-func (s *asrRealtimeStream) writeLoop() {
-	for {
-		select {
-		case <-s.stopped:
-			s.writerDone <- context.Canceled
-			return
-		case command := <-s.commands:
-			if command.finish {
-				err := s.writeJSON(map[string]any{
-					"event_id": eventID(), "type": "input_audio_buffer.commit",
-				})
-				if err == nil {
-					err = s.writeJSON(map[string]any{
-						"event_id": eventID(), "type": "session.finish",
-					})
-				}
-				s.writerDone <- err
-				if err != nil {
-					_ = s.connection.Close()
-				}
-				return
-			}
-			err := s.writeJSON(map[string]any{
-				"event_id": eventID(),
-				"type":     "input_audio_buffer.append",
-				"audio":    base64.StdEncoding.EncodeToString(command.audio),
-			})
-			for i := range command.audio {
-				command.audio[i] = 0
-			}
-			if err != nil {
-				s.writerDone <- err
-				_ = s.connection.Close()
-				return
-			}
 		}
 	}
 }
@@ -320,16 +232,29 @@ func (s *asrRealtimeStream) readEvent(ctx context.Context) (realtimeASREvent, er
 	return event, nil
 }
 
-func (s *asrRealtimeStream) writeJSON(value any) error {
-	if err := s.connection.SetWriteDeadline(time.Now().Add(s.config.Timeout)); err != nil {
+func (s *asrRealtimeStream) writeJSON(ctx context.Context, value any) error {
+	if ctx == nil {
+		return errors.New("context is required")
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return s.connection.WriteJSON(value)
+	deadline := time.Now().Add(s.config.Timeout)
+	if until, ok := ctx.Deadline(); ok && until.Before(deadline) {
+		deadline = until
+	}
+	if err := s.connection.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	stop := context.AfterFunc(ctx, s.Close)
+	defer stop()
+	err := s.connection.WriteJSON(value)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 func (s *asrRealtimeStream) Close() {
-	s.closeOnce.Do(func() {
-		close(s.stopped)
-		_ = s.connection.Close()
-	})
+	s.closeOnce.Do(func() { _ = s.connection.Close() })
 }

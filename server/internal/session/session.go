@@ -16,7 +16,6 @@ const (
 	// one in the socket reader stay below the 40-frame (800 ms) input budget.
 	commandCapacity          = 34
 	urgentCapacity           = 2
-	eventCapacity            = 8
 	providerOperationTimeout = 700 * time.Millisecond
 )
 
@@ -63,7 +62,7 @@ func Open(ctx context.Context, provider backend.ConversationBackend, cfg backend
 		stop()
 		return nil, errors.New("provider returned nil session")
 	}
-	a := &Actor{provider: session, events: make(chan Event, eventCapacity), wake: make(chan struct{}, 1), done: make(chan struct{}), stop: stop}
+	a := &Actor{provider: session, events: make(chan Event), wake: make(chan struct{}, 1), done: make(chan struct{}), stop: stop}
 	go a.run(actorCtx)
 	return a, nil
 }
@@ -169,15 +168,7 @@ func (a *Actor) run(ctx context.Context) {
 				// Cancel guarantees no more old events after it returns; draining
 				// here is safe before the new generation can produce any output.
 				opCtx, cancel := context.WithTimeout(ctx, providerOperationTimeout)
-				err := a.provider.Cancel(opCtx)
-				if err == nil && cmd.retract {
-					discarder, ok := a.provider.(backend.CompletedResponseDiscarder)
-					if !ok {
-						err = errors.New("provider cannot retract completed response")
-					} else {
-						err = discarder.DiscardLastResponse(opCtx)
-					}
-				}
+				err := a.provider.Cancel(opCtx, cmd.retract)
 				cancel()
 				if err != nil {
 					return
@@ -270,7 +261,7 @@ func validProviderEvent(event backend.ConversationEvent) bool {
 	case backend.EventTextDelta:
 		return len(event.Text) > 0 && len(event.Text) <= 64*1024
 	case backend.EventAudio:
-		return event.SampleRateHz == 24_000 && len(event.PCM) > 0 && len(event.PCM) <= protocol.DownlinkFrameBytes && len(event.PCM)%2 == 0
+		return event.SampleRateHz == 16_000 && len(event.PCM) > 0 && len(event.PCM) <= protocol.DownlinkFrameBytes && len(event.PCM)%2 == 0
 	case backend.EventError:
 		return event.Err != nil
 	}

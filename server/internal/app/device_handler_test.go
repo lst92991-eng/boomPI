@@ -72,7 +72,7 @@ func (s *roundTripSession) Commit(ctx context.Context) error {
 		if len(pcm) >= 4 {
 			pcm[0], pcm[2] = 1, 2
 		}
-		events = append(events, backend.ConversationEvent{Type: backend.EventAudio, ResponseID: id, PCM: pcm, SampleRateHz: 24000})
+		events = append(events, backend.ConversationEvent{Type: backend.EventAudio, ResponseID: id, PCM: pcm, SampleRateHz: 16000})
 	}
 	events = append(events, backend.ConversationEvent{Type: backend.EventDone, ResponseID: id})
 	for _, event := range events {
@@ -84,15 +84,17 @@ func (s *roundTripSession) Commit(ctx context.Context) error {
 	}
 	return nil
 }
-func (s *roundTripSession) Cancel(ctx context.Context) error {
+func (s *roundTripSession) Cancel(ctx context.Context, retract bool) error {
+	if retract {
+		s.discards.Add(1)
+	}
 	s.cancels.Add(1)
 	if s.cancelHook != nil {
 		return s.cancelHook(ctx)
 	}
 	return nil
 }
-func (s *roundTripSession) DiscardLastResponse(context.Context) error { s.discards.Add(1); return nil }
-func (s *roundTripSession) Events() <-chan backend.ConversationEvent  { return s.events }
+func (s *roundTripSession) Events() <-chan backend.ConversationEvent { return s.events }
 func (s *roundTripSession) Close() error {
 	s.once.Do(func() { close(s.closed); close(s.events) })
 	return nil
@@ -141,7 +143,7 @@ func startDeviceTest(t *testing.T, provider *roundTripBackend) (*websocket.Conn,
 
 func helloDevice(t *testing.T, c *websocket.Conn) {
 	t.Helper()
-	writeControl(t, c, protocol.Control{Type: "hello", DeviceID: testDeviceID, Token: testDeviceToken})
+	writeControl(t, c, protocol.Control{Type: "hello", SampleRate: 16000, DeviceID: testDeviceID, Token: testDeviceToken})
 	kind, data, err := readWire(c)
 	if err != nil {
 		t.Fatal(err)
@@ -221,7 +223,7 @@ func readReply(t *testing.T, c *websocket.Conn, generation uint32) ([]protocol.P
 }
 
 func TestV2StreamingRoundTripAndTerminalPCM(t *testing.T) {
-	for _, audioBytes := range []int{0, 2, 4, 960, 962, 960 * 6} {
+	for _, audioBytes := range []int{0, 2, 4, 640, 642, 640 * 6} {
 		t.Run(fmt.Sprint(audioBytes), func(t *testing.T) {
 			provider := newRoundTripBackend()
 			provider.session.audioBytes = audioBytes
@@ -313,7 +315,7 @@ func TestV2RejectsGapsDuplicateStartAndPCMWithoutStart(t *testing.T) {
 func TestV2AuthenticationRunsBeforeProviderOpen(t *testing.T) {
 	provider := newRoundTripBackend()
 	c, _ := startDeviceTest(t, provider)
-	writeControl(t, c, protocol.Control{Type: "hello", DeviceID: testDeviceID, Token: "wrong-token"})
+	writeControl(t, c, protocol.Control{Type: "hello", SampleRate: 16000, DeviceID: testDeviceID, Token: "wrong-token"})
 	if _, _, err := readWire(c); err == nil {
 		t.Fatal("unauthenticated connection accepted")
 	}

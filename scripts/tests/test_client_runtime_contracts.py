@@ -53,9 +53,8 @@ class ClientRuntimeContracts(unittest.TestCase):
         self.assertNotIn("-re -f rawvideo", source)
         self.assertIn("-framerate 25", source)
         self.assertIn("fps=5,scale=320:180", source)
-        self.assertIn("++dropped_frames;", source)
 
-    def test_camera_error_discards_pixels_and_reports_load(self):
+    def test_camera_error_discards_pixels(self):
         camera = self.read("client/src/ui/camera_capture.cpp")
         screen = self.read("client/src/ui/lvgl_screen.cpp")
         error_start = camera.index("void CameraCapture::Fail")
@@ -64,8 +63,6 @@ class ClientRuntimeContracts(unittest.TestCase):
         self.assertIn("ClearFrame();", error_path)
         self.assertIn("frame_ready_ = false", camera)
         self.assertIn("frame_.fill(0U)", camera)
-        self.assertIn("pipeline_fps=%u.%u", camera)
-        self.assertIn("load1=%.2f", camera)
         self.assertIn("lv_obj_add_flag(camera_image, LV_OBJ_FLAG_HIDDEN)", screen)
 
 

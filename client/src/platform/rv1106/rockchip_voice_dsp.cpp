@@ -1,4 +1,11 @@
-/// @file 对匹配 BSP 的 librkaudio 3A ABI 做固定参数、固定帧适配。
+/**
+ * @file rockchip_voice_dsp.cpp
+ * @brief 对匹配 BSP 的 librkaudio 3A ABI 做固定参数、固定帧适配。
+ *
+ * Open 建立参数树与句柄并预置一帧静音；Process 将 320 个双麦/参考采样时刻
+ * 顺序补齐 256 样本输入块，vendor 直接写输出 FIFO，再取走 320 样本。
+ * PCM 与输入元数据一起延迟一帧。运行期由采集线程独占，不承担播放或网络控制。
+ */
 #include "boompi/platform/rv1106/rockchip_voice_dsp.h"
 
 #include <algorithm>
@@ -12,12 +19,12 @@
 namespace boompi::platform::rv1106 {
 namespace {
 
-// 以下格式由当前 BSP 的 librkaudio ABI 与已验证模型共同约束。
+// 保留当前适配器的16kHz/双麦/单参考契约，修改支持范围需匹配SDK与真板证据。
 constexpr int kSampleRateHz = 16000;
 constexpr int kBitsPerSample = 16;
 constexpr int kMicrophoneChannels = 2;
 constexpr int kReferenceChannels = 1;
-// vendor 每次固定消费 256 samples，产品层仍以 320 samples/20 ms 交付。
+// 当前read_size配置为256，产品层以320 samples/20 ms交付；不据此断言SDK只支持256。
 constexpr int kVendorBlockSamples = 256;
 constexpr int kVendorInputShorts =
     kVendorBlockSamples * (kMicrophoneChannels + kReferenceChannels);
@@ -40,6 +47,7 @@ static_assert(std::is_same<decltype(&rkaudio_preprocess_short), ProcessSignature
 static_assert(std::is_same<decltype(&rkaudio_preprocess_destory), DestroySignature>::value,
               "unexpected rkaudio_preprocess_destory signature");
 static_assert(kBeamformingFeatureMask == 1109, "validated Rockchip 3A profile changed");
+/** @brief 释放完整或部分初始化的参数树；Open 的失败回滚与 Close 共用。 */
 void ReleaseParameters(RKAUDIOParam* const parameters) noexcept {
   // vendor deinit 释放各子参数树，外层 RKAUDIOParam 由本适配器负责 delete。
   if (parameters == nullptr) {
@@ -49,6 +57,11 @@ void ReleaseParameters(RKAUDIOParam* const parameters) noexcept {
   delete parameters;
 }
 
+/**
+ * @brief 根据维护者 profile 建立当前 BSP 的 AEC、波束成形和降噪参数。
+ * 调用方传入零初始化的参数树；任一必要子对象缺失返回 false，外层统一回滚。
+ * feature mask 未启用 vendor AGC，避免与音频硬件或用户增益形成多重自动增益。
+ */
 bool PrepareParameters(RKAUDIOParam* const parameters, const int delay_samples) noexcept {
   // 参数树只在 Open 构造一次；实时 Process 仅使用已验证句柄，不进行配置或分配。
   parameters->model_en = kMainFeatureMask;
@@ -153,67 +166,66 @@ void RockchipVoiceDsp::Close() noexcept {
   ResetFifos(false);
 }
 
-bool RockchipVoiceDsp::Process(const RockchipVoiceFrame16k& mic_left,
-                               const RockchipVoiceFrame16k& mic_right,
-                               const RockchipVoiceFrame16k& reference_left,
-                               RockchipVoiceFrame16k* const output) noexcept {
+bool RockchipVoiceDsp::Process(const audio::CaptureChannels& input,
+                               audio::CleanAudioFrame* const output) noexcept {
   if (output == nullptr) {
     return false;
   }
-  output->fill(0);
-  if (!is_open()) {
+  *output = {};
+  if (!IsOpen()) {
     return false;
   }
-  // 正常状态最多保留 255 个输入 frame，再追加 320 frame 必须能装入固定 FIFO。
-  if (input_count_ > kInputFifoFrames - kRockchipVoiceFrameSamples16k) {
-    return false;
-  }
-  // REF-R 在调用本 API 前已经丢弃；vendor 永远只看到双麦和一个同步参考。
+  // 跨帧余数留在同一个256样本块中；每个输入样本只复制一次，不搬移整帧FIFO。
   for (std::size_t i = 0U; i < kRockchipVoiceFrameSamples16k; ++i) {
-    const std::size_t base = (input_count_ + i) * kVendorInputChannels;
-    input_fifo_[base] = mic_left[i];
-    input_fifo_[base + 1U] = mic_right[i];
-    input_fifo_[base + 2U] = reference_left[i];
-  }
-  input_count_ += kRockchipVoiceFrameSamples16k;
-  while (input_count_ >= kVendorBlockSamples) {
-    // 一个 320-sample 产品帧有时产生一个 vendor block，有时产生两个；余数留到下次。
+    const std::size_t base = input_count_ * kVendorInputChannels;
+    input_block_[base] = input.mic_left[i];
+    input_block_[base + 1U] = input.mic_right[i];
+    input_block_[base + 2U] = input.reference_left[i];
+    if (++input_count_ != kVendorBlockSamples) {
+      continue;
+    }
+    // 先检查剩余容量，再让vendor直接写入，避免独立中转数组与第二次复制。
+    if (output_count_ > kOutputFifoSamples - kVendorBlockSamples) {
+      Close();
+      return false;
+    }
     int wakeup_status = 0;
-    const int result = rkaudio_preprocess_short(
-        handle_, reinterpret_cast<short*>(input_fifo_.data()),
-        reinterpret_cast<short*>(vendor_output_.data()), kVendorInputShorts, &wakeup_status);
-    if (result != kVendorOutputBytes ||
-        output_count_ > kOutputFifoSamples - kVendorBlockSamples) {
+    const int result =
+        rkaudio_preprocess_short(handle_, reinterpret_cast<short*>(input_block_.data()),
+                                 reinterpret_cast<short*>(output_fifo_.data() + output_count_),
+                                 kVendorInputShorts, &wakeup_status);
+    if (result != kVendorOutputBytes) {
       // vendor 返回长度或 FIFO 不变量失效后，继续处理会错位整个音频时间轴。
       Close();
       return false;
     }
-    input_count_ -= kVendorBlockSamples;
-    std::memmove(input_fifo_.data(),
-                 input_fifo_.data() + kVendorBlockSamples * kVendorInputChannels,
-                 input_count_ * kVendorInputChannels * sizeof(std::int16_t));
-    std::copy_n(vendor_output_.data(), kVendorBlockSamples,
-                output_fifo_.data() + output_count_);
+    input_count_ = 0U;
     output_count_ += kVendorBlockSamples;
   }
-  if (output_count_ < output->size()) {
+  if (output_count_ < output->pcm.size()) {
     Close();
     return false;
   }
   // 每次对外稳定取出 320 samples；prime 的静音使输入、输出始终保持固定 20 ms 延迟。
-  std::copy_n(output_fifo_.data(), output->size(), output->data());
-  output_count_ -= output->size();
-  std::memmove(output_fifo_.data(), output_fifo_.data() + output->size(),
+  std::copy_n(output_fifo_.data(), output->pcm.size(), output->pcm.data());
+  output_count_ -= output->pcm.size();
+  std::memmove(output_fifo_.data(), output_fifo_.data() + output->pcm.size(),
                output_count_ * sizeof(std::int16_t));
+  output->metadata = previous_metadata_;
+  if (output->metadata.timestamp_us == 0U) {
+    // 首次输出是预置静音，没有上一帧时刻；用当前观测时刻占位，电平/参考仍保持静音初值。
+    output->metadata.timestamp_us = input.metadata.timestamp_us;
+  }
+  previous_metadata_ = input.metadata;
   return true;
 }
 
 void RockchipVoiceDsp::ResetFifos(const bool prime_output) noexcept {
-  input_fifo_.fill(0);
+  input_block_.fill(0);
   output_fifo_.fill(0);
-  vendor_output_.fill(0);
   input_count_ = 0U;
   output_count_ = prime_output ? kRockchipVoiceFrameSamples16k : 0U;
+  previous_metadata_ = {};
 }
 
 }  // namespace boompi::platform::rv1106

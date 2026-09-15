@@ -4,6 +4,8 @@
  *
  * 只有本翻译单元包含 Snowboy C++ 类型和异常行为；跨模块边界仅传递 POD、PCM
  * 指针与不透明句柄，使旧 ABI 编译选项保持局部生效。
+ * SpeechDetector 的 Detect 每 20 ms 调用 process；返回值表示这次接口调用是否完成，
+ * detection_result 才表示是否命中唤醒词，两种结果必须分别判断。
  */
 #include "snowboy_legacy_bridge.h"
 
@@ -19,10 +21,11 @@ struct BoompiSnowboyLegacyHandle final {
   snowboy::SnowboyDetect* detector;
 };
 
+/** @brief 在旧 ABI 单元内构造模型并校验元数据，成功后把销毁责任交给 destroy。 */
 int boompi_snowboy_legacy_create(const char* resource, const char* model,
                                  const char* sensitivity, float gain,
                                  BoompiSnowboyLegacyHandle** handle) {
-  // 先验证所有 C 输入并清空输出，保证任何失败路径都能由调用者安全 destroy。
+  // 参数检查失败不会写输出；调用方把句柄初始化为空，通过检查后才开始资源创建。
   if (resource == nullptr || *resource == '\0' || model == nullptr || *model == '\0' ||
       sensitivity == nullptr || *sensitivity == '\0' || handle == nullptr) {
     return 0;
@@ -46,6 +49,7 @@ int boompi_snowboy_legacy_create(const char* resource, const char* model,
   }
 }
 
+/** @brief 在创建对象的 ABI 环境中销毁模型；退出前调用方须确保不再并发 reset/process。 */
 void boompi_snowboy_legacy_destroy(BoompiSnowboyLegacyHandle* handle) {
   if (handle == nullptr) {
     return;
@@ -58,6 +62,7 @@ void boompi_snowboy_legacy_destroy(BoompiSnowboyLegacyHandle* handle) {
   delete handle;
 }
 
+/** @brief 清除模型内部跨帧历史，避免上一监听阶段的声音触发下一阶段唤醒。 */
 int boompi_snowboy_legacy_reset(BoompiSnowboyLegacyHandle* handle) {
   if (handle == nullptr || handle->detector == nullptr) {
     return 0;
@@ -69,6 +74,7 @@ int boompi_snowboy_legacy_reset(BoompiSnowboyLegacyHandle* handle) {
   }
 }
 
+/** @brief 仅借用本次 PCM 缓冲；异常转为返回失败，由 SpeechDetector 结束当前处理链。 */
 int boompi_snowboy_legacy_process_s16(BoompiSnowboyLegacyHandle* handle, const int16_t* samples,
                                       uint32_t count, int32_t* result) {
   // INT_MAX 检查保护 Snowboy 的 int 长度参数；调用方通常传入固定 320 samples。

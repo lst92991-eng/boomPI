@@ -1,4 +1,11 @@
-#include "audio_backend.h"
+/**
+ * @file audio_pipeline.cpp
+ * @brief 用条件变量和可控故障复现板端 I/O 时序，驱动真实音频引擎回归。
+ *
+ * 测试主线程只注入事实或读取快照；引擎的采集/播放线程仍按生产路径运行。
+ * 所有共享状态由同一 mutex 保护，pending 帧只由采集线程在 Read→Process 间持有。
+ */
+#include "audio_pipeline.h"
 
 #include <condition_variable>
 #include <deque>
@@ -7,9 +14,10 @@
 #include <thread>
 #include <utility>
 
-namespace boompi::test::audio_backend {
+namespace boompi::test::audio_pipeline {
 namespace {
 
+/** @brief 测试与两个引擎线程的交接区；计数和线程 ID 用于验证顺序，不驱动产品状态。 */
 struct SharedState final {
   std::mutex mutex;
   std::condition_variable condition;
@@ -18,10 +26,9 @@ struct SharedState final {
   std::size_t capture_reads{0U};
   std::size_t processed_frames{0U};
   std::size_t capture_interrupts{0U};
-  std::uint64_t playback_xruns{0U};
   bool open{false};
   bool capture_interrupted{false};
-  PlaybackBlock playback_block{PlaybackBlock::kNone};
+  PlaybackBlock playback_block{PlaybackBlock::None};
   bool playback_blocked{false}, playback_interrupted{false};
   bool owner_order_valid{true}, playback_prepared{false};
   bool fail_playback_preparation{false};
@@ -29,11 +36,13 @@ struct SharedState final {
   std::size_t armed_sessions{0U}, prepared_sessions{0U};
 };
 
+/** @brief 每个测试进程共享一份脚本状态，场景开始前调用 Reset。 */
 SharedState& State() {
   static SharedState state;
   return state;
 }
 
+/** @brief 在共享锁下等待谓词，条件变量释放锁期间允许产品线程推进。 */
 template <typename Predicate>
 bool WaitUntil(Predicate predicate, std::chrono::milliseconds timeout) noexcept {
   auto& state = State();
@@ -41,6 +50,10 @@ bool WaitUntil(Predicate predicate, std::chrono::milliseconds timeout) noexcept 
   return state.condition.wait_for(lock, timeout, predicate);
 }
 
+/**
+ * @brief 播放线程的可控阻塞点；调用方必须已经持有共享锁。
+ * 先核对 Prepare/线程身份，再等待 Close 或 Interrupt；假 I/O 也有一秒退出上限。
+ */
 bool WaitInPlayback(PlaybackBlock stage, std::unique_lock<std::mutex>& lock) {
   auto& state = State();
   state.owner_order_valid &=
@@ -68,10 +81,9 @@ void Reset() noexcept {
   state.capture_reads = 0U;
   state.processed_frames = 0U;
   state.capture_interrupts = 0U;
-  state.playback_xruns = 0U;
   state.open = false;
   state.capture_interrupted = false;
-  state.playback_block = PlaybackBlock::kNone;
+  state.playback_block = PlaybackBlock::None;
   state.playback_blocked = state.playback_interrupted = false;
   state.owner_order_valid = true;
   state.playback_prepared = false;
@@ -105,18 +117,6 @@ bool PlaybackOwnerOrderIsValid() noexcept {
   std::lock_guard<std::mutex> lock(state.mutex);
   return state.owner_order_valid && state.prepared_sessions != 0U &&
          state.armed_sessions == state.prepared_sessions;
-}
-
-void InjectPlaybackXruns(const std::uint64_t count) noexcept {
-  auto& state = State();
-  std::lock_guard<std::mutex> lock(state.mutex);
-  state.playback_xruns += count;
-}
-
-std::uint64_t PlaybackXrunsSnapshot() noexcept {
-  auto& state = State();
-  std::lock_guard<std::mutex> lock(state.mutex);
-  return state.playback_xruns;
 }
 
 void PushCapture(const audio::CaptureFrame& frame) noexcept {
@@ -170,28 +170,29 @@ std::vector<RenderCall> RenderCallsSnapshot() {
   return state.render_calls;
 }
 
-}  // namespace boompi::test::audio_backend
+}  // namespace boompi::test::audio_pipeline
 
 namespace boompi::platform::rv1106 {
 
-struct AudioBackend::Impl final {
+/// Read 保留完整检测帧，Process 再交出，维持真实后端的两阶段输入接口。
+struct AudioPipeline::Impl final {
   CaptureFrame pending{};
   bool has_pending{false};
 };
 
-AudioBackend::~AudioBackend() noexcept {
+AudioPipeline::~AudioPipeline() noexcept {
   Close();
   delete impl_;
 }
 
-bool AudioBackend::Open(const AudioEngineConfig&) noexcept {
+bool AudioPipeline::Open() noexcept {
   if (impl_ == nullptr) {
     impl_ = new (std::nothrow) Impl;
   }
   if (impl_ == nullptr) {
     return false;
   }
-  auto& state = test::audio_backend::State();
+  auto& state = test::audio_pipeline::State();
   {
     std::lock_guard<std::mutex> lock(state.mutex);
     state.open = true;
@@ -201,11 +202,11 @@ bool AudioBackend::Open(const AudioEngineConfig&) noexcept {
   return true;
 }
 
-bool AudioBackend::ReadCapture20ms(bool* const discontinuity) noexcept {
-  if (impl_ == nullptr || discontinuity == nullptr) {
+bool AudioPipeline::ReadCapture20ms(RawCaptureFrame* const raw) noexcept {
+  if (impl_ == nullptr || raw == nullptr) {
     return false;
   }
-  auto& state = test::audio_backend::State();
+  auto& state = test::audio_pipeline::State();
   std::unique_lock<std::mutex> lock(state.mutex);
   state.capture_thread = std::this_thread::get_id();
   ++state.capture_reads;
@@ -217,21 +218,23 @@ bool AudioBackend::ReadCapture20ms(bool* const discontinuity) noexcept {
     return false;
   }
   impl_->pending = state.capture_frames.front();
+  // raw 这里只承载时刻/断点；PCM 和分类已由脚本准备，不能把本场景当作算法验证。
   state.capture_frames.pop_front();
   impl_->has_pending = true;
-  *discontinuity = impl_->pending.discontinuity;
+  raw->discontinuity = impl_->pending.discontinuity;
+  raw->timestamp_us = impl_->pending.timestamp_us;
   return true;
 }
 
-bool AudioBackend::ProcessCapture20ms(const bool discontinuity,
-                                      CaptureFrame* const frame) noexcept {
+bool AudioPipeline::ProcessCapture20ms(const RawCaptureFrame& raw,
+                                       CaptureFrame* const frame) noexcept {
   if (impl_ == nullptr || frame == nullptr || !impl_->has_pending) {
     return false;
   }
   *frame = impl_->pending;
-  frame->discontinuity = discontinuity;
+  frame->discontinuity = raw.discontinuity;
   impl_->has_pending = false;
-  auto& state = test::audio_backend::State();
+  auto& state = test::audio_pipeline::State();
   {
     std::lock_guard<std::mutex> lock(state.mutex);
     ++state.processed_frames;
@@ -240,19 +243,19 @@ bool AudioBackend::ProcessCapture20ms(const bool discontinuity,
   return true;
 }
 
-bool AudioBackend::ResetListener() noexcept {
+bool AudioPipeline::ResetListener() noexcept {
   return true;
 }
-bool AudioBackend::ArmPlayback() noexcept {
-  auto& state = test::audio_backend::State();
+bool AudioPipeline::ArmPlayback() noexcept {
+  auto& state = test::audio_pipeline::State();
   std::lock_guard<std::mutex> lock(state.mutex);
   state.owner_order_valid &= state.capture_thread == std::this_thread::get_id();
   ++state.armed_sessions;
   return true;
 }
 
-bool AudioBackend::PreparePlayback() noexcept {
-  auto& state = test::audio_backend::State();
+bool AudioPipeline::PreparePlayback() noexcept {
+  auto& state = test::audio_pipeline::State();
   std::lock_guard<std::mutex> lock(state.mutex);
   state.playback_thread = std::this_thread::get_id();
   state.owner_order_valid &= state.playback_thread != state.capture_thread &&
@@ -263,46 +266,44 @@ bool AudioBackend::PreparePlayback() noexcept {
   return state.playback_prepared;
 }
 
-bool AudioBackend::Render20ms(const std::int16_t* const pcm24, const std::size_t samples,
-                              const float gain) noexcept {
-  if (pcm24 == nullptr || samples == 0U) {
+bool AudioPipeline::Render20ms(const std::int16_t* const pcm16, const std::size_t samples,
+                               const float gain) noexcept {
+  if (pcm16 == nullptr || samples == 0U) {
     return false;
   }
-  test::audio_backend::RenderCall call;
-  call.pcm.assign(pcm24, pcm24 + samples);
+  test::audio_pipeline::RenderCall call;
+  call.pcm.assign(pcm16, pcm16 + samples);
   call.gain = gain;
-  auto& state = test::audio_backend::State();
+  auto& state = test::audio_pipeline::State();
   {
     std::unique_lock<std::mutex> lock(state.mutex);
     state.render_calls.push_back(std::move(call));
-    if (!test::audio_backend::WaitInPlayback(test::audio_backend::PlaybackBlock::kRender,
-                                             lock)) {
+    if (!test::audio_pipeline::WaitInPlayback(test::audio_pipeline::PlaybackBlock::Render,
+                                              lock)) {
       return false;
     }
   }
   state.condition.notify_all();
-  // The board backend advances one 20 ms ALSA period per call. Giving the
-  // fake backend the same media clock prevents it from draining 180 ms of
-  // queued audio instantaneously and turning scheduler jitter into underruns.
+  // 每次假渲染同样推进 20 ms，避免瞬间耗尽 180 ms 初始缓存，制造并不存在的欠载。
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
   return true;
 }
 
-bool AudioBackend::DrainPlayback() noexcept {
-  auto& state = test::audio_backend::State();
+bool AudioPipeline::DrainPlayback() noexcept {
+  auto& state = test::audio_pipeline::State();
   std::unique_lock<std::mutex> lock(state.mutex);
-  return test::audio_backend::WaitInPlayback(test::audio_backend::PlaybackBlock::kDrain, lock);
+  return test::audio_pipeline::WaitInPlayback(test::audio_pipeline::PlaybackBlock::Drain, lock);
 }
-void AudioBackend::DropPlayback() noexcept {
-  auto& state = test::audio_backend::State();
+void AudioPipeline::DropPlayback() noexcept {
+  auto& state = test::audio_pipeline::State();
   std::lock_guard<std::mutex> lock(state.mutex);
   // 尚未渲染就取消时，允许播放线程直接 drop，不要求先 prepare。
   state.owner_order_valid &= std::this_thread::get_id() != state.capture_thread;
   state.playback_prepared = false;
 }
 
-void AudioBackend::InterruptCapture() noexcept {
-  auto& state = test::audio_backend::State();
+void AudioPipeline::InterruptCapture() noexcept {
+  auto& state = test::audio_pipeline::State();
   {
     std::lock_guard<std::mutex> lock(state.mutex);
     state.capture_interrupted = true;
@@ -311,23 +312,20 @@ void AudioBackend::InterruptCapture() noexcept {
   state.condition.notify_all();
 }
 
-void AudioBackend::InterruptPlayback() noexcept {
-  auto& state = test::audio_backend::State();
+void AudioPipeline::InterruptPlayback() noexcept {
+  auto& state = test::audio_pipeline::State();
   {
     std::lock_guard<std::mutex> lock(state.mutex);
     state.playback_interrupted = true;
   }
   state.condition.notify_all();
 }
-std::uint64_t AudioBackend::playback_xruns() const noexcept {
-  return test::audio_backend::PlaybackXrunsSnapshot();
-}
-std::string AudioBackend::last_error() const {
+std::string AudioPipeline::LastError() const {
   return {};
 }
 
-void AudioBackend::Close() noexcept {
-  auto& state = test::audio_backend::State();
+void AudioPipeline::Close() noexcept {
+  auto& state = test::audio_pipeline::State();
   {
     std::lock_guard<std::mutex> lock(state.mutex);
     state.open = false;

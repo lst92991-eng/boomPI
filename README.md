@@ -2,7 +2,7 @@
 
 boomPI 是一个面向 RV1106 自研板卡的语音 AI 教学项目。板端运行 C++17 客户端，学生电脑运行 Go 服务端；API Key 只保存在电脑上，板子通过局域网连接服务端。
 
-当前版本保留已经实测的体验：双麦 AEC、Snowboy 唤醒、VAD、流式问答、连续 TTS、播放中打断并提交新问题、三秒追问、LVGL 触摸桌面、音量、Wi-Fi 配网和 SC3336 本地预览。清洗后的目标不是增加框架，而是让学生能沿着真实数据流读懂代码。
+当前实现保留双麦 AEC、Snowboy 唤醒、VAD、流式问答、连续 TTS、播放中打断并提交新问题、三秒追问、LVGL 触摸桌面、音量、Wi-Fi 配网和 SC3336 本地预览。学生沿真实数据流阅读客户端；服务端是只需配置 Key 的课程配套程序。本轮验证边界见[重构验收记录](docs/test/refactor-handoff-20260915.md)。
 
 ## 使用方式
 
@@ -17,7 +17,7 @@ boomPI 是一个面向 RV1106 自研板卡的语音 AI 教学项目。板端运�
              boompi-server
                     │
                     ▼
-        Qwen 中国内地（北京）区
+        DashScope 中国内地（北京）区
 ```
 
 ### 1. 启动服务端
@@ -51,7 +51,7 @@ ALSA 48 kHz / 4 ch [mic0,mic1,refL,refR]
   → application 状态机
   → WSS 上传 16 kHz mono
 
-WSS 下发 24 kHz mono
+WSS 下发 16 kHz mono（CosyVoice 直接输出）
   → 有界 TTS 环形缓冲
   → 48 kHz stereo ALSA playback
 ```
@@ -70,7 +70,7 @@ playback volume     = 60%
 ```text
 client/                 RV1106 客户端、LVGL 和板端脚本
 server/                 跨平台 Go 服务端
-protocol/               客户端与服务端共用的 v1 线协议
+protocol/               客户端与服务端共用的 v2 / 16 kHz 线协议
 docs/architecture/      当前系统与音频数据流
 docs/hardware/          硬件事实和 BSP 边界
 docs/test/              可复现验证入口

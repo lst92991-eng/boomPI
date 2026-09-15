@@ -77,11 +77,11 @@ func Defaults() Config {
 		WSSPort:              17806,
 		DiscoveryPort:        DefaultDiscoveryPort,
 		LogLevel:             "info",
-		ASRModel:             "qwen3-asr-flash",
+		ASRModel:             "qwen3-asr-flash-realtime",
 		ReasoningModel:       "qwen3.6-flash",
 		ReasoningEffort:      "none",
-		TTSModel:             "qwen3-tts-flash-realtime",
-		TTSVoice:             "Cherry",
+		TTSModel:             "cosyvoice-v3-flash",
+		TTSVoice:             "longxiaochun_v3",
 		SearchMode:           "off",
 		SystemPrompt:         "You are boomPI, a concise and helpful voice assistant. Reply in Simplified Chinese unless the user asks for another language.",
 		Persona:              "Natural, young, friendly, and not overly cute.",
@@ -244,6 +244,15 @@ func (c Config) Validate() error {
 		if strings.TrimSpace(value) == "" || len(value) > 128 || strings.IndexFunc(value, unicode.IsControl) >= 0 {
 			return fmt.Errorf("%s must contain 1..128 characters without control characters", name)
 		}
+	}
+	if !strings.HasPrefix(c.ASRModel, "qwen3-asr-flash-realtime") {
+		return errors.New("asr_model must use qwen3-asr-flash-realtime; batch ASR has been removed")
+	}
+	if !strings.HasPrefix(c.TTSModel, "cosyvoice-v2") && !strings.HasPrefix(c.TTSModel, "cosyvoice-v3") {
+		return errors.New("tts_model must use Beijing CosyVoice v2 or v3 with a matching voice; recommended cosyvoice-v3-flash / longxiaochun_v3 for 16000 Hz PCM")
+	}
+	if c.TTSVoice == "Cherry" {
+		return errors.New("Cherry belongs to Qwen TTS; update tts_voice to match CosyVoice, for example longxiaochun_v3 with cosyvoice-v3-flash")
 	}
 	if !oneOf(c.ReasoningEffort, "none", "minimal", "low", "medium", "high") {
 		return errors.New("reasoning_effort must be none, minimal, low, medium, or high")

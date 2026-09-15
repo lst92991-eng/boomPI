@@ -1,7 +1,4 @@
-/**
- * @file main.cpp
- * @brief 板端进程入口，支持运行、自检和保存Wi-Fi配置。
- */
+// 小智客户端入口：读取配置 → 初始化 → 运行 → 退出。
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
@@ -11,49 +8,90 @@
 #include "boompi/config/voice_client_config.h"
 #include "boompi/network/voice_link.h"
 
+using boompi::config::LoadClientConfig;
+using boompi::config::VoiceClientConfig;
+
 namespace {
-// 信号处理函数只置标志。线程回收和设备关闭留给主循环，不能在信号上下文中执行。
-volatile std::sig_atomic_t g_stop = 0;
-void Stop(int) {
-  g_stop = 1;
-}
+volatile std::sig_atomic_t stop_requested = 0;
+bool IsVoiceMode(int argc, char* argv[]);
+int RunCommand(int argc, char* argv[]);
+void SetupExitSignals();
+int ReportFailure(const std::string& message);
 }  // namespace
 
 int main(int argc, char* argv[]) {
-  const std::string_view mode = argc == 2 ? argv[1] : "--voice-loop";
-  if (argc > 2 ||
-      (mode != "--voice-loop" && mode != "--check-config" && mode != "--save-wifi")) {
-    std::cerr << "usage: boompi-client [--voice-loop|--check-config|--save-wifi]\n";
-    return EXIT_FAILURE;
+  // 配置检查、Wi-Fi 保存等辅助命令，由文件下方处理。
+  if (!IsVoiceMode(argc, argv)) {
+    return RunCommand(argc, argv);
   }
-  if (mode == "--save-wifi") {
-    // SSID 与密码从标准输入分两行读取，避免密码出现在进程命令行和 shell 历史中。
-    std::string ssid, password;
-    if (!std::getline(std::cin, ssid) || !std::getline(std::cin, password) ||
-        !boompi::network::SaveWifi(ssid, password)) {
-      return EXIT_FAILURE;
-    }
-    return EXIT_SUCCESS;
-  }
-  boompi::config::VoiceClientConfig config;
+
+  // 1. 读取配置。
+  VoiceClientConfig config;
   std::string error;
-  // 配置不合法时，不启动线程或打开设备。
-  if (!boompi::config::LoadVoiceClientConfigFromEnvironment(&config, &error)) {
-    std::cerr << "boompi-client: configuration failed: " << error << '\n';
-    return EXIT_FAILURE;
+  if (!LoadClientConfig(&config, &error)) {
+    return ReportFailure(error);
   }
-  if (mode == "--check-config") {
-    // 该模式只验证配置，不接触板端硬件，适合安装脚本在启动守护进程前快速失败。
-    std::cout << "boompi-client: configuration is valid\n";
-    return EXIT_SUCCESS;
+
+  // 2. 初始化显示、音频和网络。
+  SetupExitSignals();
+  bool succeeded = App_Init(config);
+
+  // 3. 持续处理问答，直到退出信号或处理失败。
+  while (stop_requested == 0 && succeeded) {
+    succeeded = App_Process();
   }
-  std::signal(SIGINT, Stop);
-  std::signal(SIGTERM, Stop);
-  // 本程序只在Linux板端运行；断开的socket交给网络层处理，不让SIGPIPE结束进程。
-  std::signal(SIGPIPE, SIG_IGN);
-  if (!boompi::application::RunVoiceClient(config, &g_stop, &error)) {
-    std::cerr << "boompi-client: voice loop failed: " << error << '\n';
-    return EXIT_FAILURE;
+
+  // 4. 关闭线程和设备，返回运行结果。
+  App_Close();
+  if (!succeeded) {
+    return ReportFailure(App_GetError());
   }
   return EXIT_SUCCESS;
 }
+
+namespace {
+// 不带参数和 --voice-loop 都进入上方的正常启动流程。
+bool IsVoiceMode(int argc, char* argv[]) {
+  return argc <= 1 || (argc == 2 && std::string_view(argv[1]) == "--voice-loop");
+}
+
+int RunCommand(int argc, char* argv[]) {
+  const std::string_view command = argc == 2 ? argv[1] : "";
+  if (command == "--check-config") {
+    VoiceClientConfig config;
+    std::string error;
+    if (!LoadClientConfig(&config, &error)) {
+      return ReportFailure(error);
+    }
+    std::cout << "boompi-client: configuration is valid\n";
+    return EXIT_SUCCESS;
+  }
+  if (command == "--save-wifi") {
+    // 凭据从标准输入读取，不放进命令行、历史或日志。
+    std::string ssid;
+    std::string password;
+    if (!std::getline(std::cin, ssid) || !std::getline(std::cin, password) ||
+        !boompi::network::SaveWifi(ssid, password)) {
+      return ReportFailure("Wi-Fi configuration could not be saved");
+    }
+    return EXIT_SUCCESS;
+  }
+  return ReportFailure("usage: boompi-client [--voice-loop|--check-config|--save-wifi]");
+}
+
+// 信号只置位；资源由 main 中的正常退出流程回收。
+void RequestStop(int) {
+  stop_requested = 1;
+}
+
+void SetupExitSignals() {
+  std::signal(SIGINT, RequestStop);
+  std::signal(SIGTERM, RequestStop);
+  std::signal(SIGPIPE, SIG_IGN);
+}
+
+int ReportFailure(const std::string& message) {
+  std::cerr << "boompi-client: " << message << '\n';
+  return EXIT_FAILURE;
+}
+}  // namespace

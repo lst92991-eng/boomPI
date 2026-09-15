@@ -16,7 +16,7 @@ import (
 
 const (
 	maxInputPCMBytes = 60 * 16000 * 2
-	ttsSampleRateHz  = 24_000
+	ttsSampleRateHz  = 16_000
 	ttsEventPCMBytes = ttsSampleRateHz * 2 * 20 / 1000
 )
 
@@ -63,11 +63,11 @@ func (b *Backend) Open(ctx context.Context, cfg backend.SessionConfig) (backend.
 		cancel:        cancel,
 		events:        make(chan backend.ConversationEvent, b.config.QueueSize),
 		openASR:       b.openASR,
-		asrPreparing:  true,
+		asrReady:      make(chan struct{}),
 	}
 	// Provider setup is deliberately off the hello path. The device only waits
 	// five seconds for ready, while a realtime ASR handshake may take ten;
-	// audio received before preparation completes uses the existing batch path.
+	// 输入只在有界期限内等待准备完成；失败时中止本轮，不另存整句重试。
 	session.launchRealtimeASRPreparation()
 	return session, nil
 }
@@ -82,14 +82,13 @@ type Session struct {
 	events        chan backend.ConversationEvent
 	openASR       realtimeASROpener
 
-	mu            sync.Mutex
-	pcm           []byte
-	history       []chatMessage
-	activeCancel  context.CancelFunc
-	activeDone    chan struct{}
-	asr           *asrRealtimeStream
-	asrPreparing  bool
-	turnBatchOnly bool
+	mu           sync.Mutex
+	inputBytes   int
+	history      []chatMessage
+	activeCancel context.CancelFunc
+	activeDone   chan struct{}
+	asr          *asrRealtimeStream
+	asrReady     chan struct{}
 	// True only after the newest response has been committed to history and
 	// before the next user turn starts. This closes the race where provider
 	// generation finishes before the device has finished playing the answer:
@@ -101,7 +100,6 @@ type Session struct {
 }
 
 var _ backend.ConversationSession = (*Session)(nil)
-var _ backend.CompletedResponseDiscarder = (*Session)(nil)
 
 func (s *Session) SendAudio(ctx context.Context, pcm []byte) error {
 	if ctx == nil || len(pcm) == 0 || len(pcm)%2 != 0 {
@@ -119,33 +117,47 @@ func (s *Session) SendAudio(ctx context.Context, pcm []byte) error {
 		s.mu.Unlock()
 		return errors.New("Qwen pipeline response is already active")
 	}
-	if len(s.pcm)+len(pcm) > maxInputPCMBytes {
+	if s.inputBytes+len(pcm) > maxInputPCMBytes {
 		s.mu.Unlock()
 		return errors.New("Qwen pipeline input exceeds 60 seconds")
 	}
-	if len(s.pcm) == 0 && s.asr == nil {
-		s.turnBatchOnly = true
-	}
-	if len(s.pcm) == 0 {
-		s.lastResponseDiscardable = false
-	}
-	s.pcm = append(s.pcm, pcm...)
-	stream := s.asr
-	if s.turnBatchOnly {
-		stream = nil
-	}
+	ready := s.asrReady
 	s.mu.Unlock()
-	if stream != nil {
-		if err := stream.Append(pcm); err != nil {
-			s.disableRealtimeASR(stream, err)
+	if ready != nil {
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.ctx.Done():
+			return s.ctx.Err()
 		}
 	}
+	s.mu.Lock()
+	stream := s.asr
+	if stream == nil {
+		s.mu.Unlock()
+		return errors.New("Qwen realtime ASR is unavailable; retry the turn")
+	}
+	if s.inputBytes == 0 {
+		s.lastResponseDiscardable = false
+	}
+	s.mu.Unlock()
+	// Actor 已隔开设备读取与云端写入，这里直接写，不再复制到第二个 PCM 队列。
+	if err := stream.Append(ctx, pcm); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.inputBytes += len(pcm)
+	s.mu.Unlock()
 	return nil
 }
 
 func (s *Session) Commit(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -155,76 +167,50 @@ func (s *Session) Commit(ctx context.Context) error {
 	if s.activeDone != nil {
 		return errors.New("Qwen pipeline response is already active")
 	}
-	if len(s.pcm) == 0 {
+	if s.inputBytes == 0 {
 		return errors.New("Qwen pipeline input audio is empty")
 	}
-	pcm := append([]byte(nil), s.pcm...)
-	clear(s.pcm)
-	s.pcm = s.pcm[:0]
-	stream := s.asr
-	batchFallback := s.turnBatchOnly
-	if batchFallback {
-		stream = nil
-	} else {
-		s.asr = nil
-	}
-	s.turnBatchOnly = false
-	// A live stream is replaced after its final result is received. Starting
-	// its replacement here would briefly overlap two provider ASR sessions and
-	// can hit provider connection limits. Batch-only turns have no such overlap.
-	if stream == nil && s.asr == nil && !s.asrPreparing {
-		s.asrPreparing = true
-		s.launchRealtimeASRPreparation()
-	}
+	stream, inputBytes := s.asr, s.inputBytes
+	s.asr, s.inputBytes = nil, 0
 	jobCtx, cancel := context.WithCancel(s.ctx)
 	done := make(chan struct{})
 	s.activeCancel = cancel
 	s.activeDone = done
 	committedAt := time.Now()
-	go s.run(jobCtx, pcm, stream, batchFallback, done, committedAt)
+	go s.run(jobCtx, inputBytes, stream, done, committedAt)
 	return nil
 }
 
-func (s *Session) Cancel(ctx context.Context) error {
+func (s *Session) Cancel(ctx context.Context, retract bool) error {
 	if ctx == nil {
 		return errors.New("context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	s.mu.Lock()
 	cancel, done := s.activeCancel, s.activeDone
-	inputWasActive := len(s.pcm) != 0
 	var stream *asrRealtimeStream
-	if inputWasActive && !s.turnBatchOnly {
-		stream = s.asr
-		s.asr = nil
+	if s.inputBytes != 0 {
+		stream, s.asr = s.asr, nil
 	}
-	clear(s.pcm)
-	s.pcm = s.pcm[:0]
-	s.turnBatchOnly = false
-	if stream != nil && !s.asrPreparing {
-		s.asrPreparing = true
-		s.launchRealtimeASRPreparation()
-	}
+	s.inputBytes = 0
 	s.mu.Unlock()
 	if stream != nil {
 		stream.Close()
+		s.startRealtimeASRPreparation()
 	}
-	if cancel == nil || done == nil {
-		return nil
+	if cancel != nil && done != nil {
+		cancel()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	cancel()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	if retract {
+		s.discardCompletedResponseIfNeeded()
 	}
-}
-
-func (s *Session) DiscardLastResponse(ctx context.Context) error {
-	if ctx == nil {
-		return errors.New("context is required")
-	}
-	s.discardCompletedResponseIfNeeded()
 	return nil
 }
 
@@ -268,21 +254,19 @@ func (s *Session) Close() error {
 
 func (s *Session) run(
 	ctx context.Context,
-	pcm []byte,
+	inputBytes int,
 	asr *asrRealtimeStream,
-	batchFallback bool,
 	done chan struct{},
 	committedAt time.Time,
 ) {
 	responseID := eventID()
-	timing := newTurnTiming(s.config.Logger, responseID, committedAt, len(pcm))
+	timing := newTurnTiming(s.config.Logger, responseID, committedAt, inputBytes)
 	status := "canceled"
 	failureStage := ""
 	defer func() {
 		timing.log(status, failureStage, time.Now())
 	}()
 	defer func() {
-		clear(pcm)
 		s.mu.Lock()
 		if s.activeDone == done {
 			s.activeCancel = nil
@@ -291,35 +275,17 @@ func (s *Session) run(
 		s.mu.Unlock()
 		close(done)
 	}()
+	// 先退休旧 ASR 并建立下轮准备状态，再让 Cancel 的等待者继续提交。
+	defer func() { asr.Close(); s.startRealtimeASRPreparation() }()
 
 	if !s.emit(ctx, backend.ConversationEvent{Type: backend.EventStarted, ResponseID: responseID}) {
 		status, failureStage = turnFailure(ctx, "event_delivery")
 		return
 	}
-	var transcript string
-	var err error
-	asrMode := "batch"
-	if batchFallback {
-		asrMode = "batch_fallback"
-	}
-	if asr != nil {
-		asrMode = "realtime"
-		transcript, err = asr.Commit(ctx)
-		asr.Close()
-		s.startRealtimeASRPreparation()
-		if err != nil && ctx.Err() == nil && s.config.Logger != nil {
-			asrMode = "batch_fallback"
-			s.config.Logger.Warn("Qwen realtime ASR failed; retrying this turn with batch ASR",
-				"component", "qwen_pipeline", "response_id", responseID,
-				"error_code", qwenPipelineErrorCode(err))
-		}
-	}
-	if asr == nil || err != nil {
-		if ctx.Err() == nil {
-			transcript, err = s.http.transcribe(ctx, pcm)
-		}
-	}
-	timing.markASRMode(asrMode)
+	transcript, err := asr.Commit(ctx)
+	asr.Close()
+	s.startRealtimeASRPreparation()
+	timing.markASRMode("realtime")
 	if err != nil {
 		status, failureStage = turnFailure(ctx, "asr")
 		s.emitError(ctx, responseID, "asr", err)
@@ -466,7 +432,7 @@ func (s *Session) handleClearConversation(
 }
 
 // Provider WebSocket deltas can contain more than a second of PCM. Split them
-// into one media-clock frame per event so the two bounded event queues express
+// into one media-clock frame per event so the bounded provider queue expresses
 // time, not an unbounded number of provider-sized byte slices.
 func (s *Session) emitTTSAudio(
 	ctx context.Context,
@@ -506,20 +472,6 @@ func isClearConversationCommand(transcript string) bool {
 	return normalized == "清空对话"
 }
 
-func (s *Session) disableRealtimeASR(stream *asrRealtimeStream, cause error) {
-	s.mu.Lock()
-	if s.asr == stream {
-		s.asr = nil
-		s.turnBatchOnly = true
-	}
-	s.mu.Unlock()
-	stream.Close()
-	if s.config.Logger != nil {
-		s.config.Logger.Warn("Qwen realtime ASR input fell back to batch mode",
-			"component", "qwen_pipeline", "error_code", qwenPipelineErrorCode(cause))
-	}
-}
-
 func (s *Session) prepareRealtimeASR() {
 	opener := s.openASR
 	if opener == nil {
@@ -527,7 +479,8 @@ func (s *Session) prepareRealtimeASR() {
 	}
 	stream, err := opener(s.ctx, s.config)
 	s.mu.Lock()
-	s.asrPreparing = false
+	close(s.asrReady)
+	s.asrReady = nil
 	if err == nil && !s.closed && s.asr == nil {
 		s.asr = stream
 		stream = nil
@@ -537,13 +490,13 @@ func (s *Session) prepareRealtimeASR() {
 		stream.Close()
 	}
 	if err != nil && s.config.Logger != nil && s.ctx.Err() == nil {
-		s.config.Logger.Warn("Qwen realtime ASR preconnect failed; next turn will use batch fallback",
+		s.config.Logger.Warn("Qwen realtime ASR preconnect failed; input will report failure",
 			"component", "qwen_pipeline", "error_code", qwenPipelineErrorCode(err))
 	}
 }
 
 // The session owns every ASR preparation goroutine. Callers set
-// asrPreparing while holding s.mu before launching; Close cancels the shared
+// asrReady while holding s.mu before launching; Close cancels the shared
 // context and joins all preparations before returning.
 func (s *Session) launchRealtimeASRPreparation() {
 	s.prepareWG.Add(1)
@@ -555,11 +508,11 @@ func (s *Session) launchRealtimeASRPreparation() {
 
 func (s *Session) startRealtimeASRPreparation() {
 	s.mu.Lock()
-	if s.closed || s.asr != nil || s.asrPreparing {
+	if s.closed || s.asr != nil || s.asrReady != nil {
 		s.mu.Unlock()
 		return
 	}
-	s.asrPreparing = true
+	s.asrReady = make(chan struct{})
 	s.launchRealtimeASRPreparation()
 	s.mu.Unlock()
 }
@@ -799,7 +752,7 @@ func (s *Session) emitError(ctx context.Context, responseID, stage string, err e
 			"response_id", responseID, "stage", stage,
 			"error_code", qwenPipelineErrorCode(err))
 	}
-	_ = s.emit(ctx, backend.ConversationEvent{Type: backend.EventError, Err: err})
+	_ = s.emit(ctx, backend.ConversationEvent{Type: backend.EventError, ResponseID: responseID, Err: err})
 }
 
 func qwenPipelineErrorCode(err error) string {

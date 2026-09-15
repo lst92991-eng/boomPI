@@ -2,7 +2,7 @@
 
 ## 产品边界
 
-`VoiceAudio` 是 application 唯一看到的音频接口；内部 AudioEngine 管理实时线程，板级工作集中在
+`VoiceAudio` 是 application 唯一看到的音频接口；内部 AudioTasks 管理实时线程，板级工作集中在
 `client/src/platform/rv1106/`：
 
 - ALSA capture/playback；
@@ -15,7 +15,7 @@
 产品没有 backend 工厂或模拟设备分支。Host fake 和 AEC HIL 只用于测试，不链接进
 `boompi-client`。
 
-顺着 `audio_engine.cpp` 进入 `audio_backend.cpp` 可以看到一帧的重采样、3A 和 VAD 顺序；
+顺着 `audio_tasks.cpp` 进入 `audio_pipeline.cpp` 可以看到`raw → channels → clean → frame`的显式交接：`AudioConverter`负责格式、`RockchipVoiceDsp`负责3A和metadata对齐、`SpeechDetector`负责判定。详见[顺序音频教学](../teaching/audio-pipeline.md)；
 需要检查 PCM 参数协商、XRUN 或有界 drain 时再进入 `alsa_audio.cpp`。
 ALSA 头和句柄留在板级私有边界，application 只使用 `VoiceAudio`。
 
@@ -42,7 +42,7 @@ output = 16 kHz / S16 / mono
 ```
 
 vendor 每块处理 256 samples，产品每帧 320 samples。`RockchipVoiceDsp` 用固定 FIFO 对齐，
-因此输出比采集固定延迟一帧；发布给 application 的 monotonic timestamp 同步补偿这帧延迟。
+因此输出比采集固定延迟一帧；时间戳、原始电平和参考状态由同一个metadata对象跟随PCM一起延迟，检测模块不再独立补偿。
 
 当前3A配置保持 AEC + BF、FastAEC、AES、ANR、去混响和 STDT，board_voice_profile.h 中 delay 为 0；vendor AGC
 关闭。公开 ABI 没有可靠 DTD 事件，因此打断仍使用 3A 后 PCM 的 VAD 和 `voice_dbfs`。
@@ -75,5 +75,4 @@ CMake 只检查路径、头文件、库文件和目标版本，不维护开发�
 
 Host回归编译tests/support/audio_thread.cpp，使用普通线程；板端由platform/rv1106/audio_thread.cpp设置SCHED_FIFO。实际是否获得40/30优先级，仍需在板端读取线程策略。
 
-Host 测试只能证明状态和数据 packing，交叉构建只能证明 ABI；Mode1 布局、AEC、自激和最终
-声学效果必须在目标板验证。命令见 [验证入口](../test/host-validation.md)。
+Host模块测试会执行真实重采样、DSP分块和检测策略，但厂商内核及语音分类用窄替身控制。交叉构建还需检查ELF与动态依赖，不能据此保证厂商二进制实际兼容；Mode1布局、AEC、自激和最终声学效果必须在目标板验证。命令见[验证入口](../test/host-validation.md)。
