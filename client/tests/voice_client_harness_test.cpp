@@ -22,6 +22,7 @@ struct State {
   ui::UiView view;
   playback::State output{playback::State::Idle};
   bool online{false}, uploading{false}, supersede{false}, fail_send{false};
+  bool hold_requested{false};
   bool input_ok{true}, start_ok{true}, output_ok{true}, network_ok{true};
   int starts{0}, ends{0}, cancels{0}, drops{0}, finishes{0}, resets{0}, closes{0};
 } state;
@@ -32,7 +33,10 @@ void require(bool pass, const char* reason) {
 }
 audio::CaptureFrame sound(int id, bool voice) {
   audio::CaptureFrame frame;
-  frame.pcm.fill(static_cast<std::int16_t>(id));
+  for (std::size_t i = 0; i < frame.pcm.size(); ++i) {
+    frame.pcm[i] = static_cast<std::int16_t>(voice ? (i % 2 ? -4096 : 4096) : 0);
+  }
+  frame.pcm[0] = static_cast<std::int16_t>(id);
   frame.vad_now = voice;
   return frame;
 }
@@ -66,6 +70,79 @@ void question() {
           "START/PCM/END not delivered once");
   for (int id = 1; id <= 50; ++id) {
     require(state.samples[id - 1] == id, "application duplicated or omitted current/tail PCM");
+  }
+}
+audio::CaptureFrame barge_sound(int id, bool reference, bool held, bool voice = true) {
+  auto frame = sound(id, voice);
+  frame.reference_active = reference;
+  frame.playback_held = held;
+  return frame;
+}
+void reject_probes() {
+  // 缺参考不放行；软件已请求hold但声卡尚未写静音时，也不能确认。
+  for (int scenario = 0; scenario < 4; ++scenario) {
+    open();
+    question();
+    network(voice_net::LinkEventKind::Audio);
+    for (int id = 0; id < 40; ++id) {
+      auto frame = barge_sound(id, scenario != 0 && id < 6, scenario >= 2 && id >= 6);
+      if (scenario == 3) {
+        frame.reference_active = true;
+      }
+      if (scenario == 2 && id >= 6) {
+        // 回声静音后消失，但VAD保持为真；直流偏置也不能伪装成近讲。
+        frame.pcm.fill(20000);
+      }
+      tick(frame);
+    }
+    require(state.starts == 1 && state.drops == 0 && state.cancels == 0 &&
+                state.samples.size() == 50 && !state.hold_requested,
+            "echo/missing reference/unapplied hold created a new turn");
+    require(state.view.state == ui::DeviceUiState::Speaking, "rejected probe lost old reply");
+  }
+  open();
+  question();
+  network(voice_net::LinkEventKind::Audio);
+  for (int id = 0; id < 6; ++id) {
+    tick(barge_sound(id, true, false));
+  }
+  require(state.hold_requested, "candidate should hold before any START");
+  auto gap = sound(0, false);
+  gap.discontinuity = true;
+  tick(gap);
+  require(!state.hold_requested && state.cancels == 1 && state.starts == 1,
+          "discontinuity left a probe or partial input alive");
+}
+void confirmed_barge(bool natural_end, int reference_delay = 0) {
+  open();
+  question();
+  network(voice_net::LinkEventKind::Audio);
+  if (natural_end) {
+    network(voice_net::LinkEventKind::Done);
+  }
+  const int confirm_at = 116 + reference_delay;
+  for (int id = 100; id <= confirm_at; ++id) {
+    if (natural_end && id == 106) {
+      state.output = playback::State::Drained;
+    }
+    tick(barge_sound(id, id < 106 + reference_delay, id >= 106 && !natural_end));
+    if (id < confirm_at) {
+      require(state.starts == 1 && state.drops == 0, "candidate retired old reply early");
+    }
+    if (id == 105) {
+      require(state.hold_requested, "early barge hidden by startup warmup");
+    }
+  }
+  require(state.starts == 2 && state.supersede == !natural_end &&
+              state.drops == (natural_end ? 0 : 1) && !state.hold_requested,
+          "confirmed input did not take ownership exactly once");
+  for (int id = confirm_at + 1; id <= confirm_at + 35; ++id) {
+    tick(sound(id, false));
+  }
+  require(state.ends == 2 && state.samples.size() == static_cast<std::size_t>(102 + reference_delay),
+          "confirmed input missing END or PCM");
+  for (int id = 100; id <= confirm_at + 35; ++id) {
+    require(state.samples[50 + id - 100] == id, "probe pre-roll/current/tail skipped or repeated");
   }
 }
 }  // namespace harness
@@ -106,10 +183,14 @@ void finish() {
   ++harness::state.finishes;
 }
 void cancel() {
+  harness::state.hold_requested = false;
   if (harness::state.output == State::Playing) {
     ++harness::state.drops;
     harness::state.output = State::Idle;
   }
+}
+void hold(bool enabled) {
+  harness::state.hold_requested = enabled && harness::state.output == State::Playing;
 }
 void set_volume(std::uint8_t) {}
 State status() {
@@ -146,6 +227,7 @@ bool poll(LinkEvent& event) {
   return true;
 }
 SendResult start(bool supersede) {
+  harness::require(!harness::state.hold_requested, "START before releasing/canceling probe");
   ++harness::state.starts;
   harness::state.uploading = true;
   harness::state.supersede = supersede;
@@ -205,8 +287,8 @@ int main() {
     for (int stage = 0; stage < 4; ++stage) {
       state = {};
       state.input_ok = stage != 0;
-      state.output_ok = stage != 1;
-      state.start_ok = stage != 2;
+      state.start_ok = stage != 1;
+      state.output_ok = stage != 2;
       state.network_ok = stage != 3;
       require(!App_Init({}), "initialization failure ignored");
       App_Close();
@@ -226,32 +308,10 @@ int main() {
     }
     require(state.starts == 2 && state.ends == 2 && state.samples.size() == 100,
             "follow-up did not reuse the same speech path");
-    open();
-    question();
-    network(LinkEventKind::Audio);
-    for (int id = 100; id < 150; ++id) {
-      tick(sound(id, id < 115));
-    }
-    require(state.supersede && state.drops == 1 && state.starts == 2 && state.ends == 2,
-            "same spoken sentence did not replace playback");
-    require(
-        state.samples[50] == 100 && state.samples.back() == 149 && state.samples.size() == 100,
-        "barge sentence lost its beginning or tail");
-    open();
-    question();
-    network(LinkEventKind::Audio);
-    network(LinkEventKind::Done);
-    for (int id = 100; id < 114; ++id) {
-      tick(sound(id, true));
-    }
-    state.output = playback::State::Drained;
-    tick(sound(114, true));
-    for (int id = 115; id < 150; ++id) {
-      tick(sound(id, false));
-    }
-    require(state.starts == 2 && !state.supersede && state.samples.size() == 100 &&
-                state.samples[50] == 100,
-            "natural drain cleared a sentence that already started");
+    reject_probes();
+    confirmed_barge(false);
+    confirmed_barge(false, 8);  // 最晚允许确认恰好保留25帧，不扩大网络突发。
+    confirmed_barge(true);
     state.action = ui::UiAction{ui::UiActionKind::Interrupt, 60};
     tick();
     require(state.cancels == 1, "END incorrectly disabled cancel");
@@ -266,7 +326,7 @@ int main() {
     for (int id = 0; id < 15; ++id) {
       tick(sound(id, true));
     }
-    require(state.cancels == 2 && !state.uploading && state.samples.size() == 100,
+    require(state.cancels == 2 && !state.uploading && state.samples.size() == 102,
             "backpressure skipped PCM and continued uploading");
     App_Close();
     return 0;

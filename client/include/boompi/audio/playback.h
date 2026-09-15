@@ -19,6 +19,10 @@ WriteResult write(const void* bytes, std::size_t byte_count);
 void finish();
 // 异步中断write/drain并丢队列；收尾后status为Idle，旧数据不可再投递。
 void cancel();
+// 试探期间不消费TTS/滤波历史，只写设备静音；相同true不续期，最多500ms。
+void hold(bool enabled);
+// 输入线程取无锁观测；true仅表示播放线程已写入试探静音，仍须检查实际参考。
+bool held() noexcept;
 void set_volume(std::uint8_t volume);
 State status();
 std::string error();

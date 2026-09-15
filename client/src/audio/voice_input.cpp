@@ -12,6 +12,8 @@
 #include "audio_capture.h"
 #include "audio_convert.h"
 #include "audio_thread.h"
+#include "board_voice_profile.h"
+#include "boompi/audio/playback.h"
 #include "boompi/platform/rv1106/rockchip_3a.h"
 #include "vad.h"
 #include "wake.h"
@@ -39,8 +41,10 @@ bool Fail(const char* reason, int code = 0) {
 
 void CaptureTask() {
   audio::SetAudioThreadPriority("boompi-capture", 40);
+  bool previous_reference = false, previous_held = false;
   for (;;) {
     // 读取 → 必要格式适配 → 3A → 唤醒 → VAD → 交付。
+    const bool held_before_read = playback::held();
     const int captured = audio_capture::read(raw.data());
     if (captured < 0) {
       if (captured != -ECANCELED) {
@@ -50,6 +54,7 @@ void CaptureTask() {
     }
     audio::CaptureFrame frame{};
     if (captured == 0) {
+      previous_reference = previous_held = false;
       rockchip_3a::close();
       if (!audio_convert::reset_capture() || !rockchip_3a::open() || !wake::reset() ||
           !vad::reset()) {
@@ -70,6 +75,15 @@ void CaptureTask() {
       if (!rockchip_3a::process(channels, frame.pcm)) {
         Fail("Rockchip 3A rejected a frame");
         break;
+      }
+      // 3A的prime使输出固定滞后一帧，参考和播放观测也延后一帧交付。
+      frame.reference_active = previous_reference;
+      frame.playback_held = previous_held;
+      previous_held = held_before_read;
+      previous_reference = false;
+      for (std::size_t i = 2; i < channels.size(); i += 3) {
+        previous_reference = previous_reference || channels[i] > audio::board::kReferencePeak ||
+                             channels[i] < -audio::board::kReferencePeak;
       }
       const int detected = wake::detect(frame.pcm);
       if (detected < 0) {

@@ -109,6 +109,57 @@ void playback_boundaries() {
   require(std::chrono::steady_clock::now() - started < 500ms,
           "close did not interrupt blocking I/O");
 }
+void playback_probe_boundaries() {
+  const auto input = pcm(5 * audio::kVoiceFrameSamples, 12000);
+  open_audio();
+  queue(input);
+  playback::finish();
+  wait_playback(playback::State::Drained);
+  const auto baseline = hw::written_samples();
+  for (bool expire : {false, true}) {
+    open_audio();
+    hw::block_playback(hw::PlaybackBlock::Write);
+    queue(input);
+    require(hw::wait_for_playback_blocked(500ms), "probe did not reach first write");
+    playback::hold(true);
+    playback::finish();
+    hw::block_playback(hw::PlaybackBlock::None);
+    const auto began = std::chrono::steady_clock::now();
+    while (!playback::held() && std::chrono::steady_clock::now() - began < 300ms) {
+      std::this_thread::sleep_for(1ms);
+    }
+    require(playback::held(), "hold request never became a playback observation");
+    require(playback::status() == playback::State::Playing && hw::drain_count() == 0,
+            "DONE drained a held response");
+    if (expire) {
+      // 主流程反复发送相同true不能续租；没有新采集帧也必须恢复TTS。
+      while (playback::status() == playback::State::Playing &&
+             std::chrono::steady_clock::now() - began < 1000ms) {
+        playback::hold(true);
+        std::this_thread::sleep_for(5ms);
+      }
+      require(playback::status() == playback::State::Drained, "repeated hold renewed its lease");
+    }
+    playback::hold(false);
+    wait_playback(playback::State::Drained);
+    require(!playback::held(), "hold survived completion");
+    auto output = hw::written_samples();
+    // 删除明确插入的全零采样后，真实重采样输出必须逐样本相等，包含滤波尾音。
+    output.erase(std::remove(output.begin(), output.end(), 0), output.end());
+    auto expected = baseline;
+    expected.erase(std::remove(expected.begin(), expected.end(), 0), expected.end());
+    require(output == expected, "rejected/expired probe consumed or replayed TTS samples");
+  }
+  open_audio();
+  queue(input);
+  playback::hold(true);
+  playback::cancel();
+  wait_playback(playback::State::Idle);
+  require(!playback::held(), "cancel kept the probe observation");
+  queue(pcm(320, 0));
+  playback::finish();
+  wait_playback(playback::State::Drained);
+}
 void speech_samples() {
   speech::reset();
   std::vector<int> delivered;
@@ -178,6 +229,7 @@ int main(int argc, char** argv) {
       speech_samples();
     } else if (scenario == "playback") {
       playback_boundaries();
+      playback_probe_boundaries();
     } else if (scenario == "capture") {
       capture_boundaries();
     } else {

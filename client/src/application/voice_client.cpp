@@ -167,12 +167,15 @@ bool App_Process() {
       if (state == State::Idle && frame.wake) {
         listen(6s);
       } else if (state == State::Listening || state == State::Speaking) {
-        const auto speech_frame = speech::update(frame);
         const bool replacing = state == State::Speaking;
+        const auto speech_frame = speech::update(frame, replacing && view.volume != 0);
+        // 确认后直接取消，不能先解除hold给旧PCM一次复活的机会。
+        if (speech_frame.start && replacing) {
+          playback::cancel();
+        } else {
+          playback::hold(speech_frame.hold_playback);
+        }
         if (speech_frame.start) {
-          if (replacing) {
-            playback::cancel();
-          }
           if (!sent(voice_net::start(replacing))) {
             return true;
           }

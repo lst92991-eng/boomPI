@@ -23,6 +23,8 @@ using CaptureChannels = std::array<std::int16_t, kVoiceFrameSamples * 3>;
 struct CaptureFrame final {
   VoiceFrame16k pcm{};
   bool wake{false}, vad_now{false};
+  // 与3A输出对齐的参考活动及已写静音观测；不是应用发出hold的时刻。
+  bool reference_active{false}, playback_held{false};
   // 硬件断流或交接队列溢出；这块数据不能拼入当前语句。
   bool discontinuity{false};
 };

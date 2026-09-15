@@ -12,9 +12,9 @@ import (
 )
 
 const (
-	// 34 ordinary frames + 2 reserved STARTs + one in the provider call and
-	// one in the socket reader stay below the 40-frame (800 ms) input budget.
-	commandCapacity          = 34
+	// 25帧前滚 + 700ms旧轮取消 + 700ms首包准备/写入 = 95帧，另留一个END。
+	// 加上2个边界槽和在途调用，最多约2秒/64KB；超限仍结束连接，不丢PCM。
+	commandCapacity          = 96
 	urgentCapacity           = 2
 	providerOperationTimeout = 700 * time.Millisecond
 )
@@ -186,7 +186,7 @@ func (a *Actor) run(ctx context.Context) {
 			if cmd.start || cmd.stop || cmd.generation != a.latest.Load() {
 				continue
 			}
-			if cmd.generation != generation || responding || time.Since(cmd.queuedAt) > 800*time.Millisecond {
+			if cmd.generation != generation || responding || time.Since(cmd.queuedAt) > 2*time.Second {
 				return
 			}
 			opCtx, cancel := context.WithTimeout(ctx, providerOperationTimeout)

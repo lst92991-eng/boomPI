@@ -29,7 +29,12 @@ snd_pcm_t* device{nullptr};
 std::atomic<bool> stopping{false}, canceled{false};
 std::atomic<std::uint8_t> volume{60};
 State state{State::Idle};
-bool ending{false};
+bool ending{false}, holding{false};
+std::chrono::steady_clock::time_point hold_until{};
+std::atomic<bool> hold_applied{false};
+bool hold_active() {
+  return holding && std::chrono::steady_clock::now() < hold_until;
+}
 char failure[192]{};
 audio::StereoPlaybackFrame stereo;
 
@@ -40,8 +45,12 @@ bool fail(const char* stage, int code = 0) {
   }
   return false;
 }
-int render(const std::int16_t* pcm, std::size_t samples) {
-  if (!audio_convert::playback(pcm, samples, stereo)) {
+int render(const std::int16_t* pcm, std::size_t samples, bool silence = false) {
+  if (silence) {
+    // 不把静音送进TTS重采样器；保留其历史和未消费的TTS，恢复时不吞字。
+    stereo.pcm.fill(0);
+    stereo.frames = audio::kDeviceFrameSamples;
+  } else if (!audio_convert::playback(pcm, samples, stereo)) {
     return -EIO;
   }
   long peak = 0;
@@ -104,8 +113,21 @@ void play() {
     }
     while (result >= 0 && !canceled && !stopping.load()) {
       ready.wait(lock, [] {
-        return stopping.load() || canceled || ending || buffered >= audio::kVoiceFrameSamples;
+        const bool quiet = hold_active();
+        if (!quiet) {
+          hold_applied.store(false);
+        }
+        return stopping.load() || canceled || quiet || ending ||
+               buffered >= audio::kVoiceFrameSamples;
       });
+      if (!canceled && !stopping.load() && hold_active()) {
+        lock.unlock();
+        result = render(nullptr, 0, true);
+        lock.lock();
+        hold_applied.store(result >= 0 && hold_active() && !canceled);
+        continue;
+      }
+      hold_applied.store(false);
       if (canceled || stopping.load() || buffered == 0) {
         break;
       }
@@ -145,7 +167,8 @@ void play() {
     }
     state = discard ? State::Idle : State::Drained;
     buffered = 0;
-    ending = canceled = false;
+    ending = canceled = holding = false;
+    hold_applied.store(false);
     ready.notify_all();
   }
 }
@@ -221,12 +244,30 @@ void finish() {
 }
 void cancel() {
   std::lock_guard<std::mutex> lock(mutex);
+  holding = false;
+  hold_applied.store(false);
   if (state == State::Playing) {
     canceled = true;
     buffered = 0;
     drop();
     ready.notify_all();
   }
+}
+void hold(bool enabled) {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (enabled && !holding) {
+    // 为试探期间的新下行预留空间；积压时不再暂停消费，避免误试探挤满播放环。
+    const bool room = buffered <= kCapacity - audio::kVoiceRateHz * 700 / 1000;
+    hold_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(room ? 500 : 0);
+  }
+  holding = enabled && state == State::Playing && !canceled;
+  if (!holding) {
+    hold_applied.store(false);
+  }
+  ready.notify_all();
+}
+bool held() noexcept {
+  return hold_applied.load();
 }
 void set_volume(std::uint8_t level) {
   volume.store(std::min<std::uint8_t>(level, 100));
@@ -254,6 +295,7 @@ void close() {
   std::lock_guard<std::mutex> lock(mutex);
   state = State::Idle;
   buffered = 0;
-  ending = canceled = false;
+  ending = canceled = holding = false;
+  hold_applied.store(false);
 }
 }  // namespace boompi::playback
