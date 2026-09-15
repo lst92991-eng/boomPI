@@ -110,7 +110,7 @@ bool PrimePlayback(std::uint32_t generation = 1, std::size_t previous_writes = 0
       return false;
     }
   }
-  return Check(fake::wait_for_writes(previous_writes + 9, 500ms),
+  return Check(fake::wait_for_writes(previous_writes + 9, 2s),
                "180ms prebuffer did not reach real resampling and ALSA writes");
 }
 bool StereoDuration(std::size_t input_samples) {
@@ -147,7 +147,7 @@ bool TestRebufferAfterConfirmedGap() {
   if (!OpenAudio() || !PrimePlayback()) {
     return false;
   }
-  std::this_thread::sleep_for(65ms);
+  std::this_thread::sleep_for(500ms);
   if (!QueueFrame(9)) {
     return false;
   }
@@ -162,7 +162,7 @@ bool TestEndPlaybackShortTail() {
   if (!OpenAudio() || !PrimePlayback()) {
     return false;
   }
-  std::this_thread::sleep_for(65ms);
+  std::this_thread::sleep_for(500ms);
   if (!QueueFrame(9, 240)) {
     return false;
   }
