@@ -27,15 +27,15 @@ YOLO、在线音乐、长期记忆、账号系统、OTA 和多模态上传暂不
 ## 3. 目录职责
 
 ```text
-client/src/application/      唯一六状态对话与 generation 分配
-client/src/audio/            VoiceAudio、生产声学判定、pre-roll 与有界音频队列
+client/src/application/      顺序问答主流程与 generation 分配
+client/src/audio/            namespace语句整理、采集任务、播放任务与各自必要缓冲
 client/src/config/           板端环境配置
 client/src/network/          网络选择、发现和持久 WSS
 client/src/platform/rv1106/  ALSA、重采样、3A、Snowboy、VAD
 client/src/ui/               LVGL、触摸和摄像头预览
 server/internal/app/         服务组合与单设备会话
 server/internal/backend/     Qwen pipeline 和唯一 provider 接口
-server/internal/protocol/    唯一 v2 控制帧与固定20ms PCM
+server/internal/protocol/    与客户端配套的START/PCM/END/CANCEL协议
 protocol/                    跨语言线协议
 ```
 
@@ -67,16 +67,16 @@ playback volume     = 60%
 pre-roll            = 500 ms
 ```
 
-打断成功的定义是：确认近讲、停止旧 TTS、以新 generation 的 START|SUPERSEDE 退休旧回复，并把保留的近讲 PCM 作为新 turn 提交。v2 不等待 cancel ACK；仅停止扬声器不算成功。
+打断成功的定义是：确认近讲、停止旧 TTS、以新 generation 的 START(supersede)退休旧回复，并把保留的近讲 PCM 作为新 turn 提交。不等待 cancel ACK；仅停止扬声器不算成功。
 
 ## 5. 线程所有权
 
 | 上下文 | 唯一职责 |
 | --- | --- |
-| application actor | 六状态、generation、普通提问/替换回答、追问窗口 |
+| application主线程 | 对话状态、generation、普通提问/替换回答、追问窗口 |
 | capture，`SCHED_FIFO 40` | ALSA capture、3A、Snowboy/VAD、发布 20 ms 帧 |
 | playback，`SCHED_FIFO 30` | TTS ring、重采样、ALSA write/drop/drain |
-| VoiceLink | 网络建链、TLS/WebSocket、握手心跳重连和协议事件 |
+| voice_net网络线程 | 网络建链、TLS/WebSocket、握手心跳重连和协议事件 |
 | UI worker | 所有 LVGL、触摸和音量配置写入 |
 | camera worker | SC3336 拉流和固定大小帧交接 |
 
@@ -135,14 +135,18 @@ Snowboy bridge 单独使用旧 C++ ABI；不得把 `_GLIBCXX_USE_CXX11_ABI=0` �
 - 保持现有模块内命名一致；模仿样例时不增加 App_* 转发外壳或机械复制目录。普通函数或简洁类按实际责任选用，官方 C++ 库及其必需边界继续保留。
 - 样例的芯片、RTOS、音频编码、阻塞方式和算法参数不直接移植到 RV1106。原功能、库不可修改、学生零声学校准以及每次公共接口变更汇报等约定继续有效。
 
-- 当前应用层采用普通函数模块：App_Init、App_Process、App_Close、App_GetError；main 显式呈现配置、初始化、循环和退出。应用状态在实现文件中由主线程管理，不再使用 VoiceApp 类；底层音频和网络类保留。
-- AudioTasks 管理两个音频线程，Start/Stop 负责启停；ReadProcessedFrame/QueueReplyFrame 分别取录音和提交回复。内部任务函数先展开数据处理步骤，再放支持函数，不增加只转发的外壳。
+- 本次交付必须完成结构重写：应用直接调用namespace模块，旧VoiceAudio/AudioEngine/AudioBackend及更名后的AudioTasks/AudioPipeline组合转发层均删除，不在旧对象上再包namespace。旧内部接口不构成兼容性要求。
+- 保留App_Init/App_Process/App_Close作为产品入口，主流程显式读取采集结果、调用speech语句整理、提交voice_net、操作playback。speech不持有音频线程、不接收/转发下行PCM、不管理声卡生命周期。
+- 采集线程显式展开audio_capture读取、格式转换、rockchip_3a处理、wake检测、vad判断，再交给应用；播放线程直接持有自己的有界队列、转换器与ALSA输出。模块通过namespace提供少量普通函数，各自资源与线程同步由实现文件拥有。
+- 启动时先audio_capture::open、playback::open，再audio_capture::start，最后voice_net::open；保持两路PCM配置后才开始首次采集。start是真实线程生命周期函数，不新增运行时包装层。
+- namespace必须承载原实现与资源，不能只转发旧类；移除失效源文件、公共头、PImpl生命周期和CMake选源。必要第三方对象及直接硬件资源所有权可保留，硬件事实和失败回收不得因改成普通函数而丢失。
 - 官方源码、第三方库源码和库二进制不修改；兼容问题只在自有桥接、调用和构建配置中解决。
 - 学生侧不设置声学校准参数。必要硬件事实与三项已验证声学常量保留在内部 `client/src/platform/rv1106/board_voice_profile.h`，不通过公共音频配置对象传递。
 - 新增、重命名或删除跨模块接口时，逐项汇报用途、输入输出、调用方和旧接口去向。优先复用，不新增通用框架。
-- 应用模块普通函数使用 App_ 前缀；其他类的公共操作与查询使用 PascalCase，布尔查询使用 Is/Has/Was，字段沿用 snake_case；枚举项使用 PascalCase，常量保留 k 前缀。第三方/C ABI 命名遵循原契约。
-- 音频结果通过 ProcessEvents 直接返回整批事件，开始事件先于句首 PCM；停止或句尾后放弃本批剩余项，不恢复同线程的第二份事件队列。
-- VoiceLink 直接复用 VoiceClientConfig；原子变量默认采用标准内存顺序，只有测量证明有必要时再引入显式内存顺序优化。
+- App入口继续使用App_前缀；新语音namespace公共函数使用open/read/process/update/write/close等简单snake_case，字段snake_case，枚举项PascalCase，常量k前缀。UI等无关模块沿用原命名。第三方/C ABI遵循原契约。
+- 语句整理返回准入/结束决定及可直接读取的PCM，不再复制成携带整帧PCM的AudioEvent队列或vector；句首与实时帧不重不漏，停止或句尾后丢弃本批剩余输入。
+- voice_net直接复用VoiceClientConfig。线上START/END/CANCEL与PCM分开，generation和sequence继续承担在途隔离与缺帧校验；DONE和实际尾播完成必须区分。协议变更同步更新两端和共享fixture，不保留旧双栈。
+- 原子变量默认采用标准内存顺序，只有测量证明有必要时再引入显式内存顺序优化。
 - 正常流程不逐轮打印状态与统计；错误和必要的恢复提示保留在实际负责的边界。删除仅为已移除日志服务的计数状态。
 - C++17 与 `gofmt`；数值名带单位，例如 `*_ms`、`*_frames`、`*_dbfs`。
 - 注释解释硬件事实、并发所有权、时序和“为什么”；教学主流程允许简短步骤注释，避免给每条显然赋值附上重复说明。

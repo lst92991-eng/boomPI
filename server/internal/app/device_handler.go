@@ -33,7 +33,7 @@ type deviceHandler struct {
 }
 
 // Handle reads the teaching conversation in wire order. START begins input,
-// END commits it, and a newer START/STOP retires all earlier generations.
+// END commits it, and a newer START/CANCEL retires all earlier generations.
 // Provider operations run only in session.Actor, so cancellation cannot block
 // this reader or its bounded input queues.
 func (h *deviceHandler) Handle(ctx context.Context, c *transport.Connection) error {
@@ -57,7 +57,7 @@ func (h *deviceHandler) Handle(ctx context.Context, c *transport.Connection) err
 		return errors.New("provider session setup failed")
 	}
 	defer actor.Close()
-	if err = c.SendControl(ctx, protocol.Control{Type: "ready", SampleRate: 16000}); err != nil {
+	if err = c.SendControl(ctx, protocol.Control{Type: "ready", Version: 3, SampleRate: 16000}); err != nil {
 		return err
 	}
 	deviceRef := redactedDeviceRef(hello.DeviceID)
@@ -80,14 +80,32 @@ func (h *deviceHandler) Handle(ctx context.Context, c *transport.Connection) err
 		}
 		if message.Control != nil {
 			control := message.Control
-			if control.Type != "stop" {
+			switch control.Type {
+			case "start":
+				if control.Generation <= generation {
+					return errors.New("generation reuse")
+				}
+				generation, sequence, inputEnded = control.Generation, 0, false
+				err = actor.Start(generation, *control.Supersede)
+			case "cancel":
+				if control.Generation <= generation {
+					continue
+				}
+				generation, sequence, inputEnded = control.Generation, 0, true
+				err = actor.Cancel(generation, *control.Retract)
+			case "end":
+				if control.Generation < generation {
+					continue
+				}
+				if control.Generation != generation || inputEnded || sequence == 0 {
+					return errors.New("END without nonempty current input")
+				}
+				inputEnded = true
+				err = actor.End(generation)
+			default:
 				return errors.New("hello may only occur once")
 			}
-			if control.Generation <= generation {
-				continue
-			}
-			generation, sequence, inputEnded = control.Generation, 0, true
-			if err = actor.Stop(generation, *control.Retract); err != nil {
+			if err != nil {
 				return err
 			}
 			continue
@@ -96,29 +114,21 @@ func (h *deviceHandler) Handle(ctx context.Context, c *transport.Connection) err
 		if header.Generation < generation {
 			continue
 		}
-		if header.Flags&protocol.PCMFlagStart != 0 {
-			if header.Generation <= generation {
-				return errors.New("generation reuse")
-			}
-			generation, sequence, inputEnded = header.Generation, 0, false
-		}
 		if header.Generation != generation || inputEnded || header.Sequence != sequence {
-			return errors.New("uplink sequence gap or audio after END")
+			return errors.New("uplink sequence gap or PCM outside START/END")
 		}
 		if sequence >= 3000 {
 			return errors.New("input exceeds 60 seconds")
 		}
 		sequence++
-		inputEnded = header.Flags&protocol.PCMFlagEnd != 0
+
 		if err = actor.Submit(header, message.PCM); err != nil {
 			return err
 		}
 	}
 }
 
-// pacedDownlink retains one 20 ms frame as framing lookahead. This lets the
-// actual final PCM carry END, including a one-frame answer, without inventing
-// silence or exposing response/audio-start messages to the client.
+// 按网络20ms组帧并定速交付。满帧立即发送；只有不足一帧的余数等DONE。
 type pacedDownlink struct {
 	generation uint32
 	sequence   uint32
@@ -141,7 +151,7 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, c *transport.Connecti
 			}
 			output = pacedDownlink{}
 		}
-		ready := output.pending.Len() > protocol.DownlinkFrameBytes || (output.done && output.pending.Len() > 0)
+		ready := output.pending.Len() >= protocol.DownlinkFrameBytes || (output.done && output.pending.Len() > 0)
 		var timerC <-chan time.Time
 		if ready {
 			wait := time.Until(output.nextAt)
@@ -216,14 +226,7 @@ func (h *deviceHandler) forwardEvents(ctx context.Context, c *transport.Connecti
 
 func sendPacedFrame(ctx context.Context, c *transport.Connection, p *pacedDownlink) error {
 	count := min(p.pending.Len(), protocol.DownlinkFrameBytes)
-	flags := uint16(0)
-	if p.sequence == 0 {
-		flags |= protocol.PCMFlagStart
-	}
-	if p.done && count == p.pending.Len() {
-		flags |= protocol.PCMFlagEnd
-	}
-	header := protocol.PCMHeader{Generation: p.generation, Sequence: p.sequence, Flags: flags}
+	header := protocol.PCMHeader{Generation: p.generation, Sequence: p.sequence}
 	if err := c.SendPCM(ctx, header, p.pending.Bytes()[:count]); err != nil {
 		return err
 	}

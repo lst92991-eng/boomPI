@@ -2,13 +2,13 @@
  * @file network_setup.cpp
  * @brief 教学板的网卡建链、UDP 服务发现和配置保存。
  *
- * FindServer 由 VoiceLink 线程调用；配网页只调用 SaveWifi 保存配置。
+ * FindServer 由 voice_net 线程调用；配网页只调用 save_wifi 保存配置。
  * DHCP、外部命令和文件写入都可能等待，不能放到采集或播放线程。
  *
  * 地址链路先 SelectInterface，显式端点可直接返回；自动模式继续 Discover →
  * 比对已缓存 SPKI → SaveServer，发现失败时可沿用 LoadServer 缓存。
  * 这里只返回连接候选，持有相应公钥的证明由
- * voice_link.cpp 中的 TLS 握手完成，网卡可用也不等于服务器已经 ready。
+ * voice_net.cpp 中的 TLS 握手完成，网卡可用也不等于服务器已经 ready。
  */
 #include "network_setup.h"
 
@@ -28,7 +28,7 @@
 
 #include "boompi/config/voice_client_config.h"
 
-namespace boompi::network {
+namespace boompi::voice_net {
 namespace {
 
 // 网卡名来自教学板系统；发现的服务器候选及 pin 保存在 userdata，更新应用时不覆盖。
@@ -237,7 +237,7 @@ bool LoadServer(config::VoiceClientConfig* output) {
  *
  * SO_BINDTODEVICE 避免请求从另一张网卡发出。UDP 只能提供地址和公钥提示，
  * 已配对设备还要与缓存 SPKI 比对，随后由 TLS 验证持有该公钥的服务器。
- * 一次调用仅发送一次广播、读取一次响应，最多等 800 ms；重试节奏由 VoiceLink 管理。
+ * 一次调用仅发送一次广播、读取一次响应，最多等 800 ms；重试节奏由 voice_net 管理。
  * 响应必须来自 UDP 17807，WSS 端口和 44 字符 pin 来自严格格式的文本负载。
  */
 bool Discover(const char* interface, config::VoiceClientConfig* output) {
@@ -328,7 +328,7 @@ std::string EscapeWifiField(const std::string& input) {
  *
  * 此处不做网络连接，也不打印字段值；下次网络准备阶段使用保存后的配置尝试 Wi-Fi。
  */
-bool SaveWifi(const std::string& ssid, const std::string& password) {
+bool save_wifi(const std::string& ssid, const std::string& password) {
   // 拒绝控制字符并转义引号，防止输入改变 wpa_supplicant 文件结构。
   if (!IsText(ssid, 1U, 32U) || !IsText(password, 8U, 63U)) {
     return false;
@@ -383,4 +383,4 @@ bool detail::FindServer(const config::VoiceClientConfig& configured,
   return true;
 }
 
-}  // namespace boompi::network
+}  // namespace boompi::voice_net

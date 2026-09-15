@@ -14,9 +14,11 @@ import (
 const MaxControlMessageBytes = 8192
 const MaxTextBytes = 4096
 
-// Control is the complete v2 JSON vocabulary. Each message has one exact shape.
+// Control is the complete v3 JSON vocabulary. Each message has one exact shape.
 type Control struct {
 	Type       string `json:"type"`
+	Version    int    `json:"version,omitempty"`
+	Supersede  *bool  `json:"supersede,omitempty"`
 	SampleRate int    `json:"sample_rate,omitempty"`
 	DeviceID   string `json:"device_id,omitempty"`
 	Token      string `json:"token,omitempty"`
@@ -61,12 +63,12 @@ func DecodeControl(data []byte) (Control, error) {
 	want := []string{"type"}
 	switch result.Type {
 	case "hello":
-		want = append(want, "device_id", "token", "sample_rate")
+		want = append(want, "device_id", "token", "sample_rate", "version")
 		if !ValidDeviceID(result.DeviceID) || len(result.Token) == 0 || len(result.Token) > 256 {
 			return result, errors.New("invalid hello identity")
 		}
 	case "ready":
-		want = append(want, "sample_rate")
+		want = append(want, "sample_rate", "version")
 	case "text":
 		want = append(want, "generation", "text")
 		if len(result.Text) == 0 || len(result.Text) > MaxTextBytes {
@@ -79,7 +81,11 @@ func DecodeControl(data []byte) (Control, error) {
 		if len(result.Code) == 0 || len(result.Code) > 64 || strings.Trim(result.Code, "abcdefghijklmnopqrstuvwxyz0123456789_") != "" {
 			return result, errors.New("invalid error code")
 		}
-	case "stop":
+	case "start":
+		want = append(want, "generation", "supersede")
+	case "end":
+		want = append(want, "generation")
+	case "cancel":
 		want = append(want, "generation", "retract")
 	default:
 		return result, errors.New("unknown control type")
@@ -92,8 +98,8 @@ func DecodeControl(data []byte) (Control, error) {
 			return result, errors.New("missing control field")
 		}
 	}
-	if (result.Type == "hello" || result.Type == "ready") && result.SampleRate != 16000 {
-		return result, errors.New("sample_rate must be 16000; update client and server together")
+	if (result.Type == "hello" || result.Type == "ready") && (result.SampleRate != 16000 || result.Version != 3) {
+		return result, errors.New("version must be 3 and sample_rate must be 16000; update client and server together")
 	}
 	if fields["generation"] != nil && result.Generation == 0 {
 		return result, errors.New("generation must be nonzero")
@@ -119,7 +125,7 @@ func validEscapedUnicode(data []byte) bool {
 			return false
 		}
 		code, err := strconv.ParseUint(string(data[i+1:i+5]), 16, 16)
-		if err != nil {
+		if err != nil || code == 0 {
 			return false
 		}
 		if code >= 0xdc00 && code <= 0xdfff {

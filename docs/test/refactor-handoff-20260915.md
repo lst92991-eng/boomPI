@@ -1,5 +1,7 @@
 # 2026-09-15 客户端与服务端重构交接
 
+历史记录：本页对应f179051阶段，未完成本轮要求的完整namespace结构重写。当前实现、删除清单与验证见[后续结构重写](namespace-rewrite.md)；本页的旧API、源码路径和统计仅供历史对照。
+
 ## 起点与工作区保护
 
 - 分支：`codex/p1-fast-vertical-integration`。

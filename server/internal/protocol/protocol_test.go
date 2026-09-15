@@ -9,8 +9,8 @@ import (
 	"testing"
 )
 
-func TestSharedV2GoldenFixtures(t *testing.T) {
-	data, err := os.ReadFile("../../../protocol/fixtures/protocol-v2-golden.json")
+func TestSharedV3GoldenFixtures(t *testing.T) {
+	data, err := os.ReadFile("../../../protocol/fixtures/protocol-v3-golden.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,38 +115,35 @@ func TestUnicodeEscapesAgreeWithBoard(t *testing.T) {
 }
 
 func TestPCMRejectsMalformedFrames(t *testing.T) {
-	valid, _ := EncodePCM(PCMHeader{Flags: 3, Generation: 1}, make([]byte, 640), true)
+	valid, _ := EncodePCM(PCMHeader{Generation: 1}, make([]byte, 640), true)
 	for _, mutate := range []func([]byte) []byte{
-		func(b []byte) []byte { return b[:15] },
-		func(b []byte) []byte { b[3] = '1'; return b },
-		func(b []byte) []byte { b[7] = 1; return b },
-		func(b []byte) []byte { b[5] = 8; return b },
-		func(b []byte) []byte { b[5] = 2; return b },
-		func(b []byte) []byte { b[11] = 0; return b },
-		func(b []byte) []byte { b[15] = 1; return b },
+		func(b []byte) []byte { return b[:11] },
+		func(b []byte) []byte { b[3] = '2'; return b },
+		func(b []byte) []byte { clear(b[4:8]); return b },
+		func(b []byte) []byte {
+			for i := 8; i < 12; i++ {
+				b[i] = 255
+			}
+			return b
+		},
 		func(b []byte) []byte { return b[:len(b)-2] },
 	} {
 		if _, _, err := ParsePCMFrame(mutate(append([]byte(nil), valid...)), true); err == nil {
 			t.Fatal("accepted malformed PCM")
 		}
 	}
-	for _, tc := range []struct {
-		flags uint16
-		size  int
-		valid bool
-	}{
-		{3, 2, true}, {3, 640, true}, {3, 962, false}, {1, 2, false}, {1, 640, true}, {7, 640, false}, {3, 0, false}, {3, 3, false},
-	} {
-		_, err := EncodePCM(PCMHeader{Flags: tc.flags, Generation: 1}, make([]byte, tc.size), false)
-		if (err == nil) != tc.valid {
-			t.Errorf("%+v: %v", tc, err)
+	for _, size := range []int{0, 1, 2, 3, 638, 640, 642} {
+		_, err := EncodePCM(PCMHeader{Generation: 1}, make([]byte, size), false)
+		valid := size > 0 && size <= 640 && size%2 == 0
+		if (err == nil) != valid {
+			t.Errorf("size %d: %v", size, err)
 		}
 	}
 }
 
-func FuzzDecodeV2(f *testing.F) {
+func FuzzDecodeV3(f *testing.F) {
 	f.Add([]byte("{\"type\":\"ready\"}"))
-	f.Add([]byte("BPV2"))
+	f.Add([]byte("BPV3"))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		_, _ = DecodeControl(data)
 		_, _, _ = ParsePCMFrame(data, true)

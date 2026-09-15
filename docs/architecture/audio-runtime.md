@@ -1,28 +1,30 @@
-# v2 音频运行时
+# 音频任务与数据所有权
 
-固定链路：ALSA 48 kHz / 4ch → 联合重采样16 kHz → Rockchip双麦单参考3A → Snowboy/VAD → VoiceAudio语义事件 → App_Process → VoiceLink。下行16 kHz mono经有界TTS ring、重采样、音量和limiter后输出48 kHz stereo。
+主流程直接调用三个方向：audio_capture::read取得已处理帧；speech::update决定开口、句尾和插话；服务器回复直接写playback。语句模块没有播放入口、线程句柄或网络队列。
 
-`VoiceAudio::ProcessEvents`由主线程持续调用，推进输入/插话判定并直接取得整批事件（开始事件先于句首PCM）；timeout仅限制等待采集帧，不是整个函数的耗时上限。`ListenMode::Wake/FollowUp`只选择准入策略，6秒/3秒的开口窗口仍由应用管理。
-
-下行协议已固定一包最多320样本，因此AudioTasks按一包一槽入队，不再跨槽拆拼。非末帧恰好320样本，短槽之后拒绝追加，等待EndPlayback或DropPlayback；保留1.5秒容量、sequence连续性与自然尾播规则。
-
-帧契约在 `audio_format.h`，板级默认参数在 `board_voice_profile.h`。一个ALSA frame是同一采样时刻的所有通道；960个48 kHz frames才是20 ms。
-
-| 缓冲 | 容量 | 超限行为 |
+| 边界 | 所有者 | 保留原因与超限行为 |
 | --- | --- | --- |
-| capture交接 | 4 × 20 ms | 显式discontinuity，不拼接缺帧 |
-| 普通pre-roll | 25 × 20 ms | 保留最近500 ms |
-| 打断历史 | 32 × 20 ms | 覆盖声学探针与交接，不再等3 s cancel ACK |
-| TTS ring | 75 × 20 ms | 取消回答，不覆盖旧PCM |
-| VoiceLink上行 | 总计至多800 ms + 有界退休标记 | 明确背压/断线 |
-| VoiceLink入站 | 64项 | 溢出连接失败 |
+| 原始四槽、转换/3A工作区 | capture线程及各算法namespace | 硬件格式、256点vendor块和滤波历史，断点一起复位 |
+| capture交接 | audio_capture，4×20ms | 跨线程交付；满时明确断点，不能拼成连续语音 |
+| pre-roll/插话历史 | speech，同一个32帧环 | 普通保留25帧，探测最多32帧；未准入历史允许滚动覆盖 |
+| speech结果 | 调用方临时Result | 只借用历史/当前帧指针，不复制PCM；下一update/listen/reset前消费 |
+| 下行播放 | playback，75×20ms | 网络与ALSA消费解耦；满时取消整轮，不覆盖语音正文 |
+| 网络交接 | voice_net | 有界发送与接收；代际隔离、背压和生命周期 |
 
-采集和播放线程分别独占各自PCM操作。开始播放先在capture帧边界武装AEC，再由playback线程prepare。退出通过中断read/write/drain、join线程后释放设备。
+## 正常输入
 
-VoiceAudio负责原有声学策略：VAD起始120 ms、结束700 ms；硬件参考出现后AEC warm-up600 ms，自然结束尾音隔离300 ms；追问准入连续400 ms近讲。播放中保留候选120 ms、临时静音、等待低参考、清尾音、二次近讲确认的探针。假候选恢复音量；确认后立即drop，Barge事件先于已缓存PCM发给应用。
+采集线程读取48kHz四槽数据，共同降采样到16kHz，再依次执行3A、Snowboy、VAD。断流丢弃不连续片段并明确报告。3A输出和metadata一起延迟，不能拿当前参考判断上一帧声音。
 
-App_Process收到Barge即开始新generation，第一帧START|SUPERSEDE让服务端退休旧工作，无cancel ACK等待。短句最后一帧携END，旧代PCM与PlaybackDone都不能结束新回复。触屏单独停止使用STOP，残缺输入不会被伪装成END提交。
+speech::listen只选择Wake/FollowUp准入；App在调用前通过capture帧边界复位检测。speech::update返回Start时，当前帧已在历史中；应用先START，再按原顺序发送借用PCM。实时阶段只借用当前帧，最后一帧发送成功后再END。遇到背压/断点使用CANCEL，不把残缺句子提交。
 
-音量是UI偏好，声学profile只由维护者整体更新。代码为零音量的确定静音单独处理；极低音量与reference阈值的关系仍需真板验证。有硬件输出却丢失参考仍作为故障线索，不能盲目放开回声准入。
+## 播放与打断
 
-HIL只验证真实链路和观测事件。Host合成帧测试覆盖生产VoiceAudio判定，但不证明AEC消除量、远场识别或最终壳体声学效果。人工项目见 [验证入口](../test/host-validation.md)。
+首AUDIO到达时playback::begin等待旧取消收尾，并在采集帧边界武装AEC，随后允许播放线程prepare。每个PCM包直接入有界队列；没有VoiceAudio/Engine/Backend多次校验和复制。
+
+首播蓄水180ms，欠载宽限30ms后蓄水40ms。DONE调用playback::finish，短回答可立即放行。线程先排出有效滤波尾音再ALSA drain，最后发布Drained。主动cancel中断write/drain、丢弃队列，新一轮必须等旧操作收尾。
+
+speech保留120ms候选、短暂静音、等待低参考60ms（最多300ms）、清尾音60ms、再次确认60ms的插话探测。Result的playback_scale由应用应用到播放模块；确认Barge后应用取消旧播放，发送新generation的START(supersede=true)，立即上传保留人声。用户音量与探测scale分别保存。
+
+网络END结束上行，CANCEL在等待回复和播放期间仍有效。新协议没有下行音频END字段，DONE是唯一播放输入终点，故Drained一定在DONE之后，应用不再维护两份完成标志。失败终态与主动取消分开。
+
+Host运行真实任务、转换、EOS和算法胶水；只替换ALSA设备调用与vendor核心。真板调度、回采位置、AEC和实际音色仍须由用户指定时间验收。

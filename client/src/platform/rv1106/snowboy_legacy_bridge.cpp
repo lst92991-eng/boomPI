@@ -4,7 +4,7 @@
  *
  * 只有本翻译单元包含 Snowboy C++ 类型和异常行为；跨模块边界仅传递 POD、PCM
  * 指针与不透明句柄，使旧 ABI 编译选项保持局部生效。
- * SpeechDetector 的 Detect 每 20 ms 调用 process；返回值表示这次接口调用是否完成，
+ * wake::detect 每 20 ms 调用 process；返回值表示这次接口调用是否完成，
  * detection_result 才表示是否命中唤醒词，两种结果必须分别判断。
  */
 #include "snowboy_legacy_bridge.h"
@@ -74,7 +74,7 @@ int boompi_snowboy_legacy_reset(BoompiSnowboyLegacyHandle* handle) {
   }
 }
 
-/** @brief 仅借用本次 PCM 缓冲；异常转为返回失败，由 SpeechDetector 结束当前处理链。 */
+/** @brief 仅借用本次 PCM 缓冲；异常转为返回失败，由采集任务结束当前处理链。 */
 int boompi_snowboy_legacy_process_s16(BoompiSnowboyLegacyHandle* handle, const int16_t* samples,
                                       uint32_t count, int32_t* result) {
   // INT_MAX 检查保护 Snowboy 的 int 长度参数；调用方通常传入固定 320 samples。

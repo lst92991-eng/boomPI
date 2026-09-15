@@ -44,7 +44,7 @@ class TeachingLabTests(unittest.TestCase):
     def test_checkpoints_match_current_ctest_registration(self):
         cmake = (SCRIPT.parents[1] / "client/tests/CMakeLists.txt").read_text(encoding="utf-8")
         for name in LAB.ALL_TESTS:
-            self.assertIn(name.removeprefix("audio-engine-"), cmake)
+            self.assertIn(name.removeprefix("audio-flow-"), cmake)
         self.assertEqual(len(LAB.ALL_TESTS), len(set(LAB.ALL_TESTS)))
 
 

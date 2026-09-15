@@ -1,13 +1,13 @@
-# 音频后端与外部依赖
+# 音频模块与外部依赖
 
 ## 产品边界
 
-`VoiceAudio` 是 application 唯一看到的音频接口；内部 AudioTasks 管理实时线程，板级工作集中在
-`client/src/platform/rv1106/`：
+application直接调用audio_capture、speech、playback；两条任务直接执行各算法与声卡模块。
+板级工作集中在`client/src/platform/rv1106/`：
 
 - ALSA capture/playback；
 - Codec Mode1 数字回采；
-- capture 48→16 kHz 与 TTS 24→48 kHz 重采样；
+- capture 48→16 kHz 与 TTS 16→48 kHz 重采样；
 - Rockchip `librkaudio` 3A；
 - Snowboy 旧 ABI bridge；
 - WebRTC VAD、播放增益和 limiter。
@@ -15,9 +15,9 @@
 产品没有 backend 工厂或模拟设备分支。Host fake 和 AEC HIL 只用于测试，不链接进
 `boompi-client`。
 
-顺着 `audio_tasks.cpp` 进入 `audio_pipeline.cpp` 可以看到`raw → channels → clean → frame`的显式交接：`AudioConverter`负责格式、`RockchipVoiceDsp`负责3A和metadata对齐、`SpeechDetector`负责判定。详见[顺序音频教学](../teaching/audio-pipeline.md)；
+`audio_capture.cpp`直接展开`raw → channels → clean → frame`：audio_convert负责格式、rockchip_3a负责3A和metadata对齐、wake和vad负责检测。详见[顺序音频教学](../teaching/audio-pipeline.md)；
 需要检查 PCM 参数协商、XRUN 或有界 drain 时再进入 `alsa_audio.cpp`。
-ALSA 头和句柄留在板级私有边界，application 只使用 `VoiceAudio`。
+ALSA头和句柄留在私有设备模块；不存在VoiceAudio/Engine/Backend兼容层。
 
 ## ALSA 与 Mode1
 
@@ -29,8 +29,8 @@ ALSA 头和句柄留在板级私有边界，application 只使用 `VoiceAudio`�
 capture 布局固定为 `[mic0,mic1,refL,refR]`。TTS mono 被复制到左右声道，因此两个参考高度
 相关；产品 AEC 只消费 `refL`。ALSA仍读取四通道，应用不再额外复制一份HIL诊断平面。
 
-开始播放分两步：capture 线程在帧边界 `ArmPlayback`，只武装 AEC 参考/预热判定；
-playback 线程随后 `PreparePlayback`，准备 PCM 并复位播放重采样器，再消费 TTS。
+开始播放分两步：playback::begin经audio_capture::arm_playback在采集帧边界武装AEC；
+playback线程随后调用alsa_audio::prepare_playback，准备PCM并复位重采样器，再消费TTS。
 采集控制命令保持单槽、100 ms 有界握手，ALSA 播放操作不借用 capture 线程执行。
 
 ## Rockchip 3A
@@ -41,7 +41,7 @@ input  = interleaved [mic0,mic1,refL]
 output = 16 kHz / S16 / mono
 ```
 
-vendor 每块处理 256 samples，产品每帧 320 samples。`RockchipVoiceDsp` 用固定 FIFO 对齐，
+当前调用以256 samples块处理，产品每帧320 samples；这不证明SDK只能使用256点。rockchip_3a用固定FIFO对齐，
 因此输出比采集固定延迟一帧；时间戳、原始电平和参考状态由同一个metadata对象跟随PCM一起延迟，检测模块不再独立补偿。
 
 当前3A配置保持 AEC + BF、FastAEC、AES、ANR、去混响和 STDT，board_voice_profile.h 中 delay 为 0；vendor AGC

@@ -71,14 +71,15 @@ func (a *Actor) Submit(header protocol.PCMHeader, pcm []byte) error {
 	if len(pcm) != protocol.UplinkFrameBytes {
 		return errors.New("invalid session PCM frame")
 	}
-	return a.enqueue(command{
-		generation: header.Generation, start: header.Flags&protocol.PCMFlagStart != 0,
-		end: header.Flags&protocol.PCMFlagEnd != 0, retract: header.Flags&protocol.PCMFlagSupersede != 0,
-		pcm: append([]byte(nil), pcm...), queuedAt: time.Now(),
-	})
+	return a.enqueue(command{generation: header.Generation, pcm: append([]byte(nil), pcm...), queuedAt: time.Now()})
 }
-
-func (a *Actor) Stop(generation uint32, retract bool) error {
+func (a *Actor) Start(generation uint32, supersede bool) error {
+	return a.enqueue(command{generation: generation, start: true, retract: supersede, queuedAt: time.Now()})
+}
+func (a *Actor) End(generation uint32) error {
+	return a.enqueue(command{generation: generation, end: true, queuedAt: time.Now()})
+}
+func (a *Actor) Cancel(generation uint32, retract bool) error {
 	return a.enqueue(command{generation: generation, stop: true, retract: retract, queuedAt: time.Now()})
 }
 
@@ -181,17 +182,19 @@ func (a *Actor) run(ctx context.Context) {
 				responding = false
 				generation = cmd.generation
 			}
-			if cmd.stop || cmd.generation != a.latest.Load() {
+			if cmd.start || cmd.stop || cmd.generation != a.latest.Load() {
 				continue
 			}
 			if cmd.generation != generation || responding || time.Since(cmd.queuedAt) > 800*time.Millisecond {
 				return
 			}
 			opCtx, cancel := context.WithTimeout(ctx, providerOperationTimeout)
-			err := a.provider.SendAudio(opCtx, cmd.pcm)
-			if err == nil && cmd.end {
+			var err error
+			if cmd.end {
 				err = a.provider.Commit(opCtx)
 				responding = err == nil
+			} else {
+				err = a.provider.SendAudio(opCtx, cmd.pcm)
 			}
 			cancel()
 			if err != nil {

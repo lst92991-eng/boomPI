@@ -1,7 +1,7 @@
 /** @file audio_thread.h
  * @brief 音频工作线程的板端调度设置。
  *
- * AudioTasks 的 ReadMicrophoneTask/PlaySpeakerTask 在各自线程入口调用一次；Host 目标由
+ * audio_capture和playback在各自线程入口调用一次；Host目标由
  * CMake 选择替身实现，业务代码无需以平台宏分支控制线程策略。
  */
 #pragma once

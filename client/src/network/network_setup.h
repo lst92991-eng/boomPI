@@ -2,7 +2,7 @@
 
 /**
  * @file network_setup.h
- * @brief VoiceLink 私有的板端网络准备接口。
+ * @brief voice_net 私有的板端网络准备接口。
  *
  * 产品实现操作 Linux 网卡、DHCP、发现和缓存；Host 测试由 CMake 选择替身实现，
  * 无须在业务协议代码中加入平台或测试条件分支。
@@ -10,12 +10,12 @@
 
 #include <atomic>
 
-#include "boompi/network/voice_link.h"
+#include "boompi/network/voice_net.h"
 
-namespace boompi::network::detail {
+namespace boompi::voice_net::detail {
 
 /**
- * @brief 建好网卡后确定 WSS 端点；仅由 VoiceLink 网络线程调用。
+ * @brief 建好网卡后确定 WSS 端点；仅由 voice_net 网络线程调用。
  *
  * 顺序为以太网优先/Wi-Fi 备用 → 显式端点或 UDP 发现 → 校验已保存 pin → 缓存回退。
  * 本函数可能等待外部命令和 UDP 超时，不得从 ALSA 实时线程调用。
@@ -29,4 +29,4 @@ namespace boompi::network::detail {
 bool FindServer(const config::VoiceClientConfig& configured, config::VoiceClientConfig* found,
                 const std::atomic<bool>* stop);
 
-}  // namespace boompi::network::detail
+}  // namespace boompi::voice_net::detail

@@ -1,5 +1,11 @@
 include(GNUInstallDirs)
 
+# 产品与Host场景执行同一条namespace语音主线，Host仅替换ALSA设备和vendor核心。
+set(BOOMPI_AUDIO_SOURCES
+  src/audio/audio_capture.cpp src/audio/playback.cpp src/audio/speech.cpp
+  src/platform/rv1106/audio_convert.cpp src/platform/rv1106/rockchip_3a.cpp
+  src/platform/rv1106/wake.cpp src/platform/rv1106/vad.cpp)
+
 set(_boompi_ui_simulator_default ON)
 if(BOOMPI_TARGET_RV1106)
   set(_boompi_ui_simulator_default OFF)
@@ -117,18 +123,13 @@ target_link_libraries(boompi_snowboy_bridge PRIVATE boompi_vendor::snowboy)
 add_executable(boompi_client
   apps/boompi_client/main.cpp
   src/application/voice_client.cpp
-  src/audio/voice_audio.cpp
-  src/audio/audio_tasks.cpp
+  ${BOOMPI_AUDIO_SOURCES}
   src/config/voice_client_config.cpp
   src/network/network_setup.cpp
-  src/network/voice_link.cpp
+  src/network/voice_net.cpp
   src/network/voice_codec.cpp
-  src/platform/rv1106/audio_pipeline.cpp
-  src/platform/rv1106/audio_converter.cpp
-  src/platform/rv1106/speech_detector.cpp
   src/platform/rv1106/audio_thread.cpp
   src/platform/rv1106/alsa_audio.cpp
-  src/platform/rv1106/rockchip_voice_dsp.cpp
   src/platform/rv1106/display_touch.cpp
   src/ui/device_ui.cpp
   src/ui/camera_capture.cpp)
@@ -137,7 +138,7 @@ target_compile_definitions(boompi_client PRIVATE
   BOOST_ERROR_CODE_HEADER_ONLY=1 BOOST_SYSTEM_NO_DEPRECATED=1)
 target_compile_options(boompi_client PRIVATE -Wall -Wextra -Wpedantic
   $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:-Werror>)
-target_include_directories(boompi_client PRIVATE include src/platform/rv1106)
+target_include_directories(boompi_client PRIVATE include src/audio src/platform/rv1106)
 target_include_directories(boompi_client SYSTEM PRIVATE
   "${PROJECT_SOURCE_DIR}/third_party"
   "${BOOMPI_BOOST_INCLUDE_DIR}"

@@ -1,6 +1,6 @@
 /**
  * @file voice_transport_loopback_test.cpp
- * @brief 通过本机真实 TCP/TLS/WebSocket 对端验证产品 VoiceLink 的传输行为。
+ * @brief 通过本机真实 TCP/TLS/WebSocket 对端验证产品 voice_net 的传输行为。
  *
  * 默认入口逐场景创建临时证书和回环监听端口，再运行 hello/ready、PCM、切代、
  * 故障、队列满和重连检查。只替换 network_setup 的板端网卡准备，不替换协议实现。
@@ -29,16 +29,16 @@
 #include <websocketpp/config/asio.hpp>
 #include <websocketpp/server.hpp>
 
-#include "boompi/network/voice_link.h"
+#include "boompi/network/voice_net.h"
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
 using boompi::config::VoiceClientConfig;
-using boompi::network::LinkEvent;
-using boompi::network::LinkEventKind;
-using boompi::network::SendResult;
-using boompi::network::VoiceLink;
+using boompi::voice_net::LinkEvent;
+using boompi::voice_net::LinkEventKind;
+using boompi::voice_net::SendResult;
+namespace net = boompi::voice_net;
 
 constexpr char kDeviceId[] = "00112233-4455-4677-8899-aabbccddeeff";
 
@@ -181,7 +181,7 @@ struct CapturedMessage final {
 /**
  * @brief 真实 WSS 测试对端；Asio 线程负责 socket，测试主线程只下发动作和读取快照。
  *
- * 服务端消息回调先保存收到的 hello/音频/STOP，再按配置自动响应 ready。
+ * 服务端消息回调先保存收到的 hello/音频/CANCEL，再按配置自动响应 ready。
  * messages_/paused_ 用 mutex_ 和条件变量交接，handle_ 与连接对象在 Asio 线程操作。
  */
 class LoopbackServer final {
@@ -223,7 +223,7 @@ class LoopbackServer final {
       if (send_ready && message->get_opcode() == websocketpp::frame::opcode::text &&
           message->get_payload().find("\"type\":\"hello\"") != std::string::npos) {
         websocketpp::lib::error_code ec;
-        server_.send(handle, "{\"type\":\"ready\",\"sample_rate\":16000}",
+        server_.send(handle, "{\"type\":\"ready\",\"sample_rate\":16000,\"version\":3}",
                      websocketpp::frame::opcode::text, ec);
       }
     });
@@ -332,474 +332,308 @@ class LoopbackServer final {
   bool paused_{false};
 };
 
-/**
- * @brief 在测试线程以 1 ms 间隔轮询下一条事件，给异步链路有限时间完成。
- *
- * 不按类型筛掉中间事件，避免把意外 Offline 或旧代回复吞掉后仍报告场景通过。
- */
-LinkEvent WaitEvent(VoiceLink& link, unsigned timeout_ms = 3000) {
+// 测试退出必须join全局网络任务，即使断言抛出异常也不遗留线程。
+struct NetworkScope {
+  ~NetworkScope() {
+    net::close();
+  }
+};
+LinkEvent WaitEvent(unsigned timeout_ms = 3000) {
   const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
   LinkEvent event;
   while (Clock::now() < deadline) {
-    if (link.PollEvent(&event)) {
+    if (net::poll(&event)) {
       return event;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  throw std::runtime_error("link event timeout");
+  throw std::runtime_error("network event timeout");
 }
-
-/// @brief 同时验证 Open 本身快速返回，以及真正 ready 才映射为第一个 Online 事件。
-void Open(VoiceLink& link, const LoopbackServer& server) {
+void Open(const LoopbackServer& server) {
   const auto started = Clock::now();
-  Check(link.Open(server.Config()), "Open rejected");
-  Check(Clock::now() - started < std::chrono::milliseconds(200), "Open blocked on networking");
-  Check(WaitEvent(link).kind == LinkEventKind::Online, "ready did not become Online");
+  Check(net::open(server.Config()), "open rejected");
+  Check(Clock::now() - started < std::chrono::milliseconds(200), "open blocked");
+  Check(WaitEvent().kind == LinkEventKind::Online, "ready missing");
 }
-
-/// @brief 测试端独立读网络大端头字段，不调用产品解码器来验证产品自己的输出。
-std::uint32_t Read32(const std::string& bytes, std::size_t offset) {
-  const auto* p = reinterpret_cast<const unsigned char*>(bytes.data() + offset);
-  return (static_cast<std::uint32_t>(p[0]) << 24U) | (static_cast<std::uint32_t>(p[1]) << 16U) |
-         (static_cast<std::uint32_t>(p[2]) << 8U) | p[3];
+std::uint32_t Read32(const std::string& b, std::size_t offset) {
+  const auto* p = reinterpret_cast<const unsigned char*>(b.data() + offset);
+  return (std::uint32_t(p[0]) << 24U) | (std::uint32_t(p[1]) << 16U) |
+         (std::uint32_t(p[2]) << 8U) | p[3];
 }
-
-/**
- * @brief 独立构造服务器下行字节，不调用产品编码器，避免编码与解码共享错误而自洽。
- *
- * samples 默认 320，对应 16 kHz 下行 20 ms；flags/sequence/长度可故意传错以测试拒绝。
- */
-std::string Audio(std::uint32_t generation, std::uint32_t sequence, unsigned flags,
-                  std::size_t samples = 320) {
-  std::string frame(16 + samples * 2, '\0');
-  frame.replace(0, 4, "BPV2");
-  frame[5] = static_cast<char>(flags);
+std::string Audio(std::uint32_t generation, std::uint32_t sequence, std::size_t samples = 320) {
+  std::string frame(12 + samples * 2, '\0');
+  frame.replace(0, 4, "BPV3");
   for (unsigned i = 0; i < 4; ++i) {
-    frame[8 + i] = static_cast<char>(generation >> (24 - i * 8));
-    frame[12 + i] = static_cast<char>(sequence >> (24 - i * 8));
+    frame[4 + i] = static_cast<char>(generation >> (24 - i * 8));
+    frame[8 + i] = static_cast<char>(sequence >> (24 - i * 8));
   }
-  frame[16] = 0x27;
+  if (samples != 0) {
+    frame[12] = 0x27;
+  }
   return frame;
 }
-
-/// @brief 提交一帧即结束的输入；正数 0x1234 和负数 -2 用于验证 PCM 小端与符号编码。
-void Upload(VoiceLink& link, std::uint32_t generation, bool supersede = false) {
+void Upload(std::uint32_t generation, bool supersede = false) {
   std::array<std::int16_t, 320> pcm{};
   pcm[0] = 0x1234;
   pcm[1] = -2;
-  Check(link.SendAudio(generation, pcm.data(), true, true, supersede) == SendResult::Ok,
-        "complete input was rejected");
+  Check(net::start(generation, supersede) == SendResult::Ok, "start rejected");
+  Check(net::send(generation, pcm.data()) == SendResult::Ok, "PCM rejected");
+  Check(net::end(generation) == SendResult::Ok, "end rejected");
 }
-
-/**
- * @brief 正常链路：hello → 一帧完整问题 → 字幕/满帧音频/短尾帧/done → 有界关闭。
- *
- * 同时检查上行 656 字节头与 PCM 字节序、下行事件顺序和末帧有效长度；Close 后不得
- * 留下上一连接事件。此处收到音频只验证传输交付，不代表已送入真实 ALSA 扬声器。
- */
 void BasicWireAndClose() {
   LoopbackServer server;
-  VoiceLink link;
-  Open(link, server);
-  Upload(link, 1);
-  const auto messages = server.WaitMessages(2);
-  Check(messages[0].payload == "{\"type\":\"hello\",\"device_id\":\"" + std::string(kDeviceId) +
-                                   "\",\"token\":\"boompi-teaching-shared-token-v1-2026\","
-                                   "\"sample_rate\":16000}",
-        "hello schema mismatch");
-  const auto& wire = messages[1].payload;
-  Check(messages[1].opcode == websocketpp::frame::opcode::binary && wire.size() == 656 &&
-            wire.substr(0, 4) == "BPV2" && wire[5] == 3 && Read32(wire, 8) == 1 &&
-            Read32(wire, 12) == 0 && static_cast<unsigned char>(wire[16]) == 0x34 &&
-            static_cast<unsigned char>(wire[17]) == 0x12 &&
-            static_cast<unsigned char>(wire[18]) == 0xfe &&
-            static_cast<unsigned char>(wire[19]) == 0xff,
-        "PCM wire contract mismatch");
+  NetworkScope scope;
+  Open(server);
+  Upload(1);
+  const auto messages = server.WaitMessages(4);
+  Check(messages[0].payload.find("\"version\":3") != std::string::npos &&
+            messages[0].payload.find("\"sample_rate\":16000") != std::string::npos,
+        "hello contract missing");
+  Check(messages[1].payload == "{\"type\":\"start\",\"generation\":1,\"supersede\":false}",
+        "START not separate");
+  const auto& wire = messages[2].payload;
+  Check(wire.size() == 652 && wire.substr(0, 4) == "BPV3" && Read32(wire, 4) == 1 &&
+            Read32(wire, 8) == 0,
+        "BPV3 header invalid");
+  Check(static_cast<unsigned char>(wire[12]) == 0x34 &&
+            static_cast<unsigned char>(wire[13]) == 0x12 &&
+            static_cast<unsigned char>(wire[14]) == 0xfe &&
+            static_cast<unsigned char>(wire[15]) == 0xff,
+        "PCM byte order");
+  Check(messages[3].payload == "{\"type\":\"end\",\"generation\":1}", "END missing");
   server.Send("{\"type\":\"text\",\"generation\":1,\"text\":\"你好\"}");
-  server.Send(Audio(1, 0, 1), true);
-  server.Send(Audio(1, 1, 2, 7), true);
+  Check(WaitEvent().text == "你好", "text mismatch");
+  server.Send(Audio(1, 0), true);
+  Check(WaitEvent().audio_size == 640, "full audio missing before DONE");
+  server.Send(Audio(1, 1, 7), true);
+  Check(WaitEvent().audio_size == 14, "short tail lost");
   server.Send("{\"type\":\"done\",\"generation\":1}");
-  auto event = WaitEvent(link);
-  Check(event.kind == LinkEventKind::Text && event.text == "你好", "text lost");
-  event = WaitEvent(link);
-  Check(event.kind == LinkEventKind::Audio && event.start && !event.end &&
-            event.audio_size == 640,
-        "first audio lost");
-  event = WaitEvent(link);
-  Check(
-      event.kind == LinkEventKind::Audio && !event.start && event.end && event.audio_size == 14,
-      "tail audio lost");
-  Check(WaitEvent(link).kind == LinkEventKind::Done, "done missing");
-  const auto close_started = Clock::now();
-  link.Close();
-  Check(Clock::now() - close_started < std::chrono::milliseconds(500), "Close was not bounded");
-  Check(!link.PollEvent(&event), "Close kept stale events");
+  Check(WaitEvent().kind == LinkEventKind::Done, "DONE missing");
+  const auto began = Clock::now();
+  net::close();
+  net::close();
+  Check(Clock::now() - began < std::chrono::milliseconds(500), "close blocked");
+  LinkEvent event;
+  Check(!net::poll(&event), "close retained events");
 }
-
-/**
- * @brief 先开第 1 代，再以第 2 代 SUPERSEDE，故意让旧字幕/音频/done 晚到。
- *
- * 应用只能看到第 2 代回复；随后 STOP 使用第 3 代退休，再开第 4 代验证旧代不会复活。
- * 对第 2 代只回文本和 done，也覆盖无音频回答可正常完成的协议路径。
- */
-void GenerationFence() {
-  LoopbackServer server;
-  VoiceLink link;
-  Open(link, server);
-  Upload(link, 1);
-  server.WaitMessages(2);
-  Upload(link, 2, true);
-  const auto wire = server.WaitMessages(3);
-  Check(wire[2].payload[5] == 7 && Read32(wire[2].payload, 8) == 2,
-        "supersede START flags wrong");
-  server.Send("{\"type\":\"text\",\"generation\":1,\"text\":\"stale\"}");
-  server.Send(Audio(1, 0, 3), true);
-  server.Send("{\"type\":\"done\",\"generation\":1}");
-  server.Send("{\"type\":\"text\",\"generation\":2,\"text\":\"new\"}");
-  server.Send("{\"type\":\"done\",\"generation\":2}");
-  auto event = WaitEvent(link);
-  Check(event.kind == LinkEventKind::Text && event.generation == 2 && event.text == "new",
-        "old generation leaked");
-  Check(WaitEvent(link).kind == LinkEventKind::Done, "text-only done missing");
-  Check(link.Stop(3, true), "STOP rejected");
-  const auto stopped = server.WaitMessages(4);
-  Check(stopped[3].payload == "{\"type\":\"stop\",\"generation\":3,\"retract\":true}",
-        "STOP schema mismatch");
-  server.Send("{\"type\":\"done\",\"generation\":2}");
-  Upload(link, 4);
-  server.WaitMessages(5);
-  server.Send("{\"type\":\"done\",\"generation\":4}");
-  event = WaitEvent(link);
-  Check(event.kind == LinkEventKind::Done && event.generation == 4,
-        "STOP retired generation revived");
-}
-
-// 上传 END 只结束输入：等待首包和正在收音频时，STOP 都必须立即隔离旧回答。
-void StopAfterEnd() {
-  for (const bool reply_started : {false, true}) {
+void CancelAfterEndAndOldGeneration() {
+  for (bool playing : {false, true}) {
     LoopbackServer server;
-    VoiceLink link;
-    Open(link, server);
-    Upload(link, 1);
-    server.WaitMessages(2);
-    if (reply_started) {
-      server.Send(Audio(1, 0, 1), true);
-      Check(WaitEvent(link).kind == LinkEventKind::Audio, "reply did not start");
-    }
-    Check(link.Stop(2, true), "END disabled cancellation");
-    const auto stopped = server.WaitMessages(3);
-    Check(stopped[2].payload == "{\"type\":\"stop\",\"generation\":2,\"retract\":true}",
-          "END cancellation was not sent");
-    server.Send(Audio(1, reply_started ? 1 : 0, reply_started ? 2 : 3, 2), true);
-    server.Send("{\"type\":\"text\",\"generation\":1,\"text\":\"stale\"}");
-    server.Send("{\"type\":\"done\",\"generation\":1}");
-    Upload(link, 3);
+    NetworkScope scope;
+    Open(server);
+    Upload(1);
     server.WaitMessages(4);
+    if (playing) {
+      server.Send(Audio(1, 0), true);
+      Check(WaitEvent().kind == LinkEventKind::Audio, "playback setup");
+    }
+    Check(net::cancel(2, true), "cancel after END rejected");
+    Upload(3);
+    const auto messages = server.WaitMessages(8);
+    Check(messages[4].payload == "{\"type\":\"cancel\",\"generation\":2,\"retract\":true}",
+          "cancel lost before START");
+    server.Send(Audio(1, 8, 2), true);
+    server.Send("{\"type\":\"done\",\"generation\":1}");
+    server.Send(Audio(3, 0, 2), true);
     server.Send("{\"type\":\"done\",\"generation\":3}");
-    const auto done = WaitEvent(link);
-    Check(done.kind == LinkEventKind::Done && done.generation == 3,
-          "cancelled reply escaped into next turn");
+    Check(WaitEvent().generation == 3, "old PCM resurrected");
+    Check(WaitEvent().kind == LinkEventKind::Done, "new done missing");
   }
 }
-
-// 云端可在上传过程中失败。Error 已结束该轮，不能再把它当成仍开放的输入。
 void ErrorEndsUpload() {
   LoopbackServer server;
-  VoiceLink link;
-  Open(link, server);
+  NetworkScope scope;
+  Open(server);
   std::array<std::int16_t, 320> pcm{};
-  Check(link.SendAudio(1, pcm.data(), true, false, false) == SendResult::Ok,
-        "input did not start");
-  server.WaitMessages(2);
-  server.Send("{\"type\":\"error\",\"generation\":1,\"code\":\"provider_timeout\"}");
-  const auto error = WaitEvent(link);
-  Check(error.kind == LinkEventKind::Error && error.generation == 1,
-        "upload error was not delivered");
-  Check(link.SendAudio(1, pcm.data(), false, true, false) == SendResult::Disconnected,
-        "provider error left upload open");
+  Check(net::start(1, false) == SendResult::Ok && net::send(1, pcm.data()) == SendResult::Ok,
+        "input rejected");
+  server.WaitMessages(3);
+  server.Send("{\"type\":\"error\",\"generation\":1,\"code\":\"provider_error\"}");
+  Check(WaitEvent().kind == LinkEventKind::Error, "input error rejected");
+  Check(net::send(1, pcm.data()) == SendResult::Disconnected, "failed upload continued");
 }
-
-/**
- * @brief 每次新建连接后注入一类坏帧，要求显式 Offline，不能静默补帧或继续播放。
- *
- * 覆盖 sequence hole、音频 END 前 done、END 后音频、未来 generation、重复 ready、
- * 重复 JSON 键及非末帧长度不足；允许坏帧前的合法事件已被测试线程先取走。
- */
 void RejectBrokenWire() {
-  const std::vector<std::vector<std::pair<std::string, bool>>> cases{
-      {{Audio(1, 0, 1), true}, {Audio(1, 2, 2), true}},
-      {{Audio(1, 0, 1), true}, {"{\"type\":\"done\",\"generation\":1}", false}},
-      {{Audio(1, 0, 3), true}, {Audio(1, 1, 2), true}},
-      {{"{\"type\":\"text\",\"generation\":2,\"text\":\"future\"}", false}},
-      {{"{\"type\":\"ready\",\"sample_rate\":16000}", false}},
-      {{"{\"type\":\"text\",\"generation\":1,\"generation\":1,\"text\":\"duplicate\"}", false}},
-      {{Audio(1, 0, 1, 1), true}},
-      {{Audio(1, 0, 3, 480), true}},  // 旧版 24 kHz 满帧不能当成 16 kHz 接收。
-  };
-  for (const auto& messages : cases) {
+  for (unsigned scenario = 0; scenario < 8; ++scenario) {
     LoopbackServer server;
-    VoiceLink link;
-    Open(link, server);
-    Upload(link, 1);
-    server.WaitMessages(2);
-    for (const auto& message : messages) {
-      server.Send(message.first, message.second);
+    NetworkScope scope;
+    Open(server);
+    Upload(1);
+    server.WaitMessages(4);
+    if (scenario == 0) {
+      auto frame = Audio(1, 0);
+      frame[3] = '2';
+      server.Send(frame, true);
     }
-    bool offline = false;
-    for (unsigned i = 0; i < 3 && !offline; ++i) {
-      offline = WaitEvent(link).kind == LinkEventKind::Offline;
+    if (scenario == 1) {
+      auto frame = Audio(1, 0);
+      frame.pop_back();
+      server.Send(frame, true);
     }
-    Check(offline, "invalid wire did not close the connection");
+    if (scenario == 2) {
+      server.Send(Audio(2, 0), true);
+    }
+    if (scenario == 3) {
+      server.Send(Audio(1, 1), true);
+    }
+    if (scenario == 4) {
+      server.Send(Audio(1, 0, 2), true);
+      Check(WaitEvent().kind == LinkEventKind::Audio, "short setup");
+      server.Send(Audio(1, 1), true);
+    }
+    if (scenario == 5) {
+      server.Send("{\"type\":\"ready\",\"sample_rate\":16000,\"version\":3}");
+    }
+    if (scenario == 6) {
+      server.Send("{\"type\":\"done\",\"generation\":1}");
+      Check(WaitEvent().kind == LinkEventKind::Done, "empty DONE setup");
+      server.Send(Audio(1, 0), true);
+    }
+    if (scenario == 7) {
+      server.Send(Audio(1, 0, 321), true);
+    }
+    Check(WaitEvent().kind == LinkEventKind::Offline, "invalid wire accepted");
   }
 }
-
-/**
- * @brief 错误 pin 必须在握手期失败；正确 pin 连通后，对端关闭应触发 Offline→Online。
- *
- * 新连接再上传第 5 代，确认重连不要求 actor 重用旧代号或重新构造 VoiceLink。
- */
 void TlsFailureAndReconnect() {
   LoopbackServer server;
-  VoiceLink wrong_pin;
-  auto config = server.Config();
-  config.server_spki_sha256[0] = config.server_spki_sha256[0] == 'A' ? 'B' : 'A';
-  Check(wrong_pin.Open(config), "TLS failure did not start");
-  auto event = WaitEvent(wrong_pin);
-  Check(event.kind == LinkEventKind::Offline && event.code == "tls_connect",
-        "pin mismatch not reported");
-  wrong_pin.Close();
-
-  VoiceLink link;
-  Open(link, server);
-  Upload(link, 1);
-  server.WaitMessages(2);
-  server.Drop();
-  Check(WaitEvent(link).kind == LinkEventKind::Offline, "disconnect not reported");
-  Check(WaitEvent(link).kind == LinkEventKind::Online, "automatic reconnect failed");
-  const auto reconnected = server.WaitMessages(3);
-  Check(reconnected[2].payload.find("\"type\":\"hello\"") != std::string::npos,
-        "reconnect replayed old upload");
-  Upload(link, 5);
+  NetworkScope scope;
+  auto wrong = server.Config();
+  wrong.server_spki_sha256[0] = wrong.server_spki_sha256[0] == 'A' ? 'B' : 'A';
+  Check(net::open(wrong) && WaitEvent().kind == LinkEventKind::Offline, "wrong pin accepted");
+  net::close();
+  Open(server);
+  Upload(1);
   server.WaitMessages(4);
-  server.Send(Audio(1, 0, 3, 2), true);
-  server.Send("{\"type\":\"done\",\"generation\":1}");
+  server.Drop();
+  Check(WaitEvent().kind == LinkEventKind::Offline, "disconnect missing");
+  Check(WaitEvent().kind == LinkEventKind::Online, "reconnect missing");
+  Upload(5);
+  server.Send(Audio(1, 0, 2), true);
   server.Send("{\"type\":\"done\",\"generation\":5}");
-  const auto done = WaitEvent(link);
-  Check(done.kind == LinkEventKind::Done && done.generation == 5,
-        "reconnect revived the retired turn");
+  Check(WaitEvent().generation == 5, "old generation survived reconnect");
 }
-
-/**
- * @brief 快速投递填满上行队列，要求及时 Backpressure，同时仍能排入 STOP 和新代。
- *
- * 后半段停止消费并发送 65 条字幕，超过 64 条事件容量后应明确 inbound_overflow。
- * 两个方向的容量失败都不能以“成功但丢数据”掩盖，切代后旧代 done 也不得穿透。
- */
-void BoundedQueuesAndSupersede() {
+void BoundedQueuesAndRetirement() {
   LoopbackServer server;
-  VoiceLink link;
-  Open(link, server);
+  NetworkScope scope;
+  Open(server);
+  server.PauseReads(true);
   std::array<std::int16_t, 320> pcm{};
+  Check(net::start(1, false) == SendResult::Ok, "start blocked");
+  const auto began = Clock::now();
   bool full = false;
-  const auto started = Clock::now();
-  for (unsigned i = 0; i < 200000; ++i) {
-    const auto result = link.SendAudio(1, pcm.data(), i == 0, false, false);
+  for (unsigned i = 0; i < 1000; ++i) {
+    auto result = net::send(1, pcm.data());
     if (result == SendResult::Backpressure) {
       full = true;
       break;
     }
-    Check(result == SendResult::Ok, "burst input failed before capacity");
+    Check(result == SendResult::Ok, "queue disconnected instead of backpressure");
   }
-  Check(full && Clock::now() - started < std::chrono::milliseconds(250),
-        "SendAudio blocks or fails to bound burst input");
-  Check(link.Stop(2, false), "STOP reserve unavailable at full input queue");
-  Upload(link, 3, true);
-  server.Send("{\"type\":\"done\",\"generation\":1}");
-  // 新代同时淘汰尚在本地排队的旧普通 PCM 和服务器迟到的旧回答。
-  server.Send("{\"type\":\"done\",\"generation\":3}");
-  const auto done = WaitEvent(link);
-  Check(done.kind == LinkEventKind::Done && done.generation == 3, "full-queue fence failed");
-
-  // 提交第 4 代完整输入后暂停应用消费，让足够多的输出填满有界事件队列。
-  Upload(link, 4);
-  for (unsigned i = 0; i < 65; ++i) {
-    server.Send("{\"type\":\"text\",\"generation\":4,\"text\":\"x\"}");
-  }
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  const auto offline = WaitEvent(link);
-  Check(offline.kind == LinkEventKind::Offline && offline.code == "inbound_overflow",
-        "receive overflow was hidden");
-}
-
-/// @brief 对端完成 WSS 却不发 ready，要求约五秒后 hello_timeout，不能一直等待业务就绪。
-void HandshakeTimeout() {
-  LoopbackServer server(false);
-  VoiceLink link;
-  Check(link.Open(server.Config()), "no-ready Open rejected");
-  const auto event = WaitEvent(link, 6500);
-  Check(event.kind == LinkEventKind::Offline && event.code == "hello_timeout",
-        "missing ready was not bounded");
-}
-
-// 采样率在握手阶段确认；旧 ready 或声明 24 kHz 都不能进入 Online。
-void RejectOldSampleRate() {
-  for (const char* ready :
-       {"{\"type\":\"ready\"}", "{\"type\":\"ready\",\"sample_rate\":24000}"}) {
-    LoopbackServer server(false);
-    VoiceLink link;
-    Check(link.Open(server.Config()), "rate handshake did not start");
-    server.WaitMessages(1);
-    server.Send(ready);
-    const auto event = WaitEvent(link);
-    Check(event.kind == LinkEventKind::Offline && event.code == "invalid_protocol",
-          "legacy audio rate reached Online");
-  }
-}
-
-/**
- * @brief 连续切代时，验证尚未发出的 STOP/SUPERSEDE 仍按顺序传达退休与撤回含义。
- *
- * 先测紧邻提交，再暂停真实 TLS 读取制造积压；旧普通 PCM 可淘汰，但退休标记须保序。
- * 若真实 TCP 阻塞超过发送期限，允许有界 Offline；不允许标记悄悄丢失仍声称成功。
- */
-void PendingRetirementKeepsMeaning() {
-  LoopbackServer server;
-  VoiceLink link;
-  Open(link, server);
-  // 两个操作紧接提交，中间不等 ACK 或 socket；即使仍在排队，
-  // retract STOP 也必须先于随后的普通 START 抵达，才能保留撤回旧回答的含义。
-  Upload(link, 1);
-  server.WaitMessages(2);
-  Check(link.Stop(2, true), "pending retract STOP failed");
-  Upload(link, 3);
-  auto messages = server.WaitMessages(4);
-  Check(messages[2].payload == "{\"type\":\"stop\",\"generation\":2,\"retract\":true}" &&
-            Read32(messages[3].payload, 8) == 3,
-        "normal START erased pending history retraction");
-
-  // START|SUPERSEDE 同样携带撤回旧回答历史的作用；紧接的 STOP 清理旧 PCM 时不能删掉它。
-  Upload(link, 4, true);
-  Check(link.Stop(5, false), "stop after pending supersede failed");
-  Upload(link, 6);
-  messages = server.WaitMessages(7);
-  Check(messages[4].payload[5] == 7 && Read32(messages[4].payload, 8) == 4 &&
-            messages[5].payload == "{\"type\":\"stop\",\"generation\":5,\"retract\":false}" &&
-            Read32(messages[6].payload, 8) == 6,
-        "new fence erased supersede history retraction");
-
-  // 暂停真实 TLS 读取，用较小接收窗口使 socket 发送受阻；
-  // 此时普通旧 PCM 可退休，STOP 与 SUPERSEDE 仍须保持顺序。
-  server.PauseReads(true);
-  std::array<std::int16_t, 320> pcm{};
-  bool full = false;
-  for (unsigned i = 0; i < 1000 && !full; ++i) {
-    const auto result = link.SendAudio(7, pcm.data(), i == 0, false, false);
-    full = result == SendResult::Backpressure;
-    if (result == SendResult::Disconnected) {
-      const auto failure = WaitEvent(link);
-      throw std::runtime_error("slow reader disconnected before backpressure at " +
-                               std::to_string(i) + ": " + failure.code);
-    }
-    if (!full) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-  }
-  Check(full, "slow reader did not fill bounded queue");
-  const auto fence_started = Clock::now();
-  Check(link.Stop(8, true), "blocked writer lost STOP reserve");
-  Upload(link, 9, true);
-  Check(link.Stop(10, false), "blocked writer lost supersede marker");
-  Upload(link, 11);
+  Check(full && Clock::now() - began < std::chrono::milliseconds(200),
+        "unbounded or blocking PCM queue");
+  Check(net::cancel(2, true), "cancel reserve lost");
+  Check(net::start(3, true) == SendResult::Ok, "supersede reserve lost");
+  Check(net::cancel(4, false), "second cancel reserve lost");
+  Upload(5);
   server.PauseReads(false);
-  std::size_t count = 7;
   unsigned stage = 0;
-  while (stage < 4) {
-    messages = server.WaitMessages(++count);
+  std::size_t count = 1;
+  for (unsigned i = 0; i < 100 && stage < 4; ++i) {
+    auto messages = server.WaitMessages(++count);
     const auto& message = messages[count - 1];
-    if (message.opcode == websocketpp::frame::opcode::text &&
-        message.payload.find("\"type\":\"hello\"") != std::string::npos) {
-      // TCP 零窗口探测可能超过 800 ms 的退休帧发送期限；重连出现新的 hello 时，
-      // 必须已经给应用报告有界失败，不能把重连当作先前退休标记已经送达。
-      const auto failure = WaitEvent(link);
-      Check(failure.kind == LinkEventKind::Offline &&
-                (failure.code == "send_timeout" || failure.code == "uplink_timeout") &&
-                Clock::now() - fence_started < std::chrono::seconds(2),
-            "blocked retirement did not report bounded send failure");
-      return;
-    }
-    if (message.opcode == websocketpp::frame::opcode::binary &&
-        Read32(message.payload, 8) == 7) {
+    if (message.opcode == websocketpp::frame::opcode::binary) {
       continue;
     }
+    if (message.payload.find("\"type\":\"hello\"") != std::string::npos) {
+      Check(WaitEvent().kind == LinkEventKind::Offline, "silent send loss");
+      return;
+    }
+    const std::array<std::string, 4> expected = {
+        "{\"type\":\"cancel\",\"generation\":2,\"retract\":true}",
+        "{\"type\":\"start\",\"generation\":3,\"supersede\":true}",
+        "{\"type\":\"cancel\",\"generation\":4,\"retract\":false}",
+        "{\"type\":\"start\",\"generation\":5,\"supersede\":false}"};
     if (stage == 0 &&
-        message.payload != "{\"type\":\"stop\",\"generation\":8,\"retract\":true}") {
-      throw std::runtime_error(
-          "blocked STOP order: opcode=" + std::to_string(message.opcode) +
-          (message.opcode == websocketpp::frame::opcode::binary
-               ? ", generation=" + std::to_string(Read32(message.payload, 8))
-               : ", text=" + message.payload));
+        message.payload == "{\"type\":\"start\",\"generation\":1,\"supersede\":false}") {
+      continue;
     }
-    if (stage == 1) {
-      Check(message.opcode == websocketpp::frame::opcode::binary && message.payload[5] == 7 &&
-                Read32(message.payload, 8) == 9,
-            "blocked supersede erased");
-    }
-    if (stage == 2) {
-      Check(message.payload == "{\"type\":\"stop\",\"generation\":10,\"retract\":false}",
-            "blocked second STOP erased");
-    }
-    if (stage == 3) {
-      Check(message.opcode == websocketpp::frame::opcode::binary &&
-                Read32(message.payload, 8) == 11,
-            "new input overtook retirements");
-    }
+    Check(message.payload == expected[stage], "retirement reordered or lost");
     ++stage;
+  }
+  Check(stage == 4, "retirement sequence incomplete");
+}
+void RejectOldHandshake() {
+  for (const char* ready :
+       {"{\"type\":\"ready\"}", "{\"type\":\"ready\",\"sample_rate\":16000}",
+        "{\"type\":\"ready\",\"sample_rate\":24000,\"version\":3}",
+        "{\"type\":\"ready\",\"sample_rate\":16000,\"version\":2}"}) {
+    LoopbackServer server(false);
+    NetworkScope scope;
+    Check(net::open(server.Config()), "open failed");
+    server.WaitMessages(1);
+    server.Send(ready);
+    Check(WaitEvent().kind == LinkEventKind::Offline, "old handshake accepted");
+  }
+  LoopbackServer server(false);
+  NetworkScope scope;
+  Check(net::open(server.Config()), "open failed");
+  const auto event = WaitEvent(6500);
+  Check(event.kind == LinkEventKind::Offline && event.code == "hello_timeout",
+        "hello timeout missing");
+}
+void RejectInvalidInputOrder() {
+  for (unsigned scenario = 0; scenario < 3; ++scenario) {
+    LoopbackServer server;
+    NetworkScope scope;
+    Open(server);
+    std::array<std::int16_t, 320> pcm{};
+    if (scenario == 0) {
+      Check(net::send(1, pcm.data()) == SendResult::Disconnected, "PCM before START accepted");
+    } else {
+      Check(net::start(1, false) == SendResult::Ok, "START failed");
+      if (scenario == 1) {
+        Check(net::end(1) == SendResult::Disconnected, "empty END accepted");
+      } else {
+        Check(net::start(1, false) == SendResult::Disconnected, "generation reused");
+      }
+    }
+    Check(WaitEvent().kind == LinkEventKind::Offline, "input failure not reported");
   }
 }
 
-/**
- * @brief 对教师提供的外部测试服务验证错误 pin、正确握手和约定的固定回复。
- *
- * 测试对端应返回“你好”、一帧含两个 sample 的短音频及 done；不是任意生产问答服务。
- * host/port/pin 从命令行取得，此路径不测试 UDP 发现，不需要板端或云服务 API Key。
- */
 void ExternalServerSmoke(const char* host, const char* port, const char* pin) {
-  const auto parsed_port = std::stoul(port);
-  Check(parsed_port > 0 && parsed_port <= 65535, "invalid smoke port");
-  VoiceClientConfig config{kDeviceId, host, static_cast<std::uint16_t>(parsed_port), pin};
-  auto bad_config = config;
-  bad_config.server_spki_sha256[0] = bad_config.server_spki_sha256[0] == 'A' ? 'B' : 'A';
-  VoiceLink bad_link;
-  Check(bad_link.Open(bad_config) && WaitEvent(bad_link).kind == LinkEventKind::Offline,
+  NetworkScope scope;
+  const auto parsed = std::stoul(port);
+  Check(parsed > 0 && parsed <= 65535, "invalid port");
+  VoiceClientConfig config{kDeviceId, host, static_cast<std::uint16_t>(parsed), pin};
+  auto wrong = config;
+  wrong.server_spki_sha256[0] = wrong.server_spki_sha256[0] == 'A' ? 'B' : 'A';
+  Check(net::open(wrong) && WaitEvent().kind == LinkEventKind::Offline,
         "server accepted wrong pin");
-  bad_link.Close();
-  VoiceLink link;
-  Check(link.Open(config) && WaitEvent(link).kind == LinkEventKind::Online,
-        "server did not become ready");
+  net::close();
+  Check(net::open(config) && WaitEvent().kind == LinkEventKind::Online, "server not ready");
   std::array<std::int16_t, 320> pcm{};
   pcm[0] = 0x0807;
-  Check(link.SendAudio(1, pcm.data(), true, true, false) == SendResult::Ok,
-        "smoke input rejected");
-  bool have_text = false, have_audio = false, done = false;
+  Check(net::start(1, false) == SendResult::Ok && net::send(1, pcm.data()) == SendResult::Ok &&
+            net::end(1) == SendResult::Ok,
+        "smoke input");
+  bool text = false, audio = false, done = false;
   for (unsigned i = 0; i < 8 && !done; ++i) {
-    const auto event = WaitEvent(link);
+    auto event = WaitEvent();
     if (event.kind == LinkEventKind::Text) {
-      have_text = event.text == "你好";
+      text = event.text == "你好";
     } else if (event.kind == LinkEventKind::Audio) {
-      have_audio = event.start && event.end && event.audio_size == 4;
+      audio = event.audio_size == 4;
     } else if (event.kind == LinkEventKind::Done) {
       done = true;
     } else {
-      throw std::runtime_error("smoke received failure");
+      throw std::runtime_error("smoke failed");
     }
   }
-  Check(have_text && have_audio && done, "server did not complete expected reply");
+  Check(text && audio && done, "smoke incomplete");
   std::cout << "WSS_SMOKE_OK\n";
 }
-
 }  // namespace
-
-/// @brief 无参数运行本机回环场景；三个参数运行外部测试服务 smoke，失败统一返回非零。
 int main(int argc, char** argv) {
   try {
     if (argc == 4) {
@@ -807,19 +641,18 @@ int main(int argc, char** argv) {
       return EXIT_SUCCESS;
     }
     BasicWireAndClose();
-    GenerationFence();
-    StopAfterEnd();
+    CancelAfterEndAndOldGeneration();
     ErrorEndsUpload();
     RejectBrokenWire();
     TlsFailureAndReconnect();
-    BoundedQueuesAndSupersede();
-    PendingRetirementKeepsMeaning();
-    RejectOldSampleRate();
-    HandshakeTimeout();
+    BoundedQueuesAndRetirement();
+    RejectOldHandshake();
+    RejectInvalidInputOrder();
   } catch (const std::exception& error) {
-    std::cerr << "voice link loopback: " << error.what() << '\n';
+    net::close();
+    std::cerr << "voice net loopback: " << error.what() << '\n';
     return EXIT_FAILURE;
   }
-  std::cout << "voice link loopback: passed\n";
+  std::cout << "voice net loopback: passed\n";
   return EXIT_SUCCESS;
 }

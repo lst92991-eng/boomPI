@@ -6,7 +6,7 @@
 
 #include "boompi/application/voice_client.h"
 #include "boompi/config/voice_client_config.h"
-#include "boompi/network/voice_link.h"
+#include "boompi/network/voice_net.h"
 
 using boompi::config::LoadClientConfig;
 using boompi::config::VoiceClientConfig;
@@ -71,7 +71,7 @@ int RunCommand(int argc, char* argv[]) {
     std::string ssid;
     std::string password;
     if (!std::getline(std::cin, ssid) || !std::getline(std::cin, password) ||
-        !boompi::network::SaveWifi(ssid, password)) {
+        !boompi::voice_net::save_wifi(ssid, password)) {
       return ReportFailure("Wi-Fi configuration could not be saved");
     }
     return EXIT_SUCCESS;

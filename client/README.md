@@ -4,7 +4,7 @@
 
 教学复现先从[分关实验](../docs/teaching/README.md)开始：配置、固定帧、播放队列、语句输入、WSS、六态问答、插话、界面，最后完成真板验收。每关复用真实产品源码和已有测试，不用课程宏拼出多个产品。
 
-音频可以直接从[顺序数据流](../docs/teaching/audio-pipeline.md)进入：`RawCaptureFrame → CaptureChannels → CleanAudioFrame → CaptureFrame → AudioEvent`。各处理模块显式接收上一阶段输出，播放是另一条独立链。
+音频可以从[顺序数据流](../docs/teaching/audio-pipeline.md)进入：`RawCaptureFrame → CaptureChannels → CleanAudioFrame → CaptureFrame → speech::Result（借用PCM）`。各处理模块显式接收上一阶段输出，播放是另一条独立链。
 
 这是一份源码上的递进补写实验，不是已经导出的独立阶段源码快照。已有基础、只想先理解完整业务时，再读 `src/application/voice_client.cpp`。服务端是配套 EXE，学生只配置 Key；无需学习 Go 或云端 SDK。
 
@@ -15,50 +15,20 @@ python3 scripts/teaching_lab.py 1 --build-dir build/lesson-host
 
 ## 一条主线
 
+App_Init按采集、播放、网络初始化，App_Process顺序执行收回复、处理语音和触摸。应用直接调用namespace模块：
+
 ```text
-Offline → Idle → Listening → Uploading → Waiting → Speaking
-                   ↑                            │
-                   └──── 物理播放完成后追问 ─────┘
-Speaking ── 确认近讲 ──→ Uploading（新 generation，撤回旧回答）
+audio_capture::read → speech::update → voice_net::start/send/end
+voice_net::poll → playback::begin/write/finish → status(Drained)
 ```
 
-- `App_Init` 初始化模块，main 循环调用 `App_Process`；每轮依次处理超时、网络、音频和 UI；`App_Enter` 同步修改状态、计时和显示。
-- `App_ReadSpeechAndUpload` 直接取录音结果，在同一函数中处理开口、PCM 上传与句尾。
-- `App_ReceiveReplyAndPlayAudio` 直接取服务器消息，校验轮次、显示文字或排队播放。
-- `VoiceAudio` 整理语句、500 ms pre-roll、32 帧打断历史和播放生命周期；`ProcessListeningFrame`与播放期间的插话控制分开阅读。
-- `VoiceLink` 拥有发现、TLS、握手、心跳、重连、协议与有界队列。
-- `DeviceUi::Show(UiView)` 发布一个固定大小的显示快照，`PollAction` 返回触摸和音量动作。
+speech只拥有句首历史与准入策略，不启动线程或转发回复。capture任务直接执行ALSA/转换/3A/wake/vad，playback任务直接拥有播放队列、转换器和声卡。旧VoiceAudio/AudioTasks/AudioPipeline/VoiceLink类与失效接口已经删除。
 
-业务主线不读取 dBFS、硬件参考、SPKI 或握手状态。底层实现仍开放给进阶课程阅读。
-
-`VoiceAudio::ProcessEvents(events, timeout)`推进采集判定，直接返回一批“开始事件＋PCM”；应用中的 for 循环按序处理，停止或句尾后丢弃本批剩余项。`ListenMode::Wake/FollowUp`区分两种听音方式；`App_StopAndListen`表示停止当前轮后继续等追问。固定20ms的下行音频一包入一个播放槽，仅末帧允许不足一槽，不再提供任意长度跨槽拼包。
+START、PCM、END、CANCEL为不同协议消息；generation隔离旧轮，sequence检查连续PCM。DONE关闭播放输入，实际尾播之后才追问。保持唤醒、VAD、500ms句首、插话确认、三秒追问和全部UI/配网/摄像头功能。
 
 ## 阅读顺序
 
-| 课程 | 源码入口 | 学生需要解释的事情 |
-| --- | --- | --- |
-| 1 | application/voice_client.cpp：Init、App_Process、App_ReadSpeechAndUpload | 一次发言如何进入上传，最后一帧如何结束 |
-| 2 | network/voice_codec.cpp 与 protocol-v2.md | START/END、generation、sequence 的用途 |
-| 3 | audio/voice_audio.cpp | 为什么保留句首；播放中近讲如何成为 Barge |
-| 4 | audio/audio_tasks.cpp | 两条实时线程和固定容量队列的所有权 |
-| 5 | platform/rv1106/audio_pipeline.cpp | 48→16 kHz、3A、Snowboy、VAD 的先后关系 |
-| 6 | platform/rv1106/alsa_audio.cpp | Mode1 四通道、period、XRUN 与中断退出 |
-| 7 | ui/lvgl_screen.cpp、ui/device_ui.cpp | 页面、音量、摄像头资源的生命周期 |
-| 8 | platform/rv1106/display_touch.cpp | SPI屏幕、I²C触摸、复位与故障恢复 |
-
-上述路径相对 `client/src/`。课程按同一份产品代码递进，不用宏拼出多个产品。
-
-读正常问答时，先顺着 `App_ReadSpeechAndUpload → App_UploadSpeechFrame → App_ReceiveReplyAndPlayAudio → App_QueueReplyAudio`。
-需要了解异常再看 `App_HandleAudioFault`、`App_StopAndListen` 和 `App_CheckTimeout`。主状态中不处理声学门限和TLS细节。入口中的 `App_Init → 循环 App_Process → App_Close` 明确显示生命周期。
-
-采集端从 `AudioPipeline::ProcessCapture20ms` 向下看：`AudioConverter`转换原始帧，`RockchipVoiceDsp`输出PCM和对齐元数据，`SpeechDetector`输出检测结果，最后由引擎发布。各步都有明确输入输出，不共享一组可随意修改的工作数组。
-`audio_format.h` 定义帧格式，`board_voice_profile.h` 保存板级标定，公开音频接口只依赖前者。
-
-平台选择放在CMake。板端编译真实网卡操作和Linux线程调度；Host回归从 `tests/support/` 选择替身。
-产品源码不再用条件编译混合测试实现，STDT和AEC delay沿用固定profile。
-
-本项目用根目录 `.clang-format` 统一排版：每行一个语句，条件和循环带大括号，常用列宽96。
-注释说明线程归属、硬件时序、数据单位和异常原因；能从代码直接看出的赋值和调用不逐行复述。
+先读[真实数据流](../docs/teaching/audio-pipeline.md)，再看[模块所有权](../docs/architecture/audio-runtime.md)。应用入口为application/voice_client.cpp，采集/语句/播放在audio/三个namespace模块，协议在network/voice_net.cpp和[BPV3](../protocol/protocol-v3.md)。硬件与vendor细节留在platform/rv1106。
 
 ## 运行与设置
 
@@ -137,6 +107,6 @@ lvgl/        # LVGL 8.2
 
 不把私有库或模型复制进 Git。Snowboy 旧 C++ ABI 仍仅限 bridge。脚本检查 ELF 后才生成 rootfs 安装目录，不会连接开发板。
 
-## v1 升级
+## 旧版升级
 
-v2 客户端必须与同批 v2 服务端配套。旧 v1 程序留在基线快照/Git 历史，不能混用。首次更新前保留旧客户端、旧服务端、config.yaml 与 state；复用原有身份而非重新配对。协议详见 [protocol-v2.md](../protocol/protocol-v2.md)，人工验收见 [host-validation.md](../docs/test/host-validation.md)。
+v3 客户端必须与同批 v3 服务端配套。旧 v1/v2 程序留在基线快照/Git 历史，不能混用。首次更新前保留旧客户端、旧服务端、config.yaml 与 state；复用原有身份而非重新配对。协议详见 [protocol-v3.md](../protocol/protocol-v3.md)，人工验收见 [host-validation.md](../docs/test/host-validation.md)。

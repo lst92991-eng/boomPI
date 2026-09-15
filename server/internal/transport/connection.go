@@ -15,7 +15,7 @@ import (
 
 var errConnectionClosed = errors.New("transport connection is closed")
 
-// Message contains one validated v2 JSON object or one fixed 20 ms uplink frame.
+// Message contains one validated v3 JSON object or one fixed 20 ms uplink frame.
 type Message struct {
 	Control   *protocol.Control
 	PCMHeader *protocol.PCMHeader
@@ -30,7 +30,7 @@ func (m Message) generation() uint32 {
 }
 
 func (m Message) boundary() bool {
-	return m.Control != nil || m.PCMHeader.Flags&protocol.PCMFlagStart != 0
+	return m.Control != nil && (m.Control.Type == "start" || m.Control.Type == "cancel")
 }
 
 type outboundMessage struct {
@@ -164,7 +164,7 @@ func (c *Connection) readMessage() (Message, error) {
 		if err != nil {
 			return Message{}, err
 		}
-		if control.Type != "hello" && control.Type != "stop" {
+		if control.Type != "hello" && control.Type != "start" && control.Type != "end" && control.Type != "cancel" {
 			return Message{}, errors.New("unexpected client control")
 		}
 		return Message{Control: &control}, nil

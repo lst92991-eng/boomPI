@@ -49,6 +49,7 @@ type roundTripSession struct {
 	once                       sync.Once
 	commits, cancels, discards atomic.Int32
 	audioBytes                 int
+	holdDone                   bool
 	cancelHook                 func(context.Context) error
 }
 
@@ -74,7 +75,9 @@ func (s *roundTripSession) Commit(ctx context.Context) error {
 		}
 		events = append(events, backend.ConversationEvent{Type: backend.EventAudio, ResponseID: id, PCM: pcm, SampleRateHz: 16000})
 	}
-	events = append(events, backend.ConversationEvent{Type: backend.EventDone, ResponseID: id})
+	if !s.holdDone {
+		events = append(events, backend.ConversationEvent{Type: backend.EventDone, ResponseID: id})
+	}
 	for _, event := range events {
 		select {
 		case s.events <- event:
@@ -143,7 +146,7 @@ func startDeviceTest(t *testing.T, provider *roundTripBackend) (*websocket.Conn,
 
 func helloDevice(t *testing.T, c *websocket.Conn) {
 	t.Helper()
-	writeControl(t, c, protocol.Control{Type: "hello", SampleRate: 16000, DeviceID: testDeviceID, Token: testDeviceToken})
+	writeControl(t, c, protocol.Control{Type: "hello", Version: 3, SampleRate: 16000, DeviceID: testDeviceID, Token: testDeviceToken})
 	kind, data, err := readWire(c)
 	if err != nil {
 		t.Fatal(err)
@@ -163,11 +166,17 @@ func writeControl(t *testing.T, c *websocket.Conn, control protocol.Control) {
 		t.Fatal(err)
 	}
 }
-func writePCM(t *testing.T, c *websocket.Conn, generation, sequence uint32, flags uint16) {
+func writeStart(t *testing.T, c *websocket.Conn, generation uint32, supersede bool) {
+	writeControl(t, c, protocol.Control{Type: "start", Generation: generation, Supersede: &supersede})
+}
+func writeEnd(t *testing.T, c *websocket.Conn, generation uint32) {
+	writeControl(t, c, protocol.Control{Type: "end", Generation: generation})
+}
+func writePCM(t *testing.T, c *websocket.Conn, generation, sequence uint32) {
 	t.Helper()
 	pcm := make([]byte, inputFrameBytes)
 	pcm[0], pcm[1] = 7, 8
-	wire, err := protocol.EncodePCM(protocol.PCMHeader{Generation: generation, Sequence: sequence, Flags: flags}, pcm, true)
+	wire, err := protocol.EncodePCM(protocol.PCMHeader{Generation: generation, Sequence: sequence}, pcm, true)
 	if err == nil {
 		err = c.WriteMessage(websocket.BinaryMessage, wire)
 	}
@@ -213,29 +222,25 @@ func readReply(t *testing.T, c *websocket.Conn, generation uint32) ([]protocol.P
 				t.Fatalf("server error %s", wire)
 			}
 			if control.Type == "done" {
-				if len(headers) > 0 && headers[len(headers)-1].Flags&protocol.PCMFlagEnd == 0 {
-					t.Fatal("done before PCM END")
-				}
 				return headers, bytes
 			}
 		}
 	}
 }
 
-func TestV2StreamingRoundTripAndTerminalPCM(t *testing.T) {
+func TestV3StreamingRoundTripAndTerminalPCM(t *testing.T) {
 	for _, audioBytes := range []int{0, 2, 4, 640, 642, 640 * 6} {
 		t.Run(fmt.Sprint(audioBytes), func(t *testing.T) {
 			provider := newRoundTripBackend()
 			provider.session.audioBytes = audioBytes
 			c, _ := startDeviceTest(t, provider)
 			helloDevice(t, c)
-			writePCM(t, c, 1, 0, protocol.PCMFlagStart|protocol.PCMFlagEnd)
-			headers, count := readReply(t, c, 1)
+			writeStart(t, c, 1, false)
+			writePCM(t, c, 1, 0)
+			writeEnd(t, c, 1)
+			_, count := readReply(t, c, 1)
 			if count != audioBytes {
 				t.Fatalf("got %d PCM bytes, want %d", count, audioBytes)
-			}
-			if len(headers) > 0 && headers[0].Flags&protocol.PCMFlagStart == 0 {
-				t.Fatal("missing START")
 			}
 			if provider.session.commits.Load() != 1 {
 				t.Fatal("END did not commit exactly once")
@@ -244,61 +249,76 @@ func TestV2StreamingRoundTripAndTerminalPCM(t *testing.T) {
 	}
 }
 
-func TestV2HistoryIntentAndStopTombstone(t *testing.T) {
+func TestV3HistoryIntentAndCancelTombstone(t *testing.T) {
 	provider := newRoundTripBackend()
 	c, _ := startDeviceTest(t, provider)
 	helloDevice(t, c)
-	writePCM(t, c, 1, 0, 3)
+	writeStart(t, c, 1, false)
+	writePCM(t, c, 1, 0)
+	writeEnd(t, c, 1)
 	readReply(t, c, 1)
-	writePCM(t, c, 2, 0, 3)
+	writeStart(t, c, 2, false)
+	writePCM(t, c, 2, 0)
+	writeEnd(t, c, 2)
 	readReply(t, c, 2)
 	if provider.session.discards.Load() != 0 {
 		t.Fatal("NORMAL retracted history")
 	}
-	writePCM(t, c, 3, 0, 7)
+	writeStart(t, c, 3, true)
+	writePCM(t, c, 3, 0)
+	writeEnd(t, c, 3)
 	readReply(t, c, 3)
 	if provider.session.discards.Load() != 1 {
 		t.Fatal("SUPERSEDE must retract even after provider done")
 	}
 	retract := true
-	writeControl(t, c, protocol.Control{Type: "stop", Generation: 5, Retract: &retract})
-	// Frames from the old generation cannot resurrect after the STOP fence.
-	writePCM(t, c, 3, 1, 2)
-	writePCM(t, c, 9, 0, 3)
+	writeControl(t, c, protocol.Control{Type: "cancel", Generation: 5, Retract: &retract})
+	// Frames from the old generation cannot resurrect after the CANCEL fence.
+	writePCM(t, c, 3, 1)
+	writeEnd(t, c, 3)
+	writeStart(t, c, 9, false)
+	writePCM(t, c, 9, 0)
+	writeEnd(t, c, 9)
 	readReply(t, c, 9)
 	if provider.session.discards.Load() != 2 {
-		t.Fatal("STOP retract=true was lost")
+		t.Fatal("CANCEL retract=true was lost")
 	}
 	retract = false
-	writeControl(t, c, protocol.Control{Type: "stop", Generation: 10, Retract: &retract})
-	writePCM(t, c, 11, 0, 3)
+	writeControl(t, c, protocol.Control{Type: "cancel", Generation: 10, Retract: &retract})
+	writeStart(t, c, 11, false)
+	writePCM(t, c, 11, 0)
+	writeEnd(t, c, 11)
 	readReply(t, c, 11)
 	if provider.session.discards.Load() != 2 {
-		t.Fatal("STOP retract=false removed history")
+		t.Fatal("CANCEL retract=false removed history")
 	}
 }
 
-func TestV2RejectsGapsDuplicateStartAndPCMWithoutStart(t *testing.T) {
+func TestV3RejectsGapsDuplicateStartAndPCMWithoutStart(t *testing.T) {
 	for _, scenario := range []string{"gap", "duplicate_start", "missing_start", "after_end"} {
 		t.Run(scenario, func(t *testing.T) {
 			provider := newRoundTripBackend()
 			c, _ := startDeviceTest(t, provider)
 			helloDevice(t, c)
 			if scenario == "missing_start" {
-				writePCM(t, c, 1, 1, 2)
+				writePCM(t, c, 1, 1)
+				writeEnd(t, c, 1)
 			} else {
-				flags := uint16(1)
+				writeStart(t, c, 1, false)
+				writePCM(t, c, 1, 0)
 				if scenario == "after_end" {
-					flags = 3
+					writeEnd(t, c, 1)
 				}
-				writePCM(t, c, 1, 0, flags)
 				switch scenario {
 				case "gap":
-					writePCM(t, c, 1, 2, 2)
+					writePCM(t, c, 1, 2)
+					writeEnd(t, c, 1)
 				case "duplicate_start":
-					writePCM(t, c, 1, 0, 1)
+					writeStart(t, c, 1, false)
+					writePCM(t, c, 1, 0)
 				case "after_end":
-					writePCM(t, c, 1, 1, 2)
+					writePCM(t, c, 1, 1)
+					writeEnd(t, c, 1)
 				}
 			}
 			for i := 0; i < 20; i++ {
@@ -312,10 +332,10 @@ func TestV2RejectsGapsDuplicateStartAndPCMWithoutStart(t *testing.T) {
 	}
 }
 
-func TestV2AuthenticationRunsBeforeProviderOpen(t *testing.T) {
+func TestV3AuthenticationRunsBeforeProviderOpen(t *testing.T) {
 	provider := newRoundTripBackend()
 	c, _ := startDeviceTest(t, provider)
-	writeControl(t, c, protocol.Control{Type: "hello", SampleRate: 16000, DeviceID: testDeviceID, Token: "wrong-token"})
+	writeControl(t, c, protocol.Control{Type: "hello", Version: 3, SampleRate: 16000, DeviceID: testDeviceID, Token: "wrong-token"})
 	if _, _, err := readWire(c); err == nil {
 		t.Fatal("unauthenticated connection accepted")
 	}
@@ -324,7 +344,7 @@ func TestV2AuthenticationRunsBeforeProviderOpen(t *testing.T) {
 	}
 }
 
-func TestV2BlockedCancelAcceptsNewInputWithoutAcknowledgement(t *testing.T) {
+func TestV3BlockedCancelAcceptsNewInputWithoutAcknowledgement(t *testing.T) {
 	provider := newRoundTripBackend()
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
@@ -342,9 +362,12 @@ func TestV2BlockedCancelAcceptsNewInputWithoutAcknowledgement(t *testing.T) {
 	}
 	c, _ := startDeviceTest(t, provider)
 	helloDevice(t, c)
-	writePCM(t, c, 1, 0, 3)
+	writeStart(t, c, 1, false)
+	writePCM(t, c, 1, 0)
+	writeEnd(t, c, 1)
 	readReply(t, c, 1)
-	writePCM(t, c, 2, 0, 5)
+	writeStart(t, c, 2, true)
+	writePCM(t, c, 2, 0)
 	select {
 	case <-entered:
 	case <-time.After(time.Second):
@@ -352,11 +375,10 @@ func TestV2BlockedCancelAcceptsNewInputWithoutAcknowledgement(t *testing.T) {
 	}
 	// Send the complete new utterance while cancellation is still blocked.
 	for seq := uint32(1); seq <= 24; seq++ {
-		flags := uint16(0)
+		writePCM(t, c, 2, seq)
 		if seq == 24 {
-			flags = 2
+			writeEnd(t, c, 2)
 		}
-		writePCM(t, c, 2, seq, flags)
 	}
 	close(release)
 	readReply(t, c, 2)
@@ -375,5 +397,59 @@ func TestNextPacedFrameDeadlineBoundsCatchUp(t *testing.T) {
 		if next.Sub(now) < minimumOutputFrameSpacing || next.Sub(now) > outputFrameDuration {
 			t.Fatalf("bad pacing %v", next.Sub(now))
 		}
+	}
+}
+
+func TestV3FullPCMDoesNotWaitForNextFrameOrDone(t *testing.T) {
+	provider := newRoundTripBackend()
+	provider.session.audioBytes = 640
+	provider.session.holdDone = true
+	c, _ := startDeviceTest(t, provider)
+	helloDevice(t, c)
+	writeStart(t, c, 1, false)
+	writePCM(t, c, 1, 0)
+	writeEnd(t, c, 1)
+	for {
+		kind, data, err := readWire(c)
+		if err != nil {
+			t.Fatalf("first full frame waited for DONE: %v", err)
+		}
+		if kind != websocket.BinaryMessage {
+			continue
+		}
+		header, pcm, err := protocol.ParsePCMFrame(data, false)
+		if err != nil || header.Generation != 1 || header.Sequence != 0 || len(pcm) != 640 {
+			t.Fatalf("first PCM: %+v %d %v", header, len(pcm), err)
+		}
+		break
+	}
+	provider.session.events <- backend.ConversationEvent{Type: backend.EventDone, ResponseID: "1"}
+	kind, data, err := readWire(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done, err := protocol.DecodeControl(data)
+	if err != nil || kind != websocket.TextMessage || done.Type != "done" {
+		t.Fatalf("terminal control: %s %v", data, err)
+	}
+}
+
+func TestV3RejectsEmptyAndRepeatedEnd(t *testing.T) {
+	for _, hasPCM := range []bool{false, true} {
+		t.Run(fmt.Sprint(hasPCM), func(t *testing.T) {
+			provider := newRoundTripBackend()
+			c, _ := startDeviceTest(t, provider)
+			helloDevice(t, c)
+			writeStart(t, c, 1, false)
+			if hasPCM {
+				writePCM(t, c, 1, 0)
+				writeEnd(t, c, 1)
+				readReply(t, c, 1)
+			}
+			writeEnd(t, c, 1)
+			if _, _, err := readWire(c); err == nil {
+				t.Fatal("invalid END did not terminate connection")
+			}
+		})
 	}
 }

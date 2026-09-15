@@ -8,7 +8,7 @@
  * 显示：App_Enter/字幕更新 → Show → UpdateView → ShowLatestView → LvglScreen。
  * 输入：ReadInput → LVGL 事件 → HandleEvent → PollAction →
  * App_ReadUserAction；音量在此链末端 更新
- * VoiceAudio，只有滑块提交事件在本文件保存设置。摄像头帧通过另一短锁单独交接。
+ * playback，只有滑块提交事件在本文件保存设置。摄像头帧通过另一短锁单独交接。
  */
 #include "boompi/ui/device_ui.h"
 
@@ -193,7 +193,7 @@ struct DeviceUi::Impl final {
    *
    * 唤醒、打断和实时音量通过原子值快速交还 application；配网、摄像头生命周期和
    * 音量持久化仍归 UI worker 管理。写配置只发生在 VolumeCommit，滑块移动期间的
-   * VolumePreview 只发布音量值，application 随后调用 VoiceAudio::SetVolume 更新 gain，
+   * VolumePreview只发布音量值，application随后调用playback::set_volume更新gain，
    * 不在回调中访问 ALSA。离开摄像头页会同步等待 camera.Stop，避免旧管线越过页面生命周期。
    */
   static void HandleEvent(LvglScreen::Event event, std::uint8_t value, void* context) {

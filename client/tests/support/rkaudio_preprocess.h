@@ -1,8 +1,8 @@
 /** @file rkaudio_preprocess.h
  * @brief FIFO 单元测试使用的最小声明；不代表厂商结构布局，不验证真实 ABI 或 AEC。
  *
- * 由 tests 的 include 优先级替换 vendor 头；audio_pipeline_test.cpp 提供函数实现。
- * 成员只覆盖 rockchip_voice_dsp.cpp 访问的参数，结构名不能用于推断真实库的内存布局。
+ * 由 tests 的 include 优先级替换 vendor 头；audio_modules_test.cpp 提供函数实现。
+ * 成员只覆盖rockchip_3a.cpp访问的参数，结构名不能用于推断真实库的内存布局。
  */
 #pragma once
 

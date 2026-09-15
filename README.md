@@ -2,7 +2,7 @@
 
 boomPI 是一个面向 RV1106 自研板卡的语音 AI 教学项目。板端运行 C++17 客户端，学生电脑运行 Go 服务端；API Key 只保存在电脑上，板子通过局域网连接服务端。
 
-当前实现保留双麦 AEC、Snowboy 唤醒、VAD、流式问答、连续 TTS、播放中打断并提交新问题、三秒追问、LVGL 触摸桌面、音量、Wi-Fi 配网和 SC3336 本地预览。学生沿真实数据流阅读客户端；服务端是只需配置 Key 的课程配套程序。本轮验证边界见[重构验收记录](docs/test/refactor-handoff-20260915.md)。
+当前实现保留双麦 AEC、Snowboy 唤醒、VAD、流式问答、连续 TTS、播放中打断并提交新问题、三秒追问、LVGL 触摸桌面、音量、Wi-Fi 配网和 SC3336 本地预览。学生沿namespace顺序数据流阅读客户端；服务端是只需配置Key的课程配套程序。本轮验证边界见[结构重写记录](docs/test/namespace-rewrite.md)。
 
 ## 使用方式
 
@@ -70,7 +70,7 @@ playback volume     = 60%
 ```text
 client/                 RV1106 客户端、LVGL 和板端脚本
 server/                 跨平台 Go 服务端
-protocol/               客户端与服务端共用的 v2 / 16 kHz 线协议
+protocol/               客户端与服务端共用的 v3 / 16 kHz 线协议
 docs/architecture/      当前系统与音频数据流
 docs/hardware/          硬件事实和 BSP 边界
 docs/test/              可复现验证入口
@@ -107,4 +107,4 @@ cmake --build --preset rv1106-release --parallel
 - 不要把 WSS 端口暴露到公网；不要提交 `config.yaml`、`state/`、API Key、Wi-Fi 密码、模型或私有 SDK。
 - 默认不保存原始 PCM 和完整对话。
 
-当前仅支持 [protocol-v2.md](protocol/protocol-v2.md)，客户端和服务端必须配套升级。学生从 [客户端教学阅读顺序](client/README.md) 进入六状态主线，服务端只作为配置工具。开发规则见 [AGENTS.md](AGENTS.md)，架构总览见 [system-overview.md](docs/architecture/system-overview.md)。
+当前仅支持 [protocol-v3.md](protocol/protocol-v3.md)，客户端和服务端必须配套升级。学生从 [客户端教学阅读顺序](client/README.md) 进入六状态主线，服务端只作为配置工具。开发规则见 [AGENTS.md](AGENTS.md)，架构总览见 [system-overview.md](docs/architecture/system-overview.md)。

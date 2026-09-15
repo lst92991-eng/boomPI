@@ -65,7 +65,7 @@ python3 scripts/teaching_lab.py 1
 
 **本关新增概念：** 采样点/字节数、大小端、首尾标记与编号。
 
-源码：`client/include/boompi/audio/audio_format.h`、`client/src/network/voice_codec.h/.cpp`；契约见[协议v2](../../protocol/protocol-v2.md)。
+源码：`client/include/boompi/audio/audio_format.h`、`client/src/network/voice_codec.h/.cpp`；契约见[协议v3](../../protocol/protocol-v3.md)。
 
 先根据采样率推导20ms的320/960样本；再写整数读写，最后实现`EncodeAudio`、`DecodeAudio`。严格JSON校验先作为已给出的支持代码，理解二进制格式后再回看转义、重复键和类型检查。
 
@@ -81,9 +81,9 @@ python3 scripts/teaching_lab.py 2
 
 **本关新增概念：** 有界环、单生产者/消费者、准备/播放/收尾。
 
-源码：`client/src/audio/audio_tasks.cpp`与公开头。硬件替身在`client/tests/support/audio_pipeline.cpp`，只在Host测试中选入；本关真实执行产品队列和线程代码，不打开ALSA设备。
+源码：`client/src/audio/playback.cpp`与公开头。硬件替身在`client/tests/support/audio_hardware.cpp`，只在Host测试中选入；本关真实执行产品队列、转换和线程代码，不打开真实ALSA设备。
 
-先按数据流说明复现`AudioConverter`并运行新增的`pipeline-format`，再复现`ClearPlaybackQueue`与`QueueReplyFrame`，随后看`BeginPlayback`、`EndPlayback`，最后顺着`PlaySpeakerTask`理解取帧与结束。
+先按数据流说明复现audio_convert并运行格式测试，再看playback::write/begin/finish，最后顺着PlaybackTask理解取帧、转换、write和尾播结束。
 
 当前契约是一包一槽：1～320样本，短帧只能是最后一包，后面不允许继续追加。队列满必须拒绝，不能覆盖尚未播放的槽。使用槽数定位入队位置，有效样本数仅保留在槽中，不再维护第二份总样本水位计数。
 
@@ -99,9 +99,9 @@ python3 scripts/teaching_lab.py 3
 
 **本关新增概念：** 历史帧、开口/结束边沿、首次听音与追问。
 
-先看`speech_detector.cpp`中`Detect`和`GateNearVoice`，用`pipeline-detection`验证输入到判定结果。然后进入`client/src/audio/voice_audio.cpp`：写`SaveHistory`、`EmitBufferedSpeech`，再看`ProcessListeningFrame`中的听音/采集分支和句尾处理。
+先看wake.cpp/vad.cpp，用检测测试验证输入到判定结果。然后进入`client/src/audio/speech.cpp`，沿remember/admit/update理解句首借用、追问准入和句尾处理；这不是一个拥有设备的对象。
 
-`VoiceAudio::ProcessEvents`既推进采集帧处理，也返回语义事件，并非单纯读取邮箱。应用必须持续调用；20ms参数只限制一次底层等待，不保证整个调用总耗时不超过20ms。
+`audio_capture::read`取处理帧，`speech::update`返回准入决定与借用PCM，应用直接START/send/END；20ms只限制取帧等待。
 
 ```sh
 python3 scripts/teaching_lab.py 4
@@ -115,7 +115,7 @@ python3 scripts/teaching_lab.py 4
 
 **本关新增概念：** 建链与ready、发送队列、连接级事件。
 
-源码：`client/src/network/voice_link.cpp`、`network_setup.cpp`。先沿`Connect`、`SendHello`、`OnMessage`理解连接，再实现`SendNextFrame`。公钥验证、握手身份、长度边界作为必须保留的支持逻辑，不为获得“能连上”的效果跳过它们。
+源码：`client/src/network/voice_net.cpp`、`network_setup.cpp`。先沿Connect、SendHello、OnMessage理解连接，再实现SendNextFrame。公钥验证、握手身份、长度边界均为必须保留的逻辑。
 
 ```sh
 python3 scripts/teaching_lab.py 5
@@ -131,7 +131,7 @@ python3 scripts/teaching_lab.py 5
 
 源码：`client/src/application/voice_client.cpp`，入口`client/apps/boompi_client/main.cpp`。
 
-复现顺序为`App_Enter`、`App_WaitForSpeech`、`App_BeginUpload`、`App_UploadSpeechFrame`、`App_ReadSpeechAndUpload`、`App_ReceiveReplyAndPlayAudio`。先手写一张六态转换表，再实现对应分支。不要增加第二个状态机来重复表达同一业务。
+先读App_Process，再进入App_ReadSpeech和App_ReceiveReply。前者直接speech::update→voice_net::start/send/end，后者直接playback::begin/write/finish；超时与触摸取消在App_StopAndListen汇合。先手写状态与动作，再实现对应分支，不增加第二套业务状态机。
 
 ```sh
 python3 scripts/teaching_lab.py 6
@@ -139,17 +139,17 @@ python3 scripts/teaching_lab.py 6
 
 应用 harness 链接生产应用模块，只替换模块I/O和时钟。它验证完整业务，不意味着只写完正常路径就能通过全部检查。
 
-应能沿日志解释Offline→Idle→Listening→Uploading→Waiting→Speaking→追问。音频END和网络Done均不能提前结束Speaking；只有当前generation的PlaybackDone可以开启音频回答后的追问。纯文本没有声卡完成事件，处理方式不同。
+应能沿代码和UI解释Offline→Idle→Listening→Uploading→WaitingReply→Speaking→追问。DONE只关闭播放输入，当前generation的Drained才开启音频回答后的追问。纯文本无需等待声卡；正常运行不逐轮输出状态日志。
 
-`App_StopAndListen`的名字表示停止后还会重新听音；`ReplyHistory::Keep/Retract`表示是否撤回未听完的回答。常见错误是旧轮完成改变新轮状态，或者停止命令失败后仍显示正常追问。
+App_StopAndListen表示停止后会重新听音；CANCEL的retract字段决定是否撤回未听完的回答。常见错误是旧轮完成改变新轮状态，或者停止命令失败后仍显示正常追问。
 
 ## 07 插话：从“停声音”到“真正开始新问题”
 
 **本关新增概念：** 回声与近讲、主动停止、跨线程迟到结果。
 
-源码：`VoiceAudio::ProcessBargeFrame/ConfirmBarge`、应用`App_StopAndListen`以及网络`AdvanceLocked`。这是进阶关，不要求第一次学录放音时同时掌握。
+源码：`speech::update/check_barge`、应用`App_StopAndListen`以及网络`AdvanceLocked`。这是进阶关，不要求第一次学录放音时同时掌握。
 
-先在纸上走一遍候选人声→临时静音→等待低参考→清尾音→确认。再追确认后的顺序：停旧播放，交出保留PCM，应用分配新generation，首帧带START|SUPERSEDE。
+先在纸上走一遍候选人声→临时静音→等待低参考→清尾音→确认。再追确认后的顺序：停旧播放，交出保留PCM，应用分配新generation，先发START(supersede=true)，再发PCM。
 
 ```sh
 python3 scripts/teaching_lab.py 7
@@ -209,11 +209,11 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 
 如果学生能指出由哪个模块拒绝或处理、哪些状态保持不变，以及为什么不应该删掉该检查，就说明这段实现已经能够复现和维护。
 
-## 本轮基座调整与验证记录（2026-09-05）
+## 历史基座调整与验证记录（2026-09-05，不代表当前结构）
 
 以`0c0b53c`为基线。正式客户端从34文件/5671 ELOC变为36文件/5746 ELOC（+75）；物理行6975→7080。统计含私有音频与显示驱动，不含测试、教材、资源和第三方。只看DeviceUi时为631→349 ELOC，但移出的347 ELOC显示/触摸端口仍计入客户端总量，不能把移动目录当作删掉代码。
 
-生产改动预算为最多2个新文件、净增加不超过110 ELOC，未新增线程或框架。新增具体DisplayTouch边界、ListenMode/ReplyHistory及明确页面身份；删除任意长度跨槽拼包、持久tts_tail和重复相机状态映射。固定板级参数、协议v2、缓冲时长与已有功能保持。
+当时生产改动预算为最多2个新文件、净增加不超过110 ELOC，未新增线程或框架。新增具体DisplayTouch边界、ListenMode/ReplyHistory及明确页面身份；删除任意长度跨槽拼包、持久tts_tail和重复相机状态映射。该记录对应旧协议v2；当前namespace/BPV3结构及统计见[结构重写交接](../test/namespace-rewrite.md)。
 
 验证：Linux严格构建与22/22 CTest、Windows基础2/2 CTest、Python16/16、共享协议fixture、HIL的Host编译和`--help`、UI及真实Linux显示端口严格编译。九个实验入口均实际执行；第8关仅编译，不将页面视觉或触摸误报为自动验收。小智/相机/Wi-Fi三张模拟器BMP与基线逐字节一致；11个迁移硬件函数体及87字节面板初始化表经独立比对保持。
 

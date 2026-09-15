@@ -2,7 +2,7 @@
  * @file snowboy_legacy_bridge.h
  * @brief 隔离 Snowboy 旧 libstdc++ ABI 的最小 C 链接接口。
  *
- * SpeechDetector 在启动时 create，运行时由采集线程顺序 reset/process，退出时 destroy。
+ * wake模块在启动时create，运行时由采集线程顺序 reset/process，退出时 destroy。
  * 指针都只在调用期间借用；调用方不解释句柄布局，也不跨边界传 std::string 或异常。
  */
 #pragma once

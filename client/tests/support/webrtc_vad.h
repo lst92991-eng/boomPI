@@ -1,6 +1,6 @@
 /**
  * @file webrtc_vad.h
- * @brief Host 检测测试使用的 VAD 窄接口声明，实现在 audio_pipeline_test.cpp。
+ * @brief Host 检测测试使用的 VAD 窄接口声明，实现在 audio_modules_test.cpp。
  *
  * 分类结果由测试脚本注入；SpeechDetector 中的电平准入、起止滞回和 AEC 窗口仍用
  * 生产实现。Create/Free 模拟句柄所有权，不验证 WebRTC 算法准确率或厂商 ABI。

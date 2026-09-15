@@ -49,9 +49,21 @@ func (p *fakeProvider) Cancel(ctx context.Context, retract bool) error {
 }
 func (p *fakeProvider) Events() <-chan backend.ConversationEvent { return p.events }
 func (p *fakeProvider) Close() error                             { p.once.Do(func() { close(p.events) }); return nil }
-func submit(t *testing.T, a *Actor, generation, sequence uint32, flags uint16) {
+func submit(t *testing.T, a *Actor, generation, sequence uint32) {
 	t.Helper()
-	if err := a.Submit(protocol.PCMHeader{Generation: generation, Sequence: sequence, Flags: flags}, make([]byte, 640)); err != nil {
+	if err := a.Submit(protocol.PCMHeader{Generation: generation, Sequence: sequence}, make([]byte, 640)); err != nil {
+		t.Fatal(err)
+	}
+}
+func begin(t *testing.T, a *Actor, generation uint32, supersede bool) {
+	t.Helper()
+	if err := a.Start(generation, supersede); err != nil {
+		t.Fatal(err)
+	}
+}
+func finish(t *testing.T, a *Actor, generation uint32) {
+	t.Helper()
+	if err := a.End(generation); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -71,7 +83,9 @@ func TestSupersedeQueueAcceptsNewPCMWhileProviderCancellationBlocks(t *testing.T
 		t.Fatal(err)
 	}
 	defer a.Close()
-	submit(t, a, 1, 0, 3)
+	begin(t, a, 1, false)
+	submit(t, a, 1, 0)
+	finish(t, a, 1)
 	waitSent(t, p)
 	// First event proves Commit completed and the worker is in response mode.
 	p.events <- backend.ConversationEvent{Type: backend.EventStarted, ResponseID: "old"}
@@ -90,18 +104,18 @@ func TestSupersedeQueueAcceptsNewPCMWhileProviderCancellationBlocks(t *testing.T
 			return ctx.Err()
 		}
 	}
-	submit(t, a, 2, 0, 5)
+	begin(t, a, 2, true)
+	submit(t, a, 2, 0)
 	select {
 	case <-entered:
 	case <-time.After(time.Second):
 		t.Fatal("no cancellation")
 	}
 	for i := uint32(1); i <= 20; i++ {
-		flags := uint16(0)
+		submit(t, a, 2, i)
 		if i == 20 {
-			flags = 2
+			finish(t, a, 2)
 		}
-		submit(t, a, 2, i, flags)
 	}
 	// These old events existed before Cancel returned. They must be drained.
 	p.events <- backend.ConversationEvent{Type: backend.EventTextDelta, ResponseID: "old", Text: "stale"}
@@ -142,11 +156,15 @@ func TestBoundaryQueueBoundAndRetractionSurvivesFollowingNormal(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	submit(t, a, 1, 0, 1)
+	begin(t, a, 1, false)
+	submit(t, a, 1, 0)
 	<-entered
-	submit(t, a, 2, 0, 5)
-	submit(t, a, 3, 0, 3)
-	if err = a.Stop(4, false); err != ErrCongested {
+	begin(t, a, 2, true)
+	submit(t, a, 2, 0)
+	begin(t, a, 3, false)
+	submit(t, a, 3, 0)
+	finish(t, a, 3)
+	if err = a.Cancel(4, false); err != ErrCongested {
 		t.Fatalf("unbounded boundary queue: %v", err)
 	}
 	close(release)
@@ -180,15 +198,16 @@ func TestPCMQueueIsBoundedAndStopRetainsReservedCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	submit(t, a, 1, 0, 1)
+	begin(t, a, 1, false)
+	submit(t, a, 1, 0)
 	<-entered
-	for i := 1; i <= commandCapacity; i++ {
-		submit(t, a, 1, uint32(i), 0)
+	for i := 1; i < commandCapacity; i++ {
+		submit(t, a, 1, uint32(i))
 	}
 	if err = a.Submit(protocol.PCMHeader{Generation: 1, Sequence: 25}, make([]byte, 640)); err != ErrCongested {
 		t.Fatal("unbounded PCM queue")
 	}
-	if err = a.Stop(2, false); err != nil {
+	if err = a.Cancel(2, false); err != nil {
 		t.Fatal("STOP capacity unavailable")
 	}
 	close(release)
@@ -202,7 +221,8 @@ func TestCancellationDeadlineClosesSessionWithoutSpawningReplacementWorkers(t *t
 		t.Fatal(err)
 	}
 	defer a.Close()
-	submit(t, a, 1, 0, 1)
+	begin(t, a, 1, false)
+	submit(t, a, 1, 0)
 	select {
 	case _, ok := <-a.Events():
 		if ok {
@@ -225,12 +245,16 @@ func TestNormalAndExplicitStopHistoryIntent(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer a.Close()
-			submit(t, a, 1, 0, 3)
+			begin(t, a, 1, false)
+			submit(t, a, 1, 0)
+			finish(t, a, 1)
 			waitSent(t, p)
-			if err = a.Stop(2, retract); err != nil {
+			if err = a.Cancel(2, retract); err != nil {
 				t.Fatal(err)
 			}
-			submit(t, a, 3, 0, 3)
+			begin(t, a, 3, false)
+			submit(t, a, 3, 0)
+			finish(t, a, 3)
 			waitSent(t, p)
 			want := int32(0)
 			if retract {

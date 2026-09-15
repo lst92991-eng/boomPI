@@ -18,12 +18,12 @@ AUDIO_CASES = (
     "playback-prepare-failure", "drop-blocked-render", "drop-blocked-drain",
     "close-blocked-render", "voice-preroll", "voice-follow-up-boundary",
     "voice-barge-lifecycle",
-    "pipeline-format", "pipeline-detection",
+    "modules-format", "modules-detection",
 )
 ALL_TESTS = (
     "voice-client-config-contract", "protocol-json-contract",
     "voice-transport-loopback", "voice-client-behavior",
-) + tuple("audio-engine-" + name for name in AUDIO_CASES)
+) + tuple("audio-flow-" + name for name in AUDIO_CASES)
 
 # A checkpoint reuses real targets; it does not build an alternative product.
 LESSONS = {
@@ -31,20 +31,20 @@ LESSONS = {
         ("voice-client-config-contract",)),
     2: ("固定音频帧与协议", ("boompi_protocol_json_test",),
         ("protocol-json-contract",)),
-    3: ("音频转换与播放队列", ("boompi_audio_engine_harness",),
-        tuple("audio-engine-" + name for name in (
-            "pipeline-format",
+    3: ("音频转换与播放队列", ("boompi_audio_flow_test",),
+        tuple("audio-flow-" + name for name in (
+            "modules-format",
             "queue-results", "short-tail", "playback-owner-order",
             "bounded-capture", "bounded-command", "bounded-close"))),
-    4: ("开口、句首与追问输入", ("boompi_audio_engine_harness",),
-        ("audio-engine-pipeline-detection", "audio-engine-voice-preroll", "audio-engine-voice-follow-up-boundary")),
+    4: ("开口、句首与追问输入", ("boompi_audio_flow_test",),
+        ("audio-flow-modules-detection", "audio-flow-voice-preroll", "audio-flow-voice-follow-up-boundary")),
     5: ("真实本机WSS连接", ("boompi_voice_transport_loopback_test",),
         ("voice-transport-loopback",)),
     6: ("六态问答与异常路径", ("boompi_voice_client_harness",),
         ("voice-client-behavior",)),
-    7: ("播报中插话与退出", ("boompi_audio_engine_harness",),
-        ("audio-engine-voice-barge-lifecycle", "audio-engine-drop-blocked-render",
-         "audio-engine-drop-blocked-drain", "audio-engine-close-blocked-render")),
+    7: ("播报中插话与退出", ("boompi_audio_flow_test",),
+        ("audio-flow-voice-barge-lifecycle", "audio-flow-drop-blocked-render",
+         "audio-flow-drop-blocked-drain", "audio-flow-close-blocked-render")),
     8: ("页面与板级显示端口", ("boompi_ui_simulator", "boompi_device_ui_compile"), ()),
     9: ("完整Host回归", (), ALL_TESTS),
 }

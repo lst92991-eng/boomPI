@@ -3,7 +3,7 @@
  *
  * 输入链依次为 RawCaptureFrame → CaptureChannels → CleanAudioFrame → CaptureFrame，
  * 对应 ALSA → 重采样拆通道 → Rockchip 3A → 检测。前三者由采集线程复用，最后一项
- * 复制进 AudioTasks 的有界队列，再交给 actor 内的 VoiceAudio 整理成语句。
+ * 复制进audio_capture的有界队列，再由应用交给speech整理成语句。
  * 输出链为 16 kHz TTS → StereoPlaybackFrame → ALSA。
  */
 #pragma once

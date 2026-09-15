@@ -1,14 +1,3 @@
-/**
- * @file voice_codec.cpp
- * @brief v2 单帧编解码：检查 JSON 形状、PCM 格式和字节序。
- *
- * 这里只判断一帧是否合法；是否属于当前 generation、序号是否连续由 VoiceLink
- * 判断。解析失败统一抛出阶段错误，原始消息和凭据不会进入错误文本。
- *
- * 文本链：原始 UTF-8/语法检查 → cJSON 解析 → 精确字段与类型检查 → LinkEvent。
- * 音频链：16 字节头和负载长度检查 → 大端头字段 → 保持小端 PCM 字节交给播放层。
- * 发送方向相反：已校验的当前代及序号 + 320 sample → BPV2 固定 656 字节上行帧。
- */
 #include "voice_codec.h"
 
 #include <cjson/cJSON.h>
@@ -22,10 +11,10 @@
 #include <string_view>
 #include <websocketpp/utf8_validator.hpp>
 
-namespace boompi::network::detail {
+namespace boompi::voice_net::detail {
 namespace {
 
-/// @brief 统一的协议拒绝出口，由 VoiceLink::OnMessage 捕获后关闭本次连接。
+/// @brief 统一的协议拒绝出口，由 voice_net OnMessage 捕获后关闭本次连接。
 [[noreturn]] void Invalid() {
   throw std::runtime_error("invalid_protocol");
 }
@@ -53,12 +42,6 @@ void ExactFields(const cJSON* root, std::initializer_list<std::string_view> name
   }
 }
 
-/**
- * @brief 按大小写精确取非空字符串，检查解析后的 UTF-8 和字节上限。
- *
- * 原始 JSON 合法 UTF-8 并不保证转义后的字符串合法，孤立代理项等还须在这里拒绝。
- * 返回独立字符串，不保留 cJSON 树里的指针，解析树释放后事件仍可安全跨线程传递。
- */
 std::string ReadString(const cJSON* root, const char* key, std::size_t maximum) {
   const cJSON* item = cJSON_GetObjectItemCaseSensitive(root, key);
   if (!cJSON_IsString(item) || item->valuestring == nullptr) {
@@ -72,12 +55,6 @@ std::string ReadString(const cJSON* root, const char* key, std::size_t maximum) 
   return value;
 }
 
-/**
- * @brief 在 cJSON 转换数值和字符串前，排除会产生歧义的原始写法。
- *
- * cJSON 会把转义 NUL 截短、把指数数字转为 double。v2 的数值只接受无符号
- * 十进制整数；字符串转义的其余合法性继续交给 cJSON 检查。
- */
 void ValidateSyntax(const std::string& json) {
   bool quoted = false;
   for (std::size_t index = 0; index < json.size(); ++index) {
@@ -148,13 +125,6 @@ void WriteUint32(std::uint32_t value, std::uint8_t* bytes) {
 
 }  // namespace
 
-/**
- * @brief 将完整下行 JSON 转成事件，拒绝未知协议、重复字段和多余尾部数据。
- *
- * ready 没有 generation，映射 Online；text/done/error 必须携带非零 uint32 代号。
- * JSON 数字可用 double 精确表达 uint32 范围，但必须先排除负号、指数和小数写法，
- * 使 C++ 与另一端使用相同线协议契约，而不是接受解析库各自的宽松转换。
- */
 LinkEvent DecodeText(const std::string& json) {
   if (json.empty() || json.size() > 8192 || !websocketpp::utf8_validator::validate(json)) {
     Invalid();
@@ -171,9 +141,11 @@ LinkEvent DecodeText(const std::string& json) {
   const std::string type = ReadString(root.get(), "type", 16);
   LinkEvent event;
   if (type == "ready") {
-    ExactFields(root.get(), {"type", "sample_rate"});
+    ExactFields(root.get(), {"type", "sample_rate", "version"});
     const cJSON* sample_rate = cJSON_GetObjectItemCaseSensitive(root.get(), "sample_rate");
-    if (!cJSON_IsNumber(sample_rate) || sample_rate->valuedouble != 16000) {
+    const cJSON* version = cJSON_GetObjectItemCaseSensitive(root.get(), "version");
+    if (!cJSON_IsNumber(sample_rate) || sample_rate->valuedouble != 16000 ||
+        !cJSON_IsNumber(version) || version->valuedouble != 3) {
       Invalid();
     }
     event.kind = LinkEventKind::Online;
@@ -212,63 +184,34 @@ LinkEvent DecodeText(const std::string& json) {
   return event;
 }
 
-/**
- * @brief 解码 16 kHz 下行 PCM 帧；本函数只理解单帧，不访问当前会话状态。
- *
- * 头部 magic 为 BPV2，第 4 字节为 flags 高字节且必须为 0，第 6、7 字节保留为 0；
- * 下行 flags 只允许 START/END。
- * generation 从偏移 8 开始，sequence 从偏移 12 开始；SUPERSEDE 仅属于上行。
- * 检查有效负载至少一个 sample 后，复制原始 S16_LE 字节供 VoiceAudio 解释。
- */
 LinkEvent DecodeAudio(const std::string& bytes) {
   if (bytes.size() < kHeaderBytes + 2 || bytes.size() > kFrameBytes || bytes.size() % 2 != 0) {
     Invalid();
   }
   const auto* header = reinterpret_cast<const std::uint8_t*>(bytes.data());
-  if (std::memcmp(header, "BPV2", 4) != 0 || header[4] != 0 || (header[5] & ~3U) != 0 ||
-      header[6] != 0 || header[7] != 0) {
+  if (std::memcmp(header, "BPV3", 4) != 0) {
     Invalid();
   }
 
   LinkEvent event;
   event.kind = LinkEventKind::Audio;
-  event.generation = ReadUint32(header + 8);
-  event.sequence = ReadUint32(header + 12);
-  event.start = (header[5] & 1U) != 0;
-  event.end = (header[5] & 2U) != 0;
+  event.generation = ReadUint32(header + 4);
+  event.sequence = ReadUint32(header + 8);
   event.audio_size = bytes.size() - kHeaderBytes;
-  // 首帧必须带 START，非末帧必须满 20 ms；拒绝最大序号避免后续递增回绕。
-  if (event.generation == 0 || event.sequence == UINT32_MAX ||
-      event.start != (event.sequence == 0) || (!event.end && event.audio_size != kPcmBytes)) {
+  if (event.generation == 0 || event.sequence == UINT32_MAX) {
     Invalid();
   }
   std::copy_n(header + kHeaderBytes, event.audio_size, event.audio.begin());
   return event;
 }
 
-/**
- * @brief 将 VoiceLink 已确认的轮次信息与 16 kHz PCM 封装为一条二进制消息。
- *
- * 数组零初始化同时保证保留字节为 0；START/END/SUPERSEDE 分别占 flags 的 bit 0/1/2。
- * 上行 END 仍携带完整 20 ms，声音起止和 padding 由上游音频链确定，不在网络层裁剪。
- */
 std::array<std::uint8_t, kFrameBytes> EncodeAudio(std::uint32_t generation,
                                                   std::uint32_t sequence,
-                                                  const std::int16_t* pcm, bool start, bool end,
-                                                  bool supersede) {
+                                                  const std::int16_t* pcm) {
   std::array<std::uint8_t, kFrameBytes> bytes{};
-  std::memcpy(bytes.data(), "BPV2", 4);
-  if (start) {
-    bytes[5] |= 1U;
-  }
-  if (end) {
-    bytes[5] |= 2U;
-  }
-  if (supersede) {
-    bytes[5] |= 4U;
-  }
-  WriteUint32(generation, bytes.data() + 8);
-  WriteUint32(sequence, bytes.data() + 12);
+  std::memcpy(bytes.data(), "BPV3", 4);
+  WriteUint32(generation, bytes.data() + 4);
+  WriteUint32(sequence, bytes.data() + 8);
 
   // 头部使用网络大端序，PCM 固定小端序；显式写字节，不依赖 CPU 端序或对齐。
   for (std::size_t index = 0; index < kPcmBytes / 2; ++index) {
@@ -279,4 +222,4 @@ std::array<std::uint8_t, kFrameBytes> EncodeAudio(std::uint32_t generation,
   return bytes;
 }
 
-}  // namespace boompi::network::detail
+}  // namespace boompi::voice_net::detail

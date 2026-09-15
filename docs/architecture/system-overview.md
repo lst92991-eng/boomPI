@@ -1,26 +1,25 @@
-# boomPI 教学版 v2 架构
+# boomPI namespace语音架构
 
-服务端作为一个配置工具部署。客户端主课程围绕 VoiceApp、VoiceAudio、VoiceLink、DeviceUi 四个具体边界展开。
-
-逐步补写和验证见[分关实验](../teaching/README.md)。DeviceUi只协调页面、快照和资源；SPI屏幕、GT911触摸及其恢复顺序由私有DisplayTouch拥有。VoiceAudio用Process推进音频处理，用ListenMode区分唤醒后的开口与回答后的追问。
+应用直接使用语句、播放和网络模块。采集任务显式调用算法模块；语句模块不持有线程，也不转发回复音频。
 
 ```text
-main → VoiceApp（唯一六状态）
-         ├─ VoiceAudio → AudioEngine → RV1106 ALSA / 3A / Snowboy / VAD
-         ├─ VoiceLink  → network_setup + WSS + v2 codec
-         └─ DeviceUi   → LVGL / SPI / GT911 + CameraCapture
+main → App_Init / App_Process / App_Close
+                  ├─ audio_capture::read → speech::update → voice_net::start/send/end
+                  ├─ voice_net::poll → playback::begin/write/finish
+                  └─ DeviceUi → LVGL / 触摸 / 音量 / 配网 / 摄像头
+
+capture线程: ALSA read → audio_convert → rockchip_3a → wake → vad → 80ms交接队列
+playback线程: 1.5s有界队列 → audio_convert → 音量/限幅 → ALSA write → 尾音 → drain
 ```
 
-application 是唯一 generation 分配者；网络线程只校验 wire 顺序并过滤旧代。音频只决定“是否为近讲、是否结束、是否物理播完”，不决定网络轮次或追问窗口。UI 显示快照不复制对话状态。
+VoiceAudio、AudioTasks、AudioPipeline（及历史AudioEngine/AudioBackend）和VoiceLink类均已删除。namespace文件直接持有资源，没有调用旧类的包装，也没有新增运行时管理器。
 
-主状态为 Offline、Idle、Listening、Uploading、Waiting、Speaking。Listening 同时承载唤醒后的 6 s 开口窗口与播放后的 3 s 追问窗口；VoiceAudio 保留各自声学准入策略。Speaking 一直持续到物理 PlaybackDone，网络 done 不会提前宣布扬声器已停止。
+application独占业务状态、generation和开口/问答超时。Listening表示还没有START，Uploading表示已经开始发送；两者显示同一聆听画面。speech只拥有500ms句首、追问准入与插话探测。播放模块直接校验回复generation/sequence并发布自己的状态。
 
-v2 每个连接只有一个活动 generation。首 PCM 的 START 创建轮次，END 提交；SUPERSEDE 同时撤回上轮未听完的回答。STOP 退休当前工作且不等待 ACK。所有入站文本、PCM 和播放完成都携带 generation，避免旧工作污染新问题。严格协议见 [protocol-v2.md](../../protocol/protocol-v2.md)。
+BPV3把START、PCM、END、CANCEL分开。PCM头为12字节，保留generation和sequence，删除flags和reserved。DONE关闭播放输入，随后排空滤波器与ALSA才发布Drained；因此应用不再另存网络/播放完成布尔组合。纯文本DONE直接进入追问。见[协议](../../protocol/protocol-v3.md)。
 
-客户端长期执行上下文为 application、capture、playback、VoiceLink、UI；摄像头按需增加一个。capture/playback 保持 SCHED_FIFO 40/30，失败时警告。网络、显示、文件操作不进入 ALSA 热路径。
+启动顺序为audio_capture::open、playback::open、audio_capture::start、voice_net::open：两路PCM配置完成才首次读取，保持原BSP顺序。关闭先停网络，再停播放，最后停采集；线程join后才释放句柄。capture/playback保持SCHED_FIFO 40/30，申请失败仅记录警告。UI与网络不进入实时音频循环。
 
-API Key 只在服务端；TLS身份与SPKI继续复用。教学口令仅适用于可信局域网，发现并不认证。默认不保存原始PCM或完整对话。
+48kHz四通道Mode1与48kHz双声道声卡配置保留；3A使用实际RKAUDIOParam和rkaudio_preprocess接口，256点适配与Snowboy局部旧ABI保留。当前源码不证明整板16k能力或实际声学效果。服务端仍是只配置DashScope Key的课程配套黑箱。
 
-课程入口见 [客户端README](../../client/README.md)，实现记录见 [teaching-refactor.md](teaching-refactor.md)。Host 测试、真板 ABI 与真人声学分别验收，不能互相替代。
-
-产品源码和Host替身由CMake选源，业务与驱动中不混合平台条件分支。本轮整理和统计见 [readability-cleanup.md](readability-cleanup.md)。
+当前重写的删除清单与验证边界见[交接记录](../test/namespace-rewrite.md)，旧版本设计和测试记录仅作为历史对照。
