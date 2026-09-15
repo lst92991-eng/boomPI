@@ -8,12 +8,12 @@
 namespace boompi::audio {
 
 namespace board {
-// 硬件事实：双麦极性已经确认，Mode1 将麦克风与播放参考同步采集。
+// 沿用维护者的双麦极性和Mode1配置；本轮没有据此声称完成当前整板验证。
 inline constexpr std::int8_t kLeftMicPolarity = 1;
 inline constexpr std::int8_t kRightMicPolarity = 1;
 inline constexpr int kAecDelaySamples = 0;
 
-// 三项声学预置沿用已验证值，更换硬件或模型时由维护者整体回归。
+// 三项声学预置不在本轮调整；更换硬件或模型后由维护者整体回归。
 inline constexpr char kWakeSensitivity[] = "0.7";
 inline constexpr float kSpeechAdmissionDbfs = -30.0F;
 inline constexpr float kBargeVoiceDbfs = -25.0F;

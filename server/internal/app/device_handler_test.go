@@ -146,7 +146,7 @@ func startDeviceTest(t *testing.T, provider *roundTripBackend) (*websocket.Conn,
 
 func helloDevice(t *testing.T, c *websocket.Conn) {
 	t.Helper()
-	writeControl(t, c, protocol.Control{Type: "hello", Version: 3, SampleRate: 16000, DeviceID: testDeviceID, Token: testDeviceToken})
+	writeControl(t, c, protocol.Control{Type: "hello", Version: 4, SampleRate: 16000, DeviceID: testDeviceID, Token: testDeviceToken})
 	kind, data, err := readWire(c)
 	if err != nil {
 		t.Fatal(err)
@@ -335,7 +335,7 @@ func TestV3RejectsGapsDuplicateStartAndPCMWithoutStart(t *testing.T) {
 func TestV3AuthenticationRunsBeforeProviderOpen(t *testing.T) {
 	provider := newRoundTripBackend()
 	c, _ := startDeviceTest(t, provider)
-	writeControl(t, c, protocol.Control{Type: "hello", Version: 3, SampleRate: 16000, DeviceID: testDeviceID, Token: "wrong-token"})
+	writeControl(t, c, protocol.Control{Type: "hello", Version: 4, SampleRate: 16000, DeviceID: testDeviceID, Token: "wrong-token"})
 	if _, _, err := readWire(c); err == nil {
 		t.Fatal("unauthenticated connection accepted")
 	}

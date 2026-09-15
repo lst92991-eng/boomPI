@@ -9,17 +9,23 @@
 
 #include "audio_convert.h"
 #include "audio_vendor.h"
+#include "boompi/audio/playback.h"
+#include "boompi/audio/speech.h"
 #include "boompi/platform/rv1106/rockchip_3a.h"
-#include "playback_state.h"
 #include "vad.h"
 #include "wake.h"
 
 namespace {
+struct CleanAudioFrame {
+  boompi::audio::VoiceFrame16k pcm{};
+  boompi::audio::CaptureMetadata metadata{};
+};
 using namespace boompi::audio;
 using namespace boompi::test::audio_vendor;
 namespace convert = boompi::audio_convert;
 namespace dsp = boompi::rockchip_3a;
 namespace vad = boompi::vad;
+namespace speech = boompi::speech;
 namespace wake = boompi::wake;
 namespace playback = boompi::playback;
 
@@ -54,7 +60,8 @@ bool DspFrameAlignment() {
       if (period == 0) {
         expected.metadata.timestamp_us = input.metadata.timestamp_us;
       }
-      if (!Check(dsp::process(input, &output) && EqualClean(output, expected),
+      if (!Check(dsp::process(input, &output.pcm, &output.metadata) &&
+                     EqualClean(output, expected),
                  "3A PCM and metadata lost their shared one-frame delay")) {
         dsp::close();
         return false;
@@ -65,9 +72,10 @@ bool DspFrameAlignment() {
                                                     input.reference_left[i]);
       }
     }
-    const bool cadence = dsp_calls == 15 && !dsp::process(input, nullptr) && dsp::is_open();
+    const bool cadence = dsp_calls == 15 && !dsp::process(input, nullptr, &output.metadata);
     dsp::close();
-    if (!Check(cadence && !dsp::process(input, &output) && EqualClean(output, {}),
+    if (!Check(cadence && !dsp::process(input, &output.pcm, &output.metadata) &&
+                   EqualClean(output, {}),
                "3A block cadence or close failed")) {
       return false;
     }
@@ -76,19 +84,19 @@ bool DspFrameAlignment() {
     return false;
   }
   for (unsigned i = 0; i < 3; ++i) {
-    if (!dsp::process(input, &output)) {
+    if (!dsp::process(input, &output.pcm, &output.metadata)) {
       dsp::close();
       return false;
     }
   }
   dsp_failure_call = 5;
-  const bool failed = !dsp::process(input, &output) && !dsp::is_open() && dsp_calls == 5 &&
+  const bool failed = !dsp::process(input, &output.pcm, &output.metadata) && dsp_calls == 5 &&
                       EqualClean(output, {});
   dsp_failure_call = 0;
   CleanAudioFrame initial{};
   initial.metadata.timestamp_us = input.metadata.timestamp_us;
-  const bool reopened =
-      dsp::open() && dsp::process(input, &output) && EqualClean(output, initial);
+  const bool reopened = dsp::open() && dsp::process(input, &output.pcm, &output.metadata) &&
+                        EqualClean(output, initial);
   dsp::close();
   return Check(failed && reopened, "3A partial failure leaked output or survived reopen");
 }
@@ -127,6 +135,16 @@ bool CaptureFormat() {
                               }),
               "refR leaked into the single AEC reference");
   VoiceFrame16k dc{};
+  for (std::size_t i = 0; i < kCaptureFrameSamples; ++i) {
+    const auto value = static_cast<std::int16_t>(4000 * std::sin(i * 0.13));
+    raw.pcm[4 * i] = -value;
+    raw.pcm[4 * i + 1] = value;
+    raw.pcm[4 * i + 2] = value;
+    raw.pcm[4 * i + 3] = 30000;
+  }
+  ok &= Check(convert::reset_capture() && convert::capture(raw, &first) &&
+                  first.mic_left == first.mic_right && first.mic_left == first.reference_left,
+              "three used channels lost common filter phase or refR was mixed in");
   dc.fill(10000);
   ok &= Check(convert::ac_rms_dbfs(dc) == -120, "DC offset admitted speech");
   convert::close_capture();
@@ -205,6 +223,7 @@ bool TestModuleFormat() {
 
 bool TestModuleDetection() {
   audio_vendor::reset();
+  speech::reset();
   if (!wake::open() || !vad::open()) {
     wake::close();
     vad::close();
@@ -218,7 +237,15 @@ bool TestModuleDetection() {
   frame.reference_active = true;
   playback::Observation observation{};
   auto step = [&] {
-    return wake::detect(frame.pcm, &frame.wake) && vad::process(&frame, observation);
+    if (!wake::detect(frame.pcm, &frame.wake)) {
+      return false;
+    }
+    const int result = vad::process(frame.pcm);
+    if (result < 0) {
+      return false;
+    }
+    frame.vad_now = result == 1;
+    return speech::update(frame, false, observation).error == nullptr;
   };
   bool ok = true;
   wake_result = 2;
@@ -244,7 +271,7 @@ bool TestModuleDetection() {
   vad_result = 1;
   ok &= Check(step() && !frame.vad_now, "ended admission survived");
   ok &= vad::reset();
-  vad::arm_playback();
+  speech::reply_started();
   frame.input_dbfs = -20;
   frame.reference_active = false;
   for (unsigned i = 0; i < 40; ++i) {
@@ -267,7 +294,7 @@ bool TestModuleDetection() {
   }
   ok &= Check(step() && frame.near_voice, "natural tail never released speech");
   ok &= vad::reset();
-  vad::arm_playback();
+  speech::reply_started();
   observation.output_audible = false;
   ok &= Check(step() && frame.near_voice, "zero-volume playback blocked speech");
   observation.output_audible = true;
@@ -279,7 +306,9 @@ bool TestModuleDetection() {
   for (unsigned i = 0; i < 6; ++i) {
     ok &= Check(step() && frame.near_voice, "speech unavailable after warmup");
   }
-  vad::discontinuity();
+  frame.discontinuity = true;
+  speech::update(frame, true, observation);
+  frame.discontinuity = false;
   ok &= vad::reset();
   for (unsigned i = 0; i < 30; ++i) {
     ok &= Check(step() && !frame.near_voice, "capture break bypassed renewed warmup");

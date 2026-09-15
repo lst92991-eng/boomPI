@@ -9,8 +9,8 @@ import (
 	"testing"
 )
 
-func TestSharedV3GoldenFixtures(t *testing.T) {
-	data, err := os.ReadFile("../../../protocol/fixtures/protocol-v3-golden.json")
+func TestSharedV4GoldenFixtures(t *testing.T) {
+	data, err := os.ReadFile("../../../protocol/fixtures/protocol-v4-golden.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,11 @@ func TestSharedV3GoldenFixtures(t *testing.T) {
 				t.Fatal(err)
 			}
 			var got, want any
-			_ = json.Unmarshal(wire, &got)
+			encoded, _ := json.Marshal(control)
+			_ = json.Unmarshal(encoded, &got)
+			if string(wire) != fixture.Wire {
+				t.Fatalf("wire round trip mismatch: %q", wire)
+			}
 			_ = json.Unmarshal(fixture.Expected, &want)
 			g, _ := json.Marshal(got)
 			w, _ := json.Marshal(want)
@@ -82,9 +86,9 @@ func TestControlLimitsAndTypes(t *testing.T) {
 		[]byte("[]"), []byte("{}"), []byte("null"),
 		[]byte("{\"type\":\"text\",\"generation\":1,\"text\":\"\xff\"}"),
 		[]byte("{\"type\":\"stop\",\"generation\":2,\"retract\":0}"),
-		[]byte("{\"type\":\"done\",\"generation\":-1}"),
-		[]byte("{\"type\":\"done\",\"generation\":\"1\"}"),
-		[]byte("{\"type\":\"error\",\"generation\":1,\"code\":\"Raw provider secret!\"}"),
+		[]byte("DONE -1"),
+		[]byte("DONE 01"),
+		[]byte("ERROR 1 Raw provider secret!"),
 	} {
 		if _, err := DecodeControl(data); err == nil {
 			t.Errorf("accepted %q", data)
@@ -98,18 +102,17 @@ func TestControlLimitsAndTypes(t *testing.T) {
 	}
 }
 
-func TestUnicodeEscapesAgreeWithBoard(t *testing.T) {
+func TestUTF8TextIsDataNotEscapedControl(t *testing.T) {
 	for _, tc := range []struct {
 		value string
 		valid bool
 	}{
-		{`\ud800`, false}, {`\udc00`, false}, {`\ud800\u0041`, false},
-		{`\ud83d\ude00`, true}, {`\\ud800`, true}, {`\u4f60\u597d`, true},
+		{"你好", true}, {"😀", true}, {"line 1\nline 2", true}, {`\ud800`, true},
+		{string([]byte{0xc3, 0x28}), false}, {string([]byte{0}), false},
 	} {
-		wire := `{"type":"text","generation":1,"text":"` + tc.value + `"}`
-		_, err := DecodeControl([]byte(wire))
+		_, err := DecodeControl([]byte("TEXT 1 " + tc.value))
 		if (err == nil) != tc.valid {
-			t.Errorf("%s: %v", wire, err)
+			t.Errorf("%q: %v", tc.value, err)
 		}
 	}
 }
@@ -119,6 +122,7 @@ func TestPCMRejectsMalformedFrames(t *testing.T) {
 	for _, mutate := range []func([]byte) []byte{
 		func(b []byte) []byte { return b[:11] },
 		func(b []byte) []byte { b[3] = '2'; return b },
+		func(b []byte) []byte { b[3] = '3'; return b },
 		func(b []byte) []byte { clear(b[4:8]); return b },
 		func(b []byte) []byte {
 			for i := 8; i < 12; i++ {
@@ -141,9 +145,9 @@ func TestPCMRejectsMalformedFrames(t *testing.T) {
 	}
 }
 
-func FuzzDecodeV3(f *testing.F) {
+func FuzzDecodeV4(f *testing.F) {
 	f.Add([]byte("{\"type\":\"ready\"}"))
-	f.Add([]byte("BPV3"))
+	f.Add([]byte("BPV4"))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		_, _ = DecodeControl(data)
 		_, _, _ = ParsePCMFrame(data, true)

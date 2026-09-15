@@ -1,6 +1,6 @@
 /**
  * @file protocol_json_contract.cpp
- * @brief 直接调用产品编解码器，验证 v3 JSON 拒绝规则和跨语言共享字节样本。
+ * @brief 直接调用产品编解码器，验证 v4 JSON 拒绝规则和跨语言共享字节样本。
  *
  * main 的 cases 覆盖合法控制帧、歧义数字/字符串、重复字段及长度边界；传入 fixture
  * 路径时再由 SharedFixtures 将产品编码结果逐字节对照 protocol/fixtures 下的金样。
@@ -63,7 +63,7 @@ std::string HexBytes(const std::string& hex) {
 }
 
 /**
- * @brief 读取 v3 金样后分方向验证：下行解码字段，上行编码字节。
+ * @brief 读取 v4 金样后分方向验证：下行解码字段，上行编码字节。
  *
  * 先校验 fixture 自身头部和负载能重组为 wire，再交给产品函数，避免把自相矛盾的
  * 样本作为预期值。最低样本数保证没有因路径或筛选错误而空跑通过。
@@ -77,8 +77,8 @@ void SharedFixtures(const char* path) {
   const char* end = nullptr;
   std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(
       cJSON_ParseWithLengthOpts(json.c_str(), json.size() + 1, &end, true), &cJSON_Delete);
-  Check(root && end == json.c_str() + json.size() && Number(root.get(), "fixture_version") == 3,
-        "invalid v3 fixture document");
+  Check(root && end == json.c_str() + json.size() && Number(root.get(), "fixture_version") == 4,
+        "invalid v4 fixture document");
   const auto* controls = cJSON_GetObjectItemCaseSensitive(root.get(), "control_frames");
   const auto* audio = cJSON_GetObjectItemCaseSensitive(root.get(), "audio_frames");
   Check(cJSON_IsArray(controls) && cJSON_IsArray(audio), "fixture frame arrays missing");
@@ -150,7 +150,7 @@ void SharedFixtures(const char* path) {
   }
   Check(control_count >= 4 && uplink_count >= 2 && downlink_count >= 3,
         "shared fixture coverage is incomplete");
-  std::cout << "v3 shared fixture: " << control_count << " controls, " << uplink_count
+  std::cout << "v4 shared fixture: " << control_count << " controls, " << uplink_count
             << " uplink, " << downlink_count << " downlink passed\n";
 }
 
@@ -177,8 +177,8 @@ int main(int argc, char** argv) {
     std::cerr << "usage: protocol-json-test [shared-fixture.json]\n";
     return 1;
   }
-  const std::string ready = R"({"type":"ready","sample_rate":16000,"version":3})";
-  const std::string text = R"({"type":"text","generation":1,"text":"你好"})";
+  const std::string ready = "READY 4 16000";
+  const std::string text = "TEXT 1 你好";
   std::string invalid_utf8 = text;
   invalid_utf8.insert(invalid_utf8.find("你好"), "\xc3\x28", 2);
   std::string embedded_nul = text;
@@ -186,63 +186,46 @@ int main(int argc, char** argv) {
   // 第一段列合法值，随后依次覆盖对象形状、代号表示法、文本/错误码和长度上限。
   const std::vector<std::pair<std::string, bool>> cases{
       {ready, true},
-      {ready + " \n\t", true},
       {text, true},
-      {R"({"type":"done","generation":4294967295})", true},
-      {R"({"type":"error","generation":1,"code":"provider_timeout"})", true},
-      {R"({"type":"text","generation":1,"text":"\\u0000"})", true},
-      {R"({"type":"text","generation":1,"text":"\ud83d\ude42"})", true},
-      {R"([])", false},
-      {R"({"type":1})", false},
-      {R"({"type":"ready"})", false},
-      {R"({"type":"ready","sample_rate":24000})", false},
-      {R"({"type":"ready","sample_rate":"16000"})", false},
-      {R"({"type":"ready","sample_rate":true})", false},
-      {R"({"type":"ready","sample_rate":16000.0})", false},
-      {R"({"type":"ready","sample_rate":16e3})", false},
-      {R"({"type":"ready","sample_rate":16000,"sample_rate":16000})", false},
-      {R"({"type":"ready","extra":0})", false},
-      {R"({"type":"ready","type":"ready"})", false},
-      {R"({"type":"ready","\u0074ype":"ready"})", false},
-      {R"({"type\u0000hidden":"ready"})", false},
-      {R"({"type":"ready\u0000hidden"})", false},
-      {R"({"type":"done"})", false},
-      {R"({"type":"done","generation":"1"})", false},
-      {R"({"type":"done","generation":true})", false},
-      {R"({"type":"done","generation":null})", false},
-      {R"({"type":"done","generation":[]})", false},
-      {R"({"type":"done","generation":{}})", false},
-      {R"({"type":"done","generation":0})", false},
-      {R"({"type":"done","generation":-0})", false},
-      {R"({"type":"done","generation":-1})", false},
-      {R"({"type":"done","generation":01})", false},
-      {R"({"type":"done","generation":1.0})", false},
-      {R"({"type":"done","generation":1e0})", false},
-      {R"({"type":"done","generation":4294967296})", false},
-      {R"({"type":"done","generation":1,"generation":1})", false},
-      {R"({"type":"done","generation":1,"\u0067eneration":1})", false},
-      {R"({"type":"text","generation":1,"text":false})", false},
-      {R"({"type":"text","generation":1,"text":""})", false},
-      {R"({"type":"text","generation":1,"text":"bad\qescape"})", false},
-      {R"({"type":"text","generation":1,"text":"\u0000"})", false},
-      {R"({"type":"text","generation":1,"text":"\ud800"})", false},
-      {R"({"type":"text","generation":1,"text":"\udc00"})", false},
-      {R"({"type":"text","generation":1,"text":"ok","other":{"x":1,"x":2}})", false},
-      {R"({"type":"error","generation":1,"code":null})", false},
-      {R"({"type":"error","generation":1,"code":"raw exception\n"})", false},
-      {R"({"type":"hello"})", false},
-      {R"({"version":1,"type":"hello.ack"})", false},
-      {ready + "{}", false},
+      {"TEXT 1 line 1\nline 2", true},
+      {"DONE 4294967295", true},
+      {"ERROR 1 provider_timeout", true},
+      {"TEXT 1 \\u0000", true},
+      {"TEXT 1 🙂", true},
+      {"TEXT 1 " + std::string(4096, 'x'), true},
+      {"", false},
+      {"READY 3 16000", false},
+      {"READY 4 24000", false},
+      {"READY 4 16000 ", false},
+      {"READY 4 16000 extra", false},
+      {R"({"type":"ready","sample_rate":16000,"version":3})", false},
+      {"DONE 0", false},
+      {"DONE 01", false},
+      {"DONE +1", false},
+      {"DONE -1", false},
+      {"DONE 1e0", false},
+      {"DONE 1.0", false},
+      {"DONE 4294967296", false},
+      {"DONE 1 extra", false},
+      {"DONE 1 ", false},
+      {"done 1", false},
+      {"TEXT 1", false},
+      {"TEXT 1 ", false},
+      {"TEXT  1 ok", false},
+      {"TEXT 1 " + std::string(4097, 'x'), false},
+      {"ERROR 1 RawError", false},
+      {"ERROR 1 raw exception", false},
+      {"ERROR 1 " + std::string(65, 'x'), false},
+      {"HELLO 4 16000 id token", false},
+      {"START 1 0", false},
       {invalid_utf8, false},
       {embedded_nul, false},
-      {R"({"type":"text","generation":1,"text":")" + std::string(4096, 'x') + "\"}", true},
-      {R"({"type":"text","generation":1,"text":")" + std::string(4097, 'x') + "\"}", false},
       {ready + std::string(8192, ' '), false},
   };
   unsigned failures = 0;
   for (std::size_t i = 0; i < cases.size(); ++i) {
     if (Accepted(cases[i].first) != cases[i].second) {
-      std::cerr << "v3 JSON case " << i << " failed\n";
+      std::cerr << "v4 control case " << i << " failed\n";
       ++failures;
     }
   }

@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 
 #include "board_voice_profile.h"
@@ -55,9 +56,7 @@ int ConfigurePcm(snd_pcm_t* pcm, snd_pcm_stream_t stream, unsigned channels,
   snd_pcm_uframes_t period = kCapture48Frames;
   const snd_pcm_uframes_t buffer_periods =
       stream == SND_PCM_STREAM_CAPTURE ? kCaptureBufferPeriods : kPlaybackBufferPeriods;
-  unsigned period_count = static_cast<unsigned>(buffer_periods);
   snd_pcm_uframes_t buffer = buffer_periods * kCapture48Frames;
-  int direction = 0;
   *stage = "ALSA hardware format and buffer";
   int rc = 0;
   if ((rc = snd_pcm_hw_params_any(pcm, hw)) < 0 ||
@@ -65,20 +64,12 @@ int ConfigurePcm(snd_pcm_t* pcm, snd_pcm_stream_t stream, unsigned channels,
       (rc = snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE)) < 0 ||
       (rc = snd_pcm_hw_params_set_channels(pcm, hw, channels)) < 0 ||
       (rc = snd_pcm_hw_params_set_rate(pcm, hw, rate, 0)) < 0 ||
-      (rc = snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, &direction)) < 0) {
+      (rc = snd_pcm_hw_params_set_period_size(pcm, hw, period, 0)) < 0) {
     return rc;
   }
-  direction = 0;
-  if ((rc = snd_pcm_hw_params_set_periods_near(pcm, hw, &period_count, &direction)) < 0 ||
-      (rc = snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer)) < 0 ||
+  if ((rc = snd_pcm_hw_params_set_buffer_size(pcm, hw, buffer)) < 0 ||
       (rc = snd_pcm_hw_params(pcm, hw)) < 0) {
     return rc;
-  }
-  if (period != kCapture48Frames || period_count != buffer_periods ||
-      buffer != buffer_periods * kCapture48Frames) {
-    // *_near 允许驱动协商相邻值；产品算法依赖严格 20 ms，协商结果必须再次验证。
-    *stage = "ALSA exact period/buffer contract";
-    return -EINVAL;
   }
   snd_pcm_sw_params_t* sw = nullptr;
   snd_pcm_sw_params_alloca(&sw);
@@ -95,102 +86,67 @@ int ConfigurePcm(snd_pcm_t* pcm, snd_pcm_stream_t stream, unsigned channels,
   return snd_pcm_prepare(pcm);
 }
 
-void SetLoopbackId(snd_ctl_elem_id_t* id) noexcept {
-  // 使用稳定的 mixer 控件名寻找回采模式，避免依赖不同镜像中的 numid。
-  snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_MIXER);
-  snd_ctl_elem_id_set_name(id, kLoopbackControl);
-}
-
-/** @brief 打开指定 card 的 Mode1 控件并校验形状；失败时关闭 control 防止泄漏。 */
-int OpenLoopbackControl(int card, snd_ctl_t** control, snd_ctl_elem_id_t* id,
-                        snd_ctl_elem_info_t* info) noexcept {
-  // Mode1 必须是单值枚举控件；布局异常时拒绝继续，避免把未知通道送入 AEC。
-  std::array<char, 24U> name{};
-  std::snprintf(name.data(), name.size(), "hw:%d", card);
-  int rc = snd_ctl_open(control, name.data(), 0);
-  if (rc < 0) {
-    return rc;
-  }
-  SetLoopbackId(id);
-  snd_ctl_elem_info_set_id(info, id);
-  rc = snd_ctl_elem_info(*control, info);
-  if (rc >= 0 && (snd_ctl_elem_info_get_type(info) != SND_CTL_ELEM_TYPE_ENUMERATED ||
-                  snd_ctl_elem_info_get_count(info) != 1U)) {
-    rc = -EINVAL;
-  }
-  if (rc < 0) {
-    snd_ctl_close(*control);
-    *control = nullptr;
-  }
-  return rc;
-}
-
-/// 只在读取成功时写出枚举值，调用方不能把默认值误当成设备已确认的模式。
-int ReadLoopbackValue(snd_ctl_t* control, snd_ctl_elem_id_t* id, unsigned* output) noexcept {
-  snd_ctl_elem_value_t* value = nullptr;
-  snd_ctl_elem_value_alloca(&value);
-  snd_ctl_elem_value_set_id(value, id);
-  const int rc = snd_ctl_elem_read(control, value);
-  if (rc >= 0) {
-    *output = snd_ctl_elem_value_get_enumerated(value, 0U);
-  }
-  return rc;
-}
-
-/** @brief 写 mixer 后读回校验；写入返回成功但实际模式不符时转成 -EIO。 */
-int WriteLoopbackValue(snd_ctl_t* control, snd_ctl_elem_id_t* id, unsigned target) noexcept {
-  snd_ctl_elem_value_t* value = nullptr;
-  snd_ctl_elem_value_alloca(&value);
-  snd_ctl_elem_value_set_id(value, id);
-  snd_ctl_elem_value_set_enumerated(value, 0U, target);
-  int rc = snd_ctl_elem_write(control, value);
-  unsigned actual = target;
-  if (rc >= 0) {
-    rc = ReadLoopbackValue(control, id, &actual);
-  }
-  return rc >= 0 && actual != target ? -EIO : rc;
-}
-
-/** @brief 由采集 PCM 找到同一张声卡并设置 Mode1；所有路径在返回前释放 control。 */
 int ConfigureLoopbackMode1(snd_pcm_t* capture) noexcept {
-  // 先从已打开 PCM 查询真实声卡，再按枚举文本选择 Mode1，兼容枚举序号变化。
-  snd_pcm_info_t* pcm_info = nullptr;
+  snd_pcm_info_t* pcm_info;
   snd_pcm_info_alloca(&pcm_info);
   int rc = snd_pcm_info(capture, pcm_info);
   if (rc < 0) {
     return rc;
   }
-  const int card = snd_pcm_info_get_card(pcm_info);
-  snd_ctl_t* control = nullptr;
-  snd_ctl_elem_id_t* id = nullptr;
-  snd_ctl_elem_info_t* info = nullptr;
-  snd_ctl_elem_id_alloca(&id);
-  snd_ctl_elem_info_alloca(&info);
-  rc = OpenLoopbackControl(card, &control, id, info);
+  char card[24];
+  std::snprintf(card, sizeof(card), "hw:%d", snd_pcm_info_get_card(pcm_info));
+  snd_ctl_t* raw;
+  rc = snd_ctl_open(&raw, card, 0);
   if (rc < 0) {
     return rc;
   }
+  std::unique_ptr<snd_ctl_t, decltype(&snd_ctl_close)> control(raw, snd_ctl_close);
+  snd_ctl_elem_info_t* info;
+  snd_ctl_elem_value_t* value;
+  snd_ctl_elem_id_t* id;
+  snd_ctl_elem_info_alloca(&info);
+  snd_ctl_elem_value_alloca(&value);
+  snd_ctl_elem_id_alloca(&id);
+  snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_MIXER);
+  snd_ctl_elem_id_set_name(id, kLoopbackControl);
+  snd_ctl_elem_info_set_id(info, id);
+  snd_ctl_elem_value_set_id(value, id);
+  rc = snd_ctl_elem_info(raw, info);
+  if (rc < 0) {
+    return rc;
+  }
+  if (snd_ctl_elem_info_get_type(info) != SND_CTL_ELEM_TYPE_ENUMERATED ||
+      snd_ctl_elem_info_get_count(info) != 1) {
+    return -EINVAL;
+  }
+  // 按枚举文本找Mode1，不依赖镜像的numid或枚举下标。
   const unsigned items = snd_ctl_elem_info_get_items(info);
   unsigned target = items;
-  for (unsigned item = 0U; item < items && rc >= 0; ++item) {
-    snd_ctl_elem_info_set_item(info, item);
-    rc = snd_ctl_elem_info(control, info);
-    if (rc >= 0 && std::strcmp(snd_ctl_elem_info_get_item_name(info), kLoopbackMode) == 0) {
-      target = item;
+  for (unsigned i = 0; i < items; ++i) {
+    snd_ctl_elem_info_set_item(info, i);
+    rc = snd_ctl_elem_info(raw, info);
+    if (rc < 0) {
+      return rc;
+    }
+    if (std::strcmp(snd_ctl_elem_info_get_item_name(info), kLoopbackMode) == 0) {
+      target = i;
+      break;
     }
   }
-  if (rc >= 0 && target == items) {
-    rc = -ENOENT;
+  if (target == items) {
+    return -ENOENT;
   }
-  unsigned current = target;
-  if (rc >= 0) {
-    rc = ReadLoopbackValue(control, id, &current);
+  rc = snd_ctl_elem_read(raw, value);
+  if (rc < 0 || snd_ctl_elem_value_get_enumerated(value, 0) == target) {
+    return rc;
   }
-  if (rc >= 0 && current != target) {
-    rc = WriteLoopbackValue(control, id, target);
+  snd_ctl_elem_value_set_enumerated(value, 0, target);
+  rc = snd_ctl_elem_write(raw, value);
+  if (rc < 0) {
+    return rc;
   }
-  snd_ctl_close(control);
-  return rc;
+  rc = snd_ctl_elem_read(raw, value);
+  return rc >= 0 && snd_ctl_elem_value_get_enumerated(value, 0) != target ? -EIO : rc;
 }
 
 }  // namespace
@@ -273,6 +229,9 @@ bool read(std::int16_t* const output, bool* const discontinuity) noexcept {
   *discontinuity = false;
   std::size_t offset = 0U;
   while (offset < kCapture48Frames) {
+    if (capture_stopped.load()) {
+      return false;
+    }
     // readi 可能被信号打断或只返回部分 period；只有收齐 960 frame 才交给 DSP。
     const snd_pcm_sframes_t rc = snd_pcm_readi(capture_pcm, output + kCaptureChannels * offset,
                                                kCapture48Frames - offset);

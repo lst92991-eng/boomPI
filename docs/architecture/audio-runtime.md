@@ -1,30 +1,21 @@
-# 音频任务与数据所有权
+# 当前语音数据流与所有权
 
-主流程直接调用三个方向：audio_capture::read取得已处理帧；speech::update决定开口、句尾和插话；服务器回复直接写playback。语句模块没有播放入口、线程句柄或网络队列。
+ALSA只打开、读取、写入和关闭原始PCM。voice_input是独立输入处理任务，不是ALSA驱动：线程中顺序执行原始读取、双麦/refL联合重采样、3A，交付后应用执行wake、逐块VAD、speech策略、网络发送。
 
-| 边界 | 所有者 | 保留原因与超限行为 |
-| --- | --- | --- |
-| 原始四槽、转换/3A工作区 | capture线程及各算法namespace | 硬件格式、256点vendor块和滤波历史，断点一起复位 |
-| capture交接 | audio_capture，4×20ms | 跨线程交付；满时明确断点，不能拼成连续语音 |
-| pre-roll/插话历史 | speech，同一个32帧环 | 普通保留25帧，探测最多32帧；未准入历史允许滚动覆盖 |
-| speech结果 | 调用方临时Result | 只借用历史/当前帧指针，不复制PCM；下一update/listen/reset前消费 |
-| 下行播放 | playback，75×20ms | 网络与ALSA消费解耦；满时取消整轮，不覆盖语音正文 |
-| 网络交接 | voice_net | 有界发送与接收；代际隔离、背压和生命周期 |
+```text
+输入线程：alsa_audio::read → audio_convert::capture → rockchip_3a::process → 4槽交接
+应用线程：voice_input::read → wake::detect → vad::process → speech::update → voice_net
+播放线程：有界队列 → audio_convert::playback → ALSA write → 有效尾音 → drain
+```
 
-## 正常输入
+不再有跨采集线程的listener reset/arm命令、应答状态或100ms握手。wake/VAD由应用线程独占，listen直接复位；网络等待不进入输入线程。两路PCM均配置后才start输入，退出中断I/O、join后释放资源。
 
-采集线程读取48kHz四槽数据，共同降采样到16kHz，再依次执行3A、Snowboy、VAD。断流丢弃不连续片段并明确报告。3A输出和metadata一起延迟，不能拿当前参考判断上一帧声音。
+VAD仅返回-1/0/1。120ms人声确认、700ms句尾、60s语句上限、500ms前滚、400ms追问、AEC预热/尾音和插话探针都在speech。主状态只有Idle、Listening、WaitingReply、Speaking；连接和上传事实查询网络模块已有状态，不另存Offline/Uploading枚举或帧计数。
 
-speech::listen只选择Wake/FollowUp准入；App在调用前通过capture帧边界复位检测。speech::update返回Start时，当前帧已在历史中；应用先START，再按原顺序发送借用PCM。实时阶段只借用当前帧，最后一帧发送成功后再END。遇到背压/断点使用CANCEL，不把残缺句子提交。
+为防止处理排队音频时读到未来的播放结束，输入线程把当时的播放快照与PCM一起交付。playback::observe仅由输入线程消费，业务使用frame.output。3A仍把PCM与metadata一起延迟，直接写交付帧，删除中转PCM。
 
-## 播放与打断
+Mode1仍读四槽；refR始终未用于3A，现在在软件转换前丢弃，只对双麦/refL共同重采样。原始四槽不被修改。48k声卡与16k算法之间的转换尚不能凭现有资料全部删除，仍待匹配SDK/真板验证。
 
-首AUDIO到达时playback::begin等待旧取消收尾，并在采集帧边界武装AEC，随后允许播放线程prepare。每个PCM包直接入有界队列；没有VoiceAudio/Engine/Backend多次校验和复制。
+网络独占接收sequence校验。播放只维护当前/已退休generation，取消不清水位，没有另一份highest_generation或网络序号。DONE只调用finish；取尽有效滤波尾音与ALSA后才Drained。短回答、队列满、prepare/write/drain期间取消和真实Failed锁存均有Host测试。
 
-首播蓄水180ms，欠载宽限30ms后蓄水40ms。DONE调用playback::finish，短回答可立即放行。线程先排出有效滤波尾音再ALSA drain，最后发布Drained。主动cancel中断write/drain、丢弃队列，新一轮必须等旧操作收尾。
-
-speech保留120ms候选、短暂静音、等待低参考60ms（最多300ms）、清尾音60ms、再次确认60ms的插话探测。Result的playback_scale由应用应用到播放模块；确认Barge后应用取消旧播放，发送新generation的START(supersede=true)，立即上传保留人声。用户音量与探测scale分别保存。
-
-网络END结束上行，CANCEL在等待回复和播放期间仍有效。新协议没有下行音频END字段，DONE是唯一播放输入终点，故Drained一定在DONE之后，应用不再维护两份完成标志。失败终态与主动取消分开。
-
-Host运行真实任务、转换、EOS和算法胶水；只替换ALSA设备调用与vendor核心。真板调度、回采位置、AEC和实际音色仍须由用户指定时间验收。
+协议为[BPV4固定文本控制](../../protocol/protocol-v4.md)，板端不再依赖cJSON。服务端直接接管socket消息的PCM，去掉第二份数组；仍保留真正隔开socket读取与云端阻塞调用的有界队列。服务端继续作为Key-only课程黑箱。

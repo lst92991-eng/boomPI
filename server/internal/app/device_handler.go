@@ -57,7 +57,7 @@ func (h *deviceHandler) Handle(ctx context.Context, c *transport.Connection) err
 		return errors.New("provider session setup failed")
 	}
 	defer actor.Close()
-	if err = c.SendControl(ctx, protocol.Control{Type: "ready", Version: 3, SampleRate: 16000}); err != nil {
+	if err = c.SendControl(ctx, protocol.Control{Type: "ready", Version: 4, SampleRate: 16000}); err != nil {
 		return err
 	}
 	deviceRef := redactedDeviceRef(hello.DeviceID)

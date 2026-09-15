@@ -2,7 +2,7 @@ include(GNUInstallDirs)
 
 # 产品与Host场景执行同一条namespace语音主线，Host仅替换ALSA设备和vendor核心。
 set(BOOMPI_AUDIO_SOURCES
-  src/audio/audio_capture.cpp src/audio/playback.cpp src/audio/speech.cpp
+  src/audio/audio_level.cpp src/audio/voice_input.cpp src/audio/playback.cpp src/audio/speech.cpp
   src/platform/rv1106/audio_convert.cpp src/platform/rv1106/rockchip_3a.cpp
   src/platform/rv1106/wake.cpp src/platform/rv1106/vad.cpp)
 
@@ -79,15 +79,6 @@ endforeach()
 find_package(ALSA REQUIRED)
 find_library(BOOMPI_SWRESAMPLE_LIBRARY NAMES swresample REQUIRED)
 find_library(BOOMPI_AVUTIL_LIBRARY NAMES avutil REQUIRED)
-find_path(BOOMPI_CJSON_INCLUDE_DIR NAMES cjson/cJSON.h REQUIRED)
-find_library(BOOMPI_CJSON_LIBRARY NAMES cjson REQUIRED)
-if(NOT IS_ABSOLUTE "${BOOMPI_CJSON_INCLUDE_DIR}" OR
-   NOT EXISTS "${BOOMPI_CJSON_INCLUDE_DIR}/cjson/cJSON.h" OR
-   NOT IS_ABSOLUTE "${BOOMPI_CJSON_LIBRARY}" OR
-   NOT EXISTS "${BOOMPI_CJSON_LIBRARY}")
-  message(FATAL_ERROR "RV1106 BSP cJSON headers/library are missing")
-endif()
-
 if(NOT IS_ABSOLUTE "${BOOMPI_BOOST_INCLUDE_DIR}" OR
    NOT EXISTS "${BOOMPI_BOOST_INCLUDE_DIR}/boost/asio.hpp")
   message(FATAL_ERROR "BOOMPI_BOOST_INCLUDE_DIR must be an explicit Boost header root")
@@ -142,7 +133,6 @@ target_include_directories(boompi_client PRIVATE include src/audio src/platform/
 target_include_directories(boompi_client SYSTEM PRIVATE
   "${PROJECT_SOURCE_DIR}/third_party"
   "${BOOMPI_BOOST_INCLUDE_DIR}"
-  "${BOOMPI_CJSON_INCLUDE_DIR}"
   "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}"
   "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}")
 target_link_libraries(boompi_client PRIVATE
@@ -153,7 +143,6 @@ target_link_libraries(boompi_client PRIVATE
   ALSA::ALSA
   "${BOOMPI_SWRESAMPLE_LIBRARY}"
   "${BOOMPI_AVUTIL_LIBRARY}"
-  "${BOOMPI_CJSON_LIBRARY}"
   Freetype::Freetype
   OpenSSL::SSL OpenSSL::Crypto
   Threads::Threads ${CMAKE_DL_LIBS} atomic)

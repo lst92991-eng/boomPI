@@ -67,11 +67,12 @@ func Open(ctx context.Context, provider backend.ConversationBackend, cfg backend
 	return a, nil
 }
 
+// Submit takes ownership of pcm from the socket reader; callers must not mutate it after return.
 func (a *Actor) Submit(header protocol.PCMHeader, pcm []byte) error {
 	if len(pcm) != protocol.UplinkFrameBytes {
 		return errors.New("invalid session PCM frame")
 	}
-	return a.enqueue(command{generation: header.Generation, pcm: append([]byte(nil), pcm...), queuedAt: time.Now()})
+	return a.enqueue(command{generation: header.Generation, pcm: pcm, queuedAt: time.Now()})
 }
 func (a *Actor) Start(generation uint32, supersede bool) error {
 	return a.enqueue(command{generation: generation, start: true, retract: supersede, queuedAt: time.Now()})

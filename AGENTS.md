@@ -73,8 +73,8 @@ pre-roll            = 500 ms
 
 | 上下文 | 唯一职责 |
 | --- | --- |
-| application主线程 | 对话状态、generation、普通提问/替换回答、追问窗口 |
-| capture，`SCHED_FIFO 40` | ALSA capture、3A、Snowboy/VAD、发布 20 ms 帧 |
+| application主线程 | wake、逐块VAD、speech策略、四态问答、generation与追问窗口 |
+| 输入线程，`SCHED_FIFO 40` | 原始ALSA读取、转换、3A、发布PCM与同期播放快照 |
 | playback，`SCHED_FIFO 30` | TTS ring、重采样、ALSA write/drop/drain |
 | voice_net网络线程 | 网络建链、TLS/WebSocket、握手心跳重连和协议事件 |
 | UI worker | 所有 LVGL、触摸和音量配置写入 |
@@ -137,8 +137,10 @@ Snowboy bridge 单独使用旧 C++ ABI；不得把 `_GLIBCXX_USE_CXX11_ABI=0` �
 
 - 本次交付必须完成结构重写：应用直接调用namespace模块，旧VoiceAudio/AudioEngine/AudioBackend及更名后的AudioTasks/AudioPipeline组合转发层均删除，不在旧对象上再包namespace。旧内部接口不构成兼容性要求。
 - 保留App_Init/App_Process/App_Close作为产品入口，主流程显式读取采集结果、调用speech语句整理、提交voice_net、操作playback。speech不持有音频线程、不接收/转发下行PCM、不管理声卡生命周期。
-- 采集线程显式展开audio_capture读取、格式转换、rockchip_3a处理、wake检测、vad判断，再交给应用；播放线程直接持有自己的有界队列、转换器与ALSA输出。模块通过namespace提供少量普通函数，各自资源与线程同步由实现文件拥有。
-- 启动时先audio_capture::open、playback::open，再audio_capture::start，最后voice_net::open；保持两路PCM配置后才开始首次采集。start是真实线程生命周期函数，不新增运行时包装层。
+- ALSA采集只配置/读取/关闭原始PCM。语音输入任务独立执行读取、格式适配和3A，网络等待不能阻塞它；应用线程顺序执行wake、逐块VAD、speech业务策略及交付。不得在名为ALSA采集或VAD封装的模块内隐藏业务流水线。
+- 语句确认、pre-roll、追问、AEC准入保护和同句插话由speech业务模块负责；VAD只返回人声/无声/错误。检测移到应用线程后，不保留跨采集线程的listener reset/arm命令及等待握手。
+- 主业务状态优先Idle/Listening/WaitingReply/Speaking；连接是否在线由网络拥有，上传是否已START由语句/协议边界明确表达，不复制成另一套业务状态。
+- 保持两路PCM配置后才首次采集，线程退出后才释放资源；初始化顺序可按本轮职责调整，不固定旧namespace命名或旧内部接口。
 - namespace必须承载原实现与资源，不能只转发旧类；移除失效源文件、公共头、PImpl生命周期和CMake选源。必要第三方对象及直接硬件资源所有权可保留，硬件事实和失败回收不得因改成普通函数而丢失。
 - 官方源码、第三方库源码和库二进制不修改；兼容问题只在自有桥接、调用和构建配置中解决。
 - 学生侧不设置声学校准参数。必要硬件事实与三项已验证声学常量保留在内部 `client/src/platform/rv1106/board_voice_profile.h`，不通过公共音频配置对象传递。
@@ -146,6 +148,7 @@ Snowboy bridge 单独使用旧 C++ ABI；不得把 `_GLIBCXX_USE_CXX11_ABI=0` �
 - App入口继续使用App_前缀；新语音namespace公共函数使用open/read/process/update/write/close等简单snake_case，字段snake_case，枚举项PascalCase，常量k前缀。UI等无关模块沿用原命名。第三方/C ABI遵循原契约。
 - 语句整理返回准入/结束决定及可直接读取的PCM，不再复制成携带整帧PCM的AudioEvent队列或vector；句首与实时帧不重不漏，停止或句尾后丢弃本批剩余输入。
 - voice_net直接复用VoiceClientConfig。线上START/END/CANCEL与PCM分开，generation和sequence继续承担在途隔离与缺帧校验；DONE和实际尾播完成必须区分。协议变更同步更新两端和共享fixture，不保留旧双栈。
+- 当前BPV4使用固定文本命令，不再使用设备侧JSON控制；板端不依赖cJSON。线上sequence由网络校验，播放只保留取消隔离所需generation；播放快照随PCM排队，避免消费时使用未来状态。
 - 原子变量默认采用标准内存顺序，只有测量证明有必要时再引入显式内存顺序优化。
 - 正常流程不逐轮打印状态与统计；错误和必要的恢复提示保留在实际负责的边界。删除仅为已移除日志服务的计数状态。
 - C++17 与 `gofmt`；数值名带单位，例如 `*_ms`、`*_frames`、`*_dbfs`。
@@ -153,7 +156,7 @@ Snowboy bridge 单独使用旧 C++ ABI；不得把 `_GLIBCXX_USE_CXX11_ABI=0` �
 - 错误必须指出阶段且不输出 secret；返回值不能混合背压、断线和协议错误。
 - 头文件只暴露必要边界，不跨层 include 私有 vendor 头。
 - 不用压缩排版、合并语句或生成代码伪造低行数。
-- 不以预估行数作为验收配额。固定实际起始提交和工作区快照，使用 scripts/measure_client.py 统计相同范围的生产代码，头文件、测试、资源与第三方单列；不能通过移动目录、压行或省略异常行为达标。
+- 本轮.cpp预算：ALSA采集70–100、3A130–180、Snowboy50–80、VAD30–50、语句/pre-roll70–110、WSS/协议180–260、播放/ALSA90–130、主流程120–180。按职责合计物理行/ELOC，头文件、ABI桥和自有胶水单列并计入总量；不藏入辅助文件/宏/生成代码或压行。超出需列明具体保留机制与用途，未达预算如实报告。
 - 声学参数仅由 board_voice_profile.h 的维护者profile拥有，学生配置不包含门限、极性或模型路径。应用模块不读取dBFS/reference或处理hello/heartbeat。
 - 产品源码与Host替身由CMake选源，不在业务、网络或音频算法中插入平台/测试条件编译。第三方库和外部库配置按各自要求保留。
 - 使用根目录.clang-format；一行一个语句，条件和循环带大括号。复杂判定可提取有明确含义的小函数，不新增通用框架。

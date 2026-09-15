@@ -29,6 +29,8 @@ enum class SendResult : std::uint8_t { Ok, Backpressure, Disconnected };
 // Ok 仅表示入队；Backpressure 必须取消本轮，不能跳过 PCM 后补 END。
 bool open(const config::VoiceClientConfig& config);
 bool poll(LinkEvent* event);
+bool online();
+bool uploading();
 SendResult start(std::uint32_t generation, bool supersede);
 SendResult send(std::uint32_t generation, const std::int16_t* pcm);
 SendResult end(std::uint32_t generation);

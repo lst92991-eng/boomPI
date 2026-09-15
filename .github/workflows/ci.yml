@@ -48,11 +48,11 @@ jobs:
           python --version
           go version
 
-      - name: Install Linux VoiceTransport test dependencies
+      - name: Install Linux host test dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libboost-dev libcjson-dev libssl-dev
+          sudo apt-get install --yes libboost-dev libcjson-dev libssl-dev libasound2-dev libswresample-dev libavutil-dev pkg-config
 
       - name: Validate protocol fixtures
         run: python scripts/verify_protocol_fixtures.py
@@ -85,6 +85,14 @@ jobs:
       - name: Run Go vet
         working-directory: server
         run: go vet ./...
+
+      - name: Run Linux race and C++ WSS integration tests
+        if: runner.os == 'Linux'
+        working-directory: server
+        env:
+          CGO_ENABLED: "1"
+          BOOMPI_CPP_WSS_SMOKE: ${{ github.workspace }}/build/host-debug/client/boompi_voice_transport_loopback_test
+        run: go test -race ./...
 
       - name: Build Go server
         working-directory: server

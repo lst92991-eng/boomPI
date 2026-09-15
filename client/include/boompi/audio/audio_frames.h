@@ -1,9 +1,8 @@
 /** @file audio_frames.h
  * @brief 音频各处理阶段交接的数据；采样格式由 audio_format.h 统一定义。
  *
- * 输入链依次为 RawCaptureFrame → CaptureChannels → CleanAudioFrame → CaptureFrame，
- * 对应 ALSA → 重采样拆通道 → Rockchip 3A → 检测。前三者由采集线程复用，最后一项
- * 复制进audio_capture的有界队列，再由应用交给speech整理成语句。
+ * 输入线程依次处理RawCaptureFrame → CaptureChannels → CaptureFrame。
+ * 3A直接写交付帧，应用再调用wake/VAD/speech；没有clean→frame的PCM中转。
  * 输出链为 16 kHz TTS → StereoPlaybackFrame → ALSA。
  */
 #pragma once
@@ -13,11 +12,11 @@
 #include <cstdint>
 
 #include "boompi/audio/audio_format.h"
+#include "boompi/audio/playback.h"
 
 namespace boompi::audio {
 
-inline constexpr std::size_t kVoiceFrameSamples16k = kVoiceFrameSamples;
-using VoiceFrame16k = std::array<std::int16_t, kVoiceFrameSamples16k>;
+using VoiceFrame16k = std::array<std::int16_t, kVoiceFrameSamples>;
 
 /// 声卡原始20ms，按 [mic0,mic1,refL,refR] 交错。转换器不修改这份原始数据。
 struct RawCaptureFrame final {
@@ -36,21 +35,17 @@ struct CaptureMetadata final {
   bool reference_active{false};
 };
 
-/// 四通道联合降采样后，取出3A所需的双麦和refL；每个平面都是16kHz/320样本。
+/// 双麦和refL联合降采样，每个平面16kHz/320样本；refR不参与软件转换。
 struct CaptureChannels final {
   VoiceFrame16k mic_left{}, mic_right{}, reference_left{};
   CaptureMetadata metadata{};
 };
 
-/// 3A输出和与其对齐的元数据。检测模块不再自行查找上一帧的参考或电平。
-struct CleanAudioFrame final {
-  VoiceFrame16k pcm{};
-  CaptureMetadata metadata{};
-};
-
-/// 检测后的20ms单声道帧；采集线程发布，语句整理消费。
+/// 3A后的20ms单声道帧；应用填入检测/语句判断，不回写采集线程。
 struct CaptureFrame final {
   VoiceFrame16k pcm{};
+  // 与生产该帧时的播放事实一起排队，应用延迟消费时不读取未来的结束事件。
+  playback::Observation output{};
   /// 处理帧序号；序号空洞或discontinuity均不能作为连续语句上传。
   std::uint64_t sequence{0U};
   std::uint64_t timestamp_us{0U};

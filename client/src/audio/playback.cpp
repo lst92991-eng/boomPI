@@ -14,9 +14,7 @@
 #include "audio_convert.h"
 #include "audio_thread.h"
 #include "board_voice_profile.h"
-#include "boompi/audio/audio_capture.h"
 #include "frame_queue.h"
-#include "playback_state.h"
 
 namespace boompi::playback {
 namespace {
@@ -35,12 +33,11 @@ std::thread thread;
 std::atomic<bool> stop{false};
 bool opened{false}, ending{false}, started{false}, rebuffering{false}, canceled{false};
 Status current;
-std::uint32_t next_sequence{0U}, highest_generation{0U};
 audio::FrameQueue<Slot, kSlots> queue;
 audio::StereoPlaybackFrame stereo;
 std::atomic<float> volume_gain{0.6F}, scale{1.0F};
 std::array<char, 192U> failure{};
-// 采集不会等待播放队列锁；begin持队列锁等待采集武装时也不会形成互锁。
+// 输入线程只采集这份原子快照，不等待播放队列锁。
 std::atomic<bool> render_started{false}, output_audible{false};
 std::atomic<End> observed_end{End::None};
 
@@ -123,9 +120,7 @@ void Finish(bool discard, bool failed) {
   output_audible.store(false);
   observed_end.store(discard ? End::Interrupted : End::Natural);
   current.state = failed ? State::Failed : discard ? State::Idle : State::Drained;
-  if (discard && !failed) {
-    current.generation = 0U;
-  }
+  // current.generation同时保留退休水位，取消不会把旧代身份清成可复用。
   ending = started = rebuffering = canceled = false;
   queue.Clear();
   scale.store(1.0F);
@@ -203,7 +198,6 @@ bool open(std::uint8_t volume) {
   scale.store(1.0F);
   stop.store(false);
   current = {};
-  highest_generation = 0U;
   opened = true;
   try {
     thread = std::thread(PlaybackTask);
@@ -217,7 +211,7 @@ bool open(std::uint8_t volume) {
 bool begin(std::uint32_t generation) {
   std::unique_lock<std::mutex> lock(mutex);
   if (!opened || current.state == State::Failed || generation == 0U ||
-      generation <= highest_generation || (current.state == State::Playing && !canceled)) {
+      generation <= current.generation || (current.state == State::Playing && !canceled)) {
     return false;
   }
   if (!condition.wait_for(lock, kCancelTimeout,
@@ -233,25 +227,19 @@ bool begin(std::uint32_t generation) {
   render_started.store(false);
   output_audible.store(false);
   observed_end.store(End::None);
-  if (!audio_capture::arm_playback()) {
-    return Fail("capture could not arm playback");
-  }
   {
     std::lock_guard<std::mutex> error_lock(error_mutex);
     failure.fill('\0');
   }
   alsa_audio::clear_playback_error();
   current = {generation, State::Playing};
-  highest_generation = generation;
-  next_sequence = 0U;
   ending = started = rebuffering = canceled = false;
   queue.Clear();
   scale.store(1.0F);
   return true;
 }
 
-WriteResult write(std::uint32_t generation, const std::uint8_t* bytes, std::size_t byte_count,
-                  std::uint32_t sequence) {
+WriteResult write(std::uint32_t generation, const std::uint8_t* bytes, std::size_t byte_count) {
   if (bytes == nullptr || byte_count == 0U || byte_count > audio::kTtsFrameSamples * 2U ||
       (byte_count & 1U) != 0U) {
     return WriteResult::InvalidArgument;
@@ -273,9 +261,6 @@ WriteResult write(std::uint32_t generation, const std::uint8_t* bytes, std::size
   if (queue.Size() == kSlots) {
     return WriteResult::Full;
   }
-  if (sequence != next_sequence) {
-    return WriteResult::Discontinuous;
-  }
   Slot frame;
   frame.used = byte_count / 2U;
   for (std::size_t i = 0U; i < frame.used; ++i) {
@@ -284,7 +269,6 @@ WriteResult write(std::uint32_t generation, const std::uint8_t* bytes, std::size
     frame.pcm[i] = static_cast<std::int16_t>(sample);
   }
   static_cast<void>(queue.Push(frame));
-  ++next_sequence;
   condition.notify_all();
   return WriteResult::Queued;
 }

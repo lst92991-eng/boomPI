@@ -4,6 +4,7 @@
 #include <cstddef>
 
 #include "boompi/audio/audio_frames.h"
+#include "boompi/audio/playback.h"
 
 namespace boompi::speech {
 
@@ -17,12 +18,15 @@ struct Result {
   std::array<const audio::CaptureFrame*, 32> frames{};
   std::size_t count{0};
   bool end{false};
+  const char* error{nullptr};
   float playback_scale{1.0F};  // 插话候选的静音探测；用户音量另行保存。
 };
 
 // 仅主线程调用；本模块只拥有句首历史与准入计数，不打开设备、启线程或收发网络。
-void listen(ListenMode mode) noexcept;
+bool listen(ListenMode mode) noexcept;
+void reply_started() noexcept;
 void reset() noexcept;
-Result update(const audio::CaptureFrame& frame, bool speaking) noexcept;
+Result update(audio::CaptureFrame& frame, bool speaking,
+              const playback::Observation& output = {}) noexcept;
 
 }  // namespace boompi::speech

@@ -1,20 +1,26 @@
 #include "boompi/audio/speech.h"
 
+#include <algorithm>
+#include <cstdio>
+
+#include "audio_convert.h"
 #include "board_voice_profile.h"
 #include "frame_queue.h"
+#include "vad.h"
+#include "wake.h"
 
 namespace boompi::speech {
 namespace {
 using audio::CaptureFrame;
 using audio::VoiceFrameContract;
 constexpr std::size_t kPreRollFrames = VoiceFrameContract::FramesForMs(500);
-constexpr unsigned kFollowUpFrames = VoiceFrameContract::FramesForMs(400);
-constexpr unsigned kCandidateFrames = VoiceFrameContract::FramesForMs(120);
-constexpr unsigned kLowReferenceFrames = VoiceFrameContract::FramesForMs(60);
-constexpr unsigned kReferenceWaitFrames = VoiceFrameContract::FramesForMs(300);
-constexpr unsigned kEchoTailFrames = VoiceFrameContract::FramesForMs(60);
-constexpr unsigned kConfirmFrames = VoiceFrameContract::FramesForMs(60);
-constexpr unsigned kRetryFrames = VoiceFrameContract::FramesForMs(300);
+constexpr std::size_t kFollowUpFrames = VoiceFrameContract::FramesForMs(400);
+constexpr std::size_t kCandidateFrames = VoiceFrameContract::FramesForMs(120);
+constexpr std::size_t kLowReferenceFrames = VoiceFrameContract::FramesForMs(60);
+constexpr std::size_t kReferenceWaitFrames = VoiceFrameContract::FramesForMs(300);
+constexpr std::size_t kEchoTailFrames = VoiceFrameContract::FramesForMs(60);
+constexpr std::size_t kConfirmFrames = VoiceFrameContract::FramesForMs(60);
+constexpr std::size_t kRetryFrames = VoiceFrameContract::FramesForMs(300);
 constexpr std::size_t kHistoryFrames = 32;
 static_assert(kCandidateFrames + kReferenceWaitFrames + kEchoTailFrames + kConfirmFrames <=
               kHistoryFrames);
@@ -23,8 +29,64 @@ enum class Input { Idle, Listening, FollowUp, Recording };
 enum class Probe { Candidate, ReferenceLow, EchoTail, Confirm };
 Input input{Input::Idle};
 Probe probe{Probe::Candidate};
+std::size_t utterance_frames{0};
 audio::FrameQueue<CaptureFrame, kHistoryFrames> history;
 unsigned follow_up_frames{0}, probe_frames{0}, low_reference_frames{0}, cooldown_frames{0};
+
+// AEC保护是业务准入，不属于WebRTC库；一个阶段替代原来的四个组合bool。
+enum class Gate { Off, Reference, Warmup, Silent, Tail };
+Gate gate{Gate::Off};
+unsigned gate_frames{0}, voice_frames{0}, quiet_frames{0};
+
+bool classify(CaptureFrame& frame, const playback::Observation& output) {
+  frame.voice_dbfs = audio_convert::ac_rms_dbfs(frame.pcm);
+  frame.vad_now = frame.vad_now &&
+                  (voice_frames == 6 || frame.input_dbfs >= audio::board::kSpeechAdmissionDbfs);
+  frame.vad_started = frame.vad_ended = false;
+  if (frame.vad_now) {
+    quiet_frames = 0;
+    frame.vad_started = voice_frames == 5;
+    voice_frames = std::min(voice_frames + 1, 6U);
+  } else if (voice_frames < 6) {
+    voice_frames = 0;
+  } else if (++quiet_frames == 35) {
+    voice_frames = quiet_frames = 0;
+    frame.vad_ended = true;
+  }
+  bool suppress = false;
+  if (output.end != playback::End::None) {
+    gate = output.end == playback::End::Natural ? Gate::Tail : Gate::Off;
+    gate_frames = gate == Gate::Tail ? 15 : 0;
+  } else if (gate == Gate::Silent && output.output_audible) {
+    gate = Gate::Reference;
+    gate_frames = 0;
+    suppress = true;
+  } else if (gate == Gate::Reference) {
+    suppress = true;
+    if (output.render_started && !output.output_audible) {
+      gate = Gate::Silent;
+      suppress = false;
+    } else if (output.render_started && frame.reference_active) {
+      gate = Gate::Warmup;
+      gate_frames = 30;
+    } else if (output.render_started && gate_frames < 50 && ++gate_frames == 50) {
+      std::fprintf(stderr, "boompi: AEC reference absent for 1000 ms of playback\n");
+    }
+    // 缺参考时保持关闭准入；不能以等待超时自动放行回声。
+  }
+  if (gate == Gate::Warmup || gate == Gate::Tail) {
+    suppress = true;
+    if (--gate_frames == 0) {
+      gate = Gate::Off;
+      voice_frames = quiet_frames = 0;
+      if (!vad::reset()) {
+        return false;
+      }
+    }
+  }
+  frame.near_voice = !suppress && frame.vad_now;
+  return true;
+}
 
 void reset_probe() noexcept {
   probe = Probe::Candidate;
@@ -55,6 +117,7 @@ Result admit(Decision decision) noexcept {
       break;
     }
   }
+  utterance_frames = result.count;
   return result;
 }
 
@@ -119,21 +182,43 @@ Result check_barge(const CaptureFrame& frame) noexcept {
 
 void reset() noexcept {
   input = Input::Idle;
+  utterance_frames = 0;
   history.Clear();
   follow_up_frames = cooldown_frames = 0;
   reset_probe();
+  gate = Gate::Off;
+  voice_frames = quiet_frames = gate_frames = 0;
 }
 
-void listen(ListenMode mode) noexcept {
+bool listen(ListenMode mode) noexcept {
+  // 重置语句准入但保留自然播放尾音保护。
+  const auto saved_gate = gate;
+  const auto saved_frames = gate_frames;
   reset();
+  gate = saved_gate;
+  gate_frames = saved_frames;
   input = mode == ListenMode::Wake ? Input::Listening : Input::FollowUp;
+  return wake::reset() && vad::reset();
+}
+void reply_started() noexcept {
+  reset();
+  gate = Gate::Reference;
+  gate_frames = 0;
 }
 
-Result update(const CaptureFrame& frame, bool speaking) noexcept {
+Result update(CaptureFrame& frame, bool speaking,
+              const playback::Observation& output) noexcept {
   if (frame.discontinuity) {
     reset();
+    gate = speaking ? Gate::Reference : Gate::Off;
     Result result;
     result.decision = Decision::Fault;
+    return result;
+  }
+  if (!classify(frame, output)) {
+    Result result;
+    result.decision = Decision::Fault;
+    result.error = "playback VAD reset failed";
     return result;
   }
   if (speaking) {
@@ -170,7 +255,9 @@ Result update(const CaptureFrame& frame, bool speaking) noexcept {
       result.decision = Decision::Pcm;
       result.frames[0] = &frame;
       result.count = 1;
-      result.end = frame.vad_ended;
+      ++utterance_frames;
+      result.end =
+          frame.vad_ended || utterance_frames >= VoiceFrameContract::FramesForMs(60000);
       if (result.end) {
         input = Input::Idle;
       }

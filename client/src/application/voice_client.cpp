@@ -4,17 +4,21 @@
 #include <cstdio>
 #include <limits>
 
-#include "boompi/audio/audio_capture.h"
 #include "boompi/audio/playback.h"
 #include "boompi/audio/speech.h"
+#include "boompi/audio/voice_input.h"
 #include "boompi/network/voice_net.h"
 #include "boompi/ui/device_ui.h"
+#include "vad.h"
+#include "wake.h"
 
 namespace {
-namespace audio_capture = boompi::audio_capture;
+namespace voice_input = boompi::voice_input;
 namespace playback = boompi::playback;
 namespace speech = boompi::speech;
 namespace voice_net = boompi::voice_net;
+namespace wake = boompi::wake;
+namespace vad = boompi::vad;
 namespace ui = boompi::ui;
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
@@ -30,18 +34,16 @@ constexpr auto kInputLimit = 60s;
 constexpr auto kResponseIdle = 30s;
 constexpr auto kResponseLimit = 300s;
 constexpr auto kDrainLimit = 3s;
-constexpr auto kMaximumInputFrames = boompi::audio::VoiceFrameContract::FramesForMs(60000);
 
 // 聆听尚未START，上传已经START；保留这个区别，不以几个互相依赖的bool代替。
-enum class State { Offline, Idle, Listening, Uploading, WaitingReply, Speaking };
-State state_ = State::Offline;
+enum class State { Idle, Listening, WaitingReply, Speaking };
+State state_ = State::Idle;
 ui::DeviceUi ui_;
 ui::UiView view_;
 AppReadClock now_ = &Clock::now;
 Clock::time_point deadline_ = Clock::time_point::max();
 Clock::time_point response_limit_{};
 std::uint32_t generation_ = 0;
-std::uint32_t sent_frames_ = 0;
 char error_[192]{};
 
 bool App_Fail(const char* reason) {
@@ -56,14 +58,10 @@ void App_Enter(State next, Clock::duration duration = Clock::duration::zero()) {
   deadline_ =
       duration == Clock::duration::zero() ? Clock::time_point::max() : now_() + duration;
   switch (next) {
-    case State::Offline:
-      view_.state = DeviceUiState::Offline;
-      break;
     case State::Idle:
       view_.state = DeviceUiState::Idle;
       break;
     case State::Listening:
-    case State::Uploading:
       view_.state = DeviceUiState::Listening;
       break;
     case State::WaitingReply:
@@ -72,6 +70,9 @@ void App_Enter(State next, Clock::duration duration = Clock::duration::zero()) {
     case State::Speaking:
       view_.state = DeviceUiState::Speaking;
       break;
+  }
+  if (!voice_net::online()) {
+    view_.state = DeviceUiState::Offline;
   }
   ui_.Show(view_);
 }
@@ -85,16 +86,14 @@ bool App_NextGeneration() {
 }
 
 bool App_HasActiveTurn() {
-  return state_ == State::Uploading || state_ == State::WaitingReply ||
-         state_ == State::Speaking;
+  return voice_net::uploading() || state_ == State::WaitingReply || state_ == State::Speaking;
 }
 
 void App_WaitForSpeech(ListenMode mode) {
-  if (!audio_capture::reset_listener()) {
-    App_Fail(audio_capture::error().c_str());
+  if (!speech::listen(mode)) {
+    App_Fail("speech detector reset failed");
     return;
   }
-  speech::listen(mode);
   playback::set_scale(1.0F);
   App_Enter(State::Listening, mode == ListenMode::FollowUp ? kFollowUpWindow : kWakeWindow);
 }
@@ -103,7 +102,7 @@ void App_GoOffline() {
   playback::cancel();
   speech::reset();
   view_.ClearText();
-  App_Enter(State::Offline);
+  App_Enter(State::Idle);
 }
 
 void App_StopAndListen(bool retract) {
@@ -136,7 +135,7 @@ bool App_CheckTimeout() {
   if (now_() < deadline_) {
     return false;
   }
-  if (state_ == State::Listening) {
+  if (state_ == State::Listening && !voice_net::uploading()) {
     speech::reset();
     App_Enter(State::Idle);
   } else if (App_HasActiveTurn()) {
@@ -162,12 +161,12 @@ void App_ReceiveReply() {
       App_GoOffline();
       continue;
     }
-    if (event.generation != generation_ || state_ == State::Offline) {
+    if (event.generation != generation_ || !voice_net::online()) {
       continue;
     }
     if (event.kind == LinkEventKind::Error) {
       std::fprintf(stderr, "boompi: reply failed; code=%s\n", event.code.c_str());
-      if (App_HasActiveTurn()) {
+      if (state_ != State::Idle) {
         App_StopAndListen(state_ == State::Speaking);
       }
       continue;
@@ -185,10 +184,10 @@ void App_ReceiveReply() {
           App_StopAndListen(true);
           continue;
         }
-        speech::reset();
+        speech::reply_started();
         App_Enter(State::Speaking, kResponseIdle);
       }
-      if (playback::write(generation_, event.audio.data(), event.audio_size, event.sequence) !=
+      if (playback::write(generation_, event.audio.data(), event.audio_size) !=
           playback::WriteResult::Queued) {
         App_StopAndListen(true);
       } else {
@@ -209,25 +208,42 @@ void App_ReceiveReply() {
 
 void App_ReadSpeech() {
   boompi::audio::CaptureFrame frame;
-  const auto read = audio_capture::read(&frame, 20ms);
-  if (read == audio_capture::ReadResult::Failed) {
-    App_Fail(audio_capture::error().c_str());
+  const auto read = voice_input::read(&frame, 20ms);
+  if (read == voice_input::ReadResult::Failed) {
+    App_Fail(voice_input::error().c_str());
     return;
   }
-  if (App_CheckTimeout() || read == audio_capture::ReadResult::Timeout) {
+  if (App_CheckTimeout() || read == voice_input::ReadResult::Timeout) {
     return;
   }
   const bool speaking =
       state_ == State::Speaking && playback::status().state == playback::State::Playing;
-  const speech::Result result = speech::update(frame, speaking);
+  if (!wake::detect(frame.pcm, &frame.wake)) {
+    App_Fail(wake::error());
+    return;
+  }
+  const int voiced = vad::process(frame.pcm);
+  if (voiced < 0) {
+    App_Fail("WebRTC VAD processing failed");
+    return;
+  }
+  frame.vad_now = voiced == 1;
+  const speech::Result result = speech::update(frame, speaking, frame.output);
   playback::set_scale(result.playback_scale);
+  if (result.error) {
+    App_Fail(result.error);
+    return;
+  }
   if (result.decision == speech::Decision::Fault) {
     if (App_HasActiveTurn()) {
       App_StopAndListen(state_ == State::Speaking);
-    } else if (state_ != State::Offline) {
+    } else if (voice_net::online()) {
       speech::reset();
       App_Enter(State::Idle);
     }
+    return;
+  }
+  if (!voice_net::online()) {
     return;
   }
   if (result.decision == speech::Decision::Wake && state_ == State::Idle) {
@@ -243,18 +259,16 @@ void App_ReadSpeech() {
     if (!App_NextGeneration() || !App_Sent(voice_net::start(generation_, barge))) {
       return;
     }
-    sent_frames_ = 0;
     view_.ClearText();
-    App_Enter(State::Uploading, kInputLimit);
+    App_Enter(State::Listening, kInputLimit);
   }
 
   // START → 句首原缓冲/当前帧 → END。这里只借用PCM，没有第二份AudioEvent批次。
-  for (std::size_t i = 0; state_ == State::Uploading && i < result.count; ++i) {
+  for (std::size_t i = 0; voice_net::uploading() && i < result.count; ++i) {
     if (!App_Sent(voice_net::send(generation_, result.frames[i]->pcm.data()))) {
       return;
     }
-    ++sent_frames_;
-    if ((result.end && i + 1 == result.count) || sent_frames_ >= kMaximumInputFrames) {
+    if (result.end && i + 1 == result.count) {
       if (!App_Sent(voice_net::end(generation_))) {
         return;
       }
@@ -279,7 +293,7 @@ void App_ReadUserAction() {
     if (state_ == State::Speaking || state_ == State::WaitingReply) {
       App_StopAndListen(true);
     }
-  } else if (state_ == State::Idle) {
+  } else if (state_ == State::Idle && voice_net::online()) {
     App_WaitForSpeech(ListenMode::Wake);
   }
 }
@@ -289,8 +303,8 @@ bool App_Init(const boompi::config::VoiceClientConfig& config, AppReadClock cloc
   now_ = clock;
   error_[0] = '\0';
   view_ = {};
-  generation_ = sent_frames_ = 0;
-  state_ = State::Offline;
+  generation_ = 0;
+  state_ = State::Idle;
   deadline_ = Clock::time_point::max();
   response_limit_ = {};
   speech::reset();
@@ -299,20 +313,23 @@ bool App_Init(const boompi::config::VoiceClientConfig& config, AppReadClock cloc
     if (!ui_.Open()) {
       std::fprintf(stderr, "boompi: display unavailable; voice continues\n");
     }
-    if (!audio_capture::open()) {
-      return App_Fail(audio_capture::error().c_str());
+    if (!voice_input::open()) {
+      return App_Fail(voice_input::error().c_str());
+    }
+    if (!wake::open() || !vad::open()) {
+      return App_Fail("speech detector initialization failed");
     }
     if (!playback::open(view_.volume)) {
       return App_Fail(playback::error().c_str());
     }
     // 保持BSP原来的顺序：两路PCM都配置好之后，才开始首次读取。
-    if (!audio_capture::start()) {
-      return App_Fail(audio_capture::error().c_str());
+    if (!voice_input::start()) {
+      return App_Fail(voice_input::error().c_str());
     }
     if (!voice_net::open(config)) {
       return App_Fail("network startup failed");
     }
-    App_Enter(State::Offline);
+    App_Enter(State::Idle);
     return true;
   } catch (...) {
     return App_Fail("application initialization failed");
@@ -347,8 +364,10 @@ bool App_Process() {
 void App_Close() noexcept {
   voice_net::close();
   playback::close();
-  audio_capture::close();
+  voice_input::close();
   speech::reset();
+  wake::close();
+  vad::close();
   ui_.Close();
 }
 

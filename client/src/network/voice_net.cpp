@@ -77,20 +77,6 @@ ConnectionState connection_state_{ConnectionState::Offline};
 TurnPhase turn_phase_{TurnPhase::Retired};
 bool audio_ended_{false};
 bool awaiting_pong_{false};  // 只在网络线程访问；其余协议字段由 mutex 保护。
-void AdvanceLocked(std::uint32_t generation, TurnPhase phase);
-void FailLocked(const char* code);
-void Fail(const char* code);
-bool AcceptReplyLocked(const LinkEvent& event);
-void OnEvent(LinkEvent event);
-int VerifyPin(X509_STORE_CTX* store, void* argument);
-websocketpp::lib::shared_ptr<TlsContext> MakeTls();
-void SendHello(Client& client, Hdl handle);
-void OnMessage(Client::message_ptr message);
-void Configure(Client& client);
-void SendNextFrame(Client::connection_ptr connection);
-bool ProcessConnection(Client& client, Client::connection_ptr connection);
-bool Connect(const config::VoiceClientConfig& endpoint);
-void NetworkTask();
 void AdvanceLocked(std::uint32_t generation, TurnPhase phase) {
   generation_ = generation;
   turn_phase_ = phase;
@@ -240,9 +226,7 @@ void SendHello(Client& client, Hdl handle) {
     Fail("socket_setup");
     return;
   }
-  const std::string hello = "{\"type\":\"hello\",\"device_id\":\"" + configured_.device_id +
-                            "\",\"token\":\"" + kTeachingToken +
-                            "\",\"sample_rate\":16000,\"version\":3}";
+  const std::string hello = "HELLO 4 16000 " + configured_.device_id + " " + kTeachingToken;
   websocketpp::lib::error_code error;
   client.send(handle, hello, websocketpp::frame::opcode::text, error);
   if (error) {
@@ -435,6 +419,15 @@ void NetworkTask() {
     backoff = std::min(backoff * 2, std::chrono::milliseconds(8000));
   }
 }
+void QueueControl(const std::string& text, bool retirement) {
+  Outbound frame;
+  frame.text = true;
+  frame.retirement = retirement;
+  frame.size = text.size();
+  std::copy(text.begin(), text.end(), frame.bytes.begin());
+  outbound_.push_back(std::move(frame));
+  changed_.notify_one();
+}
 }  // namespace
 
 bool open(const config::VoiceClientConfig& settings) {
@@ -462,6 +455,14 @@ bool open(const config::VoiceClientConfig& settings) {
   return true;
 }
 
+bool online() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return connection_state_ == ConnectionState::Online;
+}
+bool uploading() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return turn_phase_ == TurnPhase::Uploading;
+}
 bool poll(LinkEvent* event) {
   if (event == nullptr) {
     return false;
@@ -489,15 +490,9 @@ SendResult start(std::uint32_t generation, bool supersede) {
     FailLocked("retirement_overflow");
     return SendResult::Disconnected;
   }
-  Outbound frame;
-  frame.text = true;
-  frame.retirement = true;
-  const std::string text = "{\"type\":\"start\",\"generation\":" + std::to_string(generation) +
-                           ",\"supersede\":" + (supersede ? "true}" : "false}");
-  frame.size = text.size();
-  std::copy(text.begin(), text.end(), frame.bytes.begin());
-  outbound_.push_back(std::move(frame));
-  changed_.notify_one();
+  const std::string text =
+      "START " + std::to_string(generation) + " " + (supersede ? "1" : "0");
+  QueueControl(text, true);
   return SendResult::Ok;
 }
 
@@ -507,7 +502,7 @@ SendResult send(std::uint32_t generation, const std::int16_t* pcm) {
     return SendResult::Disconnected;
   }
   if (pcm == nullptr || generation == 0 || generation != generation_ ||
-      turn_phase_ != TurnPhase::Uploading || uplink_sequence_ >= 3000) {
+      turn_phase_ != TurnPhase::Uploading || uplink_sequence_ == UINT32_MAX) {
     FailLocked("invalid_uplink");
     return SendResult::Disconnected;
   }
@@ -536,15 +531,9 @@ SendResult end(std::uint32_t generation) {
   if (outbound_.size() + kTransportFrames >= kQueueFrames) {
     return SendResult::Backpressure;
   }
-  Outbound frame;
-  frame.text = true;
-  const std::string text =
-      "{\"type\":\"end\",\"generation\":" + std::to_string(generation) + "}";
-  frame.size = text.size();
-  std::copy(text.begin(), text.end(), frame.bytes.begin());
-  outbound_.push_back(std::move(frame));
+  const std::string text = "END " + std::to_string(generation);
+  QueueControl(text, false);
   turn_phase_ = TurnPhase::WaitingReply;
-  changed_.notify_one();
   return SendResult::Ok;
 }
 
@@ -563,20 +552,8 @@ bool cancel(std::uint32_t generation, bool retract) {
     return false;
   }
 
-  std::string text =
-      "{\"type\":\"cancel\",\"generation\":" + std::to_string(generation) + ",\"retract\":";
-  if (retract) {
-    text += "true}";
-  } else {
-    text += "false}";
-  }
-  Outbound frame;
-  frame.text = true;
-  frame.retirement = true;
-  frame.size = text.size();
-  std::copy(text.begin(), text.end(), frame.bytes.begin());
-  outbound_.push_back(std::move(frame));
-  changed_.notify_one();
+  const std::string text = "CANCEL " + std::to_string(generation) + " " + (retract ? "1" : "0");
+  QueueControl(text, true);
   return true;
 }
 

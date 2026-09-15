@@ -25,11 +25,9 @@ SwrContext* capture_swr{nullptr};
 SwrContext* playback_swr{nullptr};
 std::int8_t left_polarity{1}, right_polarity{1};
 std::size_t playback_pending_frames{0U};
-std::array<std::int16_t, audio::kCaptureFrameSamples * VoiceFrameContract::capture_channels>
-    corrected48{};
-std::array<std::int16_t, audio::kVoiceFrameSamples * VoiceFrameContract::capture_channels>
-    interleaved16{};
-constexpr std::size_t kCaptureChannels = VoiceFrameContract::capture_channels;
+std::array<std::int16_t, audio::kCaptureFrameSamples * 3> corrected48{};
+std::array<std::int16_t, audio::kVoiceFrameSamples * 3> interleaved16{};
+constexpr std::size_t kCaptureChannels = 3;
 constexpr int kReferencePeakThreshold = 64;
 constexpr float kPlaybackPeakLimit = 31128.0F;  // 95% 满幅，为功放保留余量。
 
@@ -62,23 +60,6 @@ bool PrimeResampler(SwrContext* swr, const std::int16_t* input, int input_frames
 }  // namespace
 
 /** @brief 去掉直流偏置再计算相对满幅电平，避免偏置抬高 VAD 准入值。 */
-float ac_rms_dbfs(const audio::VoiceFrame16k& samples) noexcept {
-  double sum = 0.0;
-  for (const std::int16_t sample : samples) {
-    sum += sample;
-  }
-  const double mean = sum / static_cast<double>(samples.size());
-  double energy = 0.0;
-  for (const std::int16_t sample : samples) {
-    const double centered = static_cast<double>(sample) - mean;
-    energy += centered * centered;
-  }
-  if (energy <= 0.0) {
-    return -120.0F;
-  }
-  const double rms = std::sqrt(energy / static_cast<double>(samples.size()));
-  return static_cast<float>(20.0 * std::log10(rms / 32768.0));
-}
 
 bool open_capture(std::int8_t left, std::int8_t right) noexcept {
   if (capture_swr != nullptr || (left != 1 && left != -1) || (right != 1 && right != -1)) {
@@ -129,16 +110,17 @@ bool capture(const audio::RawCaptureFrame& raw, audio::CaptureChannels* output) 
     return false;
   }
   *output = {};
-  corrected48 = raw.pcm;
   // 只翻转物理麦克风；-32768 反相后先饱和，参考通道仍保留 Codec 原值。
   for (std::size_t i = 0U; i < audio::kCaptureFrameSamples; ++i) {
     const std::size_t base = kCaptureChannels * i;
-    const int left = raw.pcm[base] * left_polarity;
-    const int right = raw.pcm[base + 1U] * right_polarity;
+    const std::size_t raw_base = VoiceFrameContract::capture_channels * i;
+    const int left = raw.pcm[raw_base] * left_polarity;
+    const int right = raw.pcm[raw_base + 1U] * right_polarity;
     corrected48[base] = static_cast<std::int16_t>(std::clamp(left, -32768, 32767));
     corrected48[base + 1U] = static_cast<std::int16_t>(std::clamp(right, -32768, 32767));
+    corrected48[base + 2U] = raw.pcm[raw_base + 2U];
   }
-  // 四通道一次转换，不能各自创建重采样器，否则麦克风和参考的滤波相位可能不同。
+  // 同一个转换器处理双麦/refL以保持相位；未使用的refR不再复制和重采样。
   const std::uint8_t* in[] = {reinterpret_cast<const std::uint8_t*>(corrected48.data())};
   std::uint8_t* out[] = {reinterpret_cast<std::uint8_t*>(interleaved16.data())};
   const int converted =
@@ -153,7 +135,7 @@ bool capture(const audio::RawCaptureFrame& raw, audio::CaptureChannels* output) 
     output->reference_left[i] = interleaved16[base + 2U];
   }
   output->metadata.timestamp_us = raw.timestamp_us;
-  // AEC 前双麦取较大电平用于开口；AEC 后电平会由vad模块另算，不能混用。
+  // AEC前双麦电平用于准入；AEC后电平由speech计算，不能混用。
   output->metadata.input_dbfs =
       std::max(ac_rms_dbfs(output->mic_left), ac_rms_dbfs(output->mic_right));
   output->metadata.reference_active = std::any_of(

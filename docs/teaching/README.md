@@ -65,9 +65,9 @@ python3 scripts/teaching_lab.py 1
 
 **本关新增概念：** 采样点/字节数、大小端、首尾标记与编号。
 
-源码：`client/include/boompi/audio/audio_format.h`、`client/src/network/voice_codec.h/.cpp`；契约见[协议v3](../../protocol/protocol-v3.md)。
+源码：`client/include/boompi/audio/audio_format.h`、`client/src/network/voice_codec.h/.cpp`；契约见[BPV4](../../protocol/protocol-v4.md)。
 
-先根据采样率推导20ms的320/960样本；再写整数读写，最后实现`EncodeAudio`、`DecodeAudio`。严格JSON校验先作为已给出的支持代码，理解二进制格式后再回看转义、重复键和类型检查。
+先推导20ms的320/960样本，再实现整数读写和PCM编码。控制帧用固定文本命令，按字段数量、规范整数、UTF-8和长度校验；板端不再有JSON词法或对象树。
 
 ```sh
 python3 scripts/teaching_lab.py 2
@@ -101,7 +101,7 @@ python3 scripts/teaching_lab.py 3
 
 先看wake.cpp/vad.cpp，用检测测试验证输入到判定结果。然后进入`client/src/audio/speech.cpp`，沿remember/admit/update理解句首借用、追问准入和句尾处理；这不是一个拥有设备的对象。
 
-`audio_capture::read`取处理帧，`speech::update`返回准入决定与借用PCM，应用直接START/send/END；20ms只限制取帧等待。
+`voice_input::read`取处理帧，`speech::update`返回准入决定与借用PCM，应用直接START/send/END；20ms只限制取帧等待。
 
 ```sh
 python3 scripts/teaching_lab.py 4
@@ -213,7 +213,7 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 
 以`0c0b53c`为基线。正式客户端从34文件/5671 ELOC变为36文件/5746 ELOC（+75）；物理行6975→7080。统计含私有音频与显示驱动，不含测试、教材、资源和第三方。只看DeviceUi时为631→349 ELOC，但移出的347 ELOC显示/触摸端口仍计入客户端总量，不能把移动目录当作删掉代码。
 
-当时生产改动预算为最多2个新文件、净增加不超过110 ELOC，未新增线程或框架。新增具体DisplayTouch边界、ListenMode/ReplyHistory及明确页面身份；删除任意长度跨槽拼包、持久tts_tail和重复相机状态映射。该记录对应旧协议v2；当前namespace/BPV3结构及统计见[结构重写交接](../test/namespace-rewrite.md)。
+当时生产改动预算为最多2个新文件、净增加不超过110 ELOC，未新增线程或框架。新增具体DisplayTouch边界、ListenMode/ReplyHistory及明确页面身份；删除任意长度跨槽拼包、持久tts_tail和重复相机状态映射。该记录对应旧协议v2；当前namespace/BPV4结构及统计见[结构重写交接](../test/budget-refactor.md)。
 
 验证：Linux严格构建与22/22 CTest、Windows基础2/2 CTest、Python16/16、共享协议fixture、HIL的Host编译和`--help`、UI及真实Linux显示端口严格编译。九个实验入口均实际执行；第8关仅编译，不将页面视觉或触摸误报为自动验收。小智/相机/Wi-Fi三张模拟器BMP与基线逐字节一致；11个迁移硬件函数体及87字节面板初始化表经独立比对保持。
 

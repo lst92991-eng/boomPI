@@ -221,10 +221,9 @@ class LoopbackServer final {
       }
       changed_.notify_all();
       if (send_ready && message->get_opcode() == websocketpp::frame::opcode::text &&
-          message->get_payload().find("\"type\":\"hello\"") != std::string::npos) {
+          message->get_payload().find("HELLO ") != std::string::npos) {
         websocketpp::lib::error_code ec;
-        server_.send(handle, "{\"type\":\"ready\",\"sample_rate\":16000,\"version\":3}",
-                     websocketpp::frame::opcode::text, ec);
+        server_.send(handle, "READY 4 16000", websocketpp::frame::opcode::text, ec);
       }
     });
     websocketpp::lib::error_code ec;
@@ -362,7 +361,7 @@ std::uint32_t Read32(const std::string& b, std::size_t offset) {
 }
 std::string Audio(std::uint32_t generation, std::uint32_t sequence, std::size_t samples = 320) {
   std::string frame(12 + samples * 2, '\0');
-  frame.replace(0, 4, "BPV3");
+  frame.replace(0, 4, "BPV4");
   for (unsigned i = 0; i < 4; ++i) {
     frame[4 + i] = static_cast<char>(generation >> (24 - i * 8));
     frame[8 + i] = static_cast<char>(sequence >> (24 - i * 8));
@@ -386,28 +385,25 @@ void BasicWireAndClose() {
   Open(server);
   Upload(1);
   const auto messages = server.WaitMessages(4);
-  Check(messages[0].payload.find("\"version\":3") != std::string::npos &&
-            messages[0].payload.find("\"sample_rate\":16000") != std::string::npos,
-        "hello contract missing");
-  Check(messages[1].payload == "{\"type\":\"start\",\"generation\":1,\"supersede\":false}",
-        "START not separate");
+  Check(messages[0].payload.find("HELLO 4 16000 ") == 0, "hello contract missing");
+  Check(messages[1].payload == "START 1 0", "START not separate");
   const auto& wire = messages[2].payload;
-  Check(wire.size() == 652 && wire.substr(0, 4) == "BPV3" && Read32(wire, 4) == 1 &&
+  Check(wire.size() == 652 && wire.substr(0, 4) == "BPV4" && Read32(wire, 4) == 1 &&
             Read32(wire, 8) == 0,
-        "BPV3 header invalid");
+        "BPV4 header invalid");
   Check(static_cast<unsigned char>(wire[12]) == 0x34 &&
             static_cast<unsigned char>(wire[13]) == 0x12 &&
             static_cast<unsigned char>(wire[14]) == 0xfe &&
             static_cast<unsigned char>(wire[15]) == 0xff,
         "PCM byte order");
-  Check(messages[3].payload == "{\"type\":\"end\",\"generation\":1}", "END missing");
-  server.Send("{\"type\":\"text\",\"generation\":1,\"text\":\"你好\"}");
+  Check(messages[3].payload == "END 1", "END missing");
+  server.Send("TEXT 1 你好");
   Check(WaitEvent().text == "你好", "text mismatch");
   server.Send(Audio(1, 0), true);
   Check(WaitEvent().audio_size == 640, "full audio missing before DONE");
   server.Send(Audio(1, 1, 7), true);
   Check(WaitEvent().audio_size == 14, "short tail lost");
-  server.Send("{\"type\":\"done\",\"generation\":1}");
+  server.Send("DONE 1");
   Check(WaitEvent().kind == LinkEventKind::Done, "DONE missing");
   const auto began = Clock::now();
   net::close();
@@ -430,12 +426,11 @@ void CancelAfterEndAndOldGeneration() {
     Check(net::cancel(2, true), "cancel after END rejected");
     Upload(3);
     const auto messages = server.WaitMessages(8);
-    Check(messages[4].payload == "{\"type\":\"cancel\",\"generation\":2,\"retract\":true}",
-          "cancel lost before START");
+    Check(messages[4].payload == "CANCEL 2 1", "cancel lost before START");
     server.Send(Audio(1, 8, 2), true);
-    server.Send("{\"type\":\"done\",\"generation\":1}");
+    server.Send("DONE 1");
     server.Send(Audio(3, 0, 2), true);
-    server.Send("{\"type\":\"done\",\"generation\":3}");
+    server.Send("DONE 3");
     Check(WaitEvent().generation == 3, "old PCM resurrected");
     Check(WaitEvent().kind == LinkEventKind::Done, "new done missing");
   }
@@ -448,7 +443,7 @@ void ErrorEndsUpload() {
   Check(net::start(1, false) == SendResult::Ok && net::send(1, pcm.data()) == SendResult::Ok,
         "input rejected");
   server.WaitMessages(3);
-  server.Send("{\"type\":\"error\",\"generation\":1,\"code\":\"provider_error\"}");
+  server.Send("ERROR 1 provider_error");
   Check(WaitEvent().kind == LinkEventKind::Error, "input error rejected");
   Check(net::send(1, pcm.data()) == SendResult::Disconnected, "failed upload continued");
 }
@@ -481,10 +476,10 @@ void RejectBrokenWire() {
       server.Send(Audio(1, 1), true);
     }
     if (scenario == 5) {
-      server.Send("{\"type\":\"ready\",\"sample_rate\":16000,\"version\":3}");
+      server.Send("READY 4 16000");
     }
     if (scenario == 6) {
-      server.Send("{\"type\":\"done\",\"generation\":1}");
+      server.Send("DONE 1");
       Check(WaitEvent().kind == LinkEventKind::Done, "empty DONE setup");
       server.Send(Audio(1, 0), true);
     }
@@ -509,7 +504,7 @@ void TlsFailureAndReconnect() {
   Check(WaitEvent().kind == LinkEventKind::Online, "reconnect missing");
   Upload(5);
   server.Send(Audio(1, 0, 2), true);
-  server.Send("{\"type\":\"done\",\"generation\":5}");
+  server.Send("DONE 5");
   Check(WaitEvent().generation == 5, "old generation survived reconnect");
 }
 void BoundedQueuesAndRetirement() {
@@ -544,17 +539,13 @@ void BoundedQueuesAndRetirement() {
     if (message.opcode == websocketpp::frame::opcode::binary) {
       continue;
     }
-    if (message.payload.find("\"type\":\"hello\"") != std::string::npos) {
+    if (message.payload.find("HELLO ") != std::string::npos) {
       Check(WaitEvent().kind == LinkEventKind::Offline, "silent send loss");
       return;
     }
-    const std::array<std::string, 4> expected = {
-        "{\"type\":\"cancel\",\"generation\":2,\"retract\":true}",
-        "{\"type\":\"start\",\"generation\":3,\"supersede\":true}",
-        "{\"type\":\"cancel\",\"generation\":4,\"retract\":false}",
-        "{\"type\":\"start\",\"generation\":5,\"supersede\":false}"};
-    if (stage == 0 &&
-        message.payload == "{\"type\":\"start\",\"generation\":1,\"supersede\":false}") {
+    const std::array<std::string, 4> expected = {"CANCEL 2 1", "START 3 1", "CANCEL 4 0",
+                                                 "START 5 0"};
+    if (stage == 0 && message.payload == "START 1 0") {
       continue;
     }
     Check(message.payload == expected[stage], "retirement reordered or lost");
@@ -564,7 +555,8 @@ void BoundedQueuesAndRetirement() {
 }
 void RejectOldHandshake() {
   for (const char* ready :
-       {"{\"type\":\"ready\"}", "{\"type\":\"ready\",\"sample_rate\":16000}",
+       {"READY 3 16000", "READY 4 24000", "READY 4 16000 extra", "{\"type\":\"ready\"}",
+        "{\"type\":\"ready\",\"sample_rate\":16000}",
         "{\"type\":\"ready\",\"sample_rate\":24000,\"version\":3}",
         "{\"type\":\"ready\",\"sample_rate\":16000,\"version\":2}"}) {
     LoopbackServer server(false);
@@ -606,11 +598,7 @@ void ExternalServerSmoke(const char* host, const char* port, const char* pin) {
   const auto parsed = std::stoul(port);
   Check(parsed > 0 && parsed <= 65535, "invalid port");
   VoiceClientConfig config{kDeviceId, host, static_cast<std::uint16_t>(parsed), pin};
-  auto wrong = config;
-  wrong.server_spki_sha256[0] = wrong.server_spki_sha256[0] == 'A' ? 'B' : 'A';
-  Check(net::open(wrong) && WaitEvent().kind == LinkEventKind::Offline,
-        "server accepted wrong pin");
-  net::close();
+  // Go驱动分别传入错误/正确pin。这里再改一次会偶尔把错误pin变回正确值。
   Check(net::open(config) && WaitEvent().kind == LinkEventKind::Online, "server not ready");
   std::array<std::int16_t, 320> pcm{};
   pcm[0] = 0x0807;

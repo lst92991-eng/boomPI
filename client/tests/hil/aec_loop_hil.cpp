@@ -8,12 +8,14 @@
 #include <string_view>
 #include <vector>
 
-#include "boompi/audio/audio_capture.h"
 #include "boompi/audio/playback.h"
 #include "boompi/audio/speech.h"
+#include "boompi/audio/voice_input.h"
+#include "vad.h"
+#include "wake.h"
 
 namespace {
-namespace capture = boompi::audio_capture;
+namespace capture = boompi::voice_input;
 namespace playback = boompi::playback;
 namespace speech = boompi::speech;
 using Clock = std::chrono::steady_clock;
@@ -25,6 +27,8 @@ struct CloseAudio {
   ~CloseAudio() {
     playback::close();
     capture::close();
+    boompi::wake::close();
+    boompi::vad::close();
   }
 };
 
@@ -50,7 +54,15 @@ bool ProcessAudio(boompi::audio::CaptureFrame& frame, speech::Result& result, bo
     return false;
   }
   if (read == capture::ReadResult::Frame) {
-    result = speech::update(frame, speaking);
+    if (!boompi::wake::detect(frame.pcm, &frame.wake)) {
+      return false;
+    }
+    const int voiced = boompi::vad::process(frame.pcm);
+    if (voiced < 0) {
+      return false;
+    }
+    frame.vad_now = voiced == 1;
+    result = speech::update(frame, speaking, frame.output);
     playback::set_scale(result.playback_scale);
     if (result.decision == speech::Decision::Fault) {
       std::cerr << "boompi-aec-loop-hil: capture discontinuity\n";
@@ -76,7 +88,8 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
   CloseAudio cleanup;
-  if (!capture::open() || !playback::open(kVolume) || !capture::start()) {
+  if (!boompi::wake::open() || !boompi::vad::open() || !capture::open() ||
+      !playback::open(kVolume) || !capture::start()) {
     std::cerr << "audio initialization failed: " << capture::error() << ' ' << playback::error()
               << '\n';
     return EXIT_FAILURE;
@@ -96,11 +109,11 @@ int main(int argc, char** argv) {
   const std::size_t total_frames = fixture_frames * kPlaybackRepeats;
   const auto send = [&](std::size_t index) {
     const auto* pcm = fixture.data() + index % fixture_frames * kFrameBytes;
-    return playback::write(1, pcm, kFrameBytes, static_cast<std::uint32_t>(index)) ==
-               playback::WriteResult::Queued &&
+    return playback::write(1, pcm, kFrameBytes) == playback::WriteResult::Queued &&
            (index + 1 != total_frames || playback::finish(1));
   };
   speech::reset();
+  speech::reply_started();
   if (!playback::begin(1)) {
     return EXIT_FAILURE;
   }
@@ -134,10 +147,9 @@ int main(int argc, char** argv) {
   }
   bool would_follow_up = false;
   if (!would_barge && playback_done) {
-    if (!capture::reset_listener()) {
+    if (!speech::listen(speech::ListenMode::FollowUp)) {
       return EXIT_FAILURE;
     }
-    speech::listen(speech::ListenMode::FollowUp);
     const auto post_limit = Clock::now() + 1s;
     while (Clock::now() < post_limit) {
       if (!ProcessAudio(frame, result, false)) {

@@ -4,7 +4,7 @@
 
 教学复现先从[分关实验](../docs/teaching/README.md)开始：配置、固定帧、播放队列、语句输入、WSS、六态问答、插话、界面，最后完成真板验收。每关复用真实产品源码和已有测试，不用课程宏拼出多个产品。
 
-音频可以从[顺序数据流](../docs/teaching/audio-pipeline.md)进入：`RawCaptureFrame → CaptureChannels → CleanAudioFrame → CaptureFrame → speech::Result（借用PCM）`。各处理模块显式接收上一阶段输出，播放是另一条独立链。
+音频可以从[顺序数据流](../docs/teaching/audio-pipeline.md)进入：`RawCaptureFrame → CaptureChannels → CaptureFrame → speech::Result（借用PCM）`。各处理模块显式接收上一阶段输出，播放是另一条独立链。
 
 这是一份源码上的递进补写实验，不是已经导出的独立阶段源码快照。已有基础、只想先理解完整业务时，再读 `src/application/voice_client.cpp`。服务端是配套 EXE，学生只配置 Key；无需学习 Go 或云端 SDK。
 
@@ -18,17 +18,17 @@ python3 scripts/teaching_lab.py 1 --build-dir build/lesson-host
 App_Init按采集、播放、网络初始化，App_Process顺序执行收回复、处理语音和触摸。应用直接调用namespace模块：
 
 ```text
-audio_capture::read → speech::update → voice_net::start/send/end
+voice_input::read → wake::detect → vad::process → speech::update → voice_net::start/send/end
 voice_net::poll → playback::begin/write/finish → status(Drained)
 ```
 
-speech只拥有句首历史与准入策略，不启动线程或转发回复。capture任务直接执行ALSA/转换/3A/wake/vad，playback任务直接拥有播放队列、转换器和声卡。旧VoiceAudio/AudioTasks/AudioPipeline/VoiceLink类与失效接口已经删除。
+speech拥有语句、句首、追问和插话策略，不启动线程或转发回复。输入任务只执行ALSA/转换/3A，应用顺序执行wake/VAD/speech；已删除检测器跨线程命令握手。playback拥有播放队列、转换器和声卡，旧聚合层未恢复。
 
 START、PCM、END、CANCEL为不同协议消息；generation隔离旧轮，sequence检查连续PCM。DONE关闭播放输入，实际尾播之后才追问。保持唤醒、VAD、500ms句首、插话确认、三秒追问和全部UI/配网/摄像头功能。
 
 ## 阅读顺序
 
-先读[真实数据流](../docs/teaching/audio-pipeline.md)，再看[模块所有权](../docs/architecture/audio-runtime.md)。应用入口为application/voice_client.cpp，采集/语句/播放在audio/三个namespace模块，协议在network/voice_net.cpp和[BPV3](../protocol/protocol-v3.md)。硬件与vendor细节留在platform/rv1106。
+先读[真实数据流](../docs/teaching/audio-pipeline.md)，再看[模块所有权](../docs/architecture/audio-runtime.md)。应用入口为application/voice_client.cpp，采集/语句/播放在audio/三个namespace模块，协议在network/voice_net.cpp和[BPV4](../protocol/protocol-v4.md)。硬件与vendor细节留在platform/rv1106。
 
 ## 运行与设置
 
@@ -69,7 +69,7 @@ BOOMPI_SERVER_SPKI_SHA256=<该电脑稳定SPKI>
 
 网络每 20 ms 双向均为 320 samples，声卡当前每通道 960 samples；PCM 路径和模型位置由维护者预置。vendor 256 点块独立适配，不能把这些粒度混为一条约束。学生不逐板调参。更换硬件或模型后由维护者重新验收整个 profile。
 
-采集保持 48 kHz / S16_LE / 4ch `[mic0,mic1,refL,refR]`，3A 输入为双麦+refL，上传和 TTS 均为 16 kHz mono；仅在声卡边界转成 48 kHz stereo。hello/ready 均必须声明 `sample_rate:16000`，旧 24 kHz 服务端不能配套。原有 AEC/VAD 默认值保留，整板 16 kHz 能力、声学效果和新 TTS 实际体验仍需要真板验收。
+采集保持 48 kHz / S16_LE / 4ch `[mic0,mic1,refL,refR]`，3A 输入为双麦+refL，上传和 TTS 均为 16 kHz mono；仅在声卡边界转成 48 kHz stereo。hello/ready 均必须声明 `HELLO/READY 4 16000`，旧 24 kHz 服务端不能配套。原有 AEC/VAD 默认值保留，整板 16 kHz 能力、声学效果和新 TTS 实际体验仍需要真板验收。
 
 ## 构建
 
@@ -109,4 +109,6 @@ lvgl/        # LVGL 8.2
 
 ## 旧版升级
 
-v3 客户端必须与同批 v3 服务端配套。旧 v1/v2 程序留在基线快照/Git 历史，不能混用。首次更新前保留旧客户端、旧服务端、config.yaml 与 state；复用原有身份而非重新配对。协议详见 [protocol-v3.md](../protocol/protocol-v3.md)，人工验收见 [host-validation.md](../docs/test/host-validation.md)。
+v4 客户端必须与同批 v4 服务端配套。旧 v1/v2 程序留在基线快照/Git 历史，不能混用。首次更新前保留旧客户端、旧服务端、config.yaml 与 state；复用原有身份而非重新配对。协议详见 [protocol-v4.md](../protocol/protocol-v4.md)，人工验收见 [host-validation.md](../docs/test/host-validation.md)。
+
+当前职责、实际流程和预算例外以[本轮记录](../docs/test/budget-refactor.md)为准；旧源码阅读记录仅作历史参考。

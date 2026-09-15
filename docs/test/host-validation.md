@@ -2,7 +2,7 @@
 
 ## 版本配套
 
-客户端与服务端只有 BPV3 / 16 kHz 配套协议，hello/ready均声明`version:3,sample_rate:16000`，必须成套使用。v1/v2旧程序不能配套。`v1.0.0` tag保持不变；当前结构重写起点和结果见[记录](namespace-rewrite.md)。
+客户端与服务端只有 BPV4 / 16 kHz 配套协议，hello/ready均声明`READY 4 16000`，必须成套使用。v1/v2旧程序不能配套。`v1.0.0` tag保持不变；当前结构重写起点和结果见[记录](budget-refactor.md)。
 
 服务端产物：`build/teaching-v2-release/boompi-server.exe`。Windows上可以双击，首次配置Key；原有config.yaml和state应保留在用户可访问的私有目录。不要把Key或TLS私钥打包发出。
 
@@ -47,7 +47,7 @@ sh scripts/build_teaching_release.sh
 1. 保存板端旧客户端、服务端EXE、配置和TLS身份，以便整套回退。
 2. 确认新客户端确实经过上述交叉构建和ELF检查。
 3. 将新客户端及当前client/scripts里的控制/配网脚本成套安装；保留模型、字体和板级库。
-4. 确认v3服务端已启动，客户端 `--check-config` 通过，再手工启动客户端。
+4. 确认BPV4配套服务端已启动，客户端 `--check-config` 通过，再手工启动客户端。
 5. 观察 UI 的离线、待机、聆听、思考和播放变化，并检查故障阶段提示；正常流程不逐轮打印状态。声学参数由board_voice_profile.h决定，旧env声学键仅报迁移提示。
 
 ## 真人验收

@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 AUDIO_CASES = (
     "sub-grace-jitter", "confirmed-gap", "short-tail", "bounded-close",
-    "bounded-capture", "bounded-command", "reset-preserves-pcm", "queue-results",
+    "bounded-capture", "no-capture-command", "reset-preserves-pcm", "queue-results",
     "open-clears-error", "playback-clears-error", "playback-owner-order",
     "playback-prepare-failure", "drop-blocked-render", "drop-blocked-drain",
     "close-blocked-render", "voice-preroll", "voice-follow-up-boundary",
@@ -35,7 +35,7 @@ LESSONS = {
         tuple("audio-flow-" + name for name in (
             "modules-format",
             "queue-results", "short-tail", "playback-owner-order",
-            "bounded-capture", "bounded-command", "bounded-close"))),
+            "bounded-capture", "no-capture-command", "bounded-close"))),
     4: ("开口、句首与追问输入", ("boompi_audio_flow_test",),
         ("audio-flow-modules-detection", "audio-flow-voice-preroll", "audio-flow-voice-follow-up-boundary")),
     5: ("真实本机WSS连接", ("boompi_voice_transport_loopback_test",),

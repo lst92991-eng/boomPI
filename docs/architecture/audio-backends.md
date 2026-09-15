@@ -15,7 +15,7 @@ application直接调用audio_capture、speech、playback；两条任务直接执
 产品没有 backend 工厂或模拟设备分支。Host fake 和 AEC HIL 只用于测试，不链接进
 `boompi-client`。
 
-`audio_capture.cpp`直接展开`raw → channels → clean → frame`：audio_convert负责格式、rockchip_3a负责3A和metadata对齐、wake和vad负责检测。详见[顺序音频教学](../teaching/audio-pipeline.md)；
+`voice_input.cpp`直接展开`raw → channels → clean → frame`：audio_convert负责格式、rockchip_3a负责3A和metadata对齐、wake和vad负责检测。详见[顺序音频教学](../teaching/audio-pipeline.md)；
 需要检查 PCM 参数协商、XRUN 或有界 drain 时再进入 `alsa_audio.cpp`。
 ALSA头和句柄留在私有设备模块；不存在VoiceAudio/Engine/Backend兼容层。
 
@@ -29,9 +29,8 @@ ALSA头和句柄留在私有设备模块；不存在VoiceAudio/Engine/Backend兼
 capture 布局固定为 `[mic0,mic1,refL,refR]`。TTS mono 被复制到左右声道，因此两个参考高度
 相关；产品 AEC 只消费 `refL`。ALSA仍读取四通道，应用不再额外复制一份HIL诊断平面。
 
-开始播放分两步：playback::begin经audio_capture::arm_playback在采集帧边界武装AEC；
-playback线程随后调用alsa_audio::prepare_playback，准备PCM并复位重采样器，再消费TTS。
-采集控制命令保持单槽、100 ms 有界握手，ALSA 播放操作不借用 capture 线程执行。
+应用在首包时调用playback::begin和speech::reply_started，后者在应用线程准备AEC准入保护。
+播放线程独自prepare/write/drain；没有采集控制命令槽和100ms检测器握手。
 
 ## Rockchip 3A
 

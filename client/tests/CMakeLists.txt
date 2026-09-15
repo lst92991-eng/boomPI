@@ -24,7 +24,7 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
 
   # 链接实际应用源；测试只提供模块 I/O 与时钟，不再包含生产 .cpp 文件。
   add_executable(boompi_voice_client_harness tests/voice_client_harness_test.cpp
-    src/application/voice_client.cpp src/audio/speech.cpp src/config/voice_client_config.cpp)
+    src/application/voice_client.cpp src/audio/speech.cpp src/audio/audio_level.cpp src/config/voice_client_config.cpp)
   boompi_test_options(boompi_voice_client_harness)
   target_include_directories(boompi_voice_client_harness PRIVATE src/platform/rv1106)
   target_link_libraries(boompi_voice_client_harness PRIVATE Threads::Threads)
@@ -48,19 +48,21 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
         BOOST_ERROR_CODE_HEADER_ONLY=1 BOOST_SYSTEM_NO_DEPRECATED=1)
       target_include_directories(${target} SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/third_party"
         "${BOOMPI_HOST_BOOST_INCLUDE_DIR}" "${BOOMPI_HOST_CJSON_INCLUDE_DIR}")
-      target_link_libraries(${target} PRIVATE "${BOOMPI_HOST_CJSON_LIBRARY}"
+      target_link_libraries(${target} PRIVATE
         OpenSSL::SSL OpenSSL::Crypto Threads::Threads ${CMAKE_DL_LIBS})
     endforeach()
+    # cJSON只用于测试读取JSON金样元数据，不进入客户端或WSS运行实现。
+    target_link_libraries(boompi_protocol_json_test PRIVATE "${BOOMPI_HOST_CJSON_LIBRARY}")
     add_test(NAME voice-transport-loopback COMMAND boompi_voice_transport_loopback_test)
     add_test(NAME protocol-json-contract COMMAND boompi_protocol_json_test
-      "${PROJECT_SOURCE_DIR}/protocol/fixtures/protocol-v3-golden.json")
+      "${PROJECT_SOURCE_DIR}/protocol/fixtures/protocol-v4-golden.json")
   elseif(BOOMPI_REQUIRE_HOST_TRANSPORT_TEST)
     message(FATAL_ERROR "Real WSS tests require OpenSSL, Boost and cJSON")
   else()
     message(STATUS "Real WSS tests unavailable; set BOOMPI_REQUIRE_HOST_TRANSPORT_TEST=ON in release verification")
   endif()
 
-  if(UNIX)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # 硬件实现也严格编译；Host场景运行时只用ALSA设备替身，不声称运行了真板。
     find_package(ALSA REQUIRED)
     add_library(boompi_audio_platform_compile OBJECT
@@ -87,7 +89,7 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
     target_link_libraries(boompi_audio_flow_test PRIVATE Threads::Threads
       PkgConfig::BOOMPI_HOST_AUDIO)
     foreach(scenario IN ITEMS sub-grace-jitter confirmed-gap short-tail
-        bounded-close bounded-capture bounded-command reset-preserves-pcm
+        bounded-close bounded-capture no-capture-command reset-preserves-pcm
         queue-results open-clears-error playback-clears-error
         playback-owner-order playback-prepare-failure drop-blocked-render drop-blocked-drain
         close-blocked-render voice-preroll voice-follow-up-boundary voice-barge-lifecycle

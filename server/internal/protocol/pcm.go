@@ -31,8 +31,8 @@ func (header PCMHeader) validate(payloadBytes int, uplink bool) error {
 
 func ParsePCMFrame(frame []byte, uplink bool) (PCMHeader, []byte, error) {
 	var header PCMHeader
-	if len(frame) < PCMHeaderSize || string(frame[:4]) != "BPV3" {
-		return header, nil, errors.New("invalid BPV3 header")
+	if len(frame) < PCMHeaderSize || string(frame[:4]) != "BPV4" {
+		return header, nil, errors.New("invalid BPV4 header")
 	}
 	header = PCMHeader{Generation: binary.BigEndian.Uint32(frame[4:8]), Sequence: binary.BigEndian.Uint32(frame[8:12])}
 	if err := header.validate(len(frame)-PCMHeaderSize, uplink); err != nil {
@@ -46,7 +46,7 @@ func EncodePCM(header PCMHeader, pcm []byte, uplink bool) ([]byte, error) {
 		return nil, err
 	}
 	frame := make([]byte, PCMHeaderSize+len(pcm))
-	copy(frame, "BPV3")
+	copy(frame, "BPV4")
 	binary.BigEndian.PutUint32(frame[4:8], header.Generation)
 	binary.BigEndian.PutUint32(frame[8:12], header.Sequence)
 	copy(frame[PCMHeaderSize:], pcm)

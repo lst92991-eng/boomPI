@@ -10,11 +10,13 @@
 #include <vector>
 
 #include "boompi/application/voice_client.h"
-#include "boompi/audio/audio_capture.h"
 #include "boompi/audio/playback.h"
 #include "boompi/audio/speech.h"
+#include "boompi/audio/voice_input.h"
 #include "boompi/network/voice_net.h"
 #include "boompi/ui/device_ui.h"
+#include "vad.h"
+#include "wake.h"
 
 #ifndef _WIN32
 #define main BoompiClientMain
@@ -65,6 +67,9 @@ struct State {
   bool capture_start_ok{true};
   bool throw_on_audio_open{false}, throw_on_audio_process{false};
   std::string saved_ssid, saved_password;
+  CaptureFrame current;
+  bool connected{false}, input_open{false};
+  std::uint32_t input_frames{0};
 } state;
 
 auto Now() {
@@ -72,8 +77,12 @@ auto Now() {
 }
 CaptureFrame Sound(int sample, bool start = false, bool end = false) {
   CaptureFrame frame;
-  frame.pcm.fill(static_cast<std::int16_t>(sample));
-  frame.vad_now = frame.near_voice = true;
+  for (std::size_t i = 0; i < frame.pcm.size(); ++i) {
+    frame.pcm[i] = i % 2 ? -4096 : 4096;
+  }
+  frame.pcm[0] = static_cast<std::int16_t>(sample);
+  frame.input_dbfs = -20;
+  frame.vad_now = frame.near_voice = !end;
   frame.voice_dbfs = -10;
   frame.vad_started = start;
   frame.vad_ended = end;
@@ -118,8 +127,19 @@ LinkEvent Reply(unsigned gen = 1) {
 std::vector<Step> Question() {
   auto wake = Sound(0);
   wake.wake = true;
-  return {N(Net(LinkEventKind::Online)), A(wake), A(Sound(11, true)),
-          A(Sound(22, false, true))};
+  std::vector<Step> steps{N(Net(LinkEventKind::Online)), A(wake)};
+  for (int i = 0; i < 6; ++i) {
+    steps.push_back(A(Sound(11 + i)));
+  }
+  for (int i = 0; i < 35; ++i) {
+    steps.push_back(A(Sound(0, false, true)));
+  }
+  return steps;
+}
+std::vector<SendResult> EndBackpressure() {
+  std::vector<SendResult> values(43, SendResult::Ok);
+  values.back() = SendResult::Backpressure;
+  return values;
 }
 std::size_t Count(const char* kind) {
   std::size_t count = 0;
@@ -131,7 +151,11 @@ std::size_t Count(const char* kind) {
 SendResult Send(Sent sent) {
   state.sent.push_back(std::move(sent));
   const auto index = state.send_calls++;
-  return index < state.results.size() ? state.results[index] : SendResult::Ok;
+  const auto result = index < state.results.size() ? state.results[index] : SendResult::Ok;
+  if (result == SendResult::Disconnected) {
+    state.connected = false;
+  }
+  return result;
 }
 bool Run(std::vector<Step> steps, std::vector<SendResult> results = {}, bool play_ok = true,
          bool stop_ok = true) {
@@ -151,7 +175,7 @@ bool Run(std::vector<Step> steps, std::vector<SendResult> results = {}, bool pla
 }
 }  // namespace harness
 
-namespace boompi::audio_capture {
+namespace boompi::voice_input {
 bool start() {
   return harness::state.capture_start_ok;
 }
@@ -187,14 +211,9 @@ ReadResult read(audio::CaptureFrame* frame, std::chrono::milliseconds) {
     return ReadResult::Timeout;
   }
   *frame = *step.capture;
+  frame->output = boompi::playback::observe();
+  s.current = *frame;
   return ReadResult::Frame;
-}
-bool reset_listener() {
-  ++harness::state.resets;
-  return harness::state.listener_ok;
-}
-bool arm_playback() {
-  return true;
 }
 std::string error() {
   return "scripted audio error";
@@ -202,8 +221,40 @@ std::string error() {
 void close() {
   ++harness::state.audio_closes;
 }
-}  // namespace boompi::audio_capture
+}  // namespace boompi::voice_input
 
+namespace boompi::wake {
+bool open() noexcept {
+  return true;
+}
+bool reset() noexcept {
+  return true;
+}
+bool detect(const audio::VoiceFrame16k&, bool* detected) noexcept {
+  *detected = harness::state.current.wake;
+  return true;
+}
+const char* error() noexcept {
+  return "scripted wake error";
+}
+void close() noexcept {}
+}  // namespace boompi::wake
+namespace boompi::vad {
+bool open() noexcept {
+  return true;
+}
+bool reset() noexcept {
+  ++harness::state.resets;
+  return harness::state.listener_ok;
+}
+int process(const audio::VoiceFrame16k&) noexcept {
+  return harness::state.current.vad_now ? 1 : 0;
+}
+const char* error() noexcept {
+  return "scripted VAD error";
+}
+void close() noexcept {}
+}  // namespace boompi::vad
 namespace boompi::playback {
 bool open(std::uint8_t) {
   ++harness::state.playback_opens;
@@ -213,7 +264,7 @@ bool begin(std::uint32_t gen) {
   harness::state.output = {gen, State::Playing};
   return true;
 }
-WriteResult write(std::uint32_t gen, const std::uint8_t*, std::size_t, std::uint32_t) {
+WriteResult write(std::uint32_t gen, const std::uint8_t*, std::size_t) {
   harness::state.played.push_back(gen);
   return harness::state.play_ok ? WriteResult::Queued : WriteResult::Full;
 }
@@ -229,6 +280,9 @@ void cancel() {
 void set_volume(std::uint8_t) {}
 void set_scale(float scale) {
   harness::state.scales.push_back(scale);
+}
+Observation observe() {
+  return {harness::state.output.state == State::Playing, true, End::None};
 }
 Status status() {
   return harness::state.output;
@@ -246,6 +300,12 @@ bool open(const config::VoiceClientConfig&) {
   ++harness::state.link_opens;
   return harness::state.link_open_ok;
 }
+bool online() {
+  return harness::state.connected;
+}
+bool uploading() {
+  return harness::state.input_open;
+}
 bool poll(LinkEvent* event) {
   auto& q = harness::state.inbound;
   if (q.empty()) {
@@ -253,19 +313,36 @@ bool poll(LinkEvent* event) {
   }
   *event = std::move(q.front());
   q.pop_front();
+  if (event->kind == LinkEventKind::Online) {
+    harness::state.connected = true;
+  }
+  if (event->kind == LinkEventKind::Offline) {
+    harness::state.connected = false;
+  }
   return true;
 }
 SendResult start(std::uint32_t gen, bool supersede) {
+  harness::state.input_open = true;
+  harness::state.input_frames = 0;
   return harness::Send({"start", gen, 0, supersede});
 }
 SendResult send(std::uint32_t gen, const std::int16_t* pcm) {
-  return harness::Send({"pcm", gen, pcm[0]});
+  const auto result = harness::Send({"pcm", gen, pcm[0]});
+  if (result == SendResult::Ok) {
+    ++harness::state.input_frames;
+  }
+  return result;
 }
 SendResult end(std::uint32_t gen) {
+  harness::state.input_open = false;
   return harness::Send({"end", gen});
 }
 bool cancel(std::uint32_t gen, bool retract) {
+  harness::state.input_open = false;
   harness::state.sent.push_back({"cancel", gen, 0, retract});
+  if (!harness::state.stop_ok) {
+    harness::state.connected = false;
+  }
   return harness::state.stop_ok;
 }
 void close() noexcept {
@@ -414,10 +491,10 @@ int main() {
 #endif
 
   auto steps = Question();
-  require(Run(steps) && state.sent.size() == 4 && state.sent[0].kind == "start" &&
+  require(Run(steps) && state.sent.size() == 43 && state.sent[0].kind == "start" &&
               state.sent[1].kind == "pcm" && state.sent[1].sample == 11 &&
-              state.sent[2].kind == "pcm" && state.sent[2].sample == 22 &&
-              state.sent[3].kind == "end",
+              state.sent[2].kind == "pcm" && state.sent[2].sample == 12 &&
+              state.sent[42].kind == "end",
           "real speech drives START PCM PCM END without duplicate or missing frame");
   steps.push_back(N(Reply()));
   steps.push_back(N(Net(LinkEventKind::Done, 1)));
@@ -452,19 +529,27 @@ int main() {
   steps = Question();
   steps.push_back(N(Reply()));
   steps.push_back(Delay(20));
+  for (int i = 0; i < 30; ++i) {
+    auto frame = Sound(90);
+    frame.reference_active = true;
+    steps.push_back(A(frame));
+  }
   for (int id = 100; id < 115; ++id) {
-    auto frame = Sound(id, false, id == 114);
+    auto frame = Sound(id);
     frame.reference_active = id < 106;
     steps.push_back(A(frame));
+  }
+  for (int i = 0; i < 35; ++i) {
+    steps.push_back(A(Sound(0, false, true)));
   }
   steps.push_back(N(Net(LinkEventKind::Done, 1)));
   steps.push_back(N(Reply(2)));
   steps.push_back(Delay(20));
   steps.push_back(Drained(1));
-  require(Run(steps) && Count("start") == 2 && Count("end") == 2 && Count("pcm") == 17 &&
-              state.sent[4].kind == "start" && state.sent[4].generation == 2 &&
-              state.sent[4].retract && state.sent[5].sample == 100 &&
-              state.sent[19].sample == 114,
+  require(Run(steps) && Count("start") == 2 && Count("end") == 2 && Count("pcm") == 91 &&
+              state.sent[43].kind == "start" && state.sent[43].generation == 2 &&
+              state.sent[43].retract && state.sent[44].sample == 100 &&
+              state.sent[58].sample == 114,
           "confirmed barge stops old playback and submits all retained near speech");
   require(state.views.back().state == DeviceUiState::Speaking && state.finished.empty(),
           "old DONE and old physical completion cannot finish new answer");
@@ -479,6 +564,13 @@ int main() {
           "text-only answer and follow-up timeout");
   auto wake = Sound(0);
   wake.wake = true;
+  steps = {A(wake), User(UiActionKind::Wake)};
+  for (unsigned i = 0; i < 6; ++i) {
+    steps.push_back(A(Sound(77)));
+  }
+  require(
+      Run(steps) && state.sent.empty() && state.views.back().state == DeviceUiState::Offline,
+      "offline wake and touch cannot start an upload");
   require(Run({N(Net(LinkEventKind::Online)), A(wake), Delay(6001)}) && state.sent.empty() &&
               state.views.back().state == DeviceUiState::Idle,
           "wake timeout never creates empty START");
@@ -492,9 +584,7 @@ int main() {
   require(Run(Question(), {SendResult::Ok, SendResult::Ok, SendResult::Backpressure}) &&
               Count("end") == 0 && Count("cancel") == 1,
           "PCM backpressure cancels instead of committing truncated input");
-  require(Run(Question(),
-              {SendResult::Ok, SendResult::Ok, SendResult::Ok, SendResult::Backpressure}) &&
-              Count("cancel") == 1,
+  require(Run(Question(), EndBackpressure()) && Count("cancel") == 1,
           "END backpressure remains a failure");
   require(Run(Question(), {SendResult::Disconnected}) &&
               state.views.back().state == DeviceUiState::Offline,
@@ -531,7 +621,7 @@ int main() {
   steps.pop_back();
   steps.push_back(N(Net(LinkEventKind::Error, 1)));
   steps.push_back(A(Sound(99, false, true)));
-  require(Run(steps) && Count("pcm") == 1 && Count("end") == 0 && Count("cancel") == 1,
+  require(Run(steps) && Count("pcm") == 40 && Count("end") == 0 && Count("cancel") == 1,
           "provider error during upload stops immediately");
 
   steps = Question();
@@ -539,10 +629,15 @@ int main() {
   steps.push_back(Delay(20));
   steps.push_back(N(Net(LinkEventKind::Online)));
   steps.push_back(A(wake));
-  steps.push_back(A(Sound(55, true, true)));
+  for (int i = 0; i < 6; ++i) {
+    steps.push_back(A(Sound(55)));
+  }
+  for (int i = 0; i < 35; ++i) {
+    steps.push_back(A(Sound(0, false, true)));
+  }
   steps.push_back(N(Reply(1)));
   steps.push_back(Delay(20));
-  require(Run(steps) && Count("pcm") == 3 && state.sent.back().generation == 2 &&
+  require(Run(steps) && Count("pcm") == 82 && state.sent.back().generation == 2 &&
               state.played.empty(),
           "reconnect uses a new generation without retransmitting or accepting old audio");
   steps = Question();
