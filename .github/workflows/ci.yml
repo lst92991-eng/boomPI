@@ -74,10 +74,6 @@ jobs:
       - name: Run C++ host tests
         run: ctest --preset host-debug
 
-      - name: Confirm real VoiceTransport loopback ran
-        if: runner.os == 'Linux'
-        run: ctest --preset host-debug --tests-regex '^voice-transport-loopback$' --output-on-failure
-
       - name: Run Go tests
         working-directory: server
         run: go test ./...

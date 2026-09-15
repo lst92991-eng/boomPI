@@ -22,9 +22,9 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
   boompi_test_options(boompi_voice_client_config_test)
   add_test(NAME voice-client-config-contract COMMAND boompi_voice_client_config_test)
 
-  # 链接实际应用源；测试只提供模块 I/O 与时钟，不再包含生产 .cpp 文件。
+  # 链接实际应用源；测试只提供模块 I/O，不再包含生产 .cpp 文件。
   add_executable(boompi_voice_client_harness tests/voice_client_harness_test.cpp
-    src/application/voice_client.cpp src/audio/speech.cpp src/audio/audio_level.cpp src/config/voice_client_config.cpp)
+    src/application/voice_client.cpp src/audio/speech.cpp src/config/voice_client_config.cpp)
   boompi_test_options(boompi_voice_client_harness)
   target_include_directories(boompi_voice_client_harness PRIVATE src/platform/rv1106)
   target_link_libraries(boompi_voice_client_harness PRIVATE Threads::Threads)
@@ -63,11 +63,11 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
   endif()
 
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # 硬件实现也严格编译；Host场景运行时只用ALSA设备替身，不声称运行了真板。
+    # 真实Linux系统边界也严格编译；运行时替身不应掩盖生产源的构建错误。
     find_package(ALSA REQUIRED)
     add_library(boompi_audio_platform_compile OBJECT
-      src/platform/rv1106/alsa_audio.cpp
-      src/platform/rv1106/audio_thread.cpp)
+      src/platform/rv1106/audio_capture.cpp
+      src/platform/rv1106/audio_thread.cpp src/network/network_setup.cpp)
     boompi_test_options(boompi_audio_platform_compile)
     target_include_directories(boompi_audio_platform_compile PRIVATE
       src/platform/rv1106 tests/support)
@@ -82,18 +82,13 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
       tests/support/audio_thread.cpp ${BOOMPI_AUDIO_SOURCES})
     boompi_test_options(boompi_audio_flow_test)
     target_include_directories(boompi_audio_flow_test BEFORE PRIVATE tests/support)
-    target_include_directories(boompi_audio_flow_test PRIVATE src/audio src/platform/rv1106)
+    target_include_directories(boompi_audio_flow_test PRIVATE src/audio src/platform/rv1106 ${ALSA_INCLUDE_DIRS})
     # BSP使用的旧FFmpeg接口在Host FFmpeg 6中标记deprecated；仅此源允许该兼容警告。
     set_source_files_properties(src/platform/rv1106/audio_convert.cpp PROPERTIES
       COMPILE_OPTIONS "-Wno-error=deprecated-declarations")
     target_link_libraries(boompi_audio_flow_test PRIVATE Threads::Threads
       PkgConfig::BOOMPI_HOST_AUDIO)
-    foreach(scenario IN ITEMS sub-grace-jitter confirmed-gap short-tail
-        bounded-close bounded-capture no-capture-command reset-preserves-pcm
-        queue-results open-clears-error playback-clears-error
-        playback-owner-order playback-prepare-failure drop-blocked-render drop-blocked-drain
-        close-blocked-render voice-preroll voice-follow-up-boundary voice-barge-lifecycle
-        modules-format modules-detection)
+    foreach(scenario IN ITEMS modules-format modules-detection voice-preroll playback capture)
       add_test(NAME audio-flow-${scenario} COMMAND boompi_audio_flow_test ${scenario})
     endforeach()
   endif()
@@ -101,13 +96,14 @@ endif()
 
 if(BOOMPI_TARGET_RV1106 AND BOOMPI_BUILD_AEC_LOOP_HIL)
   add_executable(boompi_aec_loop_hil tests/hil/aec_loop_hil.cpp
-    ${BOOMPI_AUDIO_SOURCES} src/platform/rv1106/alsa_audio.cpp
+    ${BOOMPI_AUDIO_SOURCES} src/platform/rv1106/audio_capture.cpp
     src/platform/rv1106/audio_thread.cpp)
   boompi_test_options(boompi_aec_loop_hil)
   target_include_directories(boompi_aec_loop_hil PRIVATE src/audio src/platform/rv1106)
   target_include_directories(boompi_aec_loop_hil SYSTEM PRIVATE
-    "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}" "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}")
-  target_link_libraries(boompi_aec_loop_hil PRIVATE boompi_snowboy_bridge
+    "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}" "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}"
+    "${BOOMPI_SNOWBOY_INCLUDE_DIR}")
+  target_link_libraries(boompi_aec_loop_hil PRIVATE boompi_vendor::snowboy
     boompi_vendor::rockchip_3a_aec boompi_webrtc_vad ALSA::ALSA
     "${BOOMPI_SWRESAMPLE_LIBRARY}" "${BOOMPI_AVUTIL_LIBRARY}"
     Threads::Threads ${CMAKE_DL_LIBS} atomic)

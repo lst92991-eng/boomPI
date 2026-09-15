@@ -7,6 +7,7 @@
 #include <new>
 #include <type_traits>
 
+#include "board_voice_profile.h"
 #include "rkaudio_preprocess.h"
 
 namespace boompi::rockchip_3a {
@@ -16,20 +17,14 @@ namespace {
 // 当前read_size配置为256，产品层以320 samples/20 ms交付；不据此断言SDK只支持256。
 constexpr int kVendorBlockSamples = 256;
 constexpr std::size_t kVendorInputChannels = 3U;
-constexpr std::size_t kOutputFifoSamples = 640U;
+constexpr std::size_t kOutputFifoSamples = 2 * audio::kVoiceFrameSamples;
+static_assert(kVendorBlockSamples > 0 && kVendorBlockSamples <= audio::kVoiceFrameSamples);
 void* handle{nullptr};
 RKAUDIOParam* parameters{nullptr};
 std::array<std::int16_t, kVendorBlockSamples * kVendorInputChannels> input_block{};
 std::array<std::int16_t, kOutputFifoSamples> output_fifo{};
-std::size_t input_count{0U}, output_count{0U};
-audio::CaptureMetadata previous_metadata{};
+std::size_t input_shorts{0U}, output_count{0U};
 
-void ResetFifos(bool prime_output) noexcept {
-  output_fifo.fill(0);
-  input_count = 0U;
-  output_count = prime_output ? audio::kVoiceFrameSamples : 0U;
-  previous_metadata = {};
-}
 constexpr int kVendorInputShorts = kVendorBlockSamples * kVendorInputChannels;
 constexpr int kVendorOutputBytes = kVendorBlockSamples * static_cast<int>(sizeof(std::int16_t));
 constexpr int kMainFeatureMask = RKAUDIO_EN_AEC | RKAUDIO_EN_BF;
@@ -52,10 +47,7 @@ static_assert(std::is_same<decltype(&rkaudio_preprocess_destory), DestroySignatu
 static_assert(kBeamformingFeatureMask == 1109, "validated Rockchip 3A profile changed");
 }  // namespace
 
-bool open(int delay_samples) noexcept {
-  if (handle || parameters || delay_samples < 0 || delay_samples % kVendorBlockSamples != 0) {
-    return false;
-  }
+bool open() noexcept {
   parameters = new (std::nothrow) RKAUDIOParam{};
   if (!parameters) {
     return false;
@@ -75,7 +67,7 @@ bool open(int delay_samples) noexcept {
   aec->pos = 1;
   aec->model_aec_en = 0;
   aec->drop_ref_channel = 0;
-  aec->delay_len = delay_samples;
+  aec->delay_len = audio::board::kAecDelaySamples;
   bf->model_bf_en = kBeamformingFeatureMask;
   bf->Targ = 4;
   bf->ref_pos = 1;
@@ -91,9 +83,11 @@ bool open(int delay_samples) noexcept {
   anr->swU = 1;
   anr->fGmin = 0.01F;
   anr->InterV = 1;
+  // 去混响：保留当前房间衰减预置。
   auto* dereverb = static_cast<RKAudioDereverbParam*>(bf->dereverb_para);
   dereverb->curveLg = 20;
   dereverb->T60 = 0.4F;
+  // 双讲保护：配置厂商算法，不把功能位当成用户插话事件。
   auto* dtd = static_cast<RKDTDParam*>(bf->dtd_para);
   dtd->ksiThd_high = 0.70F;
   dtd->ksiThd_low = 0.50F;
@@ -103,7 +97,9 @@ bool open(int delay_samples) noexcept {
     close();
     return false;
   }
-  ResetFifos(true);
+  input_shorts = 0;
+  output_count = audio::kVoiceFrameSamples;
+  output_fifo.fill(0);
   return true;
 }
 
@@ -117,33 +113,19 @@ void close() noexcept {
     delete parameters;
     parameters = nullptr;
   }
-  ResetFifos(false);
 }
 
-bool process(const audio::CaptureChannels& input, audio::VoiceFrame16k* const pcm,
-             audio::CaptureMetadata* const metadata) noexcept {
-  if (pcm == nullptr || metadata == nullptr) {
-    return false;
-  }
-  *pcm = {};
-  *metadata = {};
-  if (!handle) {
-    return false;
-  }
-  // 跨帧余数留在同一个256样本块中；每个输入样本只复制一次，不搬移整帧FIFO。
-  for (std::size_t i = 0U; i < audio::kVoiceFrameSamples; ++i) {
-    const std::size_t base = input_count * kVendorInputChannels;
-    input_block[base] = input.mic_left[i];
-    input_block[base + 1U] = input.mic_right[i];
-    input_block[base + 2U] = input.reference_left[i];
-    if (++input_count != kVendorBlockSamples) {
-      continue;
+bool process(const audio::CaptureChannels& input, audio::VoiceFrame16k& pcm) noexcept {
+  // 上一步已提供交错PCM，直接填厂商块；保留跨帧余数，不再拆平面又重新交织。
+  for (std::size_t offset = 0; offset < input.size();) {
+    const auto count = std::min(input.size() - offset, input_block.size() - input_shorts);
+    std::copy_n(input.data() + offset, count, input_block.data() + input_shorts);
+    offset += count;
+    input_shorts += count;
+    if (input_shorts < input_block.size()) {
+      break;
     }
-    // 先检查剩余容量，再让vendor直接写入，避免独立中转数组与第二次复制。
-    if (output_count > kOutputFifoSamples - kVendorBlockSamples) {
-      close();
-      return false;
-    }
+    // 上次剩余输出+未成块输入共320点；本次再输入320，输出永远不超过640。
     int wakeup_status = 0;
     const int result =
         rkaudio_preprocess_short(handle, reinterpret_cast<short*>(input_block.data()),
@@ -154,24 +136,14 @@ bool process(const audio::CaptureChannels& input, audio::VoiceFrame16k* const pc
       close();
       return false;
     }
-    input_count = 0U;
+    input_shorts = 0U;
     output_count += kVendorBlockSamples;
   }
-  if (output_count < pcm->size()) {
-    close();
-    return false;
-  }
   // 每次对外稳定取出 320 samples；prime 的静音使输入、输出始终保持固定 20 ms 延迟。
-  std::copy_n(output_fifo.data(), pcm->size(), pcm->data());
-  output_count -= pcm->size();
-  std::memmove(output_fifo.data(), output_fifo.data() + pcm->size(),
+  std::copy_n(output_fifo.data(), pcm.size(), pcm.data());
+  output_count -= pcm.size();
+  std::memmove(output_fifo.data(), output_fifo.data() + pcm.size(),
                output_count * sizeof(std::int16_t));
-  *metadata = previous_metadata;
-  if (metadata->timestamp_us == 0U) {
-    // 首次输出是预置静音，没有上一帧时刻；用当前观测时刻占位，电平/参考仍保持静音初值。
-    metadata->timestamp_us = input.metadata.timestamp_us;
-  }
-  previous_metadata = input.metadata;
   return true;
 }
 

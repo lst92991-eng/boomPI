@@ -2,101 +2,96 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
 #include <thread>
 
-#include "alsa_audio.h"
+#include "audio_capture.h"
 #include "audio_convert.h"
 #include "audio_thread.h"
-#include "board_voice_profile.h"
 #include "boompi/platform/rv1106/rockchip_3a.h"
-#include "frame_queue.h"
+#include "vad.h"
+#include "wake.h"
 
 namespace boompi::voice_input {
 namespace {
-constexpr std::size_t kCaptureSlots = audio::VoiceFrameContract::FramesForMs(80U);
+constexpr std::size_t kCaptureSlots = 80 / audio::kFrameMs;
 std::mutex mutex;
 std::condition_variable condition;
 std::thread thread;
-std::atomic<bool> stop{false};
-bool opened{false}, failed{false};
+std::atomic<bool> wake_reset{false};
 std::array<char, 192U> failure{};
-audio::FrameQueue<audio::CaptureFrame, kCaptureSlots> frames;
+std::array<audio::CaptureFrame, kCaptureSlots> frames;
+std::size_t read_at{0}, pending{0};
 // 大块工作内存随模块预分配，采集实时循环不分配或借用应用缓冲。
 audio::RawCaptureFrame raw;
 audio::CaptureChannels channels;
 
-std::uint64_t sequence{0U};
-
-bool Fail(const char* reason) {
+bool Fail(const char* reason, int code = 0) {
   std::lock_guard<std::mutex> lock(mutex);
-  std::snprintf(failure.data(), failure.size(), "%s", reason);
-  failed = true;
+  std::snprintf(failure.data(), failure.size(), code ? "%s (ALSA %d)" : "%s", reason, code);
   condition.notify_all();
   return false;
 }
 
-bool ResetFrontEnd() {
-  if (!audio_convert::reset_capture()) {
-    return Fail("capture resampler reset failed");
-  }
-  rockchip_3a::close();
-  if (!rockchip_3a::open(audio::board::kAecDelaySamples)) {
-    return Fail("Rockchip 3A initialization failed");
-  }
-  return true;
-}
-
 void CaptureTask() {
   audio::SetAudioThreadPriority("boompi-capture", 40);
-  while (!stop.load()) {
-    // 原始读取 → 联合降采样 → 3A → 交付；这里不接收网络或业务命令。
-    raw.discontinuity = false;
-    if (!alsa_audio::read(raw.pcm.data(), &raw.discontinuity)) {
-      if (!stop.load()) {
-        Fail(alsa_audio::capture_error().c_str());
+  for (;;) {
+    // 读取 → 必要格式适配 → 3A → 唤醒 → VAD → 交付。
+    const int captured = audio_capture::read(raw.data());
+    if (captured < 0) {
+      if (captured != -ECANCELED) {
+        Fail("ALSA capture read failed", captured);
       }
       break;
     }
-    if (stop.load()) {
-      break;
-    }
-    raw.timestamp_us =
-        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                       std::chrono::steady_clock::now().time_since_epoch())
-                                       .count());
     audio::CaptureFrame frame{};
-    if (raw.discontinuity) {
-      if (!ResetFrontEnd()) {
+    if (captured == 0) {
+      rockchip_3a::close();
+      if (!audio_convert::reset_capture() || !rockchip_3a::open() || !wake::reset() ||
+          !vad::reset()) {
+        Fail("audio processing reset after discontinuity failed");
         break;
       }
       frame.discontinuity = true;
     } else {
-      if (!audio_convert::capture(raw, &channels)) {
+      // Snowboy要求外部VAD句尾后Reset；只由本线程调用，不等待业务线程握手。
+      if (wake_reset.exchange(false) && !wake::reset()) {
+        Fail("Snowboy reset failed");
+        break;
+      }
+      if (!audio_convert::capture(raw, channels)) {
         Fail("capture resampler lost frame alignment");
         break;
       }
-      audio::CaptureMetadata metadata;
-      if (!rockchip_3a::process(channels, &frame.pcm, &metadata)) {
+      if (!rockchip_3a::process(channels, frame.pcm)) {
         Fail("Rockchip 3A rejected a frame");
         break;
       }
-      frame.timestamp_us = metadata.timestamp_us;
-      frame.input_dbfs = metadata.input_dbfs;
-      frame.reference_active = metadata.reference_active;
+      const int detected = wake::detect(frame.pcm);
+      if (detected < 0) {
+        Fail("Snowboy processing failed");
+        break;
+      }
+      frame.wake = detected > 0;
+      const int voice = vad::process(frame.pcm);
+      if (voice < 0) {
+        Fail("WebRTC VAD processing failed");
+        break;
+      }
+      frame.vad_now = voice == 1;
     }
     // 队列满显式发布断点，应用必须取消残缺输入，不能悄悄跳过PCM。
-    frame.output = playback::observe();
     std::lock_guard<std::mutex> lock(mutex);
-    frame.sequence = sequence++;
-    if (frame.discontinuity || frames.Size() == kCaptureSlots) {
-      frame.actor_overrun = !frame.discontinuity;
+    if (frame.discontinuity || pending == kCaptureSlots) {
       frame.discontinuity = true;
-      frames.Clear();
+      read_at = pending = 0;
     }
-    static_cast<void>(frames.Push(frame));
+    frames[(read_at + pending) % kCaptureSlots] = frame;
+    ++pending;
     condition.notify_all();
   }
 }
@@ -104,35 +99,34 @@ void CaptureTask() {
 }  // namespace
 
 bool open() {
-  if (opened) {
-    return false;
-  }
   failure.fill('\0');
-  failed = false;
-  if (!alsa_audio::open_capture(audio::kCapturePcm)) {
-    return Fail(alsa_audio::capture_error().c_str());
+  const int result = audio_capture::open();
+  if (result < 0) {
+    return Fail("ALSA capture initialization failed", result);
   }
-  if (!audio_convert::open_capture(audio::board::kLeftMicPolarity,
-                                   audio::board::kRightMicPolarity)) {
+  if (!audio_convert::open_capture()) {
     close();
     return Fail("capture resampler initialization failed");
   }
-  if (!ResetFrontEnd()) {
+  if (!rockchip_3a::open()) {
     close();
-    return false;
+    return Fail("Rockchip 3A initialization failed");
   }
-  stop.store(false);
-  frames.Clear();
-  sequence = 0U;
-  opened = true;
+  if (!wake::open()) {
+    close();
+    return Fail("Snowboy initialization failed");
+  }
+  if (!vad::open()) {
+    close();
+    return Fail("WebRTC VAD initialization failed");
+  }
+  wake_reset.store(false);
+  read_at = pending = 0;
   return true;
 }
 
 bool start() {
   // 由应用在两个PCM均配置成功后启动；不假设Mode1允许输出open之前先read。
-  if (!opened || thread.joinable() || failed) {
-    return false;
-  }
   try {
     thread = std::thread(CaptureTask);
   } catch (...) {
@@ -142,41 +136,42 @@ bool start() {
   return true;
 }
 
-ReadResult read(audio::CaptureFrame* frame, std::chrono::milliseconds timeout) {
-  if (frame == nullptr || timeout < std::chrono::milliseconds::zero()) {
-    return ReadResult::Failed;
-  }
+ReadResult read(audio::CaptureFrame& frame) {
   std::unique_lock<std::mutex> lock(mutex);
-  if (!opened || !condition.wait_for(lock, timeout, [] {
-        return stop.load() || failed || frames.Size() != 0U;
+  if (!condition.wait_for(lock, std::chrono::milliseconds(20), [] {
+        return failure[0] || pending != 0;
       })) {
-    return opened ? ReadResult::Timeout : ReadResult::Failed;
+    return ReadResult::Timeout;
   }
-  if (stop.load() || failed) {
+  if (failure[0]) {
     return ReadResult::Failed;
   }
-  static_cast<void>(frames.Pop(frame));
+  frame = frames[read_at];
+  read_at = (read_at + 1) % kCaptureSlots;
+  --pending;
   return ReadResult::Frame;
+}
+void end_utterance() noexcept {
+  wake_reset.store(true);
 }
 std::string error() {
   std::lock_guard<std::mutex> lock(mutex);
-  return failure[0] != '\0' ? std::string(failure.data()) : alsa_audio::capture_error();
+  return failure.data();
 }
 void close() {
-  stop.store(true);
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    condition.notify_all();
+  const int interrupted = audio_capture::interrupt();
+  if (interrupted < 0) {
+    Fail("ALSA capture stop failed", interrupted);
   }
-  alsa_audio::interrupt_capture();
   if (thread.joinable()) {
     thread.join();
   }
-  alsa_audio::close_capture();
+  audio_capture::close();
   audio_convert::close_capture();
   rockchip_3a::close();
+  wake::close();
+  vad::close();
   std::lock_guard<std::mutex> lock(mutex);
-  opened = false;
-  frames.Clear();
+  read_at = pending = 0;
 }
 }  // namespace boompi::voice_input

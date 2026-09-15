@@ -2,43 +2,37 @@
 
 ## 初始化
 
-App_Init依次打开voice_input（原始输入、转换器和3A）、wake、vad、playback；两路PCM准备好以后start输入线程，最后open网络。失败后main调用App_Close，按网络、播放、输入、检测器的顺序回收。
+App_Init依次打开输入、播放，然后启动输入线程和网络。输入open顺序为ALSA、重采样器、Rockchip 3A、Snowboy、VAD；两路PCM都配置后才首次读取。main的成功和失败出口共用App_Close，先停止线程再释放资源。
 
-## 输入处理线程
+## 输入任务的真实调用
 
-`client/src/audio/voice_input.cpp` 的CaptureTask执行以下真实调用，源码在每步之间检查失败和停止：
+在[voice_input.cpp](../../client/src/audio/voice_input.cpp)的CaptureTask中：
 
 ```cpp
-alsa_audio::read(raw.pcm.data(), &raw.discontinuity);
-audio_convert::capture(raw, &channels);
-rockchip_3a::process(channels, &frame.pcm, &metadata);
-frame.output = playback::observe();
+const int captured = audio_capture::read(raw.data());
+// captured < 0报错；0表示断流并重置算法，不能拼接旧前缀。
+audio_convert::capture(raw, channels);
+rockchip_3a::process(channels, frame.pcm);
+const int detected = wake::detect(frame.pcm);
+const int voice = vad::process(frame.pcm);
+// voice < 0报错，0无声，1人声。
+frame.vad_now = voice == 1;
 ```
 
-只有原始PCM操作在alsa_audio中。3A和重采样由输入任务显式调用，不再把整条流水线藏在名为采集的API内。断流复位滤波/3A并交付断点，不能把前后两段拼成连续输入。
+这是实际调用摘录；完整代码逐步检查返回值，最后通过四帧有界交接交付给应用。算法之间不排队。
 
-## 应用线程
+## 一句话怎样形成
 
-`App_ReadSpeech`取处理帧，依次调用wake::detect、vad::process、speech::update，然后START、按顺序发送借用PCM、最后END。VAD负值立即作为错误；语句模块决定是否开口或结束，不再由VAD库封装决定业务。
+在[应用主流程](../../client/src/application/voice_client.cpp)中，仅Listening或Speaking时调用speech::update。进入监听时speech::reset清空历史与计数。
 
-Result只借用句首环/当前帧；调用下一次update/listen/reset前必须消费。当前帧已在前滚环时只发送一次，尾帧先PCM后END。发送失败立即CANCEL并丢弃剩余借用，不构造第二份PCM事件数组。
+1. 未确认时在500ms环中保留PCM。
+2. 连续120ms人声确认，返回start和历史PCM地址，当前帧已包含在其中。
+3. 确认后直接交付当前PCM地址；700ms静音或60s媒体上限同时返回end。
 
-应用状态为Idle/Listening/WaitingReply/Speaking，在线和已START由网络已有状态表示。声学准入集中在speech：原始麦准入、600ms AEC预热、300ms自然尾音、400ms追问，以及候选→静音→等参考→清尾音→确认插话。playback只提供渲染事实与播放服务，不管理问答。
+应用依次调用voice_net::start(replacing)、send(每帧)、end()。插话时先取消旧播放，触发插话的同一句话直接成为新问题。网络分配轮次号并退休旧回复。发送失败时取消本轮，不再访问这批借用数据。
 
-## 播放
+## 回复和尾播
 
-App_ReceiveReply直接begin/write。网络验证包序号，playback隔离generation并维护容量。DONE只finish输入，播放线程先取滤波有效尾音再drain；物理播完才追问。取消与关闭会中断旧write/drain，新一轮不得抢过旧收尾；真实设备失败不能被取消掩盖。
+receive_reply把AUDIO交给playback::write，DONE调用finish；只有status返回Drained才开始3s追问。网络校验轮次与连续性；播放只管理有界采样环、声卡与取消完成屏障。两者都不理解云端模型。
 
-## 文件
-
-| 职责 | 文件（相对client/src） |
-| --- | --- |
-| 原始声卡配置/读写 | platform/rv1106/alsa_audio.cpp |
-| 实时输入处理/交接 | audio/voice_input.cpp |
-| 3A配置/处理/释放 | platform/rv1106/rockchip_3a.cpp |
-| 唤醒、逐块VAD | platform/rv1106/wake.cpp、vad.cpp |
-| 语句/前滚/追问/插话策略 | audio/speech.cpp |
-| 播放/取消/尾播 | audio/playback.cpp |
-| 固定文本控制和WSS | network/voice_codec.cpp、voice_net.cpp |
-
-Host使用真实处理胶水、FFmpeg和任务，仅声卡调用/vendor核心由替身提供；不代表真实声卡、ABI、声学或云端验收。当前按职责预算统计见[本轮记录](../test/budget-refactor.md)。
+没有静音试探、参考等待、额外电平门限、预热/尾音屏蔽或二次确认。实际AEC、自激与弱声体验待上板调整。硬件48k适配及厂商256点块仍需匹配SDK与真板证据才能进一步删除。见[所有权](../architecture/audio-runtime.md)及[验证记录](../test/audio-unified-refactor.md)。

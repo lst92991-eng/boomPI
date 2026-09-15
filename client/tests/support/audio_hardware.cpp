@@ -1,19 +1,22 @@
 #include "audio_hardware.h"
 
+#include <alsa/asoundlib.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <thread>
 
-#include "alsa_audio.h"
+#include "audio_capture.h"
 
 namespace boompi::test::audio_hardware {
 namespace {
 struct Hardware {
   std::mutex mutex;
   std::condition_variable changed;
-  std::deque<audio::RawCaptureFrame> captures;
+  std::deque<std::pair<audio::RawCaptureFrame, bool>> captures;
   std::vector<std::int16_t> written;
   std::vector<std::string> operations;
   std::size_t reads{0}, interrupts{0}, writes{0}, drains{0}, prepares{0};
@@ -63,9 +66,9 @@ void reset() {
   hardware.block = PlaybackBlock::None;
   hardware.capture_thread = hardware.playback_thread = {};
 }
-void push_capture(const audio::RawCaptureFrame& frame) {
+void push_capture(const audio::RawCaptureFrame& frame, bool gap) {
   std::lock_guard<std::mutex> lock(hardware.mutex);
-  hardware.captures.push_back(frame);
+  hardware.captures.emplace_back(frame, gap);
   hardware.changed.notify_all();
 }
 void block_playback(PlaybackBlock stage) {
@@ -134,24 +137,16 @@ std::vector<std::string> operations() {
 }
 }  // namespace boompi::test::audio_hardware
 
-namespace boompi::alsa_audio {
+namespace boompi::audio_capture {
 namespace hw = test::audio_hardware;
-
-bool open_capture(const std::string&) noexcept {
+int open() noexcept {
   std::lock_guard<std::mutex> lock(hw::hardware.mutex);
   hw::hardware.capture_open = !hw::hardware.fail_capture_open;
   hw::hardware.capture_interrupted = false;
   hw::hardware.operations.push_back("capture.open");
-  return hw::hardware.capture_open;
+  return hw::hardware.capture_open ? 0 : -EIO;
 }
-bool open_playback(const std::string&) noexcept {
-  std::lock_guard<std::mutex> lock(hw::hardware.mutex);
-  hw::hardware.playback_open = true;
-  hw::hardware.playback_interrupted = false;
-  hw::hardware.operations.push_back("playback.open");
-  return true;
-}
-bool read(std::int16_t* output, bool* discontinuity) noexcept {
+int read(std::int16_t* output) noexcept {
   std::unique_lock<std::mutex> lock(hw::hardware.mutex);
   hw::hardware.capture_thread = std::this_thread::get_id();
   ++hw::hardware.reads;
@@ -160,17 +155,47 @@ bool read(std::int16_t* output, bool* discontinuity) noexcept {
     return !hw::hardware.capture_open || hw::hardware.capture_interrupted ||
            !hw::hardware.captures.empty();
   });
-  if (!hw::hardware.capture_open || hw::hardware.capture_interrupted || output == nullptr ||
-      discontinuity == nullptr) {
-    return false;
+  if (!hw::hardware.capture_open || hw::hardware.capture_interrupted || output == nullptr) {
+    return hw::hardware.capture_interrupted ? -ECANCELED : -EIO;
   }
   const auto frame = hw::hardware.captures.front();
   hw::hardware.captures.pop_front();
-  std::copy(frame.pcm.begin(), frame.pcm.end(), output);
-  *discontinuity = frame.discontinuity;
-  return true;
+  std::copy(frame.first.begin(), frame.first.end(), output);
+  return frame.second ? 0 : static_cast<int>(audio::kDeviceFrameSamples);
 }
-bool prepare_playback() noexcept {
+int interrupt() noexcept {
+  std::lock_guard<std::mutex> lock(hw::hardware.mutex);
+  hw::hardware.capture_interrupted = true;
+  ++hw::hardware.interrupts;
+  hw::hardware.operations.push_back("capture.interrupt");
+  hw::hardware.changed.notify_all();
+  return 0;
+}
+void close() noexcept {
+  std::lock_guard<std::mutex> lock(hw::hardware.mutex);
+  hw::hardware.capture_open = false;
+  hw::hardware.operations.push_back("capture.close");
+  hw::hardware.changed.notify_all();
+}
+}  // namespace boompi::audio_capture
+namespace hw = boompi::test::audio_hardware;
+extern "C" {
+int snd_pcm_open(snd_pcm_t** output, const char*, snd_pcm_stream_t, int) {
+  std::lock_guard<std::mutex> lock(hw::hardware.mutex);
+  hw::hardware.playback_open = true;
+  hw::hardware.playback_interrupted = false;
+  hw::hardware.operations.push_back("playback.open");
+  *output = reinterpret_cast<snd_pcm_t*>(&hw::hardware);
+  return 0;
+}
+int snd_pcm_set_params(snd_pcm_t*, snd_pcm_format_t format, snd_pcm_access_t access,
+                       unsigned channels, unsigned rate, int resample, unsigned) {
+  return format == SND_PCM_FORMAT_S16_LE && access == SND_PCM_ACCESS_RW_INTERLEAVED &&
+                 channels == 2 && rate == 48000 && resample == 0
+             ? 0
+             : -EINVAL;
+}
+int snd_pcm_prepare(snd_pcm_t*) {
   std::unique_lock<std::mutex> lock(hw::hardware.mutex);
   hw::hardware.playback_thread = std::this_thread::get_id();
   hw::hardware.owner_valid &= hw::hardware.playback_thread != hw::hardware.capture_thread;
@@ -182,85 +207,57 @@ bool prepare_playback() noexcept {
     if (!hw::hardware.changed.wait_for(lock, std::chrono::seconds(1), [] {
           return hw::hardware.block != hw::PlaybackBlock::Prepare;
         })) {
-      return false;
+      return hw::hardware.playback_interrupted ? -ECANCELED : -EIO;
     }
   }
   hw::hardware.prepared = !hw::hardware.fail_prepare;
   hw::hardware.playback_interrupted = false;
-  return hw::hardware.prepared;
+  return hw::hardware.prepared ? 0 : -EIO;
 }
-bool write(const std::int16_t* stereo, std::size_t frames) noexcept {
+snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t*, const void* data, snd_pcm_uframes_t frames) {
+  const auto* stereo = static_cast<const std::int16_t*>(data);
   std::unique_lock<std::mutex> lock(hw::hardware.mutex);
   if (frames == 0) {
-    return !hw::hardware.playback_interrupted;
+    return hw::hardware.playback_interrupted ? -ECANCELED : 0;
   }
   if (stereo == nullptr) {
-    return false;
+    return hw::hardware.playback_interrupted ? -ECANCELED : -EIO;
   }
   ++hw::hardware.writes;
   hw::hardware.operations.push_back("playback.write");
   hw::hardware.changed.notify_all();
   if (!hw::playback_wait(hw::PlaybackBlock::Write, lock)) {
-    return false;
+    return hw::hardware.playback_interrupted ? -ECANCELED : -EIO;
   }
   // 用实际48k样本时长模拟声卡消费；取消必须打断等待，不能靠测试超时放行。
   if (hw::hardware.changed.wait_for(lock, std::chrono::microseconds(frames * 1000000 / 48000),
                                     [] {
                                       return hw::hardware.playback_interrupted;
                                     })) {
-    return false;
+    return hw::hardware.playback_interrupted ? -ECANCELED : -EIO;
   }
   hw::hardware.written.insert(hw::hardware.written.end(), stereo, stereo + frames * 2);
-  return true;
+  return static_cast<snd_pcm_sframes_t>(frames);
 }
-bool drain() noexcept {
+int snd_pcm_drain(snd_pcm_t*) {
   std::unique_lock<std::mutex> lock(hw::hardware.mutex);
   ++hw::hardware.drains;
   hw::hardware.operations.push_back("playback.drain");
-  return hw::playback_wait(hw::PlaybackBlock::Drain, lock);
+  return hw::playback_wait(hw::PlaybackBlock::Drain, lock) ? 0 : -EBADFD;
 }
-void drop() noexcept {
-  std::lock_guard<std::mutex> lock(hw::hardware.mutex);
-  hw::hardware.owner_valid &= std::this_thread::get_id() != hw::hardware.capture_thread;
-  hw::hardware.prepared = false;
-  hw::hardware.operations.push_back("playback.drop");
-}
-void interrupt_capture() noexcept {
-  std::lock_guard<std::mutex> lock(hw::hardware.mutex);
-  hw::hardware.capture_interrupted = true;
-  ++hw::hardware.interrupts;
-  hw::hardware.operations.push_back("capture.interrupt");
-  hw::hardware.changed.notify_all();
-}
-void interrupt_playback() noexcept {
+int snd_pcm_drop(snd_pcm_t*) {
   std::lock_guard<std::mutex> lock(hw::hardware.mutex);
   hw::hardware.playback_interrupted = true;
-  hw::hardware.operations.push_back("playback.interrupt");
+  hw::hardware.prepared = false;
+  hw::hardware.operations.push_back("playback.drop");
   hw::hardware.changed.notify_all();
+  return 0;
 }
-bool playback_interrupted() noexcept {
-  std::lock_guard<std::mutex> lock(hw::hardware.mutex);
-  return hw::hardware.playback_interrupted;
-}
-std::string capture_error() {
-  std::lock_guard<std::mutex> lock(hw::hardware.mutex);
-  return hw::hardware.fail_capture_open ? "ALSA capture open: injected failure" : "";
-}
-std::string playback_error() {
-  std::lock_guard<std::mutex> lock(hw::hardware.mutex);
-  return hw::hardware.fail_prepare ? "ALSA playback prepare: injected failure" : "";
-}
-void clear_playback_error() noexcept {}
-void close_capture() noexcept {
-  std::lock_guard<std::mutex> lock(hw::hardware.mutex);
-  hw::hardware.capture_open = false;
-  hw::hardware.operations.push_back("capture.close");
-  hw::hardware.changed.notify_all();
-}
-void close_playback() noexcept {
+int snd_pcm_close(snd_pcm_t*) {
   std::lock_guard<std::mutex> lock(hw::hardware.mutex);
   hw::hardware.playback_open = false;
   hw::hardware.operations.push_back("playback.close");
   hw::hardware.changed.notify_all();
+  return 0;
 }
-}  // namespace boompi::alsa_audio
+}

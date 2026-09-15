@@ -77,12 +77,12 @@ bool IsEndpoint(const config::VoiceClientConfig& server) {
 bool AtomicWrite(const char* path, const std::string& text) {
   const std::string temporary = std::string(path) + ".tmp";
   const int fd =
-      open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+      ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
   if (fd < 0) {
     return false;
   }
   if (fchmod(fd, 0600) != 0) {
-    close(fd);
+    ::close(fd);
     unlink(temporary.c_str());
     return false;
   }
@@ -104,7 +104,7 @@ bool AtomicWrite(const char* path, const std::string& text) {
   if (succeeded) {
     succeeded = fsync(fd) == 0;
   }
-  if (close(fd) != 0) {
+  if (::close(fd) != 0) {
     succeeded = false;
   }
   if (succeeded) {
@@ -132,7 +132,7 @@ bool HasIpv4(const char* interface) {
   ifreq request{};
   std::snprintf(request.ifr_name, sizeof(request.ifr_name), "%s", interface);
   const bool found = ioctl(fd, SIOCGIFADDR, &request) == 0;
-  close(fd);
+  ::close(fd);
   return found;
 }
 
@@ -147,7 +147,7 @@ bool HasIpv4(const char* interface) {
 bool RunNetworkTool(bool start_wifi, const char* interface, const std::atomic<bool>* stop) {
   const pid_t child = fork();
   if (child == 0) {
-    const int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    const int null_fd = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
     if (null_fd >= 0) {
       dup2(null_fd, STDOUT_FILENO);
       dup2(null_fd, STDERR_FILENO);
@@ -270,7 +270,7 @@ bool Discover(const char* interface, config::VoiceClientConfig* output) {
     received = recvfrom(fd, response, sizeof(response) - 1U, 0,
                         reinterpret_cast<sockaddr*>(&peer), &peer_size);
   }
-  close(fd);
+  ::close(fd);
   if (received <= 0 || peer.sin_port != htons(17807)) {
     return false;
   }

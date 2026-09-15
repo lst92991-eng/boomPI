@@ -1,21 +1,30 @@
 # 当前语音数据流与所有权
 
-ALSA只打开、读取、写入和关闭原始PCM。voice_input是独立输入处理任务，不是ALSA驱动：线程中顺序执行原始读取、双麦/refL联合重采样、3A，交付后应用执行wake、逐块VAD、speech策略、网络发送。
-
 ```text
-输入线程：alsa_audio::read → audio_convert::capture → rockchip_3a::process → 4槽交接
-应用线程：voice_input::read → wake::detect → vad::process → speech::update → voice_net
-播放线程：有界队列 → audio_convert::playback → ALSA write → 有效尾音 → drain
+输入线程：ALSA读取 → 共同重采样 → Rockchip 3A → Snowboy → WebRTC VAD → 4帧交接
+应用线程：收回复 → 取处理帧 → 语句确认/前滚 → START/PCM/END → 尾播和触摸
+播放线程：采样环 → 重采样/音量 → ALSA write → 滤波尾音 → drain
 ```
 
-不再有跨采集线程的listener reset/arm命令、应答状态或100ms握手。wake/VAD由应用线程独占，listen直接复位；网络等待不进入输入线程。两路PCM均配置后才start输入，退出中断I/O、join后释放资源。
+应用的Idle / Listening / WaitingReply / Speaking决定何时收集语句。speech只保存25帧纯PCM和语音/静音计数；普通提问、追问与插话共用120ms连续人声确认、700ms静音句尾及60s媒体上限。未确认时只进前滚，确认时当前帧已包含其中；确认后直接借用当前PCM。追问等待窗口为3s，唤醒后为6s。
 
-VAD仅返回-1/0/1。120ms人声确认、700ms句尾、60s语句上限、500ms前滚、400ms追问、AEC预热/尾音和插话探针都在speech。主状态只有Idle、Listening、WaitingReply、Speaking；连接和上传事实查询网络模块已有状态，不另存Offline/Uploading枚举或帧计数。
+已删除静音试探、参考等待、600ms预热、300ms尾音屏蔽、独立电平门限、二次确认、专用裁剪和冷却。它们是被替换的策略；单次VAD确认的自激率、弱声和双讲体验仍需用户上板评估。
 
-为防止处理排队音频时读到未来的播放结束，输入线程把当时的播放快照与PCM一起交付。playback::observe仅由输入线程消费，业务使用frame.output。3A仍把PCM与metadata一起延迟，直接写交付帧，删除中转PCM。
+## 事实的归属
 
-Mode1仍读四槽；refR始终未用于3A，现在在软件转换前丢弃，只对双麦/refL共同重采样。原始四槽不被修改。48k声卡与16k算法之间的转换尚不能凭现有资料全部删除，仍待匹配SDK/真板验证。
+- 输入帧只有PCM、wake、VAD和断点；不传递电平、参考状态、时间戳、序号或播放快照。
+- 输入任务顺序执行算法，没有算法间队列。四帧交接满或ALSA断流时显式交付断点，应用取消残缺输入。
+- Snowboy连续检测；外部VAD句尾用一个无回执标志请求Reset，仍由输入线程调用。没有listener命令槽或arm应答。
+- 网络分配轮次号，校验上下行序号并隔离旧结果。应用和播放器不重复维护轮次号；同一个应用线程消费事件并发起开始/取消。轮次号跨重连递增，关闭后重新open才重置。
+- 发送直接进入WebSocket++有界计账的队列，不再复制一份自有发送队列。库中已入队PCM按FIFO先于CANCEL；控制投递失败或持续阻塞会结束连接。
+- 播放只保存1.5s连续采样，不保存每包长度/轮次对象。队列满明确返回Full；应用取消本轮，不能跳过语音。
 
-网络独占接收sequence校验。播放只维护当前/已退休generation，取消不清水位，没有另一份highest_generation或网络序号。DONE只调用finish；取尽有效滤波尾音与ALSA后才Drained。短回答、队列满、prepare/write/drain期间取消和真实Failed锁存均有Host测试。
+## 声卡与收尾
 
-协议为[BPV4固定文本控制](../../protocol/protocol-v4.md)，板端不再依赖cJSON。服务端直接接管socket消息的PCM，去掉第二份数组；仍保留真正隔开socket读取与云端阻塞调用的有界队列。服务端继续作为Key-only课程黑箱。
+Mode1仍按48k四槽[mic0,mic1,refL,refR]读取，双麦/refL共同降采样到16k交错三通道，再直接进入3A。无整板16k双工证据，暂留底层转换，不断言硬件只能48k。3A当前256点块对接320点交付，保留640点输出FIFO及一帧初始静音。
+
+ALSA采用snd_pcm_set_params协商period/buffer，请求采集40ms、播放80ms延迟，禁止自动格式转换，采集显式start。具体协商结果尚未上板核对。软件不再叠加180ms起播等待、30ms宽限和40ms重缓冲。
+
+首包write即启动播放。DONE只finish输入；滤波器尾音和ALSA drain完成后才报告Drained并追问。取消中断正在写入/排空的声卡，播放器完成丢弃后才接收下一条流，旧尾音不进入新回答。退出先中断、join，再释放设备和算法。
+
+配套协议仍为[BPV4](../../protocol/protocol-v4.md)，没有旧协议兼容或batch ASR fallback。统计及验证边界见[本轮记录](../test/audio-unified-refactor.md)。

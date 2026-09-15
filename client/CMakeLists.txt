@@ -2,9 +2,13 @@ include(GNUInstallDirs)
 
 # 产品与Host场景执行同一条namespace语音主线，Host仅替换ALSA设备和vendor核心。
 set(BOOMPI_AUDIO_SOURCES
-  src/audio/audio_level.cpp src/audio/voice_input.cpp src/audio/playback.cpp src/audio/speech.cpp
+  src/audio/voice_input.cpp src/audio/playback.cpp src/audio/speech.cpp
   src/platform/rv1106/audio_convert.cpp src/platform/rv1106/rockchip_3a.cpp
   src/platform/rv1106/wake.cpp src/platform/rv1106/vad.cpp)
+
+# wake公开接口只有PCM、整数和bool；旧ABI局限在真正调用Snowboy的这一个源文件。
+set_source_files_properties(src/platform/rv1106/wake.cpp PROPERTIES
+  COMPILE_DEFINITIONS "_GLIBCXX_USE_CXX11_ABI=0")
 
 set(_boompi_ui_simulator_default ON)
 if(BOOMPI_TARGET_RV1106)
@@ -102,15 +106,6 @@ find_package(OpenSSL 3.5.7 EXACT CONFIG REQUIRED PATHS "${BOOMPI_OPENSSL_ROOT}"
 add_library(boompi_webrtc_vad STATIC IMPORTED)
 set_target_properties(boompi_webrtc_vad PROPERTIES IMPORTED_LOCATION "${BOOMPI_WEBRTC_VAD_LIBRARY}")
 
-add_library(boompi_snowboy_bridge STATIC src/platform/rv1106/snowboy_legacy_bridge.cpp)
-target_compile_features(boompi_snowboy_bridge PRIVATE cxx_std_17)
-target_compile_definitions(boompi_snowboy_bridge PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
-target_compile_options(boompi_snowboy_bridge PRIVATE -Wall -Wextra -Wpedantic
-  $<$<BOOL:${BOOMPI_STRICT_WARNINGS}>:-Werror>)
-target_include_directories(boompi_snowboy_bridge PRIVATE src/platform/rv1106)
-target_include_directories(boompi_snowboy_bridge SYSTEM PRIVATE "${BOOMPI_SNOWBOY_INCLUDE_DIR}")
-target_link_libraries(boompi_snowboy_bridge PRIVATE boompi_vendor::snowboy)
-
 add_executable(boompi_client
   apps/boompi_client/main.cpp
   src/application/voice_client.cpp
@@ -120,7 +115,7 @@ add_executable(boompi_client
   src/network/voice_net.cpp
   src/network/voice_codec.cpp
   src/platform/rv1106/audio_thread.cpp
-  src/platform/rv1106/alsa_audio.cpp
+  src/platform/rv1106/audio_capture.cpp
   src/platform/rv1106/display_touch.cpp
   src/ui/device_ui.cpp
   src/ui/camera_capture.cpp)
@@ -134,10 +129,11 @@ target_include_directories(boompi_client SYSTEM PRIVATE
   "${PROJECT_SOURCE_DIR}/third_party"
   "${BOOMPI_BOOST_INCLUDE_DIR}"
   "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}"
+  "${BOOMPI_SNOWBOY_INCLUDE_DIR}"
   "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}")
 target_link_libraries(boompi_client PRIVATE
   boompi_lvgl_ui
-  boompi_snowboy_bridge
+  boompi_vendor::snowboy
   boompi_vendor::rockchip_3a_aec
   boompi_webrtc_vad
   ALSA::ALSA

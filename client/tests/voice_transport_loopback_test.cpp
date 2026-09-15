@@ -308,6 +308,10 @@ class LoopbackServer final {
    *
    * hello 也计入条数，调用方须按线协议实际顺序索引；超时说明预期帧未送达。
    */
+  std::vector<CapturedMessage> Messages() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return messages_;
+  }
   std::vector<CapturedMessage> WaitMessages(std::size_t count) {
     std::unique_lock<std::mutex> lock(mutex_);
     Check(changed_.wait_for(lock, std::chrono::seconds(3),
@@ -341,7 +345,7 @@ LinkEvent WaitEvent(unsigned timeout_ms = 3000) {
   const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
   LinkEvent event;
   while (Clock::now() < deadline) {
-    if (net::poll(&event)) {
+    if (net::poll(event)) {
       return event;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -371,19 +375,19 @@ std::string Audio(std::uint32_t generation, std::uint32_t sequence, std::size_t 
   }
   return frame;
 }
-void Upload(std::uint32_t generation, bool supersede = false) {
+void Upload(bool supersede = false) {
   std::array<std::int16_t, 320> pcm{};
   pcm[0] = 0x1234;
   pcm[1] = -2;
-  Check(net::start(generation, supersede) == SendResult::Ok, "start rejected");
-  Check(net::send(generation, pcm.data()) == SendResult::Ok, "PCM rejected");
-  Check(net::end(generation) == SendResult::Ok, "end rejected");
+  Check(net::start(supersede) == SendResult::Ok, "start rejected");
+  Check(net::send(pcm) == SendResult::Ok, "PCM rejected");
+  Check(net::end() == SendResult::Ok, "end rejected");
 }
 void BasicWireAndClose() {
   LoopbackServer server;
   NetworkScope scope;
   Open(server);
-  Upload(1);
+  Upload();
   const auto messages = server.WaitMessages(4);
   Check(messages[0].payload.find("HELLO 4 16000 ") == 0, "hello contract missing");
   Check(messages[1].payload == "START 1 0", "START not separate");
@@ -398,11 +402,11 @@ void BasicWireAndClose() {
         "PCM byte order");
   Check(messages[3].payload == "END 1", "END missing");
   server.Send("TEXT 1 你好");
-  Check(WaitEvent().text == "你好", "text mismatch");
+  Check(WaitEvent().data == "你好", "text mismatch");
   server.Send(Audio(1, 0), true);
-  Check(WaitEvent().audio_size == 640, "full audio missing before DONE");
+  Check(WaitEvent().data.size() == 640, "full audio missing before DONE");
   server.Send(Audio(1, 1, 7), true);
-  Check(WaitEvent().audio_size == 14, "short tail lost");
+  Check(WaitEvent().data.size() == 14, "short tail lost");
   server.Send("DONE 1");
   Check(WaitEvent().kind == LinkEventKind::Done, "DONE missing");
   const auto began = Clock::now();
@@ -410,21 +414,21 @@ void BasicWireAndClose() {
   net::close();
   Check(Clock::now() - began < std::chrono::milliseconds(500), "close blocked");
   LinkEvent event;
-  Check(!net::poll(&event), "close retained events");
+  Check(!net::poll(event), "close retained events");
 }
 void CancelAfterEndAndOldGeneration() {
   for (bool playing : {false, true}) {
     LoopbackServer server;
     NetworkScope scope;
     Open(server);
-    Upload(1);
+    Upload();
     server.WaitMessages(4);
     if (playing) {
       server.Send(Audio(1, 0), true);
       Check(WaitEvent().kind == LinkEventKind::Audio, "playback setup");
     }
-    Check(net::cancel(2, true), "cancel after END rejected");
-    Upload(3);
+    Check(net::cancel(true), "cancel after END rejected");
+    Upload();
     const auto messages = server.WaitMessages(8);
     Check(messages[4].payload == "CANCEL 2 1", "cancel lost before START");
     server.Send(Audio(1, 8, 2), true);
@@ -440,19 +444,19 @@ void ErrorEndsUpload() {
   NetworkScope scope;
   Open(server);
   std::array<std::int16_t, 320> pcm{};
-  Check(net::start(1, false) == SendResult::Ok && net::send(1, pcm.data()) == SendResult::Ok,
+  Check(net::start(false) == SendResult::Ok && net::send(pcm) == SendResult::Ok,
         "input rejected");
   server.WaitMessages(3);
   server.Send("ERROR 1 provider_error");
   Check(WaitEvent().kind == LinkEventKind::Error, "input error rejected");
-  Check(net::send(1, pcm.data()) == SendResult::Disconnected, "failed upload continued");
+  Check(net::send(pcm) == SendResult::Disconnected, "failed upload continued");
 }
 void RejectBrokenWire() {
   for (unsigned scenario = 0; scenario < 8; ++scenario) {
     LoopbackServer server;
     NetworkScope scope;
     Open(server);
-    Upload(1);
+    Upload();
     server.WaitMessages(4);
     if (scenario == 0) {
       auto frame = Audio(1, 0);
@@ -497,15 +501,15 @@ void TlsFailureAndReconnect() {
   Check(net::open(wrong) && WaitEvent().kind == LinkEventKind::Offline, "wrong pin accepted");
   net::close();
   Open(server);
-  Upload(1);
+  Upload();
   server.WaitMessages(4);
   server.Drop();
   Check(WaitEvent().kind == LinkEventKind::Offline, "disconnect missing");
   Check(WaitEvent().kind == LinkEventKind::Online, "reconnect missing");
-  Upload(5);
+  Upload();
   server.Send(Audio(1, 0, 2), true);
-  server.Send("DONE 5");
-  Check(WaitEvent().generation == 5, "old generation survived reconnect");
+  server.Send("DONE 2");
+  Check(WaitEvent().generation == 2, "old generation survived reconnect");
 }
 void BoundedQueuesAndRetirement() {
   LoopbackServer server;
@@ -513,11 +517,11 @@ void BoundedQueuesAndRetirement() {
   Open(server);
   server.PauseReads(true);
   std::array<std::int16_t, 320> pcm{};
-  Check(net::start(1, false) == SendResult::Ok, "start blocked");
+  Check(net::start(false) == SendResult::Ok, "start blocked");
   const auto began = Clock::now();
   bool full = false;
   for (unsigned i = 0; i < 1000; ++i) {
-    auto result = net::send(1, pcm.data());
+    auto result = net::send(pcm);
     if (result == SendResult::Backpressure) {
       full = true;
       break;
@@ -526,32 +530,25 @@ void BoundedQueuesAndRetirement() {
   }
   Check(full && Clock::now() - began < std::chrono::milliseconds(200),
         "unbounded or blocking PCM queue");
-  Check(net::cancel(2, true), "cancel reserve lost");
-  Check(net::start(3, true) == SendResult::Ok, "supersede reserve lost");
-  Check(net::cancel(4, false), "second cancel reserve lost");
-  Upload(5);
+  Check(net::cancel(true), "bounded queue left no room for cancellation");
   server.PauseReads(false);
-  unsigned stage = 0;
-  std::size_t count = 1;
-  for (unsigned i = 0; i < 100 && stage < 4; ++i) {
-    auto messages = server.WaitMessages(++count);
-    const auto& message = messages[count - 1];
-    if (message.opcode == websocketpp::frame::opcode::binary) {
-      continue;
+  // 库内已入队PCM保持FIFO；取消不能越过START，也不能悄悄丢弃正文后继续同一轮。
+  const auto deadline = Clock::now() + std::chrono::seconds(2);
+  while (Clock::now() < deadline) {
+    for (const auto& message : server.Messages()) {
+      if (message.payload == "CANCEL 2 1") {
+        return;
+      }
     }
-    if (message.payload.find("HELLO ") != std::string::npos) {
-      Check(WaitEvent().kind == LinkEventKind::Offline, "silent send loss");
+    LinkEvent event;
+    if (net::poll(event) && event.kind == LinkEventKind::Offline) {
+      // 网络持续堵塞时结束连接也是明确的退休路径，不能要求库丢旧PCM腾出空间。
+      Check(!net::uploading(), "disconnected turn still uploading");
       return;
     }
-    const std::array<std::string, 4> expected = {"CANCEL 2 1", "START 3 1", "CANCEL 4 0",
-                                                 "START 5 0"};
-    if (stage == 0 && message.payload == "START 1 0") {
-      continue;
-    }
-    Check(message.payload == expected[stage], "retirement reordered or lost");
-    ++stage;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
-  Check(stage == 4, "retirement sequence incomplete");
+  throw std::runtime_error("cancel neither reached peer nor closed stalled connection");
 }
 void RejectOldHandshake() {
   for (const char* ready :
@@ -570,24 +567,20 @@ void RejectOldHandshake() {
   NetworkScope scope;
   Check(net::open(server.Config()), "open failed");
   const auto event = WaitEvent(6500);
-  Check(event.kind == LinkEventKind::Offline && event.code == "hello_timeout",
+  Check(event.kind == LinkEventKind::Offline && event.data == "hello_timeout",
         "hello timeout missing");
 }
 void RejectInvalidInputOrder() {
-  for (unsigned scenario = 0; scenario < 3; ++scenario) {
+  for (unsigned scenario = 0; scenario < 2; ++scenario) {
     LoopbackServer server;
     NetworkScope scope;
     Open(server);
     std::array<std::int16_t, 320> pcm{};
     if (scenario == 0) {
-      Check(net::send(1, pcm.data()) == SendResult::Disconnected, "PCM before START accepted");
+      Check(net::send(pcm) == SendResult::Disconnected, "PCM before START accepted");
     } else {
-      Check(net::start(1, false) == SendResult::Ok, "START failed");
-      if (scenario == 1) {
-        Check(net::end(1) == SendResult::Disconnected, "empty END accepted");
-      } else {
-        Check(net::start(1, false) == SendResult::Disconnected, "generation reused");
-      }
+      Check(net::start(false) == SendResult::Ok, "START failed");
+      Check(net::end() == SendResult::Disconnected, "empty END accepted");
     }
     Check(WaitEvent().kind == LinkEventKind::Offline, "input failure not reported");
   }
@@ -602,16 +595,16 @@ void ExternalServerSmoke(const char* host, const char* port, const char* pin) {
   Check(net::open(config) && WaitEvent().kind == LinkEventKind::Online, "server not ready");
   std::array<std::int16_t, 320> pcm{};
   pcm[0] = 0x0807;
-  Check(net::start(1, false) == SendResult::Ok && net::send(1, pcm.data()) == SendResult::Ok &&
-            net::end(1) == SendResult::Ok,
+  Check(net::start(false) == SendResult::Ok && net::send(pcm) == SendResult::Ok &&
+            net::end() == SendResult::Ok,
         "smoke input");
   bool text = false, audio = false, done = false;
   for (unsigned i = 0; i < 8 && !done; ++i) {
     auto event = WaitEvent();
     if (event.kind == LinkEventKind::Text) {
-      text = event.text == "你好";
+      text = event.data == "你好";
     } else if (event.kind == LinkEventKind::Audio) {
-      audio = event.audio_size == 4;
+      audio = event.data.size() == 4;
     } else if (event.kind == LinkEventKind::Done) {
       done = true;
     } else {
@@ -628,13 +621,21 @@ int main(int argc, char** argv) {
       ExternalServerSmoke(argv[1], argv[2], argv[3]);
       return EXIT_SUCCESS;
     }
+    std::cerr << "checking BasicWireAndClose\n";
     BasicWireAndClose();
+    std::cerr << "checking CancelAfterEndAndOldGeneration\n";
     CancelAfterEndAndOldGeneration();
+    std::cerr << "checking ErrorEndsUpload\n";
     ErrorEndsUpload();
+    std::cerr << "checking RejectBrokenWire\n";
     RejectBrokenWire();
+    std::cerr << "checking TlsFailureAndReconnect\n";
     TlsFailureAndReconnect();
+    std::cerr << "checking BoundedQueuesAndRetirement\n";
     BoundedQueuesAndRetirement();
+    std::cerr << "checking RejectOldHandshake\n";
     RejectOldHandshake();
+    std::cerr << "checking RejectInvalidInputOrder\n";
     RejectInvalidInputOrder();
   } catch (const std::exception& error) {
     net::close();

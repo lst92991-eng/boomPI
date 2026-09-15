@@ -8,19 +8,20 @@
 
 namespace boompi::test::audio_vendor {
 std::atomic<int> vad_result{1}, wake_result{0};
-std::atomic<bool> snowboy_process_ok{true};
+std::atomic<bool> snowboy_process_ok{true}, vad_init_ok{true};
+std::atomic<unsigned> wake_calls{0}, vad_calls{0}, wake_resets{0}, vad_resets{0};
 std::atomic<unsigned> dsp_calls{0}, dsp_failure_call{0};
 void reset() noexcept {
   vad_result = 1;
   wake_result = 0;
-  snowboy_process_ok = true;
+  snowboy_process_ok = vad_init_ok = true;
+  wake_calls = vad_calls = wake_resets = vad_resets = 0;
   dsp_calls = dsp_failure_call = 0;
 }
 }  // namespace boompi::test::audio_vendor
 
 using namespace boompi::test::audio_vendor;
 struct VadInst {};
-struct BoompiSnowboyLegacyHandle {};
 extern "C" {
 void* rkaudio_aec_param_init() {
   static SKVAECParameter parameters{};
@@ -60,7 +61,8 @@ void WebRtcVad_Free(VadInst* vad) {
   delete vad;
 }
 int WebRtcVad_Init(VadInst* vad) {
-  return vad == nullptr ? -1 : 0;
+  ++vad_resets;
+  return vad == nullptr || !vad_init_ok ? -1 : 0;
 }
 int WebRtcVad_set_mode(VadInst* vad, int mode) {
   return vad != nullptr && mode == 3 ? 0 : -1;
@@ -69,30 +71,10 @@ int WebRtcVad_ValidRateAndFrameLength(int rate, std::size_t samples) {
   return rate == 16000 && samples == 320 ? 0 : -1;
 }
 int WebRtcVad_Process(VadInst* vad, int rate, const std::int16_t* pcm, std::size_t samples) {
+  ++vad_calls;
   return vad != nullptr && pcm != nullptr &&
                  WebRtcVad_ValidRateAndFrameLength(rate, samples) == 0
              ? vad_result.load()
              : -1;
-}
-int boompi_snowboy_legacy_create(const char*, const char*, const char*, float,
-                                 BoompiSnowboyLegacyHandle** handle) {
-  *handle = new (std::nothrow) BoompiSnowboyLegacyHandle;
-  return *handle != nullptr;
-}
-void boompi_snowboy_legacy_destroy(BoompiSnowboyLegacyHandle* handle) {
-  delete handle;
-}
-int boompi_snowboy_legacy_reset(BoompiSnowboyLegacyHandle* handle) {
-  return handle != nullptr;
-}
-int boompi_snowboy_legacy_process_s16(BoompiSnowboyLegacyHandle* handle,
-                                      const std::int16_t* pcm, std::uint32_t samples,
-                                      std::int32_t* result) {
-  if (handle == nullptr || pcm == nullptr || samples != 320 || result == nullptr ||
-      !snowboy_process_ok) {
-    return 0;
-  }
-  *result = wake_result;
-  return 1;
 }
 }

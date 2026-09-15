@@ -1,11 +1,15 @@
 /** @file audio_convert.cpp
  * @brief 采集端保持麦克风与参考同相位，播放端保持 20 ms 的重采样节拍。
  *
- * 采集：校正双麦极性 → 四通道共同 48k→16k → 拆出双麦/refL → 计算准入元数据。
- * 播放：16k单声道 → 48k交错双声道 → 峰值限制/音量；EOS单独取出滤波尾音。
- * 两条方向各持有独立 SwrContext；Open/Close 由启动/退出路径串行管理。
+ * 采集：校正双麦极性 → 双麦/refL共同48k→16k。
+ * 播放：16k单声道 →
+ * 48k交错双声道；EOS单独取出滤波尾音。
+ * 两条方向各持有独立
+ * SwrContext；Open/Close 由启动/退出路径串行管理。
  */
 #include "audio_convert.h"
+
+#include "board_voice_profile.h"
 
 extern "C" {
 #include <libavutil/channel_layout.h>
@@ -14,76 +18,51 @@ extern "C" {
 }
 
 #include <algorithm>
-#include <cmath>
-#include <limits>
 
 namespace boompi::audio_convert {
 namespace {
-using audio::VoiceFrameContract;
 // capture和playback各自只由对应线程使用，启动/退出时分别开关，不共享滤波历史。
 SwrContext* capture_swr{nullptr};
 SwrContext* playback_swr{nullptr};
-std::int8_t left_polarity{1}, right_polarity{1};
 std::size_t playback_pending_frames{0U};
-std::array<std::int16_t, audio::kCaptureFrameSamples * 3> corrected48{};
-std::array<std::int16_t, audio::kVoiceFrameSamples * 3> interleaved16{};
-constexpr std::size_t kCaptureChannels = 3;
-constexpr int kReferencePeakThreshold = 64;
-constexpr float kPlaybackPeakLimit = 31128.0F;  // 95% 满幅，为功放保留余量。
 
-/** @brief 创建 S16 交错格式转换器；失败返回空指针，成功句柄由 本模块 回收。 */
+// 只分配并配置，open/reset在所属方向完成初始化。
 SwrContext* NewResampler(int in_rate, int in_channels, int out_rate,
                          int out_channels) noexcept {
-  SwrContext* swr = swr_alloc_set_opts(
+  return swr_alloc_set_opts(
       nullptr, av_get_default_channel_layout(out_channels), AV_SAMPLE_FMT_S16, out_rate,
       av_get_default_channel_layout(in_channels), AV_SAMPLE_FMT_S16, in_rate, 0, nullptr);
-  if (swr == nullptr || swr_init(swr) < 0) {
-    swr_free(&swr);
-  }
-  return swr;
-}
-
-/** @brief 清掉旧滤波历史并送入一帧静音；只在所属线程的控制边界调用。 */
-bool PrimeResampler(SwrContext* swr, const std::int16_t* input, int input_frames,
-                    int output_frames, std::int16_t* output) noexcept {
-  if (swr == nullptr) {
-    return false;
-  }
-  swr_close(swr);
-  if (swr_init(swr) < 0) {
-    return false;
-  }
-  const std::uint8_t* in[] = {reinterpret_cast<const std::uint8_t*>(input)};
-  std::uint8_t* out[] = {reinterpret_cast<std::uint8_t*>(output)};
-  return swr_convert(swr, out, output_frames, in, input_frames) >= 0;
 }
 }  // namespace
 
-/** @brief 去掉直流偏置再计算相对满幅电平，避免偏置抬高 VAD 准入值。 */
-
-bool open_capture(std::int8_t left, std::int8_t right) noexcept {
-  if (capture_swr != nullptr || (left != 1 && left != -1) || (right != 1 && right != -1)) {
+bool open_capture() noexcept {
+  capture_swr = NewResampler(audio::kDeviceRateHz, 4, audio::kVoiceRateHz, 3);
+  // 每行对应一个输出通道；最后一列全零，refR不进入算法。
+  const double channels[] = {audio::board::kLeftMicPolarity,
+                             0,
+                             0,
+                             0,
+                             0,
+                             audio::board::kRightMicPolarity,
+                             0,
+                             0,
+                             0,
+                             0,
+                             1,
+                             0};
+  if (!capture_swr || swr_set_matrix(capture_swr, channels, 4) < 0 || !reset_capture()) {
+    close_capture();
     return false;
   }
-  capture_swr = NewResampler(48000, kCaptureChannels, 16000, kCaptureChannels);
-  left_polarity = left;
-  right_polarity = right;
-  return capture_swr != nullptr;
+  return true;
 }
 
 bool open_playback() noexcept {
-  if (playback_swr != nullptr) {
-    return false;
-  }
-  playback_swr = NewResampler(VoiceFrameContract::output_rate_hz, 1,
-                              VoiceFrameContract::capture_rate_hz, 2);
-  if (playback_swr == nullptr) {
-    return false;
-  }
+  playback_swr = NewResampler(audio::kVoiceRateHz, 1, audio::kDeviceRateHz, 2);
   // 明确L=mono、R=mono，避免默认声道矩阵衰减；矩阵在初始化前设置。
-  swr_close(playback_swr);
   const double stereo_matrix[] = {1.0, 1.0};
-  if (swr_set_matrix(playback_swr, stereo_matrix, 1) < 0 || swr_init(playback_swr) < 0) {
+  if (!playback_swr || swr_set_matrix(playback_swr, stereo_matrix, 1) < 0 ||
+      swr_init(playback_swr) < 0) {
     close_playback();
     return false;
   }
@@ -91,76 +70,45 @@ bool open_playback() noexcept {
 }
 
 bool reset_capture() noexcept {
-  corrected48.fill(0);
-  return PrimeResampler(capture_swr, corrected48.data(), audio::kCaptureFrameSamples,
-                        audio::kVoiceFrameSamples, interleaved16.data());
+  swr_close(capture_swr);
+  if (swr_init(capture_swr) < 0) {
+    return false;
+  }
+  // 送入一块静音建立滤波历史，后续每次960点输入才能稳定交付320点。
+  const audio::RawCaptureFrame silence{};
+  const std::uint8_t* in[] = {reinterpret_cast<const std::uint8_t*>(silence.data())};
+  audio::CaptureChannels discarded;
+  std::uint8_t* out[] = {reinterpret_cast<std::uint8_t*>(discarded.data())};
+  return swr_convert(capture_swr, out, audio::kVoiceFrameSamples, in,
+                     audio::kDeviceFrameSamples) >= 0;
 }
 
 bool reset_playback() noexcept {
-  if (playback_swr == nullptr) {
-    return false;
-  }
   swr_close(playback_swr);
   playback_pending_frames = 0U;
   return swr_init(playback_swr) >= 0;
 }
 
-bool capture(const audio::RawCaptureFrame& raw, audio::CaptureChannels* output) noexcept {
-  if (capture_swr == nullptr || output == nullptr) {
-    return false;
-  }
-  *output = {};
-  // 只翻转物理麦克风；-32768 反相后先饱和，参考通道仍保留 Codec 原值。
-  for (std::size_t i = 0U; i < audio::kCaptureFrameSamples; ++i) {
-    const std::size_t base = kCaptureChannels * i;
-    const std::size_t raw_base = VoiceFrameContract::capture_channels * i;
-    const int left = raw.pcm[raw_base] * left_polarity;
-    const int right = raw.pcm[raw_base + 1U] * right_polarity;
-    corrected48[base] = static_cast<std::int16_t>(std::clamp(left, -32768, 32767));
-    corrected48[base + 1U] = static_cast<std::int16_t>(std::clamp(right, -32768, 32767));
-    corrected48[base + 2U] = raw.pcm[raw_base + 2U];
-  }
-  // 同一个转换器处理双麦/refL以保持相位；未使用的refR不再复制和重采样。
-  const std::uint8_t* in[] = {reinterpret_cast<const std::uint8_t*>(corrected48.data())};
-  std::uint8_t* out[] = {reinterpret_cast<std::uint8_t*>(interleaved16.data())};
+bool capture(const audio::RawCaptureFrame& raw, audio::CaptureChannels& output) noexcept {
+  // 直接消费原始交错PCM，库内一次完成选通道、极性与共同重采样。
+  const std::uint8_t* in[] = {reinterpret_cast<const std::uint8_t*>(raw.data())};
+  std::uint8_t* out[] = {reinterpret_cast<std::uint8_t*>(output.data())};
   const int converted =
-      swr_convert(capture_swr, out, audio::kVoiceFrameSamples, in, audio::kCaptureFrameSamples);
-  if (converted != static_cast<int>(audio::kVoiceFrameSamples)) {
-    return false;
-  }
-  for (std::size_t i = 0U; i < audio::kVoiceFrameSamples; ++i) {
-    const std::size_t base = kCaptureChannels * i;
-    output->mic_left[i] = interleaved16[base];
-    output->mic_right[i] = interleaved16[base + 1U];
-    output->reference_left[i] = interleaved16[base + 2U];
-  }
-  output->metadata.timestamp_us = raw.timestamp_us;
-  // AEC前双麦电平用于准入；AEC后电平由speech计算，不能混用。
-  output->metadata.input_dbfs =
-      std::max(ac_rms_dbfs(output->mic_left), ac_rms_dbfs(output->mic_right));
-  output->metadata.reference_active = std::any_of(
-      output->reference_left.begin(), output->reference_left.end(), [](std::int16_t sample) {
-        return sample > kReferencePeakThreshold || sample < -kReferencePeakThreshold;
-      });
-  return true;
+      swr_convert(capture_swr, out, audio::kVoiceFrameSamples, in, audio::kDeviceFrameSamples);
+  return converted == static_cast<int>(audio::kVoiceFrameSamples);
 }
 
 bool playback(const std::int16_t* pcm, std::size_t samples,
-              audio::StereoPlaybackFrame* output) noexcept {
-  if (playback_swr == nullptr || (pcm == nullptr) != (samples == 0U) ||
-      samples > audio::kTtsFrameSamples || output == nullptr) {
-    return false;
-  }
-  output->frames = 0U;
+              audio::StereoPlaybackFrame& output) noexcept {
+  output.frames = 0U;
   // FFmpeg的null flush可能吞掉不足滤波半窗的极短输入(真实库1样本回归)。
   // EOS送入只读静音来推进滤波，但输出上限仅为尚欠的有效采样时刻，不播放补齐静音。
-  static constexpr std::array<std::int16_t, audio::kTtsFrameSamples> silence{};
-  constexpr std::size_t ratio =
-      VoiceFrameContract::capture_rate_hz / VoiceFrameContract::output_rate_hz;
-  static_assert(VoiceFrameContract::capture_rate_hz % VoiceFrameContract::output_rate_hz == 0U,
+  static constexpr std::array<std::int16_t, audio::kVoiceFrameSamples> silence{};
+  constexpr std::size_t ratio = audio::kDeviceRateHz / audio::kVoiceRateHz;
+  static_assert(audio::kDeviceRateHz % audio::kVoiceRateHz == 0U,
                 "playback duration requires an integer rate ratio");
   playback_pending_frames += samples * ratio;
-  if (playback_pending_frames > audio::kPlaybackFrameCapacity) {
+  if (playback_pending_frames > 2 * audio::kPlaybackFrameCapacity) {
     return false;
   }
   if (playback_pending_frames == 0U) {
@@ -172,54 +120,21 @@ bool playback(const std::int16_t* pcm, std::size_t samples,
     samples = silence.size();
   }
   const std::uint8_t* in[] = {reinterpret_cast<const std::uint8_t*>(pcm)};
-  std::uint8_t* out[] = {reinterpret_cast<std::uint8_t*>(output->pcm.data())};
+  std::uint8_t* out[] = {reinterpret_cast<std::uint8_t*>(output.pcm.data())};
   const int converted = swr_convert(
       playback_swr, out,
       static_cast<int>(std::min(playback_pending_frames, audio::kPlaybackFrameCapacity)), in,
       static_cast<int>(samples));
-  if (converted < 0 || converted > static_cast<int>(audio::kPlaybackFrameCapacity) ||
-      (ending && converted == 0)) {
+  if (converted < 0 || (ending && converted == 0)) {
     return false;
   }
-  output->frames = static_cast<std::size_t>(converted);
-  playback_pending_frames -= output->frames;
+  output.frames = static_cast<std::size_t>(converted);
+  playback_pending_frames -= output.frames;
   return true;
-}
-
-long peak(const audio::StereoPlaybackFrame& frame) noexcept {
-  if (frame.frames > audio::kPlaybackFrameCapacity) {
-    return 0;
-  }
-  long peak = 0;
-  for (std::size_t i = 0U; i < frame.frames * 2U; ++i) {
-    peak = std::max(peak, std::abs(static_cast<long>(frame.pcm[i])));
-  }
-  return peak;
-}
-
-void apply_volume(audio::StereoPlaybackFrame* frame, float gain, long peak) noexcept {
-  if (frame == nullptr || frame->frames > audio::kPlaybackFrameCapacity) {
-    return;
-  }
-  if (!std::isfinite(gain) || gain < 0.0F) {
-    gain = 0.0F;
-  }
-  if (peak != 0 && gain * static_cast<float>(peak) > kPlaybackPeakLimit) {
-    // 同一帧使用同一个受限增益，避免对峰顶逐样本硬剪切；后续整数饱和处理数值边界。
-    gain = kPlaybackPeakLimit / static_cast<float>(peak);
-  }
-  for (std::size_t i = 0U; i < frame->frames * 2U; ++i) {
-    const long value = std::lround(static_cast<float>(frame->pcm[i]) * gain);
-    frame->pcm[i] = static_cast<std::int16_t>(
-        std::clamp<long>(value, std::numeric_limits<std::int16_t>::min(),
-                         std::numeric_limits<std::int16_t>::max()));
-  }
 }
 
 void close_capture() noexcept {
   swr_free(&capture_swr);
-  corrected48.fill(0);
-  interleaved16.fill(0);
 }
 void close_playback() noexcept {
   swr_free(&playback_swr);

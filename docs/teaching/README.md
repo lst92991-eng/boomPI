@@ -75,7 +75,7 @@ python3 scripts/teaching_lab.py 2
 
 检查名虽然叫`protocol-json-contract`，也会读取共享fixture逐字节比对音频编码和解码。上行PCM必须640字节，下行非末帧必须640字节；头部大端，PCM小端。
 
-自行解释：`generation`为什么不是设备ID？`sequence`为什么不能代替generation？常见错误是把320个样本当320字节，或把flags偏移4/5误读成两个独立字段。
+自行解释：`generation`为什么不是设备ID？`sequence`为什么不能代替generation？常见错误是把320个样本当320字节，或沿用已经删除的flags字段。
 
 ## 03 播放：先把一包音频完整地交出去
 
@@ -83,7 +83,7 @@ python3 scripts/teaching_lab.py 2
 
 源码：`client/src/audio/playback.cpp`与公开头。硬件替身在`client/tests/support/audio_hardware.cpp`，只在Host测试中选入；本关真实执行产品队列、转换和线程代码，不打开真实ALSA设备。
 
-先按数据流说明复现audio_convert并运行格式测试，再看playback::write/begin/finish，最后顺着PlaybackTask理解取帧、转换、write和尾播结束。
+先按数据流说明复现audio_convert并运行格式测试，再看playback::write/finish，最后顺着play理解取帧、转换、write和尾播结束。
 
 当前契约是一包一槽：1～320样本，短帧只能是最后一包，后面不允许继续追加。队列满必须拒绝，不能覆盖尚未播放的槽。使用槽数定位入队位置，有效样本数仅保留在槽中，不再维护第二份总样本水位计数。
 
@@ -93,13 +93,13 @@ python3 scripts/teaching_lab.py 3
 
 本关检查队列边界、短尾帧、采集准备与播放准备次序，以及采集/控制/退出的有界等待。应能验证1样本和完整320样本的回答都能结束、321样本被拒绝、75槽容量满时返回背压。
 
-常见错误：收到END立即置完成、把短帧当损坏数据、结束前清空剩余音频、删除采集帧边界的AEC准备握手。先理解这些约束，再读锁与条件变量的具体次序；不要用直接跨线程调用后端替代握手。
+常见错误：收到END立即置完成、把短帧当损坏数据、结束前清空剩余音频、取消后又写入已取出的旧帧。先理解这些约束，再读锁与条件变量的具体次序；播放不再与输入线程进行检测器握手。
 
 ## 04 输入：确认开口之后仍保留句首
 
 **本关新增概念：** 历史帧、开口/结束边沿、首次听音与追问。
 
-先看wake.cpp/vad.cpp，用检测测试验证输入到判定结果。然后进入`client/src/audio/speech.cpp`，沿remember/admit/update理解句首借用、追问准入和句尾处理；这不是一个拥有设备的对象。
+先看wake.cpp/vad.cpp，用检测测试验证输入到判定结果。然后进入`client/src/audio/speech.cpp`，沿listen/update理解共用的句首借用、开口确认和句尾处理；这不是一个拥有设备的对象。
 
 `voice_input::read`取处理帧，`speech::update`返回准入决定与借用PCM，应用直接START/send/END；20ms只限制取帧等待。
 
@@ -107,9 +107,9 @@ python3 scripts/teaching_lab.py 3
 python3 scripts/teaching_lab.py 4
 ```
 
-检查`voice-preroll`和`voice-follow-up-boundary`。合成输入的句首按原顺序补出，开始事件先于PCM，结束标志附着在有效末帧；追问中被拒绝的短句不能把旧END带入下一句。
+检查`voice-preroll`；应用交付由`voice-client-behavior`核对。合成输入的句首按原顺序补出，开始事件先于PCM，结束标志附着在有效末帧；追问中被拒绝的短句不能把旧END带入下一句。
 
-`ListenMode::Wake`与`ListenMode::FollowUp`明确表达两种准入策略。500ms是普通历史的目标容量，不代表Idle阶段已缓存此前半秒。常见错误是确认开口才开始保存、取消输入时顺带结束播放、混淆算法状态复位与已经采集到的PCM。
+普通提问、追问和插话共用120ms开口确认，追问窗口由主流程控制。500ms是普通历史的目标容量，不代表Idle阶段已缓存此前半秒。常见错误是确认开口才开始保存、取消输入时顺带结束播放、混淆算法状态复位与已经采集到的PCM。
 
 ## 05 连接：把固定帧通过真实WSS发送
 
@@ -131,7 +131,7 @@ python3 scripts/teaching_lab.py 5
 
 源码：`client/src/application/voice_client.cpp`，入口`client/apps/boompi_client/main.cpp`。
 
-先读App_Process，再进入App_ReadSpeech和App_ReceiveReply。前者直接speech::update→voice_net::start/send/end，后者直接playback::begin/write/finish；超时与触摸取消在App_StopAndListen汇合。先手写状态与动作，再实现对应分支，不增加第二套业务状态机。
+先读App_Process及receive_reply：输入直接speech::update→voice_net::start/send/end，回复直接playback::write/finish；超时与触摸取消在cancel汇合。先手写状态与动作，再实现对应分支，不增加第二套业务状态机。
 
 ```sh
 python3 scripts/teaching_lab.py 6
@@ -139,7 +139,7 @@ python3 scripts/teaching_lab.py 6
 
 应用 harness 链接生产应用模块，只替换模块I/O和时钟。它验证完整业务，不意味着只写完正常路径就能通过全部检查。
 
-应能沿代码和UI解释Offline→Idle→Listening→Uploading→WaitingReply→Speaking→追问。DONE只关闭播放输入，当前generation的Drained才开启音频回答后的追问。纯文本无需等待声卡；正常运行不逐轮输出状态日志。
+应能沿代码和UI解释Idle→Listening→WaitingReply→Speaking→追问；离线与正在上传由网络明确表示。DONE只关闭播放输入，取消完成屏障之后的Drained才开启音频回答后的追问。纯文本无需等待声卡；正常运行不逐轮输出状态日志。
 
 App_StopAndListen表示停止后会重新听音；CANCEL的retract字段决定是否撤回未听完的回答。常见错误是旧轮完成改变新轮状态，或者停止命令失败后仍显示正常追问。
 
@@ -147,9 +147,9 @@ App_StopAndListen表示停止后会重新听音；CANCEL的retract字段决定�
 
 **本关新增概念：** 回声与近讲、主动停止、跨线程迟到结果。
 
-源码：`speech::update/check_barge`、应用`App_StopAndListen`以及网络`AdvanceLocked`。这是进阶关，不要求第一次学录放音时同时掌握。
+源码：`speech::update`、应用`App_StopAndListen`以及网络`AdvanceLocked`。这是进阶关，不要求第一次学录放音时同时掌握。
 
-先在纸上走一遍候选人声→临时静音→等待低参考→清尾音→确认。再追确认后的顺序：停旧播放，交出保留PCM，应用分配新generation，先发START(supersede=true)，再发PCM。
+先走共用语句确认：六块连续人声后产生Start。正在播放时，主流程停止旧播放，调用start(true)让网络分配新generation并发送START，再发送完整前滚与后续PCM；不再静音试探或二次确认。
 
 ```sh
 python3 scripts/teaching_lab.py 7
@@ -159,7 +159,7 @@ python3 scripts/teaching_lab.py 5
 
 音频检查覆盖插话生命周期，以及渲染/drain阻塞时的停止；应用和网络回归继续证明新轮开始与退休控制不能丢失。Host合成帧通过不代表真板没有误触发。
 
-常见错误：只drop扬声器、不替换远端旧轮；删除尚未发送的退休控制；将正常追问也当作撤回上一轮；用用户音量代替会话临时衰减，导致探针结束后音量恢复错误。
+常见错误：只drop扬声器、不替换远端旧轮；删除尚未发送的退休控制；将正常追问也当作撤回上一轮；确认时清空前滚，导致触发插话的这句话丢失。
 
 ## 08 界面：先页面，再看硬件端口
 

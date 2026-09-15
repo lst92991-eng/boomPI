@@ -2,34 +2,34 @@
 
 ## 产品边界
 
-application直接调用audio_capture、speech、playback；两条任务直接执行各算法与声卡模块。
+application直接调用voice_input、speech、playback；两条任务直接执行各算法与声卡模块。
 板级工作集中在`client/src/platform/rv1106/`：
 
 - ALSA capture/playback；
 - Codec Mode1 数字回采；
 - capture 48→16 kHz 与 TTS 16→48 kHz 重采样；
 - Rockchip `librkaudio` 3A；
-- Snowboy 旧 ABI bridge；
-- WebRTC VAD、播放增益和 limiter。
+- Snowboy 旧 ABI编译单元；
+- WebRTC VAD。播放增益和limiter直接位于playback。
 
 产品没有 backend 工厂或模拟设备分支。Host fake 和 AEC HIL 只用于测试，不链接进
 `boompi-client`。
 
-`voice_input.cpp`直接展开`raw → channels → clean → frame`：audio_convert负责格式、rockchip_3a负责3A和metadata对齐、wake和vad负责检测。详见[顺序音频教学](../teaching/audio-pipeline.md)；
-需要检查 PCM 参数协商、XRUN 或有界 drain 时再进入 `alsa_audio.cpp`。
+`voice_input.cpp`直接展开`raw → channels → frame.pcm → wake/VAD → 交付`：audio_convert负责格式、rockchip_3a负责3A分块、wake和vad负责检测。详见[顺序音频教学](../teaching/audio-pipeline.md)；
+需要检查 PCM 参数协商、XRUN 或有界 drain 时再进入 `audio_capture.cpp`。
 ALSA头和句柄留在私有设备模块；不存在VoiceAudio/Engine/Backend兼容层。
 
 ## ALSA 与 Mode1
 
 | 方向 | 格式 | 通道 | period / buffer |
 | --- | --- | ---: | --- |
-| capture | 48 kHz / S16_LE | 4 | `960 / 1920` frames |
-| playback | 48 kHz / S16_LE | 2 | `960 / 3840` frames |
+| capture | 48 kHz / S16_LE | 4 | 请求40ms延迟，ALSA协商period/buffer |
+| playback | 48 kHz / S16_LE | 2 | 请求80ms延迟，ALSA协商period/buffer |
 
 capture 布局固定为 `[mic0,mic1,refL,refR]`。TTS mono 被复制到左右声道，因此两个参考高度
 相关；产品 AEC 只消费 `refL`。ALSA仍读取四通道，应用不再额外复制一份HIL诊断平面。
 
-应用在首包时调用playback::begin和speech::reply_started，后者在应用线程准备AEC准入保护。
+应用首包直接调用playback::write；仅主流程决定何时收集插话。
 播放线程独自prepare/write/drain；没有采集控制命令槽和100ms检测器握手。
 
 ## Rockchip 3A
@@ -41,16 +41,14 @@ output = 16 kHz / S16 / mono
 ```
 
 当前调用以256 samples块处理，产品每帧320 samples；这不证明SDK只能使用256点。rockchip_3a用固定FIFO对齐，
-因此输出比采集固定延迟一帧；时间戳、原始电平和参考状态由同一个metadata对象跟随PCM一起延迟，检测模块不再独立补偿。
+因此输出比采集固定延迟一帧；电平与参考快照已删除，不再需要附带元数据延迟。
 
 当前3A配置保持 AEC + BF、FastAEC、AES、ANR、去混响和 STDT，board_voice_profile.h 中 delay 为 0；vendor AGC
-关闭。公开 ABI 没有可靠 DTD 事件，因此打断仍使用 3A 后 PCM 的 VAD 和 `voice_dbfs`。
+关闭。一次语句确认只采用3A后PCM的VAD；不把vendor双讲功能位当作已验证的用户插话事件，真实声学效果待验。
 
 ## Snowboy ABI
 
-只有 `snowboy_legacy_bridge.cpp` 包含 Snowboy C++ 头并使用
-`_GLIBCXX_USE_CXX11_ABI=0`。边界外只传 PCM、长度和不透明 handle，旧 ABI 不得扩散到整个
-客户端。
+只有wake.cpp包含Snowboy C++头，并以`_GLIBCXX_USE_CXX11_ABI=0`单独编译。namespace接口只传PCM及整数/布尔值，不让string、异常或厂商对象跨ABI；旧C桥和额外句柄已经删除。
 
 ## 唯一板端构建入口
 

@@ -1,8 +1,8 @@
-# 教学版 v2 验证与上板清单
+# 当前语音链验证与上板清单
 
 ## 版本配套
 
-客户端与服务端只有 BPV4 / 16 kHz 配套协议，hello/ready均声明`READY 4 16000`，必须成套使用。v1/v2旧程序不能配套。`v1.0.0` tag保持不变；当前结构重写起点和结果见[记录](budget-refactor.md)。
+客户端与服务端只有 BPV4 / 16 kHz 配套协议，hello/ready均声明`READY 4 16000`，必须成套使用。v1/v2旧程序不能配套。`v1.0.0` tag保持不变；当前结构重写起点和结果见[记录](audio-unified-refactor.md)。
 
 服务端产物：`build/teaching-v2-release/boompi-server.exe`。Windows上可以双击，首次配置Key；原有config.yaml和state应保留在用户可访问的私有目录。不要把Key或TLS私钥打包发出。
 
@@ -20,9 +20,9 @@ go vet ./...
 go test -race ./...
 ```
 
-Host真实传输测试需要OpenSSL、Boost和cJSON。缺依赖时默认会跳过网络测试；发布验收应在Linux强制启用。C++应用测试执行真实App_Process与speech，用可控时钟和假I/O验证状态转移。音频线程测试现在执行真实capture/playback、转换、3A/wake/vad胶水与EOS；替身只在ALSA设备调用和vendor核心。实际ALSA驱动实现只做host严格编译，不能说成真实声卡运行验收。
+Host真实传输测试需要OpenSSL、Boost和cJSON。缺依赖时默认会跳过网络测试；发布验收应在Linux强制启用。C++应用测试执行真实App_Process与speech，用假I/O核对模块交付，不模拟时间和声学体验。音频线程测试现在执行真实capture/playback、转换、3A/wake/vad胶水与EOS；替身只在ALSA设备调用和vendor核心。实际ALSA驱动实现只做host严格编译，不能说成真实声卡运行验收。
 
-Host音频harness还直接验证AudioConverter、SpeechDetector和RockchipVoiceDsp的分块/metadata适配，需libswresample/libavutil开发文件。厂商处理、WebRTC分类和Snowboy命中使用测试专属C替身，不代表实际声学效果；新增pipeline-format和pipeline-detection后完整Linux CTest为24项。Windows与WSL必须使用不同构建目录。
+Host音频harness还直接验证audio_convert、speech和rockchip_3a的256/320分块适配，需libswresample/libavutil开发文件。厂商处理、WebRTC分类和Snowboy命中使用测试专属C替身，不代表实际声学效果；旧策略与重复场景已删除，当前Linux CTest为9个入口，数量不作为质量或声学验收标准。Windows与WSL必须使用不同构建目录。
 
 C++与Go联测可在server目录运行：
 
@@ -64,8 +64,8 @@ sh scripts/build_teaching_release.sh
 | 长句打断 | 旧字幕/声音/done不混入新回答 |
 | 尾播阶段触屏停止 | 本地声音停止，服务端撤回未听完回答；后续提问可用 |
 | 三秒追问 | 无需唤醒可继续；窗口结束回Idle |
-| 追问先“嗯”再提问 | 较短前一句不会截断真正问题的句首 |
-| 安静播放 | 不自激、不产生伪Barge或新generation |
+| 追问先“嗯”再提问 | 不足120ms的前一句不创建问题；达到120ms即按统一规则开始，前滚不丢 |
+| 安静播放 | 不自激、不产生伪Start或新generation |
 | 音量0、低音量、默认音量 | 音量变化不锁死语音入口；恢复音量后无回声误打断 |
 | 网络断开/恢复 | 残缺输入不提交、不重放；自动回到Idle |
 | UI与摄像头 | 四个已实现入口可用，触摸音量正常，离开摄像头页释放进程 |

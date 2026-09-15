@@ -1,9 +1,11 @@
 #include "voice_codec.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <websocketpp/utf8_validator.hpp>
 
 namespace boompi::voice_net::detail {
@@ -15,17 +17,12 @@ std::uint32_t Generation(std::string_view text) {
   if (text.empty() || text.front() == '0') {
     Invalid();
   }
-  std::uint64_t value = 0;
-  for (unsigned char c : text) {
-    if (c < '0' || c > '9') {
-      Invalid();
-    }
-    value = value * 10 + (c - '0');
-    if (value > UINT32_MAX) {
-      Invalid();
-    }
+  std::uint32_t value = 0;
+  const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
+    Invalid();
   }
-  return static_cast<std::uint32_t>(value);
+  return value;
 }
 std::uint32_t ReadUint32(const std::uint8_t* bytes) {
   std::uint32_t value = 0;
@@ -45,7 +42,7 @@ void WriteUint32(std::uint32_t value, std::uint8_t* bytes) {
 
 }  // namespace
 
-LinkEvent DecodeText(const std::string& text) {
+LinkEvent DecodeText(std::string text) {
   if (text.empty() || text.size() > 8192 || text.find('\0') != std::string::npos ||
       !websocketpp::utf8_validator::validate(text)) {
     Invalid();
@@ -61,23 +58,25 @@ LinkEvent DecodeText(const std::string& text) {
   }
   const auto kind = text.substr(0, first);
   const auto second = text.find(' ', first + 1);
-  const auto generation =
-      text.substr(first + 1, second == std::string::npos ? second : second - first - 1);
+  const auto generation = std::string_view(text).substr(
+      first + 1, second == std::string::npos ? second : second - first - 1);
   event.generation = Generation(generation);
+  if (second != std::string::npos) {
+    text.erase(0, second + 1);
+    event.data = std::move(text);
+  }
   if (kind == "DONE" && second == std::string::npos) {
     event.kind = LinkEventKind::Done;
   } else if (kind == "TEXT" && second != std::string::npos) {
-    event.text = text.substr(second + 1);
-    if (event.text.empty() || event.text.size() > 4096) {
+    if (event.data.empty() || event.data.size() > 4096) {
       Invalid();
     }
     event.kind = LinkEventKind::Text;
   } else if (kind == "ERROR" && second != std::string::npos) {
-    event.code = text.substr(second + 1);
-    if (event.code.empty() || event.code.size() > 64) {
+    if (event.data.empty() || event.data.size() > 64) {
       Invalid();
     }
-    for (unsigned char c : event.code) {
+    for (unsigned char c : event.data) {
       if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) {
         Invalid();
       }
@@ -89,7 +88,7 @@ LinkEvent DecodeText(const std::string& text) {
   return event;
 }
 
-LinkEvent DecodeAudio(const std::string& bytes) {
+LinkEvent DecodeAudio(std::string bytes) {
   if (bytes.size() < kHeaderBytes + 2 || bytes.size() > kFrameBytes || bytes.size() % 2 != 0) {
     Invalid();
   }
@@ -102,17 +101,17 @@ LinkEvent DecodeAudio(const std::string& bytes) {
   event.kind = LinkEventKind::Audio;
   event.generation = ReadUint32(header + 4);
   event.sequence = ReadUint32(header + 8);
-  event.audio_size = bytes.size() - kHeaderBytes;
   if (event.generation == 0 || event.sequence == UINT32_MAX) {
     Invalid();
   }
-  std::copy_n(header + kHeaderBytes, event.audio_size, event.audio.begin());
+  bytes.erase(0, kHeaderBytes);
+  event.data = std::move(bytes);
   return event;
 }
 
 std::array<std::uint8_t, kFrameBytes> EncodeAudio(std::uint32_t generation,
                                                   std::uint32_t sequence,
-                                                  const std::int16_t* pcm) {
+                                                  const audio::VoiceFrame16k& pcm) {
   std::array<std::uint8_t, kFrameBytes> bytes{};
   std::memcpy(bytes.data(), "BPV4", 4);
   WriteUint32(generation, bytes.data() + 4);

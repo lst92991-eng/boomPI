@@ -13,16 +13,18 @@ inline constexpr std::int8_t kLeftMicPolarity = 1;
 inline constexpr std::int8_t kRightMicPolarity = 1;
 inline constexpr int kAecDelaySamples = 0;
 
-// 三项声学预置不在本轮调整；更换硬件或模型后由维护者整体回归。
+// 唤醒模型灵敏度；语句确认直接使用3A后的WebRTC VAD。
 inline constexpr char kWakeSensitivity[] = "0.7";
-inline constexpr float kSpeechAdmissionDbfs = -30.0F;
-inline constexpr float kBargeVoiceDbfs = -25.0F;
 
+static_assert((kLeftMicPolarity == 1 || kLeftMicPolarity == -1) &&
+                  (kRightMicPolarity == 1 || kRightMicPolarity == -1),
+              "microphone polarity must be +/-1");
 static_assert(kAecDelaySamples >= 0 && kAecDelaySamples % 256 == 0,
               "AEC delay must be a non-negative 256-sample multiple");
 }  // namespace board
 
 // 同一卡的两个方向独立打开；模型文件由配套部署预置。
+inline constexpr char kMixerCard[] = "hw:0";
 inline constexpr char kCapturePcm[] = "hw:0,0";
 inline constexpr char kPlaybackPcm[] = "hw:0,0";
 inline constexpr char kSnowboyResource[] = "/userdata/boompi/models/common.res";

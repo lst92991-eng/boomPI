@@ -1,10 +1,10 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 
+#include "boompi/audio/audio_format.h"
 #include "boompi/config/voice_client_config.h"
 
 namespace boompi::voice_net {
@@ -17,25 +17,24 @@ struct LinkEvent final {
   LinkEventKind kind{LinkEventKind::Error};
   std::uint32_t generation{0};  // 连接事件为 0；回答事件属于对应轮次。
   std::uint32_t sequence{0};  // 下行音频从 0 连续递增，缺帧/重复帧会断开连接。
-  std::string text;           // Text：增量字幕。
-  std::string code;           // Error/Offline：可打印的短错误码。
-  std::array<std::uint8_t, 640> audio{};  // Audio：16 kHz/mono/S16_LE。
-  std::size_t audio_size{0};              // 末帧可少于 320 个样本。
+  // TEXT为UTF-8，ERROR/Offline为短错误码，AUDIO为S16_LE字节；每个事件只有一份负载。
+  std::string data;
 };
 
 enum class SendResult : std::uint8_t { Ok, Backpressure, Disconnected };
 
 // 应用线程投递 START、PCM、END 与取消；网络线程拥有真实 WSS 连接。
 // Ok 仅表示入队；Backpressure 必须取消本轮，不能跳过 PCM 后补 END。
+// 配置由LoadClientConfig校验；发现/缓存端点由网络准备模块校验，TLS仍验证实际公钥。
 bool open(const config::VoiceClientConfig& config);
-bool poll(LinkEvent* event);
+bool poll(LinkEvent& event);
 bool online();
 bool uploading();
-SendResult start(std::uint32_t generation, bool supersede);
-SendResult send(std::uint32_t generation, const std::int16_t* pcm);
-SendResult end(std::uint32_t generation);
-// 用新的 generation 退休旧轮；上传 END 后仍可撤回正在等待或播放的回复。
-bool cancel(std::uint32_t new_generation, bool retract);
+SendResult start(bool supersede);
+SendResult send(const audio::VoiceFrame16k& pcm);
+SendResult end();
+// 网络分配新的generation退休旧轮；END后仍可撤回等待/播放中的回复。
+bool cancel(bool retract);
 void close() noexcept;
 
 // 保存后供网络准备使用，不等待联网。SSID 1～32 字节，密码 8～63 字节。

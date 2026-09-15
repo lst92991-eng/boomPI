@@ -1,56 +1,50 @@
 #include "wake.h"
 
+#include <memory>
+
 #include "board_voice_profile.h"
-#include "snowboy_legacy_bridge.h"
+#include "snowboy-detect.h"
 
 namespace boompi::wake {
 namespace {
-BoompiSnowboyLegacyHandle* detector{nullptr};
-const char* failure{""};
+// 只有本文件按旧C++ ABI编译；公开接口不传string或Snowboy对象。
+std::unique_ptr<snowboy::SnowboyDetect> detector;
 }  // namespace
-
 bool open() noexcept {
-  if (detector != nullptr) {
-    failure = "Snowboy is already open";
-    return false;
+  try {
+    detector =
+        std::make_unique<snowboy::SnowboyDetect>(audio::kSnowboyResource, audio::kSnowboyModel);
+    detector->SetSensitivity(audio::board::kWakeSensitivity);
+    detector->SetAudioGain(1.0F);
+    // 3A已经处理音频，关闭Snowboy自带前端，保留匹配模型的输入格式检查。
+    detector->ApplyFrontend(false);
+    if (detector->SampleRate() == 16000 && detector->NumChannels() == 1 &&
+        detector->BitsPerSample() == 16 && detector->NumHotwords() > 0) {
+      return true;
+    }
+  } catch (...) {
+    // 第三方异常在当前ABI内收住，调用方报告初始化阶段。
   }
-  // 资源和增益保持板级预置，真实Snowboy对象仍由旧ABI的C桥持有。
-  if (!boompi_snowboy_legacy_create(audio::kSnowboyResource, audio::kSnowboyModel,
-                                    audio::board::kWakeSensitivity, 1.0F, &detector)) {
-    close();
-    failure = "Snowboy initialization failed";
-    return false;
-  }
-  failure = "";
-  return true;
+  close();
+  return false;
 }
-
-bool detect(const audio::VoiceFrame16k& pcm, bool* detected) noexcept {
-  std::int32_t result = 0;
-  if (detector == nullptr || detected == nullptr ||
-      !boompi_snowboy_legacy_process_s16(detector, pcm.data(), pcm.size(), &result)) {
-    failure = "Snowboy processing failed";
-    return false;
+int detect(const audio::VoiceFrame16k& pcm) noexcept {
+  try {
+    const int result = detector->RunDetection(pcm.data(), static_cast<int>(pcm.size()), false);
+    // SDK的-2是静音、-1是错误；模块只向主线交付错误/未命中/命中。
+    return result == -2 ? 0 : result < 0 ? -1 : result > 0 ? 1 : 0;
+  } catch (...) {
+    return -1;
   }
-  *detected = result > 0;
-  return true;
 }
-
 bool reset() noexcept {
-  if (detector == nullptr || !boompi_snowboy_legacy_reset(detector)) {
-    failure = "Snowboy reset failed";
+  try {
+    return detector->Reset();
+  } catch (...) {
     return false;
   }
-  return true;
-}
-const char* error() noexcept {
-  return failure;
 }
 void close() noexcept {
-  if (detector != nullptr) {
-    boompi_snowboy_legacy_destroy(detector);
-    detector = nullptr;
-  }
-  failure = "";
+  detector.reset();
 }
 }  // namespace boompi::wake

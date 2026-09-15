@@ -2,7 +2,7 @@
 
 从 [main](apps/boompi_client/main.cpp) 的四个中文步骤开始阅读：LoadClientConfig、App_Init、循环 App_Process、App_Close。命令行辅助功能和信号处理的定义在本文件下方。完整调用路径见[源码阅读索引](../docs/teaching/client-source-reading.md)，本次接口变化与验证范围见[可读性重构记录](../docs/architecture/client-readability-refactor.md)。
 
-教学复现先从[分关实验](../docs/teaching/README.md)开始：配置、固定帧、播放队列、语句输入、WSS、六态问答、插话、界面，最后完成真板验收。每关复用真实产品源码和已有测试，不用课程宏拼出多个产品。
+教学复现先从[分关实验](../docs/teaching/README.md)开始：配置、固定帧、播放队列、语句输入、WSS、四态问答、插话、界面，最后完成真板验收。每关复用真实产品源码和已有测试，不用课程宏拼出多个产品。
 
 音频可以从[顺序数据流](../docs/teaching/audio-pipeline.md)进入：`RawCaptureFrame → CaptureChannels → CaptureFrame → speech::Result（借用PCM）`。各处理模块显式接收上一阶段输出，播放是另一条独立链。
 
@@ -18,11 +18,12 @@ python3 scripts/teaching_lab.py 1 --build-dir build/lesson-host
 App_Init按采集、播放、网络初始化，App_Process顺序执行收回复、处理语音和触摸。应用直接调用namespace模块：
 
 ```text
-voice_input::read → wake::detect → vad::process → speech::update → voice_net::start/send/end
-voice_net::poll → playback::begin/write/finish → status(Drained)
+输入任务：ALSA → 转换 → 3A → wake → VAD
+应用：voice_input::read → speech::update → voice_net::start/send/end
+voice_net::poll → playback::write/finish → status(Drained)
 ```
 
-speech拥有语句、句首、追问和插话策略，不启动线程或转发回复。输入任务只执行ALSA/转换/3A，应用顺序执行wake/VAD/speech；已删除检测器跨线程命令握手。playback拥有播放队列、转换器和声卡，旧聚合层未恢复。
+speech只拥有语句确认与句首缓存，应用拥有追问和插话决策，不启动线程或转发回复。输入任务顺序执行ALSA/转换/3A/wake/VAD，应用只处理speech与问答；没有检测器跨线程命令握手或四阶段插话试探。playback拥有播放队列、转换器和声卡，旧聚合层未恢复。
 
 START、PCM、END、CANCEL为不同协议消息；generation隔离旧轮，sequence检查连续PCM。DONE关闭播放输入，实际尾播之后才追问。保持唤醒、VAD、500ms句首、插话确认、三秒追问和全部UI/配网/摄像头功能。
 
@@ -59,12 +60,10 @@ BOOMPI_SERVER_SPKI_SHA256=<该电脑稳定SPKI>
 
 ## 内部板级预置
 
-`src/platform/rv1106/board_voice_profile.h` 只由内部实现引用。学生侧没有声学校准项；以下已验证常量按硬件事实和声学预置分组：
+`src/platform/rv1106/board_voice_profile.h` 只由内部实现引用。学生侧没有声学校准项；以下沿用常量（本轮真板未验证）按硬件事实和声学预置分组：
 
 - 左右麦极性 +1/+1；
 - Snowboy 0.7；
-- raw mic VAD -30 dBFS；
-- AEC 后 barge -25 dBFS；
 - AEC delay 0。
 
 网络每 20 ms 双向均为 320 samples，声卡当前每通道 960 samples；PCM 路径和模型位置由维护者预置。vendor 256 点块独立适配，不能把这些粒度混为一条约束。学生不逐板调参。更换硬件或模型后由维护者重新验收整个 profile。

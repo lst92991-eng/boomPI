@@ -12,7 +12,7 @@
 namespace boompi::test::audio_hardware {
 enum class PlaybackBlock { None, Prepare, Write, Drain };
 void reset();
-void push_capture(const audio::RawCaptureFrame& frame);
+void push_capture(const audio::RawCaptureFrame& frame, bool gap = false);
 void block_playback(PlaybackBlock stage);
 void fail_playback_preparation(bool fail = true);
 void fail_capture_open(bool fail);

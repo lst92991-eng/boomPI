@@ -1,11 +1,9 @@
-// 运行真实采集/播放namespace、FFmpeg、3A适配与检测；仅声卡I/O及vendor C核心替换。
+// Host只核对样本和资源边界；不模拟声学体验或固定旧调参策略。
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cmath>
-#include <cstdint>
 #include <cstdio>
-#include <future>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -15,638 +13,181 @@
 #include "boompi/audio/playback.h"
 #include "boompi/audio/speech.h"
 #include "boompi/audio/voice_input.h"
-#include "vad.h"
-#include "wake.h"
 
 namespace boompi::test {
 bool TestModuleFormat();
 bool TestModuleDetection();
 }  // namespace boompi::test
-
 namespace {
+using namespace boompi;
 using namespace std::chrono_literals;
-using boompi::audio::CaptureFrame;
-using boompi::audio::RawCaptureFrame;
-namespace capture = boompi::voice_input;
-namespace playback = boompi::playback;
-namespace speech = boompi::speech;
-namespace fake = boompi::test::audio_hardware;
-namespace vendor = boompi::test::audio_vendor;
-
-bool Check(bool condition, const char* message) {
-  if (!condition) {
-    std::fprintf(stderr, "audio harness: %s\n", message);
+namespace hw = test::audio_hardware;
+namespace vendor = test::audio_vendor;
+void require(bool pass, const char* reason) {
+  if (!pass) {
+    throw std::runtime_error(reason);
   }
-  return condition;
 }
-void CloseAudio() {
+void close_audio() {
   playback::close();
-  capture::close();
-  boompi::wake::close();
-  boompi::vad::close();
+  voice_input::close();
 }
-bool OpenAudio() {
-  CloseAudio();
-  fake::reset();
+void open_audio() {
+  close_audio();
+  hw::reset();
   vendor::reset();
-  speech::reset();
-  return Check(boompi::wake::open() && boompi::vad::open() && capture::open(),
-               "capture open failed") &&
-         Check(fake::capture_reads() == 0, "capture read preceded playback configuration") &&
-         Check(playback::open(100) && capture::start(), "audio start failed") &&
-         Check(fake::wait_for_capture_reads(1, 500ms), "capture did not reach ALSA read");
+  require(voice_input::open(), "input open");
+  require(hw::capture_reads() == 0, "read before both PCM devices configured");
+  require(playback::open(100) && voice_input::start(), "audio start");
+  require(hw::wait_for_capture_reads(1, 500ms), "capture did not start");
 }
-bool WaitForPlaybackDone(std::chrono::milliseconds timeout = 500ms) {
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (playback::status().state == playback::State::Playing &&
-         std::chrono::steady_clock::now() < deadline) {
+void wait_playback(playback::State expected) {
+  const auto end = std::chrono::steady_clock::now() + 500ms;
+  while (playback::status() == playback::State::Playing &&
+         std::chrono::steady_clock::now() < end) {
     std::this_thread::sleep_for(1ms);
   }
-  return playback::status().state != playback::State::Playing;
+  require(playback::status() == expected, "playback did not complete expected transition");
 }
-RawCaptureFrame RawTone(int amplitude = 1000) {
-  RawCaptureFrame frame{};
-  for (std::size_t i = 0; i < boompi::audio::kCaptureFrameSamples; ++i) {
-    const auto sample = static_cast<std::int16_t>(amplitude * std::sin(i * 0.13));
-    frame.pcm[4 * i] = sample;
-    frame.pcm[4 * i + 1] = sample;
-  }
-  return frame;
-}
-bool BeginPlayback(std::uint32_t generation = 1) {
-  return Check(playback::begin(generation), "playback begin failed");
-}
-std::vector<std::uint8_t> Pcm16(std::size_t samples, std::int16_t value) {
-  std::vector<std::uint8_t> bytes(samples * 2);
-  const auto bits = static_cast<std::uint16_t>(value);
-  for (std::size_t i = 0; i < samples; ++i) {
-    bytes[2 * i] = static_cast<std::uint8_t>(bits);
-    bytes[2 * i + 1] = static_cast<std::uint8_t>(bits >> 8);
+std::vector<std::uint8_t> pcm(std::size_t count, std::int16_t sample) {
+  std::vector<std::uint8_t> bytes(count * 2);
+  for (std::size_t i = 0; i < count; ++i) {
+    bytes[2 * i] = static_cast<std::uint8_t>(sample);
+    bytes[2 * i + 1] = static_cast<std::uint8_t>(static_cast<std::uint16_t>(sample) >> 8);
   }
   return bytes;
 }
-bool QueueFrame(std::uint32_t sequence, std::size_t samples = 320,
-                std::uint32_t generation = 1) {
-  const auto bytes = Pcm16(samples, static_cast<std::int16_t>(1000 + sequence * 100));
-  return Check(
-      playback::write(generation, bytes.data(), bytes.size()) == playback::WriteResult::Queued,
-      "valid PCM did not enter playback");
+void queue(const std::vector<std::uint8_t>& bytes) {
+  require(playback::write(bytes.data(), bytes.size()) == playback::WriteResult::Queued,
+          "PCM rejected");
 }
-bool PrimePlayback(std::uint32_t generation = 1, std::size_t previous_writes = 0) {
-  if (!BeginPlayback(generation)) {
-    return false;
+void playback_boundaries() {
+  for (std::size_t count : {1, 73, 320}) {
+    open_audio();
+    queue(pcm(count, 16000));
+    hw::block_playback(hw::PlaybackBlock::Drain);
+    playback::finish();
+    require(hw::wait_for_playback_blocked(500ms), "short reply never reached drain");
+    require(playback::status() == playback::State::Playing, "DONE ended physical tail early");
+    hw::block_playback(hw::PlaybackBlock::None);
+    wait_playback(playback::State::Drained);
+    const auto output = hw::written_samples();
+    require(output.size() == count * 6, "short reply duration changed");
+    require(*std::max_element(output.begin(), output.end()) > 8000, "short reply muted");
   }
-  for (std::uint32_t sequence = 0; sequence < 9; ++sequence) {
-    if (!QueueFrame(sequence, 320, generation)) {
-      return false;
-    }
-  }
-  return Check(fake::wait_for_writes(previous_writes + 9, 2s),
-               "180ms prebuffer did not reach real resampling and ALSA writes");
-}
-bool StereoDuration(std::size_t input_samples) {
-  const auto pcm = fake::written_samples();
-  if (!Check(pcm.size() == input_samples * 3 * 2,
-             "playback/flush lost valid samples or appended padding")) {
-    return false;
-  }
-  for (std::size_t i = 0; i < pcm.size(); i += 2) {
-    if (!Check(pcm[i] == pcm[i + 1], "left/right samples differ")) {
-      return false;
-    }
-  }
-  const auto operations = fake::operations();
-  const auto drain = std::find(operations.begin(), operations.end(), "playback.drain");
-  return Check(drain != operations.end() &&
-                   std::find(drain, operations.end(), "playback.write") == operations.end(),
-               "filter tail was written after ALSA drain");
-}
-
-bool TestSubGraceJitter() {
-  if (!OpenAudio() || !PrimePlayback()) {
-    return false;
-  }
-  for (std::uint32_t sequence = 9; sequence < 12; ++sequence) {
-    std::this_thread::sleep_for(5ms);
-    if (!QueueFrame(sequence) || !fake::wait_for_writes(sequence + 1, 100ms)) {
-      return Check(false, "sub-30ms jitter forced rebuffering");
-    }
-  }
-  return playback::finish(1) && WaitForPlaybackDone() && StereoDuration(12 * 320);
-}
-bool TestRebufferAfterConfirmedGap() {
-  if (!OpenAudio() || !PrimePlayback()) {
-    return false;
-  }
-  std::this_thread::sleep_for(500ms);
-  if (!QueueFrame(9)) {
-    return false;
-  }
-  std::this_thread::sleep_for(15ms);
-  if (!Check(fake::write_count() == 9, "confirmed gap resumed on a single packet") ||
-      !QueueFrame(10) || !fake::wait_for_writes(11, 200ms)) {
-    return false;
-  }
-  return playback::finish(1) && WaitForPlaybackDone() && StereoDuration(11 * 320);
-}
-bool TestEndPlaybackShortTail() {
-  if (!OpenAudio() || !PrimePlayback()) {
-    return false;
-  }
-  std::this_thread::sleep_for(500ms);
-  if (!QueueFrame(9, 240)) {
-    return false;
-  }
-  const auto extra = Pcm16(320, 99);
-  if (!Check(playback::write(1, extra.data(), extra.size()) == playback::WriteResult::Ending,
-             "PCM after short tail was accepted") ||
-      !Check(fake::write_count() == 9, "short tail started before END") ||
-      !playback::finish(1) || !WaitForPlaybackDone()) {
-    return false;
-  }
-  return StereoDuration(9 * 320 + 240);
-}
-bool TestSingleFrameReply(std::size_t samples, std::int16_t value) {
-  if (!OpenAudio() || !BeginPlayback()) {
-    return false;
-  }
-  const auto input = Pcm16(samples, 0);
-  auto bytes = input;
-  const auto bits = static_cast<std::uint16_t>(value);
-  bytes[2 * (samples - 1)] = static_cast<std::uint8_t>(bits);
-  bytes[2 * (samples - 1) + 1] = static_cast<std::uint8_t>(bits >> 8);
-  if (playback::write(1, bytes.data(), bytes.size()) != playback::WriteResult::Queued ||
-      !playback::finish(1) || !WaitForPlaybackDone() || !StereoDuration(samples)) {
-    return false;
-  }
-  const auto pcm = fake::written_samples();
-  const auto peak = *std::max_element(pcm.begin(), pcm.end(), [](auto left, auto right) {
-    return std::abs(static_cast<int>(left)) < std::abs(static_cast<int>(right));
-  });
-  return Check(std::abs(static_cast<int>(peak)) > 16000 && (peak < 0) == (value < 0),
-               "one-sample/last-sample reply lost sign or filter tail");
-}
-bool TestBoundedClose() {
-  if (!OpenAudio()) {
-    return false;
-  }
-  const auto start = std::chrono::steady_clock::now();
-  CloseAudio();
-  return Check(
-      std::chrono::steady_clock::now() - start < 200ms && fake::capture_interrupts() != 0,
-      "close failed to interrupt blocked capture");
-}
-bool TestBoundedCaptureWait() {
-  if (!OpenAudio()) {
-    return false;
-  }
-  CaptureFrame frame{};
-  const auto start = std::chrono::steady_clock::now();
-  const auto result = capture::read(&frame, 40ms);
-  const auto elapsed = std::chrono::steady_clock::now() - start;
-  if (!Check(result == capture::ReadResult::Timeout && elapsed >= 30ms && elapsed < 500ms,
-             "capture timeout was not bounded")) {
-    return false;
-  }
-  for (unsigned i = 0; i < 5; ++i) {
-    fake::push_capture(RawTone());
-  }
-  return Check(fake::wait_for_capture_reads(6, 500ms) &&
-                   capture::read(&frame, 100ms) == capture::ReadResult::Frame &&
-                   frame.sequence == 4 && frame.discontinuity && frame.actor_overrun,
-               "capture overrun concealed a missing frame");
-}
-bool TestNoCaptureCommand() {
-  if (!OpenAudio()) {
-    return false;
-  }
-  const auto began = std::chrono::steady_clock::now();
-  return Check(playback::begin(1) && std::chrono::steady_clock::now() - began < 80ms,
-               "playback still waits for a capture command acknowledgement");
-}
-bool TestPlaybackSnapshotFollowsCapture() {
-  if (!OpenAudio() || !PrimePlayback()) {
-    return false;
-  }
-  const auto reads = fake::capture_reads();
-  for (unsigned i = 0; i < 3; ++i) {
-    fake::push_capture(RawTone());
-  }
-  if (!fake::wait_for_capture_reads(reads + 3, 500ms)) {
-    return false;
-  }
-  playback::cancel();
-  if (!WaitForPlaybackDone()) {
-    return false;
-  }
-  fake::push_capture(RawTone());
-  for (unsigned i = 0; i < 4; ++i) {
-    CaptureFrame frame;
-    if (capture::read(&frame, 500ms) != capture::ReadResult::Frame ||
-        frame.output.end != (i == 3 ? playback::End::Interrupted : playback::End::None)) {
-      return Check(false, "future playback end was applied to queued old capture");
-    }
-  }
-  return true;
-}
-bool TestResetPreservesQueuedPcm() {
-  if (!OpenAudio()) {
-    return false;
-  }
-  vendor::wake_result = 2;
-  for (unsigned i = 0; i < 3; ++i) {
-    fake::push_capture(RawTone(1000 + static_cast<int>(i) * 1000));
-  }
-  if (!fake::wait_for_capture_reads(4, 500ms)) {
-    return false;
-  }
-  if (!speech::listen(speech::ListenMode::Wake)) {
-    return false;
-  }
-  fake::push_capture(RawTone(4000));
-  bool have_pcm = false;
-  std::uint64_t previous_timestamp = 0;
-  for (std::uint64_t i = 0; i < 4; ++i) {
-    CaptureFrame frame{};
-    if (!Check(capture::read(&frame, 100ms) == capture::ReadResult::Frame &&
-                   frame.sequence == i && frame.timestamp_us >= previous_timestamp &&
-                   !frame.discontinuity && !frame.wake && !frame.vad_now &&
-                   !frame.vad_started && !frame.vad_ended && !frame.near_voice,
-               "reset erased PCM timeline or kept old detection flags")) {
-      return false;
-    }
-    previous_timestamp = frame.timestamp_us;
-    have_pcm |= std::any_of(frame.pcm.begin(), frame.pcm.end(), [](auto value) {
-      return value != 0;
-    });
-  }
-  return Check(have_pcm && vendor::dsp_calls == 5, "capture bypassed real conversion/3A");
-}
-bool TestQueueResults() {
-  if (!OpenAudio()) {
-    return false;
-  }
-  const auto frame = Pcm16(320, 1000);
-  if (!Check(playback::write(1, nullptr, 0) == playback::WriteResult::InvalidArgument &&
-                 playback::write(1, frame.data(), frame.size()) ==
-                     playback::WriteResult::NotActive,
-             "invalid/inactive results were conflated") ||
-      !BeginPlayback()) {
-    return false;
-  }
-  const auto oversized = Pcm16(321, 1);
-  if (!Check(
-          playback::write(1, oversized.data(), oversized.size()) ==
-                  playback::WriteResult::InvalidArgument &&
-              playback::write(1, frame.data(), frame.size() - 1) ==
-                  playback::WriteResult::InvalidArgument &&
-              playback::write(2, frame.data(), frame.size()) ==
-                  playback::WriteResult::StaleGeneration &&
-              playback::write(1, frame.data(), frame.size()) == playback::WriteResult::Queued &&
-              playback::error().empty(),
-          "length/sequence/generation checks lost distinct outcomes")) {
-    return false;
-  }
-  playback::cancel();
-  return WaitForPlaybackDone();
-}
-bool TestQueueCapacity() {
-  if (!OpenAudio() || !BeginPlayback()) {
-    return false;
-  }
-  fake::block_playback(fake::PlaybackBlock::Write);
-  for (unsigned i = 0; i < 9; ++i) {
-    if (!QueueFrame(i)) {
-      return false;
-    }
-  }
-  if (!fake::wait_for_playback_blocked(500ms)) {
-    return false;
-  }
-  for (unsigned i = 9; i <= 75; ++i) {
-    if (!QueueFrame(i)) {
-      return false;
-    }
-  }
-  const auto extra = Pcm16(320, 999);
-  const bool rejected =
-      playback::write(1, extra.data(), extra.size()) == playback::WriteResult::Full;
-  playback::cancel();
-  return Check(
-      rejected && WaitForPlaybackDone() && playback::status().state == playback::State::Idle,
-      "full queue overwrote PCM or could not cancel");
-}
-bool TestOpenClearsError() {
-  CloseAudio();
-  fake::reset();
-  vendor::reset();
-  fake::fail_capture_open(true);
-  if (!Check(!capture::open() && !capture::error().empty(),
-             "ALSA open failure did not produce a diagnostic")) {
-    return false;
-  }
-  fake::fail_capture_open(false);
-  return Check(capture::open() && capture::error().empty(),
-               "successful reopen kept the previous ALSA error");
-}
-bool TestPlaybackPrepareFailure(bool cancel_race = false);
-bool TestPlaybackClearsError() {
-  if (!TestPlaybackPrepareFailure(true)) {
-    return false;
-  }
-  // 真实设备失败锁存；只有close/open明确重建资源后才允许重新播放。
-  if (!OpenAudio() || !BeginPlayback()) {
-    return false;
-  }
-  return Check(playback::error().empty() && QueueFrame(0) && playback::finish(1) &&
-                   WaitForPlaybackDone() &&
-                   playback::status().state == playback::State::Drained,
-               "successful playback retained the old prepare failure");
-}
-bool TestPlaybackOwnerOrder() {
-  if (!OpenAudio() || !PrimePlayback() || !playback::finish(1) || !WaitForPlaybackDone()) {
-    return false;
-  }
-  const auto count = fake::write_count();
-  return PrimePlayback(2, count) && playback::finish(2) && WaitForPlaybackDone() &&
-         Check(fake::owner_order_valid() && fake::drain_count() == 2,
-               "capture/playback operations crossed thread owners");
-}
-bool TestInterruptBlockedPlayback(fake::PlaybackBlock stage, bool close) {
-  if (!OpenAudio() || !BeginPlayback()) {
-    return false;
-  }
-  fake::block_playback(stage);
-  if (!QueueFrame(0) || !playback::finish(1) || !fake::wait_for_playback_blocked(500ms)) {
-    return false;
-  }
-  const auto writes = fake::write_count();
-  const auto start = std::chrono::steady_clock::now();
-  if (close) {
-    CloseAudio();
-  } else {
+  for (auto stage : {hw::PlaybackBlock::Write, hw::PlaybackBlock::Drain}) {
+    open_audio();
+    hw::block_playback(stage);
+    queue(pcm(320, 16000));
+    playback::finish();
+    require(hw::wait_for_playback_blocked(500ms), "I/O not reached");
     playback::cancel();
+    wait_playback(playback::State::Idle);
+    const auto old_size = hw::written_samples().size();
+    hw::block_playback(hw::PlaybackBlock::None);
+    queue(pcm(320, 0));
+    playback::finish();
+    wait_playback(playback::State::Drained);
+    const auto output = hw::written_samples();
+    require(std::all_of(output.begin() + old_size, output.end(),
+                        [](auto x) {
+                          return x == 0;
+                        }),
+            "canceled samples or filter tail leaked into next reply");
   }
-  if (!Check(WaitForPlaybackDone(200ms) && std::chrono::steady_clock::now() - start < 250ms &&
-                 playback::status().state == playback::State::Idle &&
-                 fake::write_count() == writes && fake::owner_order_valid(),
-             "cancel/close leaked an old write or did not interrupt blocked I/O")) {
-    return false;
-  }
-  return true;
+  open_audio();
+  hw::block_playback(hw::PlaybackBlock::Write);
+  queue(pcm(320, -32768));
+  require(hw::wait_for_playback_blocked(500ms), "blocked write not reached");
+  const auto full = pcm(24000, 0);
+  queue(full);
+  const auto extra = pcm(1, 0);
+  require(playback::write(extra.data(), extra.size()) == playback::WriteResult::Full,
+          "full queue silently overwrote speech");
+  const auto started = std::chrono::steady_clock::now();
+  close_audio();
+  require(std::chrono::steady_clock::now() - started < 500ms,
+          "close did not interrupt blocking I/O");
 }
-bool TestPlaybackPrepareFailure(bool cancel_race) {
-  if (!OpenAudio() || !BeginPlayback()) {
-    return false;
-  }
-  fake::fail_playback_preparation();
-  if (cancel_race) {
-    fake::block_playback(fake::PlaybackBlock::Prepare);
-  }
-  for (unsigned i = 0; i < 9; ++i) {
-    if (!QueueFrame(i)) {
-      return false;
-    }
-  }
-  if (cancel_race) {
-    if (!Check(fake::wait_for_playback_blocked(500ms), "prepare race never entered hardware")) {
-      return false;
-    }
-    // prepare期间播放线程持状态锁。取消先等该锁，再与失败收尾竞争，不能抹掉真实错误。
-    auto cancel = std::async(std::launch::async, [] {
-      playback::cancel();
-    });
-    std::this_thread::sleep_for(5ms);
-    fake::block_playback(fake::PlaybackBlock::None);
-    if (!Check(cancel.wait_for(200ms) == std::future_status::ready,
-               "cancel stayed blocked after failed prepare")) {
-      return false;
-    }
-    cancel.get();
-  }
-  if (!Check(WaitForPlaybackDone() && playback::status().state == playback::State::Failed &&
-                 !playback::error().empty() && fake::write_count() == 0,
-             "prepare failure waited for END, wrote PCM, or disappeared after cancel")) {
-    return false;
-  }
-  const auto error = playback::error();
-  playback::cancel();
-  return Check(!playback::begin(2) && playback::status().state == playback::State::Failed &&
-                   playback::error() == error,
-               "cancel or a new generation cleared the latched device failure");
-}
-
-CaptureFrame SpeechFrame(std::uint64_t id, bool voice = false) {
-  CaptureFrame frame{};
-  for (std::size_t i = 0; i < frame.pcm.size(); ++i) {
-    frame.pcm[i] = voice ? (i % 2 ? -4096 : 4096) : 0;
-  }
-  frame.pcm[0] = static_cast<std::int16_t>(id);
-  frame.input_dbfs = -20;
-  frame.sequence = id;
-  frame.timestamp_us = id * 20000;
-  frame.vad_now = frame.near_voice = voice;
-  frame.voice_dbfs = voice ? -10 : -120;
-  return frame;
-}
-bool TestSpeechPreRoll() {
-  boompi::wake::open();
-  boompi::vad::open();
-  speech::listen(speech::ListenMode::Wake);
-  for (unsigned id = 1; id <= 55; ++id) {
-    auto frame = SpeechFrame(id, id >= 51);
-    if (!Check(speech::update(frame, false).decision == speech::Decision::None,
-               "pre-roll emitted PCM before admission")) {
-      return false;
-    }
-  }
-  auto admitted = SpeechFrame(56, true);
-  admitted.vad_started = true;
-  const auto batch = speech::update(admitted, false);
-  if (!Check(batch.decision == speech::Decision::Start && batch.count == 25 && !batch.end,
-             "speech admission lost its 500ms pre-roll")) {
-    return false;
-  }
-  for (std::size_t i = 0; i < batch.count; ++i) {
-    if (!Check(batch.frames[i]->pcm[0] == static_cast<int>(32 + i) &&
-                   batch.frames[i]->sequence == 32 + i &&
-                   batch.frames[i]->timestamp_us == (32 + i) * 20000,
-               "pre-roll duplicated/reordered current PCM or metadata")) {
-      return false;
-    }
-  }
-  for (unsigned i = 0; i < 34; ++i) {
-    auto quiet = SpeechFrame(57);
-    speech::update(quiet, false);
-  }
-  auto tail = SpeechFrame(57);
-  tail.vad_ended = true;
-  const auto ended = speech::update(tail, false);
-  return Check(ended.decision == speech::Decision::Pcm && ended.count == 1 && ended.end &&
-                   ended.frames[0]->pcm[0] == 57,
-               "real-time END omitted the last PCM frame");
-}
-bool TestSpeechFollowUp() {
-  boompi::wake::open();
-  boompi::vad::open();
-  speech::listen(speech::ListenMode::FollowUp);
-  for (unsigned id = 1; id <= 10; ++id) {
-    auto frame = SpeechFrame(id, true);
-    if (speech::update(frame, false).decision != speech::Decision::None) {
-      return Check(false, "short follow-up was admitted before 400ms");
-    }
-  }
-  auto old_end = SpeechFrame(11);
-  old_end.vad_ended = true;
-  for (unsigned i = 0; i < 35; ++i) {
-    speech::update(old_end, false);
-  }
-  for (unsigned id = 12; id <= 31; ++id) {
-    auto frame = SpeechFrame(id, true);
-    const auto result = speech::update(frame, false);
-    if (id < 31 && result.decision != speech::Decision::None) {
-      return Check(false, "follow-up reused old admission count");
-    }
-    if (id == 31) {
-      if (!Check(
-              result.decision == speech::Decision::Start && result.count == 20 && !result.end,
-              "new follow-up inherited old END")) {
-        return false;
-      }
-      for (std::size_t i = 0; i < result.count; ++i) {
-        if (!Check(result.frames[i]->pcm[0] == static_cast<int>(12 + i),
-                   "old rejected follow-up polluted pre-roll")) {
-          return false;
-        }
-      }
-    }
-  }
-  return true;
-}
-bool TestSpeechBarge() {
-  boompi::wake::open();
-  boompi::vad::open();
+void speech_samples() {
   speech::reset();
-  // 探针走120ms候选、60ms低参考、60ms尾音、60ms确认，不能VAD一命中就取消。
-  for (unsigned id = 1; id <= 15; ++id) {
-    auto frame = SpeechFrame(id, true);
-    frame.reference_active = id <= 6;
-    const auto result = speech::update(frame, true);
-    if (id < 15 && !Check(result.decision != speech::Decision::Barge,
-                          "barge skipped acoustic confirmation")) {
-      return false;
+  std::vector<int> delivered;
+  bool started = false, ended = false;
+  for (int id = 0; id < 65; ++id) {
+    audio::CaptureFrame frame;
+    frame.pcm.fill(static_cast<std::int16_t>(id));
+    frame.vad_now = id >= 20 && id < 30;
+    const auto result = speech::update(frame);
+    if (result.start) {
+      require(!started && id == 25, "more than one onset or wrong current frame");
+      started = true;
     }
-    if (id >= 6 && id < 15 &&
-        !Check(result.playback_scale == 0, "barge probe did not request temporary mute")) {
-      return false;
+    for (std::size_t i = 0; i < result.count; ++i) {
+      delivered.push_back((*result.frames[i])[0]);
     }
-    if (id == 15) {
-      if (!Check(result.decision == speech::Decision::Barge && result.count == 15 &&
-                     result.playback_scale == 1,
-                 "confirmed barge lost buffered near speech")) {
-        return false;
-      }
-      for (std::size_t i = 0; i < result.count; ++i) {
-        if (!Check(result.frames[i]->pcm[0] == static_cast<int>(i + 1),
-                   "barge repeated/reordered probe PCM")) {
-          return false;
-        }
-      }
+    ended = result.end;
+  }
+  require(started && ended && delivered.size() == 64, "pre-roll or tail missing");
+  for (int id = 1; id <= 64; ++id) {
+    require(delivered[id - 1] == id, "pre-roll/current/tail duplicated or skipped");
+  }
+}
+void capture_boundaries() {
+  open_audio();
+  audio::RawCaptureFrame raw{};
+  audio::CaptureFrame frame;
+  hw::push_capture(raw, true);
+  require(voice_input::read(frame) == voice_input::ReadResult::Frame && frame.discontinuity,
+          "capture gap hidden");
+  for (int i = 0; i < 6; ++i) {
+    hw::push_capture(raw);
+  }
+  require(hw::wait_for_capture_reads(8, 500ms), "capture stopped while consumer stalled");
+  require(voice_input::read(frame) == voice_input::ReadResult::Frame && frame.discontinuity,
+          "queue overflow silently stitched PCM");
+  for (int failure = 0; failure < 4; ++failure) {
+    open_audio();
+    if (failure == 0) {
+      vendor::vad_result = -1;
+    } else if (failure == 1) {
+      vendor::snowboy_process_ok = false;
+    } else if (failure == 2) {
+      vendor::dsp_failure_call = 1;
+    } else {
+      vendor::wake_result = -1;
     }
+    hw::push_capture(raw);
+    require(voice_input::read(frame) == voice_input::ReadResult::Failed &&
+                !voice_input::error().empty(),
+            "vendor failure became silence");
+    close_audio();
   }
-  auto next = SpeechFrame(16, true);
-  const auto continuing = speech::update(next, false);
-  if (!Check(continuing.decision == speech::Decision::Pcm && continuing.count == 1 &&
-                 continuing.frames[0]->pcm[0] == 16,
-             "confirmed barge did not continue as the same utterance")) {
-    return false;
-  }
-  // 另走真实播放取消→新轮，确认重采样尾音也不会复活。
-  if (!OpenAudio() || !BeginPlayback()) {
-    return false;
-  }
-  fake::block_playback(fake::PlaybackBlock::Write);
-  if (!QueueFrame(0) || !playback::finish(1) || !fake::wait_for_playback_blocked(500ms)) {
-    return false;
-  }
-  playback::cancel();
-  if (!WaitForPlaybackDone()) {
-    return false;
-  }
-  fake::block_playback(fake::PlaybackBlock::None);
-  if (!BeginPlayback(2)) {
-    return false;
-  }
-  const auto silence = Pcm16(320, 0);
-  if (playback::write(2, silence.data(), silence.size()) != playback::WriteResult::Queued ||
-      !playback::finish(2) || !WaitForPlaybackDone()) {
-    return false;
-  }
-  const auto output = fake::written_samples();
-  return Check(std::all_of(output.begin(), output.end(),
-                           [](auto value) {
-                             return value == 0;
-                           }),
-               "cancelled filter tail appeared in next reply");
+  hw::fail_capture_open(true);
+  require(!voice_input::open(), "capture open failure ignored");
+  close_audio();
 }
 }  // namespace
-
 int main(int argc, char** argv) {
-  if (argc != 2) {
-    std::fprintf(stderr, "usage: %s <scenario>\n", argv[0]);
-    return 2;
-  }
-  const std::string scenario = argv[1];
-  bool passed = false;
   try {
-    if (scenario == "sub-grace-jitter") {
-      passed = TestSubGraceJitter();
-    } else if (scenario == "confirmed-gap") {
-      passed = TestRebufferAfterConfirmedGap();
-    } else if (scenario == "short-tail") {
-      passed = TestEndPlaybackShortTail() && TestSingleFrameReply(1, -32768) &&
-               TestSingleFrameReply(320, 32767);
-    } else if (scenario == "bounded-close") {
-      passed = TestBoundedClose();
-    } else if (scenario == "bounded-capture") {
-      passed = TestBoundedCaptureWait();
-    } else if (scenario == "no-capture-command") {
-      passed = TestNoCaptureCommand();
-    } else if (scenario == "reset-preserves-pcm") {
-      passed = TestResetPreservesQueuedPcm() && TestPlaybackSnapshotFollowsCapture();
-    } else if (scenario == "queue-results") {
-      passed = TestQueueResults() && TestQueueCapacity();
-    } else if (scenario == "open-clears-error") {
-      passed = TestOpenClearsError();
-    } else if (scenario == "playback-clears-error") {
-      passed = TestPlaybackClearsError();
-    } else if (scenario == "playback-owner-order") {
-      passed = TestPlaybackOwnerOrder();
-    } else if (scenario == "drop-blocked-render") {
-      passed = TestInterruptBlockedPlayback(fake::PlaybackBlock::Write, false);
-    } else if (scenario == "drop-blocked-drain") {
-      passed = TestInterruptBlockedPlayback(fake::PlaybackBlock::Drain, false);
-    } else if (scenario == "close-blocked-render") {
-      passed = TestInterruptBlockedPlayback(fake::PlaybackBlock::Write, true);
-    } else if (scenario == "playback-prepare-failure") {
-      passed = TestPlaybackPrepareFailure();
-    } else if (scenario == "voice-preroll") {
-      passed = TestSpeechPreRoll();
-    } else if (scenario == "voice-follow-up-boundary") {
-      passed = TestSpeechFollowUp();
-    } else if (scenario == "voice-barge-lifecycle") {
-      passed = TestSpeechBarge();
-    } else if (scenario == "modules-format") {
-      passed = boompi::test::TestModuleFormat();
+    const std::string scenario = argc == 2 ? argv[1] : "";
+    if (scenario == "modules-format") {
+      require(boompi::test::TestModuleFormat(), "format boundary failed");
     } else if (scenario == "modules-detection") {
-      passed = boompi::test::TestModuleDetection();
+      require(boompi::test::TestModuleDetection(), "vendor result contract failed");
+    } else if (scenario == "voice-preroll") {
+      speech_samples();
+    } else if (scenario == "playback") {
+      playback_boundaries();
+    } else if (scenario == "capture") {
+      capture_boundaries();
     } else {
-      std::fprintf(stderr, "unknown scenario: %s\n", argv[1]);
+      throw std::runtime_error("unknown audio check");
     }
+    close_audio();
+    return 0;
   } catch (const std::exception& error) {
-    std::fprintf(stderr, "audio harness: %s\n", error.what());
+    std::fprintf(stderr, "audio: %s\n", error.what());
+    close_audio();
+    return 1;
   }
-  CloseAudio();
-  std::printf("audio harness: %s %s\n", argv[1], passed ? "passed" : "FAILED");
-  return passed ? 0 : 1;
 }

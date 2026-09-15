@@ -1,5 +1,7 @@
 # 客户端教学重构执行记录
 
+> 历史阶段记录；当前音频实现与约定见 [audio-runtime.md](audio-runtime.md)。
+
 本文记录v2首次重构（后提交为f35ed82）的结果。后续可读性整理见 [readability-cleanup.md](readability-cleanup.md)。
 
 目标：保留可用的语音、打断、追问、触摸、音量、Wi-Fi 和摄像头体验；服务端作为配套工具；客户端主线只有一个对话状态机。

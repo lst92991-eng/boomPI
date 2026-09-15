@@ -67,14 +67,18 @@ def measure(revision=None):
         row["comment_only"] += sum(bool(line.strip()) for line in text.splitlines()) - metrics["eloc"]
         row["sources"].append(name)
 
-    alsa = sources.pop("src/platform/rv1106/alsa_audio.cpp")
-    matches = list(re.finditer(r"^(?:bool|void|std::string) (\w+)\(", alsa, re.M))
-    matches = matches[next(i for i, m in enumerate(matches) if m[1] == "open_capture"):]
-    add("ALSA capture + shared setup", "alsa_audio.cpp:shared", alsa[:matches[0].start()])
-    for i, match in enumerate(matches):
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(alsa)
-        group = "Playback + ALSA output" if match[1] in OUTPUT_FUNCTIONS else "ALSA capture + shared setup"
-        add(group, "alsa_audio.cpp:" + match[1], alsa[match.start():end])
+    if "src/platform/rv1106/audio_capture.cpp" in sources:
+        add("ALSA capture + shared setup", "src/platform/rv1106/audio_capture.cpp",
+            sources.pop("src/platform/rv1106/audio_capture.cpp"))
+    else:
+        alsa = sources.pop("src/platform/rv1106/alsa_audio.cpp")
+        matches = list(re.finditer(r"^(?:bool|int|void|std::string) (\w+)\(", alsa, re.M))
+        matches = matches[next(i for i, m in enumerate(matches) if m[1] == "open_capture"):]
+        add("ALSA capture + shared setup", "alsa_audio.cpp:shared", alsa[:matches[0].start()])
+        for i, match in enumerate(matches):
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(alsa)
+            group = "Playback + ALSA output" if match[1] in OUTPUT_FUNCTIONS else "ALSA capture + shared setup"
+            add(group, "alsa_audio.cpp:" + match[1], alsa[match.start():end])
     for group, names in GROUPS.items():
         for name in names:
             if name in sources:
@@ -88,11 +92,38 @@ def measure(revision=None):
             "vad_and_policy": total(["WebRTC VAD", "Speech + pre-roll + policy"])}
 
 
+def measure_audio(revision=None):
+    """Audio implementation plus every direct header/adapter, excluding WSS and app/CLI."""
+    stems = {"alsa_audio", "audio_capture", "audio_convert", "audio_thread",
+             "board_voice_profile", "rockchip_3a", "wake", "vad", "snowboy_legacy_bridge"}
+    files = {}
+    for name, source in read_tree(revision).items():
+        audio = name.startswith(("src/audio/", "include/boompi/audio/"))
+        platform = name.startswith(("src/platform/rv1106/", "include/boompi/platform/rv1106/"))
+        if audio or (platform and Path(name).stem in stems):
+            files[name] = source_metrics(source)
+    totals = {}
+    for group, suffixes in {"cpp": {".cpp", ".cc", ".c"}, "headers": {".h", ".hpp"}}.items():
+        selected = [m for name, m in files.items() if Path(name).suffix in suffixes]
+        totals[group] = {key: sum(m[key] for m in selected) for key in ("physical", "eloc")}
+    totals["total"] = {key: totals["cpp"][key] + totals["headers"][key] for key in ("physical", "eloc")}
+    return {"totals": totals, "files": files}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--before", default="8018787795119011bf930f6afcb9c6203fbe07a4")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--audio", action="store_true", help="Only audio sources and their direct headers/adapters")
     args = parser.parse_args()
+    if args.audio:
+        before, after = measure_audio(args.before), measure_audio()
+        if args.json:
+            print(json.dumps({"before": before, "after": after}, indent=2, ensure_ascii=False))
+        else:
+            for group in ("cpp", "headers", "total"):
+                print(group, before["totals"][group], "->", after["totals"][group])
+        raise SystemExit(0)
     before, after = measure(args.before), measure()
     if args.json:
         print(json.dumps({"before": before, "after": after}, indent=2, ensure_ascii=False))

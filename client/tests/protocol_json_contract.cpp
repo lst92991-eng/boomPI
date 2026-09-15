@@ -98,12 +98,12 @@ void SharedFixtures(const char* path) {
     } else {
       Check(event.generation == Number(expected, "generation"), name + ": generation mismatch");
       if (type == "text") {
-        Check(event.kind == LinkEventKind::Text && event.text == Field(expected, "text"),
+        Check(event.kind == LinkEventKind::Text && event.data == Field(expected, "text"),
               name + ": text mismatch");
       } else if (type == "done") {
         Check(event.kind == LinkEventKind::Done, name + ": done mismatch");
       } else if (type == "error") {
-        Check(event.kind == LinkEventKind::Error && event.code == Field(expected, "code"),
+        Check(event.kind == LinkEventKind::Error && event.data == Field(expected, "code"),
               name + ": error mismatch");
       } else {
         throw std::runtime_error(name + ": unsupported fixture control");
@@ -133,7 +133,7 @@ void SharedFixtures(const char* path) {
                                                          : static_cast<int>(value) - 65536);
       }
       // 预期 wire 来自独立共享金样，不用生产编码器输出反过来构造自己的期望。
-      const auto encoded = detail::EncodeAudio(generation, sequence, pcm.data());
+      const auto encoded = detail::EncodeAudio(generation, sequence, pcm);
       Check(std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()) == wire,
             name + ": encoded bytes differ from shared golden wire");
       ++uplink_count;
@@ -141,9 +141,9 @@ void SharedFixtures(const char* path) {
       Check(direction == "downlink", name + ": unknown direction");
       const auto event = detail::DecodeAudio(wire);
       Check(event.kind == LinkEventKind::Audio && event.generation == generation &&
-                event.sequence == sequence && event.audio_size == payload.size() &&
-                std::string(reinterpret_cast<const char*>(event.audio.data()),
-                            event.audio_size) == payload,
+                event.sequence == sequence && event.data.size() == payload.size() &&
+                std::string(reinterpret_cast<const char*>(event.data.data()),
+                            event.data.size()) == payload,
             name + ": decoded audio differs from shared golden fields");
       ++downlink_count;
     }
