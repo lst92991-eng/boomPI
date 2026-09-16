@@ -1,7 +1,9 @@
-// 客户端入口：处理维护命令，随后初始化、运行、退出。
+// 客户端入口：读取配置，初始化，运行，退出。
+#include <fcntl.h>
+#include <sys/file.h>
+
 #include <csignal>
 #include <cstdlib>
-#include <string_view>
 
 #include "boompi/application/voice_client.h"
 #include "boompi/config/voice_client_config.h"
@@ -14,9 +16,15 @@ void RequestStop(int) {
 }
 }  // namespace
 
-int main(int argc, char* argv[]) {
-  const std::string_view command = argc <= 1 ? "--voice-loop" : argv[1];
-  if (argc > 2 || (command != "--voice-loop" && command != "--check-config")) {
+int main() {
+  // 锁由进程持有到退出，内核自动释放；重复启动不能重新初始化正在使用的硬件。
+  const int instance = open("/run/boompi-client.lock", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+  if (instance < 0) {
+    boompi::debug::log.failure("cannot open instance lock");
+    return EXIT_FAILURE;
+  }
+  if (flock(instance, LOCK_EX | LOCK_NB) < 0) {
+    boompi::debug::log.failure("client is already running or instance lock failed");
     return EXIT_FAILURE;
   }
   boompi::config::VoiceClientConfig config;
@@ -24,9 +32,6 @@ int main(int argc, char* argv[]) {
   if (!boompi::config::LoadClientConfig(&config, &error)) {
     boompi::debug::log.failure(error.c_str());
     return EXIT_FAILURE;
-  }
-  if (command == "--check-config") {
-    return EXIT_SUCCESS;
   }
   std::signal(SIGINT, RequestStop);
   std::signal(SIGTERM, RequestStop);

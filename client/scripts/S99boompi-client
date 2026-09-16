@@ -1,8 +1,0 @@
-#!/bin/sh
-# Buildroot/SysV启动入口：客户端后台启动，网络等待不阻塞后续服务。
-case ${1:-} in
-  start) /usr/sbin/boompi-clientctl start >/dev/null 2>&1 & ;;
-  stop) /usr/sbin/boompi-clientctl stop ;;
-  restart|reload) /usr/sbin/boompi-clientctl restart >/dev/null 2>&1 & ;;
-  *) echo 'usage: S99boompi-client start|stop|restart' >&2; exit 2 ;;
-esac

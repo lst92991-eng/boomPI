@@ -88,5 +88,6 @@ set_target_properties(boompi_client PROPERTIES OUTPUT_NAME boompi-client
   BUILD_WITH_INSTALL_RPATH FALSE INSTALL_RPATH_USE_LINK_PATH FALSE)
 
 install(TARGETS boompi_client RUNTIME DESTINATION /userdata/boompi/bin)
-install(PROGRAMS scripts/boompi-clientctl DESTINATION /usr/sbin)
-install(PROGRAMS scripts/S99boompi-client DESTINATION /etc/init.d)
+# 让系统加载器直接找到这两个SDK库，不依赖启动脚本的LD_LIBRARY_PATH。
+install(FILES "${BOOMPI_ROCKCHIP_3A_AEC_LIBRARY}" "${BOOMPI_ROCKCHIP_3A_COMMON_LIBRARY}"
+  DESTINATION /usr/lib)

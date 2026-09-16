@@ -1,15 +1,46 @@
 #include "boompi/config/voice_client_config.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
-#include <cstdlib>
+#include <fstream>
 #include <string_view>
+#include <utility>
 
 namespace boompi::config {
 namespace {
-std::string_view environment(const char* name) {
-  const char* text = std::getenv(name);
-  return text ? text : "";
+constexpr char kConfigPath[] = "/userdata/boompi/config/client.conf";
+
+bool create_config() {
+  for (const char* directory : {"/userdata/boompi", "/userdata/boompi/config"}) {
+    if (mkdir(directory, 0700) < 0 && errno != EEXIST) {
+      return false;
+    }
+  }
+  std::ifstream random_id("/proc/sys/kernel/random/uuid");
+  std::string id;
+  if (!(random_id >> id) || !IsValidDeviceId(id)) {
+    return false;
+  }
+  // 只创建缺失配置，不覆盖已有身份；持久化成功后才允许连接服务端。
+  const int fd = open(kConfigPath, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    return errno == EEXIST;
+  }
+  const std::string text = "device_id=" + id + "\n";
+  bool ok = write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size()) &&
+            fsync(fd) == 0;
+  if (close(fd) < 0) {
+    ok = false;
+  }
+  if (!ok) {
+    unlink(kConfigPath);
+  }
+  return ok;
 }
 bool decimal(std::string_view text, unsigned limit, unsigned& number) {
   const auto end = text.data() + text.size();
@@ -73,26 +104,63 @@ bool LoadClientConfig(VoiceClientConfig* output, std::string* error) {
     return fail("configuration output");
   }
   *output = {};
-  // 先借用环境字符串并校验，全部成功后再复制一次；不把字段值写入日志。
-  const auto id = environment("BOOMPI_DEVICE_ID");
-  const auto ip = environment("BOOMPI_SERVER_IP");
-  const auto pin = environment("BOOMPI_SERVER_SPKI_SHA256");
-  const auto port = environment("BOOMPI_SERVER_PORT");
+  std::ifstream file(kConfigPath);
+  if (!file) {
+    if (errno != ENOENT || !create_config()) {
+      return fail("client.conf access");
+    }
+    file.clear();
+    file.open(kConfigPath);
+  }
+  file.seekg(0, std::ios::end);
+  const std::streamoff size = file.tellg();
+  if (size <= 0 || size > 4096) {
+    return fail("client.conf size");
+  }
+  file.seekg(0);
+  std::string id, ip, pin, port, line;
+  while (std::getline(file, line)) {
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    if (line.empty() || line.front() == '#') {
+      continue;
+    }
+    const auto equal = line.find('=');
+    if (equal == std::string::npos) {
+      return fail("client.conf format");
+    }
+    const auto name = std::string_view(line).substr(0, equal);
+    const auto value = std::string_view(line).substr(equal + 1);
+    if (name == "device_id") {
+      id = value;
+    } else if (name == "server_ip") {
+      ip = value;
+    } else if (name == "server_port") {
+      port = value;
+    } else if (name == "server_spki_sha256") {
+      pin = value;
+    } else {
+      return fail("client.conf field");
+    }
+  }
+  if (file.bad()) {
+    return fail("client.conf read");
+  }
   unsigned number = output->server_port;
   if (!IsValidDeviceId(id)) {
-    return fail("BOOMPI_DEVICE_ID");
+    return fail("device_id");
   }
   if (!ip.empty() && (ip.size() > 15 || !ipv4(ip))) {
-    return fail("BOOMPI_SERVER_IP");
+    return fail("server_ip");
   }
   if (ip.empty() != pin.empty() || (!pin.empty() && !IsValidSpkiSha256(pin))) {
-    return fail("BOOMPI_SERVER_SPKI_SHA256");
+    return fail("server_spki_sha256");
   }
   if (!port.empty() && (port.size() > 5 || !decimal(port, 65535, number) || number == 0)) {
-    return fail("BOOMPI_SERVER_PORT");
+    return fail("server_port");
   }
-  *output = {std::string(id), std::string(ip), static_cast<std::uint16_t>(number),
-             std::string(pin)};
+  *output = {std::move(id), std::move(ip), static_cast<std::uint16_t>(number), std::move(pin)};
   if (error) {
     error->clear();
   }
