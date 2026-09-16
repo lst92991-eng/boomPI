@@ -30,7 +30,7 @@ struct CaptureFrame final {
 };
 
 // 每次最多交付一块48k双声道PCM；滤波尾音通过后续调用继续取出。
-inline constexpr std::size_t kPlaybackFrameCapacity = kDeviceFrameSamples;
+constexpr std::size_t kPlaybackFrameCapacity = kDeviceFrameSamples;
 /// @brief 48 kHz 交错双声道输出；frames 数的是采样时刻，实际 S16 元素数为 frames×2。
 struct StereoPlaybackFrame final {
   std::array<std::int16_t, kPlaybackFrameCapacity * kPlaybackChannels> pcm{};

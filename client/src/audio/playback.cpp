@@ -42,13 +42,13 @@ State state{State::Idle};
 bool ending{false}, holding{false};
 std::chrono::steady_clock::time_point hold_until{};
 std::atomic<bool> hold_applied{false};
+char failure[192]{};
+audio::StereoPlaybackFrame stereo;
+
 /** @brief 持锁检查试探暂停是否尚未过期；重复 true 请求不会延长截止时间。 */
 bool hold_active() {
   return holding && std::chrono::steady_clock::now() < hold_until;
 }
-
-char failure[192]{};
-audio::StereoPlaybackFrame stereo;
 
 // 启动时尚无工作线程；运行时所有错误写入均持mutex，保留最初失败原因。
 bool fail(const char* stage, int code = 0) {
@@ -58,17 +58,10 @@ bool fail(const char* stage, int code = 0) {
   return false;
 }
 
-/** @brief 转换并完整写出一块；nullptr/0 排滤波尾音，silence 单独写静音且不消费 TTS。
+/** @brief 对已准备的 stereo 应用音量并完整写声卡，不决定本块来自正文、静音或尾音。
  * 只由播放线程在不持队列锁时调用；部分写从后缀继续，取消返回 -ECANCELED。
  */
-int render(const std::int16_t* pcm, std::size_t samples, bool silence = false) {
-  if (silence) {
-    // 不把静音送进TTS重采样器；保留其历史和未消费的TTS，恢复时不吞字。
-    stereo.pcm.fill(0);
-    stereo.frames = audio::kDeviceFrameSamples;
-  } else if (!audio_convert::playback(pcm, samples, stereo)) {
-    return -EIO;
-  }
+int write_device() {
   long peak = 0;
   for (std::size_t i = 0; i < stereo.frames * 2; ++i) {
     peak = std::max(peak, std::abs(static_cast<long>(stereo.pcm[i])));
@@ -106,6 +99,29 @@ int render(const std::int16_t* pcm, std::size_t samples, bool silence = false) {
   return static_cast<int>(stereo.frames);
 }
 
+/** @brief 正文已经交付完毕后，取出滤波尾音并等待声卡播完。
+ * 只由播放线程无锁调用；取消会打断 write/drain，不把旧尾音留给下一轮。
+ */
+int drain_output() {
+  for (;;) {
+    if (!audio_convert::playback(nullptr, 0, stereo)) {
+      return -EIO;
+    }
+    if (stereo.frames == 0) {
+      break;
+    }
+    const int result = write_device();
+    if (result < 0) {
+      return result;
+    }
+  }
+  const int result = snd_pcm_drain(device);
+  if (canceled.load() && (result == -EBADFD || result == -EINTR)) {
+    return -ECANCELED;
+  }
+  return result;
+}
+
 /** @brief 丢弃声卡尚未播放的数据；调用方持 mutex，保留除已停止状态以外的错误。 */
 void drop() {
   const int result = snd_pcm_drop(device);
@@ -119,39 +135,42 @@ void drop() {
  */
 void play() {
   audio::SetAudioThreadPriority("boompi-playback", 30);
+  std::unique_lock<std::mutex> lock(mutex);
   while (!stopping.load()) {
-    std::unique_lock<std::mutex> lock(mutex);
     ready.wait(lock, [] {
-      return stopping.load() || canceled ||
+      return stopping.load() || canceled.load() ||
              (state == State::Playing && (ending || buffered != 0));
     });
     if (stopping.load()) {
       break;
     }
     // 1. 新回答重新准备声卡及滤波历史；旧回答取消收尾前不会接纳新数据。
-    int result = canceled ? -ECANCELED : snd_pcm_prepare(device);
+    int result = canceled.load() ? -ECANCELED : snd_pcm_prepare(device);
     if (result >= 0 && !audio_convert::reset_playback()) {
       result = -EIO;
     }
-    while (result >= 0 && !canceled && !stopping.load()) {
-      // 2. 通常等完整 320 点；收到 finish 后，少于一帧的短回答/尾帧也立即放行。
-      ready.wait(lock, [] {
-        const bool quiet = hold_active();
-        if (!quiet) {
-          hold_applied.store(false);
-        }
-        return stopping.load() || canceled || quiet || ending ||
-               buffered >= audio::kVoiceFrameSamples;
-      });
-      if (!canceled && !stopping.load() && hold_active()) {
+    while (result >= 0) {
+      if (canceled.load() || stopping.load()) {
+        result = -ECANCELED;
+        break;
+      }
+      // 2. 插话试探期间直接写静音，采样环和转换器历史都保持原位。
+      if (hold_active()) {
+        stereo.pcm.fill(0);
+        stereo.frames = audio::kDeviceFrameSamples;
         lock.unlock();
-        result = render(nullptr, 0, true);
+        result = write_device();
         lock.lock();
-        hold_applied.store(result >= 0 && hold_active() && !canceled);
+        hold_applied.store(result >= 0 && hold_active() && !canceled.load());
         continue;
       }
       hold_applied.store(false);
-      if (canceled || stopping.load() || buffered == 0) {
+      // 3. 通常等完整 320 点；finish 后立即消费剩余短帧，队列为空才进入尾播。
+      if (buffered < audio::kVoiceFrameSamples && !ending) {
+        ready.wait(lock);
+        continue;  // 唤醒后重新检查取消、暂停和数据量，不在等待条件里修改状态。
+      }
+      if (buffered == 0) {
         break;
       }
       audio::VoiceFrame16k frame;
@@ -162,27 +181,20 @@ void play() {
       head = (head + count) % kCapacity;
       buffered -= count;
       lock.unlock();
-      // 采样环 → 必要重采样/音量 → 声卡。起播缓冲交给ALSA，软件不再叠加180ms等待。
-      result = render(frame.data(), count);
+      if (!audio_convert::playback(frame.data(), count, stereo)) {
+        result = -EIO;
+      } else {
+        result = write_device();
+      }
       lock.lock();
     }
-    // 3. 正常结束补滤波尾音并等待硬件播完；取消路径直接丢弃，不跨轮保留尾音。
-    bool discard = canceled || stopping.load() || result == -ECANCELED;
-    lock.unlock();
-    if (result >= 0 && !discard) {
-      // 正常结束写完滤波尾音再drain；取消时绝不把旧尾音补到下一次播放。
-      do {
-        result = render(nullptr, 0);
-      } while (result > 0);
-      if (result == 0) {
-        result = snd_pcm_drain(device);
-        if (canceled.load() && (result == -EBADFD || result == -EINTR)) {
-          result = -ECANCELED;
-        }
-      }
+    // 4. 只有正常结束才排尾音；解锁期间仍可取消，所以重新持锁后再决定最终状态。
+    if (result >= 0 && !canceled.load() && !stopping.load()) {
+      lock.unlock();
+      result = drain_output();
+      lock.lock();
     }
-    lock.lock();
-    discard = discard || canceled || stopping.load() || result == -ECANCELED;
+    const bool discard = canceled.load() || stopping.load() || result == -ECANCELED;
     if (result < 0 && result != -ECANCELED) {
       fail("playback render/drain failed", result);
     }
@@ -191,7 +203,8 @@ void play() {
     }
     state = discard ? State::Idle : State::Drained;
     buffered = 0;
-    ending = canceled = holding = false;
+    ending = holding = false;
+    canceled.store(false);
     hold_applied.store(false);
     ready.notify_all();
   }
@@ -234,7 +247,7 @@ WriteResult write(const void* data, std::size_t bytes) {
     return WriteResult::InvalidArgument;
   }
   std::unique_lock<std::mutex> lock(mutex);
-  if (canceled && !ready.wait_for(lock, std::chrono::milliseconds(60), [] {
+  if (canceled.load() && !ready.wait_for(lock, std::chrono::milliseconds(60), [] {
         return state != State::Playing || stopping.load();
       })) {
     fail("playback cancel timed out");
@@ -276,7 +289,7 @@ void cancel() {
   holding = false;
   hold_applied.store(false);
   if (state == State::Playing) {
-    canceled = true;
+    canceled.store(true);
     buffered = 0;
     drop();
     ready.notify_all();
@@ -290,7 +303,7 @@ void hold(bool enabled) {
     const bool room = buffered <= kCapacity - audio::kVoiceRateHz * 700 / 1000;
     hold_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(room ? 500 : 0);
   }
-  holding = enabled && state == State::Playing && !canceled;
+  holding = enabled && state == State::Playing && !canceled.load();
   if (!holding) {
     hold_applied.store(false);
   }
@@ -330,7 +343,8 @@ void close() {
   std::lock_guard<std::mutex> lock(mutex);
   state = State::Idle;
   buffered = 0;
-  ending = canceled = holding = false;
+  ending = holding = false;
+  canceled.store(false);
   hold_applied.store(false);
 }
 }  // namespace boompi::playback

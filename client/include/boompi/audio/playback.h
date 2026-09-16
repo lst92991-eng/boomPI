@@ -13,18 +13,19 @@ namespace boompi::playback {
 enum class State { Idle, Playing, Drained, Failed };
 enum class WriteResult { Queued, Full, Rejected, InvalidArgument };
 
-// capture已打开后调用；直接拥有播放队列、声卡输出、重采样器和播放线程。
+/** @brief capture 已打开后配置播放资源，再创建线程；失败回收已取得的资源。 */
 bool open(std::uint8_t volume = 60U);
-// 主线程是唯一生产者；首次write起播，等旧取消完成后才能接新音频。
-// 输入为16kHz/mono/S16_LE；按采样缓存，容量不足明确返回Full，不静默丢弃。
+/** @brief 主线程投递 16k/mono/S16_LE，首次投递启动播放；容量不足返回 Full，不丢旧采样。
+ * 旧回答取消后最多等待 60ms 收尾才接纳新音频；等待超时返回 Rejected 并保留故障。
+ */
 WriteResult write(const void* bytes, std::size_t byte_count);
-// DONE只关闭输入；status到Drained才表示重采样器和声卡尾音均已播完。
+/** @brief DONE 只关闭输入；status 到 Drained 才表示滤波器及声卡尾音均已播完。 */
 void finish();
-// 异步中断write/drain并丢队列；收尾后status为Idle，旧数据不可再投递。
+/** @brief 异步打断输出并丢弃队列；收尾后为 Idle，调用方需保证不再投递旧轮音频。 */
 void cancel();
-// 试探期间不消费TTS/滤波历史，只写设备静音；相同true不续期，最多500ms。
+/** @brief 试探期间不消费 TTS/滤波历史，只写设备静音；相同 true 不续期，最多 500ms。 */
 void hold(bool enabled);
-// 输入线程取无锁观测；true仅表示播放线程已写入试探静音，仍须检查实际参考。
+/** @brief 输入线程读取无锁观测；true 表示已写入试探静音，仍须检查实际回采参考。 */
 bool held() noexcept;
 /** @brief 原子更新 0..100 音量；播放线程在后续输出块应用，参数超过 100 时限制为 100。 */
 void set_volume(std::uint8_t volume);
