@@ -1,0 +1,43 @@
+name: teaching-ui
+on:
+  push:
+    branches: [codex/minimal-non-audio]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: teaching-ui-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux-ui:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: lvgl/lvgl
+          ref: 0b5a1d4b23975b920ff841ea9cd038802f51711b
+          path: build-deps/lvgl
+      - name: Archive reproducible source inputs
+        run: |
+          mkdir -p /tmp/teaching-inputs
+          git archive --format=tar.gz HEAD > /tmp/teaching-inputs/boompi-source.tar.gz
+          git -C build-deps/lvgl archive --format=tar.gz HEAD > /tmp/teaching-inputs/lvgl-source.tar.gz
+          python3 scripts/measure_client.py > /tmp/teaching-inputs/client-metrics.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: teaching-source-inputs
+          path: /tmp/teaching-inputs/
+          retention-days: 3
+      - name: Install UI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsdl2-dev libfreetype6-dev libasound2-dev libswresample-dev libavutil-dev libboost-dev libcjson-dev libssl-dev fonts-noto-cjk
+      - name: Build real UI and Linux platform sources
+        run: |
+          cmake --preset host-debug -DBOOMPI_BUILD_UI_SIMULATOR=ON -DBOOMPI_LVGL_ROOT="$GITHUB_WORKSPACE/build-deps/lvgl"
+          cmake --build --preset host-debug --parallel 4
+          ctest --preset host-debug
