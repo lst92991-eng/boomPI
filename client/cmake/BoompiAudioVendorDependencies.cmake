@@ -80,7 +80,7 @@ function(boompi_configure_audio_vendor_dependencies)
     INTERFACE_LINK_LIBRARIES "boompi_vendor::openblas")
   add_library(boompi_vendor::snowboy ALIAS boompi_vendor_snowboy)
 
-  # 让缺失的头文件参与 CMake 重新配置，但不把本机路径写入目标 ELF。
+  # 头文件变化时重新执行CMake，确保依赖配置与实际SDK文件一致。
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${rockchip_header}" "${snowboy_header}")
 endfunction()

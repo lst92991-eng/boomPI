@@ -3,14 +3,15 @@
  */
 #pragma once
 #include <cstdint>
-namespace boompi::audio_capture {
+namespace audio_capture
+{
 // 只管理原始四槽PCM；0成功、负值为ALSA错误码。
-int open() noexcept;
+int open();
 // 固定20ms：正值为完整帧数，0为断流，-ECANCELED为主动停止，其余负值为错误。
 /** @brief pcm 须容纳 960×4 个 S16；完整返回前不得把任何短读前缀交给算法。 */
-int read(std::int16_t* pcm) noexcept;
+int read(std::int16_t *pcm);
 // 中断阻塞读取，所属任务退出后再close。
-int interrupt() noexcept;
+int interrupt();
 /** @brief 仅在线程退出后释放句柄；允许初始化失败或重复关闭。 */
-void close() noexcept;
-}  // namespace boompi::audio_capture
+void close();
+}  // namespace audio_capture

@@ -7,33 +7,14 @@
   },
   "configurePresets": [
     {
-      "name": "rv1106-base",
-      "hidden": true,
-      "binaryDir": "${sourceDir}/build/${presetName}",
-      "toolchainFile": "${sourceDir}/client/cmake/toolchains/rv1106.cmake",
-      "cacheVariables": {
-        "BOOMPI_STRICT_WARNINGS": "OFF",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
-      }
-    },
-    {
       "name": "rv1106-release",
       "displayName": "RV1106 release",
-      "description": "Complete board client; local dependency paths come from BOOMPI_* environment variables or CMakeUserPresets.json.",
-      "inherits": "rv1106-base",
+      "description": "Luckfox SDK plus dependencies in third_party.",
+      "binaryDir": "${sourceDir}/build/rv1106-release",
+      "toolchainFile": "${sourceDir}/client/cmake/toolchains/rv1106.cmake",
       "cacheVariables": {
-        "BOOMPI_BOOST_INCLUDE_DIR": "$env{BOOMPI_BOOST_INCLUDE_DIR}",
-        "BOOMPI_LVGL_ROOT": "$env{BOOMPI_LVGL_ROOT}",
-        "BOOMPI_OPENBLAS_LIBRARY": "$env{BOOMPI_OPENBLAS_LIBRARY}",
-        "BOOMPI_OPENSSL_ROOT": "$env{BOOMPI_OPENSSL_ROOT}",
-        "BOOMPI_ROCKCHIP_3A_AEC_LIBRARY": "$env{BOOMPI_ROCKCHIP_3A_AEC_LIBRARY}",
-        "BOOMPI_ROCKCHIP_3A_COMMON_LIBRARY": "$env{BOOMPI_ROCKCHIP_3A_COMMON_LIBRARY}",
-        "BOOMPI_ROCKCHIP_3A_INCLUDE_DIR": "$env{BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}",
-        "BOOMPI_SNOWBOY_INCLUDE_DIR": "$env{BOOMPI_SNOWBOY_INCLUDE_DIR}",
-        "BOOMPI_SNOWBOY_LIBRARY": "$env{BOOMPI_SNOWBOY_LIBRARY}",
-        "BOOMPI_WEBRTC_VAD_INCLUDE_DIR": "$env{BOOMPI_WEBRTC_VAD_INCLUDE_DIR}",
-        "BOOMPI_WEBRTC_VAD_LIBRARY": "$env{BOOMPI_WEBRTC_VAD_LIBRARY}",
         "BOOMPI_STRICT_WARNINGS": "ON",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_BUILD_TYPE": "Release"
       }
     }
@@ -41,8 +22,7 @@
   "buildPresets": [
     {
       "name": "rv1106-release",
-      "configurePreset": "rv1106-release",
-      "configuration": "Release"
+      "configurePreset": "rv1106-release"
     }
   ]
 }

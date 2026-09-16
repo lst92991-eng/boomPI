@@ -11,55 +11,74 @@
 #include "board_voice_profile.h"
 #include "snowboy-detect.h"
 
-namespace boompi::wake {
-namespace {
-// 只有本文件按旧C++ ABI编译；公开接口不传string或Snowboy对象。
-std::unique_ptr<snowboy::SnowboyDetect> detector;
-}  // namespace
-bool open() noexcept {
-  try {
-    detector =
-        std::make_unique<snowboy::SnowboyDetect>(audio::kSnowboyResource, audio::kSnowboyModel);
-    detector->SetSensitivity(audio::board::kWakeSensitivity);
-    detector->SetAudioGain(1.0F);
-    // 3A已经处理音频，关闭Snowboy自带前端，保留匹配模型的输入格式检查。
-    detector->ApplyFrontend(false);
-    if (detector->SampleRate() == 16000 && detector->NumChannels() == 1 &&
-        detector->BitsPerSample() == 16 && detector->NumHotwords() > 0) {
-      return true;
+namespace wake
+{
+// Snowboy对象及其字符串局限在本文件的旧ABI内；公开接口使用固定PCM与基础类型。
+static std::unique_ptr<snowboy::SnowboyDetect> detector;
+bool open()
+{
+    try
+    {
+        // 1. 资源文件提供检测器数据，模型文件确定当前唤醒词。
+        detector = std::make_unique<snowboy::SnowboyDetect>(board_voice::kSnowboyResource,
+                                                            board_voice::kSnowboyModel);
+        // 2. 设置灵敏度及输入增益，采集链已经完成声学前处理。
+        detector->SetSensitivity(board_voice::kWakeSensitivity);
+        detector->SetAudioGain(1.0F);
+        // 3A已经处理音频，关闭Snowboy自带前端，保留匹配模型的输入格式检查。
+        detector->ApplyFrontend(false);
+        // 3. 核对模型输入格式，使后续320点PCM可直接送入检测器。
+        if (detector->SampleRate() == 16000 && detector->NumChannels() == 1 &&
+            detector->BitsPerSample() == 16 && detector->NumHotwords() > 0)
+        {
+            return true;
+        }
     }
-  } catch (...) {
-    // 第三方异常在当前ABI内收住，调用方报告初始化阶段。
-  }
-  close();
-  return false;
-}
-
-int detect(const audio::VoiceFrame16k& pcm) noexcept {
-  try {
-    const int result = detector->RunDetection(pcm.data(), static_cast<int>(pcm.size()), false);
-    // SDK的-2是静音、-1是错误；模块只向主线交付错误/未命中/命中。
-    if (result == -2) {
-      return 0;
+    catch (...)
+    {
+        // 第三方异常在当前ABI内收住，调用方报告初始化阶段。
     }
-    if (result < 0) {
-      return -1;
-    }
-    return result > 0 ? 1 : 0;
-  } catch (...) {
-    return -1;
-  }
-}
-
-bool reset() noexcept {
-  try {
-    return detector->Reset();
-  } catch (...) {
+    close();
     return false;
-  }
 }
 
-void close() noexcept {
-  detector.reset();
+int detect(const audio::VoiceFrame16k &pcm)
+{
+    try
+    {
+        const int result =
+            detector->RunDetection(pcm.data(), static_cast<int>(pcm.size()), false);
+        // SDK的-2是静音、-1是错误；模块只向主线交付错误/未命中/命中。
+        if (result == -2)
+        {
+            return 0;
+        }
+        if (result < 0)
+        {
+            return -1;
+        }
+        return result > 0 ? 1 : 0;
+    }
+    catch (...)
+    {
+        return -1;
+    }
 }
-}  // namespace boompi::wake
+
+bool reset()
+{
+    try
+    {
+        return detector->Reset();
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+void close()
+{
+    detector.reset();
+}
+}  // namespace wake

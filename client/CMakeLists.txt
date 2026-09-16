@@ -16,12 +16,7 @@ set_source_files_properties(src/platform/rv1106/wake.cpp PROPERTIES
 
 set(BOOMPI_OPENSSL_ROOT "" CACHE PATH "OpenSSL 3.5.7 package root")
 set(BOOMPI_BOOST_INCLUDE_DIR "" CACHE PATH "Boost header root")
-set(BOOMPI_WEBRTC_VAD_INCLUDE_DIR "" CACHE PATH "Directory containing webrtc_vad.h")
-set(BOOMPI_WEBRTC_VAD_LIBRARY "" CACHE FILEPATH "RV1106 WebRTC VAD archive")
 set(BOOMPI_LVGL_ROOT "" CACHE PATH "LVGL 8.2 source root")
-if(BOOMPI_LVGL_ROOT STREQUAL "" AND DEFINED ENV{BOOMPI_LVGL_ROOT})
-  file(TO_CMAKE_PATH "$ENV{BOOMPI_LVGL_ROOT}" BOOMPI_LVGL_ROOT)
-endif()
 find_package(Threads REQUIRED)
 find_package(Freetype REQUIRED)
 find_package(ALSA REQUIRED)
@@ -46,10 +41,8 @@ if(NOT IS_ABSOLUTE "${BOOMPI_BOOST_INCLUDE_DIR}" OR
   message(FATAL_ERROR "BOOMPI_BOOST_INCLUDE_DIR must be an absolute Boost header path")
 endif()
 if(NOT IS_ABSOLUTE "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}" OR
-   NOT EXISTS "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}/webrtc_vad.h" OR
-   NOT IS_ABSOLUTE "${BOOMPI_WEBRTC_VAD_LIBRARY}" OR
-   NOT EXISTS "${BOOMPI_WEBRTC_VAD_LIBRARY}")
-  message(FATAL_ERROR "WebRTC VAD headers/archive are missing")
+   NOT EXISTS "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}/webrtc_vad.h")
+  message(FATAL_ERROR "Clone wiseman/py-webrtcvad into third_party/webrtc-vad; see third_party/README.md")
 endif()
 if(NOT IS_ABSOLUTE "${BOOMPI_OPENSSL_ROOT}" OR NOT IS_DIRECTORY "${BOOMPI_OPENSSL_ROOT}")
   message(FATAL_ERROR "BOOMPI_OPENSSL_ROOT must be an absolute package directory")
@@ -59,8 +52,21 @@ set(OPENSSL_USE_STATIC_LIBS TRUE)
 set(OpenSSL_DIR "${BOOMPI_OPENSSL_ROOT}" CACHE PATH "Pinned OpenSSL package" FORCE)
 find_package(OpenSSL 3.5.7 EXACT CONFIG REQUIRED PATHS "${BOOMPI_OPENSSL_ROOT}"
   NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
-add_library(boompi_webrtc_vad STATIC IMPORTED)
-set_target_properties(boompi_webrtc_vad PROPERTIES IMPORTED_LOCATION "${BOOMPI_WEBRTC_VAD_LIBRARY}")
+# 直接编译克隆下来的VAD源码；不包含Python绑定，也不再引用单独构建的旧静态库。
+file(GLOB vad_sources CONFIGURE_DEPENDS
+  "${BOOMPI_WEBRTC_VAD_ROOT}/webrtc/common_audio/signal_processing/*.c"
+  "${BOOMPI_WEBRTC_VAD_ROOT}/webrtc/common_audio/vad/*.c")
+add_library(boompi_webrtc_vad STATIC ${vad_sources}
+  "${BOOMPI_WEBRTC_VAD_ROOT}/webrtc/rtc_base/checks.cc")
+set_target_properties(boompi_webrtc_vad PROPERTIES C_STANDARD 99 CXX_STANDARD 11)
+target_compile_definitions(boompi_webrtc_vad PRIVATE WEBRTC_POSIX)
+target_compile_options(boompi_webrtc_vad PRIVATE -O2
+  "-ffile-prefix-map=${BOOMPI_WEBRTC_VAD_ROOT}=boompi-vendor/webrtc-vad")
+target_include_directories(boompi_webrtc_vad PRIVATE "${BOOMPI_WEBRTC_VAD_ROOT}"
+  "${BOOMPI_WEBRTC_VAD_ROOT}/webrtc"
+  "${BOOMPI_WEBRTC_VAD_ROOT}/webrtc/common_audio/signal_processing/include"
+  "${BOOMPI_WEBRTC_VAD_ROOT}/webrtc/common_audio/third_party/spl_sqrt_floor"
+  "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}")
 
 add_executable(boompi_client apps/boompi_client/main.cpp
   src/application/voice_client.cpp ${BOOMPI_AUDIO_SOURCES}

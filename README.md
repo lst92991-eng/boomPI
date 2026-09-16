@@ -1,36 +1,43 @@
 # boomPI
 
-RV1106 Linux语音客户端与配套Go服务端。客户端提供唤醒、声学处理、语句检测、流式对话、插话、追问、小智屏幕和触摸音量。
+RV1106 Linux小智客户端：唤醒、声学处理、语句检测、流式问答、插话、追问、屏幕和触摸音量。配套服务端作为课程黑箱使用，学生只配置Qwen/DashScope API Key。
+
+## 学习与开发顺序
+
+1. 按[第三方依赖说明](third_party/README.md)，先把固定版本克隆到 `third_party/`，阅读真实头文件和API。
+2. 配置匹配的幸狐SDK，按[客户端说明](client/README.md)编译。
+3. 从 `client/apps/boompi_client/main.cpp` 开始，阅读应用、音频任务和板级调用。
+4. 启动教师提供的服务端，再直接运行板端 `boompi-client`。
+
+参考ESP32项目时只看正式App/Inf/Driver业务源码，不使用其test/text示例作为实现依据。
 
 ## 目录
 
-- `client/`：板端C/C++程序、界面资源、CMake和启动脚本。
-- `server/`：配套服务端，配置DashScope API Key后运行。
-- `protocol/`：两端共用的BPV4业务协议说明。
-- `scripts/`：发布构建和ARM ELF检查。
-- `docs/hardware/`：代码依赖的板级接口约束。
-- `third_party/`：WebSocket++头文件及许可信息，其余SDK依赖在项目外。
+- `client/`：板端C/C++、小智界面资源和CMake；只有一个程序入口。
+- `third_party/`：上游源码克隆、SDK专有库及各库自己的ARM构建产物。
+- `protocol/`：客户端使用的BPV4业务协议。
+- `server/`：配套服务端源码与维护说明，不属于学生开发要求。
+- `scripts/`：维护者的发布构建和ARM ELF检查。
+- `docs/hardware/`：板级格式、接口和待实测约束。
 
-## 构建
+## 客户端构建
 
-客户端需要匹配的幸狐RV1106 SDK、GCC/uClibc工具链和厂商库，具体见[客户端说明](client/README.md)。
+第三方依赖准备好后，在Linux虚拟机中设置SDK根目录：
 
 ```sh
+export BOOMPI_RV1106_SDK_ROOT=/path/to/luckfox-pico
 cmake --preset rv1106-release
-cmake --build --preset rv1106-release --parallel
+cmake --build --preset rv1106-release --parallel 4
 ```
 
-服务端使用Go 1.26：
+## 配套服务端与发布
 
-```sh
-cd server
-go build -trimpath -o boompi-server ./cmd/boompi-server
-```
+学生运行教师提供的 `boompi-server.exe`，首次输入Key，后续自动读取配置。详见[服务端使用说明](server/README.md)。
 
-发布客户端、Windows服务端及rootfs安装目录：
+维护者准备客户端、Windows服务端和rootfs安装目录时运行：
 
 ```sh
 sh scripts/build_release.sh
 ```
 
-服务端使用方式见[服务端说明](server/README.md)。API Key、Wi-Fi密码、TLS身份、模型和SDK二进制不提交Git。
+这是编译打包脚本；小智业务由可执行程序直接启动。维护者打包服务端需要Go 1.26。Key、设备配置、TLS私钥和本机构建产物不提交Git。

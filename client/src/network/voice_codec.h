@@ -3,15 +3,16 @@
 
 #include "boompi/network/voice_net.h"
 
-namespace boompi::voice_net::detail {
+namespace voice_codec
+{
 
-constexpr std::size_t kHeaderBytes = 12;
-constexpr std::size_t kPcmBytes = 640;
-constexpr std::size_t kFrameBytes = kHeaderBytes + kPcmBytes;
-LinkEvent DecodeText(std::string text);
-LinkEvent DecodeAudio(std::string bytes);
+const std::size_t kHeaderBytes = 12;
+const std::size_t kPcmBytes = 640;
+const std::size_t kFrameBytes = kHeaderBytes + kPcmBytes;
+voice_net::LinkEvent DecodeText(std::string text);
+voice_net::LinkEvent DecodeAudio(std::string bytes);
 std::array<std::uint8_t, kFrameBytes> EncodeAudio(std::uint32_t generation,
                                                   std::uint32_t sequence,
-                                                  const audio::VoiceFrame16k& pcm);
+                                                  const audio::VoiceFrame16k &pcm);
 
-}  // namespace boompi::voice_net::detail
+}  // namespace voice_codec

@@ -7,14 +7,15 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace boompi::audio {
-// 业务按20ms处理；这不是ALSA period。硬件16k双工未验，暂留48k设备格式。
-constexpr unsigned kFrameMs = 20;
-constexpr unsigned kDeviceRateHz = 48000;
-constexpr unsigned kVoiceRateHz = 16000;
-constexpr std::size_t kCaptureChannels = 4;
-constexpr std::size_t kPlaybackChannels = 2;
-constexpr std::size_t kDeviceFrameSamples = kDeviceRateHz * kFrameMs / 1000;
-constexpr std::size_t kVoiceFrameSamples = kVoiceRateHz * kFrameMs / 1000;
-using VoiceFrame16k = std::array<std::int16_t, kVoiceFrameSamples>;
-}  // namespace boompi::audio
+namespace audio
+{
+// 业务帧长20ms，用于语句计数和交付；设备采用48k格式，ALSA缓冲由声卡配置管理。
+const unsigned kFrameMs = 20;
+const unsigned kDeviceRateHz = 48000;
+const unsigned kVoiceRateHz = 16000;
+const std::size_t kCaptureChannels = 4;
+const std::size_t kPlaybackChannels = 2;
+const std::size_t kDeviceFrameSamples = kDeviceRateHz * kFrameMs / 1000;
+const std::size_t kVoiceFrameSamples = kVoiceRateHz * kFrameMs / 1000;
+typedef std::array<std::int16_t, kVoiceFrameSamples> VoiceFrame16k;
+}  // namespace audio

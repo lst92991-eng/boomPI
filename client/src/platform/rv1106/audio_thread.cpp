@@ -11,17 +11,20 @@
 
 #include "boompi/debug.h"
 
-namespace boompi::audio {
+namespace audio
+{
 
-void SetAudioThreadPriority(const char* name, int priority) noexcept {
-  // SCHED_FIFO 优先级只决定就绪线程间的抢占；采集/播放仍需依靠 ALSA 或条件变量阻塞让出 CPU。
-  static_cast<void>(pthread_setname_np(pthread_self(), name));
-  sched_param parameters{};
-  parameters.sched_priority = priority;
-  const int result = pthread_setschedparam(pthread_self(), SCHED_FIFO, &parameters);
-  if (result != 0) {
-    debug::log.priority_failed(name, priority, result);
-  }
+void SetAudioThreadPriority(const char *name, int priority)
+{
+    // SCHED_FIFO 优先级只决定就绪线程间的抢占；采集/播放仍需依靠 ALSA 或条件变量阻塞让出 CPU。
+    static_cast<void>(pthread_setname_np(pthread_self(), name));
+    sched_param parameters{};
+    parameters.sched_priority = priority;
+    const int result = pthread_setschedparam(pthread_self(), SCHED_FIFO, &parameters);
+    if (result != 0)
+    {
+        debug::log.priority_failed_cb(name, priority, result);
+    }
 }
 
-}  // namespace boompi::audio
+}  // namespace audio

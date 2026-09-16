@@ -11,19 +11,24 @@
 
 `src/debug.cpp`注册终端日志回调，业务通过`debug::log`交付事件。硬件和第三方细节集中在`src/platform/rv1106`；只有wake.cpp使用Snowboy需要的旧C++ ABI。
 
+代码排版采用四空格缩进、换行花括号。对外使用一级模块namespace，内部函数和变量用static限定在实现文件；类型别名使用typedef。
+
 ## 编译依赖
 
-使用匹配GCC8.3/uClibc的工具链和sysroot，以及Rockchip 3A、Snowboy/OpenBLAS、WebRTC VAD、Boost、OpenSSL3.5.7、LVGL8.2、FreeType、ALSA和FFmpeg转换库。
+先按[third_party说明](../third_party/README.md)克隆并准备依赖。CMake默认从本项目third_party读取OpenSSL、Snowboy、OpenBLAS、VAD、Boost、LVGL和Rockchip库。
 
-通过`BOOMPI_RV1106_SDK_ROOT`与SDK中的`boompi-sdk.cmake`提供路径，也可在本机Git忽略的`CMakeUserPresets.json`中设置现有BOOMPI_*路径。
+幸狐SDK提供GCC8.3/uClibc工具链和匹配的Buildroot sysroot；ALSA、FreeType、libswresample及libavutil由该sysroot提供。只需设置BOOMPI_RV1106_SDK_ROOT，不需要逐项填写临时构建目录。
 
 ```sh
+export BOOMPI_RV1106_SDK_ROOT=/path/to/luckfox-pico
 cmake --preset rv1106-release
 cmake --build --preset rv1106-release --parallel
 DESTDIR="$PWD/build/rootfs" cmake --install build/rv1106-release
 ```
 
-模型与字体安装在`/userdata/boompi/models`和`/userdata/boompi/fonts`，不随源码分发。
+模型与字体由课程资源包预置到 `/userdata/boompi/models` 和 `/userdata/boompi/fonts`。默认模型对应Snowboy克隆目录的 `resources/common.res`、`resources/models/snowboy.umdl`。字体使用 `NotoSansCJK-Regular.ttc`，或基础镜像内的simsun字体。
+
+rootfs安装目录包含程序与两份3A动态库；模型、字体及其余运行库仍需按上述清单准备，不能把安装目录当成完整系统镜像。
 
 安装目录还包含匹配SDK的libaec_bf_process.so和librkaudio_common.so，安装到/usr/lib供系统加载器查找。其余运行库由BSP提供，运行不需要设置LD_LIBRARY_PATH。SDK库只在许可范围内用于本机构建/部署，不提交Git。
 
@@ -34,6 +39,10 @@ DESTDIR="$PWD/build/rootfs" cmake --install build/rv1106-release
 ```
 
 程序在前台运行，日志直接输出到终端。Ctrl+C或发送SIGTERM会结束主循环并回收线程、算法和设备；程序不自行fork到后台。
+
+终端可观察服务端握手、唤醒命中、进入监听、VAD人声/静音变化、START/END入队、首包回答音频、DONE和声卡尾播完成。VAD持续检测输入，首次有效结果及每次状态变化各打印一条；日志顺序随实际输入和线程调度出现。START/END表示交付到发送队列，DONE表示服务端结束发送，声卡播完有独立日志。
+
+这些消息由 `debug.cpp` 的注册回调写入标准错误输出。Windows CMD查看中文日志前执行 `chcp 65001`，再连接板端查看日志。
 
 首次启动会创建`/userdata/boompi/config/client.conf`并持久化设备UUID。默认局域网发现服务端；固定端点时在同一文件补充以下字段，地址和pin必须成对：
 

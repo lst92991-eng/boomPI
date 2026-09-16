@@ -62,11 +62,15 @@ core
 core.*
 !third_party/websocketpp/config/core.hpp
 
-# Vendor/model payloads are installed externally until redistribution is cleared
-/third_party/snowboy/runtime/
-/third_party/snowboy/models/
-/third_party/rockchip/bin/
-/third_party/rockchip/lib/
+# Upstream checkouts and board-specific vendor packages stay under third_party.
+# Clone/import locally; the parent repository tracks the instructions, not nested repositories.
+/third_party/openssl/
+/third_party/snowboy/
+/third_party/webrtc-vad/
+/third_party/openblas/
+/third_party/boost/
+/third_party/lvgl/
+/third_party/rockchip/
 
 # Editor and operating-system state
 .vs/

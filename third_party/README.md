@@ -1,33 +1,91 @@
-# Third-party dependencies
+# 第三方依赖
 
-本目录当前跟踪WebSocket++ 0.8.2头文件及许可信息。项目还使用下表中的依赖，由匹配SDK或本机CMake配置提供；没有复制进本目录不代表没有使用。
+教学流程：**git clone固定版本 → 阅读真实API → 编译/选择匹配ARM库 → 开发本项目接入代码**。独立依赖集中在这里，CMake不再引用个人临时构建目录。
 
-接入顺序是固定版本和来源、阅读真实API、确认格式/ABI/生命周期，再决定直接调用还是增加必要适配。源码、预编译库、模型和工具链分别管理，不默认所有依赖都能从公开源码重新构建。
+嵌套Git仓库、二进制及构建目录由父仓库忽略；它们仍实际存在于third_party，能在编辑器中查看。不要把上游源码改写成本项目代码，也不要提交其构建产物。
 
-增加或升级依赖时记录版本或 commit、上游地址、许可证、RV1106 ABI 和是否允许再分发。没有结论时只能作为本机外部输入，不能提交。
+## 1. 克隆公开仓库
 
-| 依赖 | 固定版本/来源 | 许可与仓库策略 |
+从boomPI根目录执行；已有目录先核对版本，不覆盖本地修改：
+
+```sh
+git clone --depth 1 --branch openssl-3.5.7 https://github.com/openssl/openssl.git third_party/openssl
+
+git clone https://github.com/Kitt-AI/snowboy.git third_party/snowboy
+git -C third_party/snowboy checkout --detach c9ff036e2ef3f9c422a3b8c9a01361dbad7a9bd4
+
+git clone https://github.com/wiseman/py-webrtcvad.git third_party/webrtc-vad
+git -C third_party/webrtc-vad checkout --detach e283ca41df3a84b0e87fb1f5cb9b21580a286b09
+
+git clone https://github.com/OpenMathLib/OpenBLAS.git third_party/openblas
+git -C third_party/openblas checkout --detach 1bd74ad3d1e8d21f86d1a6be35abfcdf27c0208a
+```
+
+| 目录 | 内容与接入方式 |
+| --- | --- |
+| `openssl/` | OpenSSL 3.5.7；commit `8cf17aaeb4599f8af87fefd810b5b5fee90fe69e`，在自身build/rv1106目录交叉编译 |
+| `snowboy/` | 上游头文件、模型和预编译库；直接使用lib/rpi/libsnowboy-detect.a，核心识别器不以完整源码交付 |
+| `webrtc-vad/` | py-webrtcvad中的WebRTC C/C++部分；客户端CMake直接编译，不使用Python绑定或单独的旧静态库 |
+| `openblas/` | Snowboy使用的数学库源码；当前课程采用下述已验证ARM库 |
+| `boost/boost/` | 1.74头文件，来自配套开发环境的同版头文件包 |
+| `lvgl/` | 匹配幸狐SDK的LVGL 8.2.0源码快照 |
+| `rockchip/` | 匹配SDK的rkaudio_preprocess.h和两份动态库；这是专有SDK输入，不是公开算法仓库 |
+| `websocketpp/` | 已跟踪的WebSocket++ 0.8.2头文件及许可证，网络评估前保持原版 |
+
+公开库保留各自LICENSE。Rockchip资源只在匹配SDK许可范围内本地使用，不提交父仓库。上游自身的测试文件保留原样，不加入客户端构建。
+
+## 2. 构建OpenSSL
+
+在Linux构建主机执行，工具链与客户端使用同一套SDK：
+
+```sh
+export BOOMPI_RV1106_SDK_ROOT=/path/to/luckfox-pico
+export PATH="$BOOMPI_RV1106_SDK_ROOT/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/bin:$PATH"
+mkdir -p third_party/openssl/build/rv1106
+cd third_party/openssl/build/rv1106
+../../Configure linux-armv4 \
+  --cross-compile-prefix=arm-rockchip830-linux-uclibcgnueabihf- \
+  --prefix=/usr --openssldir=/etc/ssl \
+  no-shared no-tests no-docs no-module no-comp no-weak-ssl-ciphers
+make -j4 build_libs
+cd ../../../..
+```
+
+CMake读取这个目录生成的OpenSSLConfig.cmake、头文件和静态库，不执行系统安装。
+
+## 3. 准备同版配套资源
+
+以下文件来自教师提供的依赖包或同一套开发环境，目录必须与CMake默认布局一致：
+
+```text
+third_party/
+  openblas/build/rv1106/libopenblas.a
+  boost/boost/asio.hpp
+  lvgl/lvgl.h
+  rockchip/include/rkaudio_preprocess.h
+  rockchip/lib/libaec_bf_process.so
+  rockchip/lib/librkaudio_common.so
+```
+
+当前基线的来源与SHA-256：
+
+- Snowboy RPi archive：`346db1193490a9cc404d49fcfb22ca612cd3a0e649c4863f411553eb1c4f9f1f`。
+- OpenBLAS ARMV7库：`fabfc588e0e0d94f3655d4ad5515e0c90fd161f016be5261e2f11d3df77a3e9d`。课程配套包提供这份已验证ARM产物，客户端直接链接该静态库。
+- LVGL源码快照来自幸狐SDK commit `994243753789e1b40ef91122e8b3688aae8f01b8` 的 `project/app/component/lvgl/lvgl`。
+- Rockchip头文件和库取自匹配SDK的 `output/out/media_out/include`、`output/out/media_out/lib`。不要替换成其他板卡的同名文件。
+
+工具链、Linux驱动与sysroot仍属于幸狐SDK。ALSA、FreeType和FFmpeg转换库由sysroot提供，不复制整套BSP到third_party。
+
+## 4. 从API读到调用
+
+| 第三方API | 本项目实现 | 需要处理的边界 |
 | --- | --- | --- |
-| [WebSocket++](https://github.com/zaphoyd/websocketpp) | 0.8.2；当前仓库内为所需头文件子集 | BSD 3-Clause；保留 `websocketpp/NOTICE.debian` 和 `websocketpp/README.boompi.md` |
-| [Kitt-AI Snowboy](https://github.com/Kitt-AI/snowboy/commit/c9ff036e2ef3f9c422a3b8c9a01361dbad7a9bd4) | commit `c9ff036e2ef3`; RPi archive SHA-256 `346db1193490a9cc404d49fcfb22ca612cd3a0e649c4863f411553eb1c4f9f1f` | 仓库许可证适用于其代码、库、资源和默认 `snowboy.umdl`；其他模型需单独检查。runtime/model 保持外部输入 |
-| OpenBLAS | commit `1bd74ad3d1e8d21f86d1a6be35abfcdf27c0208a` | BSD 3-Clause；只作为 Snowboy bridge 的外部静态库 |
-| [OpenSSL 3.5.7](https://github.com/openssl/openssl/releases/tag/openssl-3.5.7) | 3.5.7 | Apache-2.0；RV1106 package 保持外部输入，CMake 只校验目录与 package 版本 |
-| Rockchip 3A | 与目标 BSP `media/common_algorithm/out` 匹配 | Vendor SDK 条款；再分发未确认，头文件、配置和库不得提交 |
-| WebRTC VAD | 与目标镜像 ABI 匹配的外部头文件和静态库 | 上游许可随实际来源记录；仓库只保存接入代码 |
-| LVGL 8.2 / FreeType / Boost | 与 CMake 入口匹配的外部源码或 sysroot 依赖 | 遵循各自上游许可；大型源码、完整字体和构建产物不进入本目录 |
+| ALSA `snd_pcm_*` | `audio_capture.cpp`、`playback.cpp` | PCM格式、短读写、断流和关闭 |
+| `rkaudio_preprocess_*` | `rockchip_3a.cpp` | SDK参数树、通道排列、256/320点适配 |
+| `snowboy::SnowboyDetect` | `wake.cpp` | 模型、结果转换与旧C++ ABI隔离 |
+| `WebRtcVad_*` | `vad.cpp` | 错误、静音和人声三种结果 |
+| `swr_*` | `audio_convert.cpp` | 重采样、声道矩阵和滤波尾音 |
+| WebSocket++ / Boost / OpenSSL | `voice_net.cpp` | WSS、TLS身份和协议交付 |
+| LVGL / FreeType | `device_ui.cpp`、`lvgl_screen.cpp` | 字体、页面与SPI/I²C端口 |
 
-构建输入与ABI约束见[客户端说明](../client/README.md)和[硬件约束](../docs/hardware/README.md)。秘密、下载缓存、构建产物和许可证不明的资产不得进入源码树。
-
-## 从依赖读到本项目调用
-
-| 依赖接口 | 本项目调用位置 | 适配理由 |
-| --- | --- | --- |
-| ALSA `snd_pcm_*` | `audio_capture.cpp`、`playback.cpp` | 声卡格式、短读写、断流和生命周期 |
-| `rkaudio_preprocess_*` | `rockchip_3a.cpp` | SDK参数树、通道排列、256点块到320点交付 |
-| `snowboy::SnowboyDetect` | `wake.cpp` | 模型初始化、结果转换，旧C++ ABI只局限此文件 |
-| `WebRtcVad_*` | `vad.cpp` | 直接调用WebRTC VAD部分，区分错误/静音/人声 |
-| `swr_*` | `audio_convert.cpp` | 共同重采样、声道矩阵与播放滤波尾音 |
-| WebSocket++ / Boost / OpenSSL | `voice_net.cpp` | 持久WSS、TLS身份、异步连接与协议交付 |
-| LVGL / FreeType | `device_ui.cpp`、`lvgl_screen.cpp` | 单页小智界面、中文字体与SPI/I²C端口 |
-
-这里的WebRTC依赖指VAD组件，不是另一套完整实时音视频框架。Go服务端的依赖由`server/go.mod`和`go.sum`固定，与板端SDK分开。
+Snowboy旧ABI只用于wake.cpp。WebRTC在这里仅提供VAD。服务端依赖由自己的go.mod/go.sum管理，学生无需学习其内部实现。

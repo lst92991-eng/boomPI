@@ -5,7 +5,7 @@
 
 /** @brief 准备进程、读取配置，再启动界面、音频和网络。
  * @return 成功才可进入 Process；失败也必须调用 Close，回收已完成的初始化部分。
- * 重新 Init 前先 Close；启动网络线程成功不代表已经连接服务端。
+ * 重新Init前先Close；网络握手完成后以Online事件通知应用。
  */
 bool App_Init();
 /** @brief 处理回复、输入帧和触摸动作；每次输入等待最多 20ms。
@@ -16,4 +16,4 @@ bool App_Process();
 /** @brief 停线程后关设备，释放进程锁；返回进程退出码 0 正常、1 故障。
  * 初始化未完成时也可调用；故障原因由 debug 回调在此报告。
  */
-int App_Close() noexcept;
+int App_Close();
