@@ -28,7 +28,7 @@ bool IsValidDeviceId(std::string_view value) noexcept;
 bool IsValidSpkiSha256(std::string_view value) noexcept;
 /**
  * @brief 读取 BOOMPI_* 环境变量并验证长度、身份、地址/pin 配对和端口范围。
- * @param output 非空，先恢复默认值再填充；失败时可能部分填写，不可用于启动。
+ * @param output 非空；全部校验成功后一次赋值，失败保留默认值，不可用于启动。
  * @param error 可选错误输出，只报告字段名称；成功时清空。
  * @return 配置全部通过返回 true；不进行网络连接、证书认证或设备探测。
  */

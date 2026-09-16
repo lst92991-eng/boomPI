@@ -202,7 +202,11 @@ bool find_server(const config::VoiceClientConfig& configured, Endpoint& output,
     if (server.server_ip.empty()) {
       const bool found = discover(kInterfaces[wifi], server, stop) &&
                          (!cached || saved.server_spki_sha256 == server.server_spki_sha256);
-      if (!found || !save_server(server)) {
+      const bool changed = !cached || server.server_ip != saved.server_ip ||
+                           server.server_port != saved.server_port ||
+                           server.server_spki_sha256 != saved.server_spki_sha256;
+      // 重连仍重新发现，但端点未变时不重复写入闪存。
+      if (!found || (changed && !save_server(server))) {
         if (!cached) {
           continue;
         }

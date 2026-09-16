@@ -41,8 +41,8 @@ void save_volume(std::uint8_t value) {
   const int fd =
       ::open(kTemporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
   std::FILE* file = fd < 0 ? nullptr : fdopen(fd, "w");
-  bool ok = file && std::fprintf(file, "%u\n", value) > 0 && std::fflush(file) == 0 &&
-            fsync(fd) == 0;
+  bool ok =
+      file && std::fprintf(file, "%u\n", value) > 0 && std::fflush(file) == 0 && fsync(fd) == 0;
   if (file) {
     ok = std::fclose(file) == 0 && ok;
   } else if (fd >= 0) {
@@ -65,7 +65,7 @@ void event(page::Event type, std::uint8_t value) {
     }
   } else {
     action.store(static_cast<int>(type == page::Event::Wake ? UiActionKind::Wake
-                                                         : UiActionKind::Interrupt));
+                                                            : UiActionKind::Interrupt));
   }
 }
 void flush(lv_disp_drv_t* driver, const lv_area_t* area, lv_color_t* pixels) {
@@ -85,7 +85,9 @@ void run() {
       {
         std::lock_guard<std::mutex> lock(mutex);
         update = dirty;
-        next = view;
+        if (update) {
+          next = view;
+        }
         dirty = false;
       }
       if (update) {

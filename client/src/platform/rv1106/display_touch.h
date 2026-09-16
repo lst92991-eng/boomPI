@@ -18,7 +18,7 @@ namespace boompi::platform::rv1106 {
 /**
  * @brief 同步 Linux 设备端口，不创建线程或持有业务状态。
  *
- * DeviceUi 在调用线程完成 Open() 后才启动 UI worker，join 后才 Close()；运行期
+ * ui::open在调用线程完成硬件Open后才启动UI线程，join后才Close；运行期
  * Flush/ReadInput 只由 UI worker 顺序调用，因此初始化阶段也不会与绘制交叉访问 fd。
  */
 class DisplayTouch final {

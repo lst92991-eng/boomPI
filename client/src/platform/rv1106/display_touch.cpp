@@ -2,7 +2,7 @@
  * @brief ST7789P3 横屏刷写和 GT911 触摸。板级引脚、寄存器与恢复时序集中在此。
  *
  * Open 在 UI worker 启动前配置资源；运行期 LVGL Flush/ReadInput 同步进入本端口。
- * 显示故障返回 false 让 DeviceUi 结束 UI，触摸故障则按连续失败预算尝试恢复，
+ * 显示故障返回false让UI线程结束，触摸故障则按连续失败预算尝试恢复，
  * 最终可禁用触摸并保留显示。硬件等待和 Linux I/O 不进入采集/播放实时线程。
  */
 #include "display_touch.h"
@@ -152,7 +152,7 @@ bool DisplayTouch::Command(std::uint8_t command, const std::uint8_t* data, std::
  *
  * LVGL 的 RGB565 主机字节序像素在这里转成面板要求的高字节在前，并使用固定
  * 4 KiB 暂存块限制栈和单次 write 大小。刷屏失败时熄灭背光并返回 false。
- * LVGL 的 flush_ready 由 DeviceUi 回调统一执行，避免库内部一直等待。
+ * LVGL的flush_ready由UI端口回调统一执行，避免库内部一直等待。
  */
 bool DisplayTouch::Flush(const lv_area_t& area, const lv_color_t* pixels) {
   const int width = area.x2 - area.x1 + 1;
@@ -195,7 +195,7 @@ bool DisplayTouch::Flush(const lv_area_t& area, const lv_color_t* pixels) {
  *
  * 背光先保持关闭，避免复位和寄存器配置期间显示随机显存；RESET 的两个 100 ms
  * 窗口以及 Sleep Out 后的 120 ms 是当前初始化序列使用的等待值。只有 Display On
- * 成功后才点亮背光；此时仅面板就绪，页面还需由之后启动的 UI worker 构建和刷入。
+ * 成功后才点亮背光；此时仅面板就绪。ui::open随后创建页面，再启动UI线程刷入。
  */
 bool DisplayTouch::InitPanel() {
   if ((data_command = OpenGpio(kDataCommandGpio)) < 0 ||

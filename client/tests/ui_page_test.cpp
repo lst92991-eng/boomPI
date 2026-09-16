@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -15,6 +16,7 @@ using namespace boompi::ui;
 std::vector<page::Event> events;
 std::array<lv_color_t, 320 * 32> draw;
 std::array<std::uint16_t, 320 * 240> screen;
+unsigned flushes{0};
 void require(bool ok, const char* text) {
   if (!ok) {
     throw std::runtime_error(text);
@@ -38,14 +40,26 @@ lv_obj_t* find(lv_obj_t* parent, const lv_obj_class_t* type) {
   }
   return nullptr;
 }
+lv_obj_t* find_text(lv_obj_t* parent, const char* text) {
+  if (lv_obj_check_type(parent, &lv_label_class) &&
+      std::strcmp(lv_label_get_text(parent), text) == 0) {
+    return parent;
+  }
+  for (unsigned i = 0; i < lv_obj_get_child_cnt(parent); ++i) {
+    if (auto* found = find_text(lv_obj_get_child(parent, static_cast<int>(i)), text)) {
+      return found;
+    }
+  }
+  return nullptr;
+}
 void save(const std::string& path) {
   lv_refr_now(nullptr);
   std::ofstream file(path, std::ios::binary);
   file << "P6\n320 240\n255\n";
   for (auto p : screen) {
     const char rgb[] = {static_cast<char>(((p >> 11) & 31) * 255 / 31),
-                       static_cast<char>(((p >> 5) & 63) * 255 / 63),
-                       static_cast<char>((p & 31) * 255 / 31)};
+                        static_cast<char>(((p >> 5) & 63) * 255 / 63),
+                        static_cast<char>((p & 31) * 255 / 31)};
     file.write(rgb, 3);
   }
   require(file.good(), "preview write failed");
@@ -62,6 +76,7 @@ int main(int argc, char** argv) {
   driver.ver_res = 240;
   driver.draw_buf = &buffer;
   driver.flush_cb = [](lv_disp_drv_t* d, const lv_area_t* area, lv_color_t* pixels) {
+    ++flushes;
     for (int y = area->y1; y <= area->y2; ++y) {
       for (int x = area->x1; x <= area->x2; ++x) {
         screen[y * 320 + x] = pixels++->full;
@@ -89,15 +104,38 @@ int main(int argc, char** argv) {
       page::show(view);
       lv_event_send(face, LV_EVENT_CLICKED, nullptr);
       require(events.back() == page::Event::Wake, "face wake");
+      if (argc > 2 && cycle == 0) {
+        save(std::string(argv[2]) + "/idle.ppm");
+      }
+      view.state = DeviceUiState::Thinking;
+      page::show(view);
+      lv_event_send(face, LV_EVENT_CLICKED, nullptr);
+      require(events.back() == page::Event::Interrupt, "waiting reply cannot be stopped");
+      auto* stop = find_text(lv_scr_act(), "停止");
+      require(stop != nullptr, "explicit stop action missing");
+      lv_event_send(lv_obj_get_parent(stop), LV_EVENT_CLICKED, nullptr);
+      require(events.back() == page::Event::Interrupt, "stop button did not interrupt");
+      if (argc > 2 && cycle == 0) {
+        save(std::string(argv[2]) + "/thinking.ppm");
+      }
       view.state = DeviceUiState::Speaking;
       view.AppendText("正在回答。😅\n保留中文，过滤不支持的字符。😂");
       page::show(view);
       lv_event_send(face, LV_EVENT_CLICKED, nullptr);
       require(events.back() == page::Event::Interrupt, "face interrupt");
+      lv_refr_now(display);
+      const auto before_refresh = flushes;
+      page::show(view);
+      lv_refr_now(display);
+      require(flushes == before_refresh, "identical view redrew unchanged controls");
       auto* slider = find(lv_scr_act(), &lv_slider_class);
       lv_slider_set_value(slider, 42, LV_ANIM_OFF);
       lv_event_send(slider, LV_EVENT_VALUE_CHANGED, nullptr);
       require(events.back() == page::Event::Volume, "volume preview");
+      lv_obj_add_state(slider, LV_STATE_PRESSED);
+      page::show(view);
+      require(lv_slider_get_value(slider) == 42, "application snapshot moved a pressed slider");
+      lv_obj_clear_state(slider, LV_STATE_PRESSED);
       lv_event_send(slider, LV_EVENT_RELEASED, nullptr);
       require(events.back() == page::Event::SaveVolume, "volume commit");
       if (argc > 2 && cycle == 0) {
@@ -123,6 +161,8 @@ int main(int argc, char** argv) {
         page::pixels().fill(0x07E0);
         page::present(CameraStatus::Live, true);
         save(std::string(argv[2]) + "/camera.ppm");
+        page::present(CameraStatus::Error, false);
+        save(std::string(argv[2]) + "/camera-error.ppm");
       }
       page::close();
       page::close();

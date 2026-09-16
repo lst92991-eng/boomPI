@@ -168,8 +168,7 @@ int main(int argc, char** argv) {
   constexpr std::array states{
       boompi::ui::DeviceUiState::Idle,     boompi::ui::DeviceUiState::Listening,
       boompi::ui::DeviceUiState::Thinking, boompi::ui::DeviceUiState::Speaking,
-      boompi::ui::DeviceUiState::Happy,    boompi::ui::DeviceUiState::Offline,
-      boompi::ui::DeviceUiState::Error};
+      boompi::ui::DeviceUiState::Offline,  boompi::ui::DeviceUiState::Error};
   std::size_t state = 0;
   // 仅模拟 application 的显示投影，state 下标不是产品状态机或音频轮次。
   auto apply_state = [&] {

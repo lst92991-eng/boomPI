@@ -2,7 +2,7 @@
  * @file ui_view.h
  * @brief application 与 UI 之间按值传递的显示快照和用户动作。
  *
- * 应用模块 拥有对话状态及字幕累积；DeviceUi 复制 UiView 后交给 UI worker 渲染。
+ * 应用拥有对话状态及字幕累积；ui::show复制快照，由UI线程渲染。
  * UiAction 沿相反方向传递意图，页面不分配 generation，也不决定录音或回复的生命周期。
  */
 #pragma once
@@ -13,9 +13,9 @@
 
 namespace boompi::ui {
 /**
- * @brief 页面显示状态；与 application 的六状态不是一一对应。
+ * @brief 应用四态的显示投影，另含网络离线和错误提示。
  *
- * Listening/Uploading 共用聆听画面，Waiting 使用思考画面；Happy 是可供显示的完成态。
+ * Listening共用等待开口和正在上传的画面，WaitingReply显示Thinking。
  * 枚举次序对应 lvgl_screen.cpp 的静态表情表，只能传入这里定义的有效值。
  */
 enum class DeviceUiState : std::uint8_t {
@@ -23,13 +23,12 @@ enum class DeviceUiState : std::uint8_t {
   Listening,
   Thinking,
   Speaking,
-  Happy,
   Offline,
   Error,
 };
-/** @brief camera worker 发布的预览阶段，只有 Live 时页面展示像素及 FPS。 */
+/** @brief 摄像头线程发布的阶段，只有Live时页面展示完整像素帧。 */
 enum class CameraStatus : std::uint8_t { Stopped, Starting, Live, Error };
-/** @brief application 可消费的意图；摄像头和配网操作留在 UI 内部。 */
+/** @brief 应用消费语音与音量动作，摄像头开关由UI线程处理。 */
 enum class UiActionKind : std::uint8_t { Wake, Interrupt, Volume };
 /** @brief 一个已合并的用户动作，volume 仅对 Volume 有效，单位为百分比。 */
 struct UiAction {
@@ -41,7 +40,7 @@ struct UiAction {
  * @brief 一份可直接复制的状态、音量和字幕快照。
  *
  * text 最多保留 126 字节 UTF-8 文本，最后一字节为 NUL；上限按字节而非汉字数计算。
- * AppendText() 在 application 中累积流式文本，DeviceUi 只在短锁内复制整个结构。
+ * AppendText()在应用中累积流式文本，UI只在短锁内复制整个结构。
  * 这里不含互斥量，也不允许生产者和消费者同时读写同一个实例。
  */
 struct UiView {
