@@ -1,11 +1,13 @@
 // 真LVGL/FreeType，无声卡、网络或硬件；固定页面切换与事件回归。
 #include <lvgl.h>
+
 #include <array>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+
 #include "boompi/ui/lvgl_screen.h"
 
 namespace {
@@ -42,8 +44,8 @@ void save(const std::string& path) {
   file << "P6\n320 240\n255\n";
   for (auto p : screen) {
     const char rgb[] = {static_cast<char>(((p >> 11) & 31) * 255 / 31),
-                        static_cast<char>(((p >> 5) & 63) * 255 / 63),
-                        static_cast<char>((p & 31) * 255 / 31)};
+                       static_cast<char>(((p >> 5) & 63) * 255 / 63),
+                       static_cast<char>((p & 31) * 255 / 31)};
     file.write(rgb, 3);
   }
   require(file.good(), "preview write failed");
@@ -69,10 +71,17 @@ int main(int argc, char** argv) {
   };
   auto* display = lv_disp_drv_register(&driver);
   try {
-    const char* font = argc > 1 ? argv[1] : "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+    const char* font =
+        argc > 1 ? argv[1] : "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
     require(!page::open("/missing-font-for-test"), "missing font accepted");
+    require(!page::open(nullptr), "null font accepted");
+    require(!page::open("/dev/null"), "invalid font accepted");
     for (int cycle = 0; cycle < 3; ++cycle) {
-      require(page::open(font, [](page::Event e, std::uint8_t) { events.push_back(e); }), "page init");
+      require(page::open(font,
+                         [](page::Event e, std::uint8_t) {
+                           events.push_back(e);
+                         }),
+              "page init");
       const auto count = objects(lv_scr_act());
       auto* face = find(lv_scr_act(), &lv_img_class);
       UiView view;
@@ -98,7 +107,8 @@ int main(int argc, char** argv) {
         auto before = events.size();
         page::camera(true);
         page::camera(true);
-        require(events.size() == before + 1 && events.back() == page::Event::CameraOn, "duplicate camera start");
+        require(events.size() == before + 1 && events.back() == page::Event::CameraOn,
+                "duplicate camera start");
         page::pixels().fill(0x07E0);
         page::present(CameraStatus::Live, true);
         lv_refr_now(display);
@@ -119,11 +129,19 @@ int main(int argc, char** argv) {
       require(lv_obj_get_child_cnt(lv_scr_act()) == 0, "page cleanup");
     }
     lv_disp_remove(display);
+    driver.draw_ctx_deinit(&driver, driver.draw_ctx);
+    lv_mem_free(driver.draw_ctx);
+    lv_img_cache_set_size(0);
+    lv_freetype_destroy();  // 进程退出，整个测试期间只初始化过一次。
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     page::close();
     lv_disp_remove(display);
+    driver.draw_ctx_deinit(&driver, driver.draw_ctx);
+    lv_mem_free(driver.draw_ctx);
+    lv_img_cache_set_size(0);
+    lv_freetype_destroy();
     return 1;
   }
 }

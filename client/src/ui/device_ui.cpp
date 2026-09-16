@@ -1,7 +1,9 @@
 #include "boompi/ui/device_ui.h"
+
 #include <fcntl.h>
 #include <lvgl.h>
 #include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -9,6 +11,7 @@
 #include <cstdio>
 #include <mutex>
 #include <thread>
+
 #include "../platform/rv1106/display_touch.h"
 #include "boompi/ui/lvgl_screen.h"
 #include "camera_capture.h"
@@ -35,10 +38,11 @@ lv_indev_drv_t pointer;
 std::array<lv_color_t, 320 * 32> draw_pixels;
 void save_volume(std::uint8_t value) {
   // 仅在释放滑块时提交；临时文件完整写入后才替换正式配置。
-  const int fd = ::open(kTemporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+  const int fd =
+      ::open(kTemporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
   std::FILE* file = fd < 0 ? nullptr : fdopen(fd, "w");
-  bool ok = file && std::fprintf(file, "%u\n", value) > 0 &&
-            std::fflush(file) == 0 && fsync(fd) == 0;
+  bool ok = file && std::fprintf(file, "%u\n", value) > 0 && std::fflush(file) == 0 &&
+            fsync(fd) == 0;
   if (file) {
     ok = std::fclose(file) == 0 && ok;
   } else if (fd >= 0) {
@@ -60,7 +64,8 @@ void event(page::Event type, std::uint8_t value) {
       save_volume(value);
     }
   } else {
-    action.store(static_cast<int>(type == page::Event::Wake ? UiActionKind::Wake : UiActionKind::Interrupt));
+    action.store(static_cast<int>(type == page::Event::Wake ? UiActionKind::Wake
+                                                         : UiActionKind::Interrupt));
   }
 }
 void flush(lv_disp_drv_t* driver, const lv_area_t* area, lv_color_t* pixels) {
@@ -190,6 +195,12 @@ void close() noexcept {
   if (display) {
     lv_disp_remove(display);
     display = nullptr;
+  }
+  // LVGL8.2的disp_remove不释放自动分配的draw_ctx，由端口持有者收尾。
+  if (output.draw_ctx) {
+    output.draw_ctx_deinit(&output, output.draw_ctx);
+    lv_mem_free(output.draw_ctx);
+    output.draw_ctx = nullptr;
   }
   hardware.Close();
 }

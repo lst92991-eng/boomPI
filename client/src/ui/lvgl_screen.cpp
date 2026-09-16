@@ -1,8 +1,13 @@
 #include "boompi/ui/lvgl_screen.h"
+
 #include <lvgl.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
 #include <algorithm>
 #include <cstring>
 #include <string>
+
 #include "twemoji_64.h"
 
 namespace boompi::ui::page {
@@ -11,20 +16,18 @@ lv_obj_t *voice_page{}, *camera_page{}, *face{}, *subtitle{}, *slider{}, *image{
 lv_font_t* font{};
 Handler handler{};
 DeviceUiState voice_state{DeviceUiState::Idle};
-bool camera_visible{false}, freetype_ready{false};
+bool camera_visible{false};
 Image frame{};
 lv_img_dsc_t descriptor{};
 struct VoiceView {
   const char* title;
   const lv_img_dsc_t* face;
 };
-const VoiceView views[] = {{"说出唤醒词开始对话", &emoji_1f642_64},
-                           {"正在聆听", &emoji_1f62f_64},
-                           {"正在思考", &emoji_1f914_64},
-                           {"正在回答，轻触可打断", &emoji_1f606_64},
-                           {"回答完成", &emoji_1f642_64},
-                           {"离线，等待网络恢复", &emoji_1f614_64},
-                           {"发生错误，请重试", &emoji_1f614_64}};
+const VoiceView views[] = {
+    {"说出唤醒词开始对话", &emoji_1f642_64}, {"正在聆听", &emoji_1f62f_64},
+    {"正在思考", &emoji_1f914_64},           {"正在回答，轻触可打断", &emoji_1f606_64},
+    {"回答完成", &emoji_1f642_64},           {"离线，等待网络恢复", &emoji_1f614_64},
+    {"发生错误，请重试", &emoji_1f614_64}};
 void emit(Event event, std::uint8_t value = 0) {
   if (handler) {
     handler(event, value);
@@ -49,7 +52,8 @@ void click(lv_event_t* event) {
 }
 void volume_changed(lv_event_t* event) {
   const auto code = lv_event_get_code(event);
-  if (code == LV_EVENT_VALUE_CHANGED || code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+  if (code == LV_EVENT_VALUE_CHANGED || code == LV_EVENT_RELEASED ||
+      code == LV_EVENT_PRESS_LOST) {
     const auto value = static_cast<std::uint8_t>(lv_slider_get_value(slider));
     emit(code == LV_EVENT_VALUE_CHANGED ? Event::Volume : Event::SaveVolume, value);
   }
@@ -87,13 +91,25 @@ void button(lv_obj_t* parent, const char* text, int x) {
 
 bool open(const char* font_path, Handler callback) {
   close();
-  freetype_ready = lv_freetype_init(2, 4, 65536);
+  // lv_init已创建进程级FreeType缓存，不能再次初始化覆盖旧句柄。
+  // 旧版lv_ft_font_init失败会遗留名字引用，先用FreeType直接验证字体。
+  FT_Library library{};
+  FT_Face face_check{};
+  if (!font_path || FT_Init_FreeType(&library) != 0) {
+    return false;
+  }
+  const bool valid = FT_New_Face(library, font_path, 0, &face_check) == 0 &&
+                     FT_Set_Pixel_Sizes(face_check, 0, 16) == 0 &&
+                     FT_Get_Char_Index(face_check, 0x667A) != 0;
+  if (face_check) {
+    FT_Done_Face(face_check);
+  }
+  FT_Done_FreeType(library);
   lv_ft_info_t settings{};
   settings.name = font_path;
   settings.weight = 16;
   settings.style = FT_FONT_STYLE_NORMAL;
-  if (!freetype_ready || !font_path || !lv_ft_font_init(&settings)) {
-    close();
+  if (!valid || !lv_ft_font_init(&settings)) {
     return false;
   }
   font = settings.font;
@@ -181,10 +197,6 @@ void close() noexcept {
   if (font) {
     lv_ft_font_destroy(font);
     font = nullptr;
-  }
-  if (freetype_ready) {
-    lv_freetype_destroy();
-    freetype_ready = false;
   }
   handler = nullptr;
 }
