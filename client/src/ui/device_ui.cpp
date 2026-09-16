@@ -13,8 +13,8 @@
 #include <thread>
 
 #include "../platform/rv1106/display_touch.h"
+#include "boompi/debug.h"
 #include "boompi/ui/lvgl_screen.h"
-#include "camera_capture.h"
 
 namespace boompi::ui {
 namespace {
@@ -50,15 +50,11 @@ void save_volume(std::uint8_t value) {
   }
   if (!ok || std::rename(kTemporary, kSettings) != 0) {
     unlink(kTemporary);
-    std::fprintf(stderr, "boompi-ui: volume save failed\n");
+    debug::log.volume_save_failed();
   }
 }
 void event(page::Event type, std::uint8_t value) {
-  if (type == page::Event::CameraOn) {
-    camera_capture::open();
-  } else if (type == page::Event::CameraOff) {
-    camera_capture::close();
-  } else if (type == page::Event::Volume || type == page::Event::SaveVolume) {
+  if (type == page::Event::Volume || type == page::Event::SaveVolume) {
     volume.store(value);
     if (type == page::Event::SaveVolume) {
       save_volume(value);
@@ -79,7 +75,7 @@ void run() {
   auto tick = std::chrono::steady_clock::now();
   try {
     while (!stopping.load()) {
-      // 快照只在短锁内复制；渲染、字体、SPI和摄像头I/O不持应用交接锁。
+      // 快照只在短锁内复制；渲染、字体和SPI不持应用交接锁。
       UiView next;
       bool update;
       {
@@ -93,9 +89,6 @@ void run() {
       if (update) {
         page::show(next);
       }
-      CameraStatus status;
-      const bool frame = camera_capture::read(page::pixels(), status);
-      page::present(status, frame);
       const auto now = std::chrono::steady_clock::now();
       lv_tick_inc(static_cast<std::uint32_t>(
           std::chrono::duration_cast<std::chrono::milliseconds>(now - tick).count()));
@@ -108,9 +101,8 @@ void run() {
     }
   } catch (...) {
     stopping.store(true);
-    std::fprintf(stderr, "boompi-ui: display worker failed\n");
+    debug::log.display_worker_failed();
   }
-  camera_capture::close();
 }
 }  // namespace
 std::uint8_t load_volume(std::uint8_t fallback) noexcept {
@@ -129,7 +121,7 @@ bool open() {
   if (!hardware.Open()) {
     return false;
   }
-  // 尚未启动工作线程，此处依次配置LVGL端口、字体、两页；不需要启动回执。
+  // 尚未启动工作线程，此处依次配置LVGL端口、字体和小智页面。
   lv_init();
   lv_disp_draw_buf_init(&draw_buffer, draw_pixels.data(), nullptr, draw_pixels.size());
   lv_disp_drv_init(&output);
@@ -187,7 +179,6 @@ void close() noexcept {
   if (worker.joinable()) {
     worker.join();
   }
-  camera_capture::close();
   // join后不再有回调；按页面→输入/显示→硬件释放，允许失败阶段调用。
   page::close();
   if (input) {

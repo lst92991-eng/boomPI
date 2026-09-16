@@ -26,9 +26,7 @@ enum class DeviceUiState : std::uint8_t {
   Offline,
   Error,
 };
-/** @brief 摄像头线程发布的阶段，只有Live时页面展示完整像素帧。 */
-enum class CameraStatus : std::uint8_t { Stopped, Starting, Live, Error };
-/** @brief 应用消费语音与音量动作，摄像头开关由UI线程处理。 */
+/** @brief 应用消费语音与音量动作。 */
 enum class UiActionKind : std::uint8_t { Wake, Interrupt, Volume };
 /** @brief 一个已合并的用户动作，volume 仅对 Volume 有效，单位为百分比。 */
 struct UiAction {

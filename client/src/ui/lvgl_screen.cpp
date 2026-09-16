@@ -12,15 +12,12 @@
 
 namespace boompi::ui::page {
 namespace {
-lv_obj_t *voice_page{}, *camera_page{}, *face{}, *status{}, *hint{}, *subtitle{};
-lv_obj_t *talk{}, *talk_text{}, *slider{}, *volume_text{}, *image{}, *info{};
+lv_obj_t *voice_page{}, *face{}, *status{}, *hint{}, *subtitle{};
+lv_obj_t *talk{}, *talk_text{}, *slider{}, *volume_text{};
 lv_font_t* font{};
 Handler handler{};
 DeviceUiState voice_state{DeviceUiState::Idle};
-bool camera_visible{false};
 bool shown{false};
-Image frame{};
-lv_img_dsc_t descriptor{};
 struct VoiceView {
   const char* title;
   const char* hint;
@@ -33,9 +30,7 @@ const VoiceView views[] = {{"准备好了", "说出唤醒词或点开始", &emoj
                            {"连接已断开", "正在尝试重新连接", &emoji_1f614_64},
                            {"暂时遇到问题", "详情请查看终端日志", &emoji_1f614_64}};
 void emit(Event event, std::uint8_t value = 0) {
-  if (handler) {
-    handler(event, value);
-  }
+  handler(event, value);
 }
 lv_obj_t* label(lv_obj_t* parent, const char* text, int x, int y, int w, int h) {
   auto* object = lv_label_create(parent);
@@ -46,16 +41,11 @@ lv_obj_t* label(lv_obj_t* parent, const char* text, int x, int y, int w, int h) 
   lv_label_set_text(object, text);
   return object;
 }
-void click(lv_event_t* event) {
-  const auto* target = lv_event_get_target(event);
-  if (target == face || target == talk) {
-    if (voice_state == DeviceUiState::Speaking || voice_state == DeviceUiState::Thinking) {
-      emit(Event::Interrupt);
-    } else if (voice_state == DeviceUiState::Idle) {
-      emit(Event::Wake);
-    }
-  } else {
-    camera(!camera_visible);
+void click(lv_event_t*) {
+  if (voice_state == DeviceUiState::Speaking || voice_state == DeviceUiState::Thinking) {
+    emit(Event::Interrupt);
+  } else if (voice_state == DeviceUiState::Idle) {
+    emit(Event::Wake);
   }
 }
 void show_volume(std::uint8_t value) {
@@ -145,10 +135,9 @@ bool open(const char* font_path, Handler callback) {
     return false;
   }
   handler = callback;
-  // 两页一次创建，切页只隐藏容器，不销毁后再依靠标志保护悬空控件。
+  // 仅创建小智页面，运行时只更新状态、字幕和音量。
   voice_page = container();
   label(voice_page, "boomPI · 小智", 16, 12, 175, 24);
-  button(voice_page, "摄像头", 228, 7, 80, 30);
   auto* card = lv_obj_create(voice_page);
   lv_obj_set_pos(card, 12, 43);
   lv_obj_set_size(card, 296, 139);
@@ -175,24 +164,8 @@ bool open(const char* font_path, Handler callback) {
   lv_obj_set_style_bg_color(slider, lv_color_hex(0x087F8C), LV_PART_KNOB);
   lv_slider_set_range(slider, 0, 100);
   lv_obj_add_event_cb(slider, volume_changed, LV_EVENT_ALL, nullptr);
-  camera_page = container();
-  button(camera_page, "返回", 12, 7, 76, 30);
-  label(camera_page, "摄像头预览", 112, 12, 190, 24);
-  info = label(camera_page, "", 25, 98, 270, 60);
-  lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
-  descriptor.header.cf = LV_IMG_CF_TRUE_COLOR;
-  descriptor.header.w = kWidth;
-  descriptor.header.h = kHeight;
-  descriptor.data_size = frame.size() * sizeof(frame[0]);
-  descriptor.data = reinterpret_cast<const std::uint8_t*>(frame.data());
-  image = lv_img_create(camera_page);
-  lv_img_set_src(image, &descriptor);
-  lv_obj_set_pos(image, 0, 46);
-  lv_obj_add_flag(camera_page, LV_OBJ_FLAG_HIDDEN);
-  camera_visible = false;
   shown = false;
   show(UiView{});
-  present(CameraStatus::Stopped, false);
   return true;
 }
 void show(const UiView& view) {
@@ -223,41 +196,12 @@ void show(const UiView& view) {
   }
   shown = true;
 }
-void camera(bool visible) {
-  if (visible == camera_visible) {
-    return;
-  }
-  camera_visible = visible;
-  lv_obj_add_flag(visible ? voice_page : camera_page, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_clear_flag(visible ? camera_page : voice_page, LV_OBJ_FLAG_HIDDEN);
-  present(visible ? CameraStatus::Starting : CameraStatus::Stopped, false);
-  emit(visible ? Event::CameraOn : Event::CameraOff);
-}
-Image& pixels() noexcept {
-  return frame;
-}
-void present(CameraStatus status, bool new_frame) {
-  constexpr const char* labels[] = {"摄像头已关闭", "正在开启摄像头…", "",
-                                    "暂时无法预览\n返回后可重新打开"};
-  const char* text = labels[static_cast<unsigned>(status)];
-  if (std::strcmp(lv_label_get_text(info), text) != 0) {
-    lv_label_set_text(info, text);
-  }
-  if (status != CameraStatus::Live) {
-    lv_obj_add_flag(image, LV_OBJ_FLAG_HIDDEN);
-  } else if (new_frame) {
-    lv_obj_clear_flag(image, LV_OBJ_FLAG_HIDDEN);
-    lv_img_cache_invalidate_src(&descriptor);
-    lv_obj_invalidate(image);
-  }
-}
 void close() noexcept {
-  // 页面先于字体释放；外部必须先停UI线程和摄像头生产者。
+  // 页面先于字体释放；外部必须先停UI线程。
   if (voice_page) {
     lv_obj_del(voice_page);
-    lv_obj_del(camera_page);
   }
-  voice_page = camera_page = nullptr;
+  voice_page = nullptr;
   if (font) {
     lv_ft_font_destroy(font);
     font = nullptr;

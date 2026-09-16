@@ -101,7 +101,7 @@ bool capture(const audio::RawCaptureFrame& raw, audio::CaptureChannels& output) 
 bool playback(const std::int16_t* pcm, std::size_t samples,
               audio::StereoPlaybackFrame& output) noexcept {
   output.frames = 0U;
-  // FFmpeg的null flush可能吞掉不足滤波半窗的极短输入(真实库1样本回归)。
+  // FFmpeg的null flush可能吞掉不足滤波半窗的极短输入。
   // EOS送入只读静音来推进滤波，但输出上限仅为尚欠的有效采样时刻，不播放补齐静音。
   static constexpr std::array<std::int16_t, audio::kVoiceFrameSamples> silence{};
   constexpr std::size_t ratio = audio::kDeviceRateHz / audio::kVoiceRateHz;

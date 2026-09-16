@@ -6,7 +6,7 @@
 namespace boompi::network {
 struct Endpoint {
   config::VoiceClientConfig server;
-  const char* interface{nullptr};  // 固定板级名字；Host替身使用nullptr。
+  const char* interface{nullptr};  // find_server成功后为选中的固定板级网卡名。
 };
 // 只在网络线程执行：有线优先，失败后无线；显式地址或UDP发现均绑定所选接口。
 bool find_server(const config::VoiceClientConfig& config, Endpoint& output,

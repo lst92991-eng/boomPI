@@ -34,10 +34,6 @@ function(boompi_require_file name path output)
 endfunction()
 
 function(boompi_configure_audio_vendor_dependencies)
-  if(NOT BOOMPI_TARGET_RV1106)
-    return()
-  endif()
-
   boompi_require_directory(BOOMPI_ROCKCHIP_3A_INCLUDE_DIR
     "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}" rockchip_include)
   boompi_require_file(BOOMPI_ROCKCHIP_3A_HEADER

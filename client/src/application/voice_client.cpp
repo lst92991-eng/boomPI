@@ -7,6 +7,7 @@
 #include "boompi/audio/playback.h"
 #include "boompi/audio/speech.h"
 #include "boompi/audio/voice_input.h"
+#include "boompi/debug.h"
 #include "boompi/network/voice_net.h"
 #include "boompi/ui/device_ui.h"
 
@@ -68,13 +69,13 @@ void receive_reply() {
       view.ClearText();
       if (event.kind == LinkEventKind::Offline) {
         voice_input::end_utterance();
-        std::fprintf(stderr, "boompi: offline; stage=%s\n", event.data.c_str());
+        debug::log.offline(event.data.c_str());
       }
       show(State::Idle);
       continue;
     }
     if (event.kind == LinkEventKind::Error) {
-      std::fprintf(stderr, "boompi: reply failed; code=%s\n", event.data.c_str());
+      debug::log.reply_failed(event.data.c_str());
       cancel(state == State::Speaking);
       continue;
     }
@@ -112,7 +113,7 @@ bool App_Init(const boompi::config::VoiceClientConfig& config) {
   try {
     view.volume = ui::load_volume();
     if (!ui::open()) {
-      std::fprintf(stderr, "boompi: display unavailable; voice continues\n");
+      debug::log.display_unavailable();
     }
     if (!voice_input::open()) {
       return fail(voice_input::error().c_str());
@@ -153,7 +154,7 @@ bool App_Process() {
     }
     // 超时或缺帧不能继续提交残缺语句；停止后才重新等待开口。
     if (input == voice_input::ReadResult::Frame && frame.discontinuity) {
-      std::fprintf(stderr, "boompi: input discontinuity; current input canceled\n");
+      debug::log.input_discontinuity();
     }
     if ((state != State::Idle && Clock::now() >= deadline) ||
         (input == voice_input::ReadResult::Frame && frame.discontinuity)) {

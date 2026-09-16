@@ -1,6 +1,6 @@
 # BPV4：固定文本控制与16 kHz PCM
 
-客户端与服务端成套使用。WSS、TLS/SPKI与课堂鉴权保持；旧JSON控制和BPV3音频不兼容，不保留双栈。
+客户端与服务端成套使用，通过WSS、TLS/SPKI和课堂口令建立连接。
 
 每个WebSocket文本消息是一条完整控制。字段间使用一个ASCII空格；正文是剩余全部UTF-8字节，不做JSON转义。TEXT正文可以包含空格、换行和反斜杠，它们不会被当作新命令。所有消息拒绝NUL、非法UTF-8、超长消息、缺字段、未知命令和无效数字。
 
@@ -32,8 +32,6 @@ HELLO使用规范小写UUID；口令限定1～256个可打印非空白ASCII字�
 
 上行固定640字节（20ms），下行2～640个偶数字节。短下行包只能是最后一包，此后允许TEXT、DONE或ERROR，但不能再有音频。服务端满帧立即发送，余数只在完成时发出，不补静音。
 
-客户端网络是接收sequence的唯一校验者；播放队列仍检查内存边界、generation和取消状态，不再重复维护网络序号。服务端socket消息的PCM所有权直接转给会话worker，不追加第二份PCM副本。
+客户端网络校验generation和sequence，播放器通过取消完成屏障隔离旧I/O并检查内存边界，不保存另一套网络轮次/序号。服务端socket消息的PCM所有权直接转给会话worker，不追加第二份PCM副本。
 
 DONE只表示服务端发完；应用调用playback::finish后，播放线程取完有效滤波尾音、等待ALSA drain，才发布Drained并进入追问。队列满、缺帧或超时取消整轮，不跳帧后继续，也不伪造END。断线重连不重发半句话，旧轮次不得复活。
-
-共享样本：[protocol-v4-golden.json](fixtures/protocol-v4-golden.json)。该文件用JSON保存测试元数据，线上报文不是JSON，板端已无cJSON依赖。

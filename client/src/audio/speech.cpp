@@ -1,9 +1,9 @@
 #include "boompi/audio/speech.h"
 
 #include <algorithm>
-#include <cstdio>
 
 #include "board_voice_profile.h"
+#include "boompi/debug.h"
 
 namespace boompi::speech {
 namespace {
@@ -81,13 +81,13 @@ Result update(const audio::CaptureFrame& frame, bool speaking) noexcept {
     if (voice_frames >= kConfirmFrames) {
       probing = false;
       result.start = true;
-      std::fprintf(stderr, "boompi: barge confirmed\n");
+      debug::log.barge_confirmed();
     } else if (probe_frames >= kProbeFrames) {
       // 丢掉被拒绝的候选；恢复旧回答，不创建空轮次，不把旧END或回声带给追问。
       probing = false;
       next = stored = voice_frames = reference_quiet_frames = 0;
       retry_frames = audio::board::kBargeRetryMs / audio::kFrameMs;
-      std::fprintf(stderr, "boompi: barge rejected; reference=%d\n", frame.reference_active);
+      debug::log.barge_rejected(frame.reference_active);
     }
   } else if (retry_frames != 0) {
     --retry_frames;
@@ -98,7 +98,7 @@ Result update(const audio::CaptureFrame& frame, bool speaking) noexcept {
     if (voice_frames >= kCandidateFrames) {
       probing = true;
       probe_frames = reference_quiet_frames = voice_frames = 0;
-      std::fprintf(stderr, "boompi: barge probe\n");
+      debug::log.barge_probe();
     }
   } else {
     voice_frames = frame.vad_now ? voice_frames + 1 : 0;

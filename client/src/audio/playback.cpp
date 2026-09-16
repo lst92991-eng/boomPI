@@ -16,6 +16,7 @@
 #include "audio_convert.h"
 #include "audio_thread.h"
 #include "board_voice_profile.h"
+#include "boompi/debug.h"
 
 namespace boompi::playback {
 namespace {
@@ -82,7 +83,7 @@ int render(const std::int16_t* pcm, std::size_t samples, bool silence = false) {
         return result;
       }
       // 恢复只写尚未接受的后缀，不能重播前半帧。
-      std::fprintf(stderr, "boompi: playback xrun after %zu frames (%d)\n", offset, count);
+      debug::log.playback_xrun(offset, count);
     } else if (count != -EINTR) {
       return count < 0 ? count : -EIO;
     }

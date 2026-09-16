@@ -16,8 +16,9 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <cstdio>
 #include <string>
+
+#include "boompi/debug.h"
 
 namespace boompi::platform::rv1106 {
 namespace {
@@ -114,7 +115,7 @@ bool DisplayTouch::Open() {
     Close();
     return false;
   }
-  std::fprintf(stderr, "boompi-ui: SPI=%u Hz; touch=GT911/i2c-3\n", speed);
+  debug::log.display_ready(speed);
   return true;
 }
 
@@ -329,14 +330,13 @@ void DisplayTouch::TouchFailed(const char* stage) {
   }
   if (touch_recovery_attempts >= kTouchRecoveryLimit) {
     touch_disabled = true;
-    std::fprintf(stderr, "boompi-ui: GT911 disabled after bounded recovery\n");
+    debug::log.touch_disabled();
     return;
   }
 
   ++touch_recovery_attempts;
   next_touch_recovery = now + std::chrono::seconds(2);
-  std::fprintf(stderr, "boompi-ui: GT911 %s failed; recovery %u/%u\n", stage,
-               touch_recovery_attempts, kTouchRecoveryLimit);
+  debug::log.touch_recovery(stage, touch_recovery_attempts, kTouchRecoveryLimit);
   if (touch >= 0) {
     close(touch);
   }
@@ -344,10 +344,10 @@ void DisplayTouch::TouchFailed(const char* stage) {
   if (InitTouch()) {
     touch_failures = 0U;
     touch_recovery_attempts = 0U;
-    std::fprintf(stderr, "boompi-ui: GT911 recovered\n");
+    debug::log.touch_recovered();
   } else if (touch_recovery_attempts == kTouchRecoveryLimit) {
     touch_disabled = true;
-    std::fprintf(stderr, "boompi-ui: GT911 disabled after bounded recovery\n");
+    debug::log.touch_disabled();
   }
 }
 

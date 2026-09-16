@@ -15,7 +15,7 @@ import (
 
 var errConnectionClosed = errors.New("transport connection is closed")
 
-// Message contains one validated v3 JSON object or one fixed 20 ms uplink frame.
+// Message contains one validated BPV4 text command or one fixed 20 ms uplink frame.
 type Message struct {
 	Control   *protocol.Control
 	PCMHeader *protocol.PCMHeader

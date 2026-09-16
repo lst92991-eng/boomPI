@@ -9,7 +9,7 @@
 #include <pthread.h>
 #include <sched.h>
 
-#include <cstdio>
+#include "boompi/debug.h"
 
 namespace boompi::audio {
 
@@ -20,8 +20,7 @@ void SetAudioThreadPriority(const char* name, int priority) noexcept {
   parameters.sched_priority = priority;
   const int result = pthread_setschedparam(pthread_self(), SCHED_FIFO, &parameters);
   if (result != 0) {
-    std::fprintf(stderr, "boompi-client: warning: %s realtime priority %d failed (%d)\n", name,
-                 priority, result);
+    debug::log.priority_failed(name, priority, result);
   }
 }
 

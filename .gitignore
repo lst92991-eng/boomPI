@@ -7,8 +7,6 @@
 **/CMakeFiles/
 **/CMakeCache.txt
 **/cmake_install.cmake
-**/CTestTestfile.cmake
-**/Testing/
 **/compile_commands.json
 CMakeUserPresets.json
 *.o
@@ -26,11 +24,9 @@ CMakeUserPresets.json
 *.ilk
 *.exe
 
-# Go output and coverage
+# Go output
 /server/boompi-server
 /server/boompi-server.exe
-/server/coverage.out
-*.test
 *.prof
 
 # Python helper cache
@@ -60,7 +56,6 @@ CMakeUserPresets.json
 **/logs/
 **/recordings/
 **/debug-audio/
-/test/**/*.raw
 *.log
 *.core
 core

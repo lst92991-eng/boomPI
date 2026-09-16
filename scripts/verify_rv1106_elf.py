@@ -44,7 +44,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--readelf",
         default=os.environ.get("READELF", "readelf"),
-        help="readelf executable (or a Python .py test shim)",
+        help="readelf executable from the matching toolchain",
     )
     parser.add_argument(
         "--max-glibcxx",
@@ -63,18 +63,11 @@ def _normalize_glibcxx(value: str) -> Tuple[str, Tuple[int, ...]]:
     return token, version
 
 
-def _readelf_command(readelf: str) -> List[str]:
-    # Supporting a Python shim keeps offline tests portable without invoking a shell.
-    if Path(readelf).suffix.lower() == ".py":
-        return [sys.executable, readelf]
-    return [readelf]
-
-
 def _run_readelf(readelf: str, option: str, elf: Path, stage: str) -> str:
     environment = os.environ.copy()
     environment["LC_ALL"] = "C"
     environment["LANG"] = "C"
-    command = _readelf_command(readelf) + ["--wide", option, os.fspath(elf)]
+    command = [readelf, "--wide", option, os.fspath(elf)]
     try:
         completed = subprocess.run(
             command,

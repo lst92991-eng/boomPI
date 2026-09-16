@@ -1,8 +1,7 @@
 /** @file audio_thread.h
  * @brief 音频工作线程的板端调度设置。
  *
- * voice_input和playback在各自线程入口调用一次；Host目标由
- * CMake 选择替身实现，业务代码无需以平台宏分支控制线程策略。
+ * voice_input和playback在各自线程入口调用一次，调度设置只作用于当前线程。
  */
 #pragma once
 
