@@ -1,3 +1,9 @@
+/** @file audio_capture.cpp
+ * @brief ALSA 原始 PCM 采集：设置 Mode1 → 配置四槽输入 → 连续读取 → 中断/关闭。
+ *
+ * 本层只读硬件，不调用声学算法。短读可补齐，XRUN 必须丢弃前缀并报告断点。
+ * 主线程 interrupt 打断读取；采集任务退出后才能 close 释放句柄。
+ */
 #include "audio_capture.h"
 
 #include <alsa/asoundlib.h>
@@ -21,7 +27,10 @@ constexpr const char* kLoopbackMode = "Mode1";
 constexpr int kOpenFlags =
     SND_PCM_NO_AUTO_RESAMPLE | SND_PCM_NO_AUTO_CHANNELS | SND_PCM_NO_AUTO_FORMAT;
 
-int ConfigureLoopbackMode1() noexcept {
+/** @brief 按枚举名字启用并回读 Mode1；临时 mixer 句柄离开函数即释放。
+ * 配置只能证明驱动接受选项，不能据此推断真实回采点、增益位置及延迟。
+ */
+int configure_loopback_mode1() noexcept {
   snd_ctl_t* raw;
   int rc = snd_ctl_open(&raw, audio::kMixerCard, 0);
   if (rc < 0) {
@@ -67,14 +76,20 @@ int ConfigureLoopbackMode1() noexcept {
     return rc;
   }
   rc = snd_ctl_elem_read(raw, value);
-  return rc >= 0 && snd_ctl_elem_value_get_enumerated(value, 0) != target ? -EIO : rc;
+  if (rc < 0) {
+    return rc;
+  }
+  if (snd_ctl_elem_value_get_enumerated(value, 0) != target) {
+    return -EIO;
+  }
+  return rc;
 }
 
 }  // namespace
 
 int open() noexcept {
   // Mode1先于首次PCM打开；采集只有一种固定板级格式。
-  int result = ConfigureLoopbackMode1();
+  int result = configure_loopback_mode1();
   if (result >= 0) {
     result = snd_pcm_open(&capture_pcm, audio::kCapturePcm, SND_PCM_STREAM_CAPTURE, kOpenFlags);
   }
@@ -89,6 +104,7 @@ int open() noexcept {
   capture_stopped.store(false);
   return result;
 }
+
 int read(std::int16_t* output) noexcept {
   if (capture_stopped.load()) {
     return -ECANCELED;
@@ -121,10 +137,12 @@ int read(std::int16_t* output) noexcept {
   }
   return static_cast<int>(kCapture48Frames);
 }
+
 int interrupt() noexcept {
   capture_stopped.store(true);
   return capture_pcm ? snd_pcm_abort(capture_pcm) : 0;
 }
+
 void close() noexcept {
   if (capture_pcm) {
     snd_pcm_close(capture_pcm);

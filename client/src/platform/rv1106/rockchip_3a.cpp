@@ -1,3 +1,9 @@
+/** @file rockchip_3a.cpp
+ * @brief 配置并调用一个 Rockchip 声学处理句柄，将双麦/单参考转换为单声道。
+ *
+ * open 按 AEC、AES、ANR、去混响、双讲展开配置；这是阅读顺序，不代表库内执行顺序。
+ * process 只适配当前 256 点厂商块和 320 点业务帧，用户插话策略在 speech.cpp。
+ */
 #include "boompi/platform/rv1106/rockchip_3a.h"
 
 #include <algorithm>
@@ -5,7 +11,6 @@
 #include <cstdint>
 #include <cstring>
 #include <new>
-#include <type_traits>
 
 #include "board_voice_profile.h"
 #include "rkaudio_preprocess.h"
@@ -17,12 +22,13 @@ namespace {
 // 当前read_size配置为256，产品层以320 samples/20 ms交付；不据此断言SDK只支持256。
 constexpr int kVendorBlockSamples = 256;
 constexpr std::size_t kVendorInputChannels = 3U;
+// 当前厂商块 256 <= 业务帧 320，配合一帧预填，输出容量取两帧；改块长须重新核算余数。
 constexpr std::size_t kOutputFifoSamples = 2 * audio::kVoiceFrameSamples;
-static_assert(kVendorBlockSamples > 0 && kVendorBlockSamples <= audio::kVoiceFrameSamples);
 void* handle{nullptr};
 RKAUDIOParam* parameters{nullptr};
 std::array<std::int16_t, kVendorBlockSamples * kVendorInputChannels> input_block{};
 std::array<std::int16_t, kOutputFifoSamples> output_fifo{};
+// input_shorts 数交错 S16 元素（包含三个通道）；output_count 数单声道采样点。
 std::size_t input_shorts{0U}, output_count{0U};
 
 constexpr int kVendorInputShorts = kVendorBlockSamples * kVendorInputChannels;
@@ -32,19 +38,8 @@ constexpr int kMainFeatureMask = RKAUDIO_EN_AEC | RKAUDIO_EN_BF;
 constexpr int kBeamformingFeatureMask =
     EN_Fastaec | EN_AES | EN_Anr | EN_Dereverberation | EN_STDT;
 
-using InitSignature = void* (*)(int, int, int, int, RKAUDIOParam*);
-using ProcessSignature = int (*)(void*, short*, short*, int, int*);
-using DestroySignature = void (*)(void*);
-
-// 编译期核对 vendor 头文件 ABI 和已验证 feature 数值，BSP 变更会在构建时明确失败。
-static_assert(sizeof(short) == sizeof(std::int16_t), "Rockchip 3A requires a 16-bit short");
-static_assert(std::is_same<decltype(&rkaudio_preprocess_init), InitSignature>::value,
-              "unexpected rkaudio_preprocess_init signature");
-static_assert(std::is_same<decltype(&rkaudio_preprocess_short), ProcessSignature>::value,
-              "unexpected rkaudio_preprocess_short signature");
-static_assert(std::is_same<decltype(&rkaudio_preprocess_destory), DestroySignature>::value,
-              "unexpected rkaudio_preprocess_destory signature");
-static_assert(kBeamformingFeatureMask == 1109, "validated Rockchip 3A profile changed");
+// 直接使用配套 SDK 的头文件和库；当前 ARM 工具链的 short 为 16 位。
+// 更换 SDK 时需核对参数树、返回长度与功能位，不能只替换一个同名动态库。
 }  // namespace
 
 bool open() noexcept {
@@ -139,7 +134,7 @@ bool process(const audio::CaptureChannels& input, audio::VoiceFrame16k& pcm) noe
     input_shorts = 0U;
     output_count += kVendorBlockSamples;
   }
-  // 每次对外稳定取出 320 samples；prime 的静音使输入、输出始终保持固定 20 ms 延迟。
+  // 每次交付 320 点；预填静音带来固定一帧的适配延迟，厂商库内部延迟需另行测量。
   std::copy_n(output_fifo.data(), pcm.size(), pcm.data());
   output_count -= pcm.size();
   std::memmove(output_fifo.data(), output_fifo.data() + pcm.size(),

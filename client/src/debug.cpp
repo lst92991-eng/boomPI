@@ -1,9 +1,14 @@
+/** @file debug.cpp
+ * @brief 集中定义终端日志文案，并在 main 前注册只读回调表。
+ * 调用点负责选择事件；回调只输出，不发起取消、重连或其他业务动作。
+ */
 #include "boompi/debug.h"
 
 #include <cstdio>
 
 namespace boompi::debug {
 namespace {
+/** @brief 返回完整回调表；无捕获 lambda 可直接转为函数指针，无额外对象或消息队列。 */
 Callbacks register_callbacks() {
   Callbacks callbacks{};
   callbacks.failure = [](const char* reason) {
@@ -35,9 +40,6 @@ Callbacks register_callbacks() {
   };
   callbacks.volume_save_failed = [] {
     std::fprintf(stderr, "boompi-ui: volume save failed\n");
-  };
-  callbacks.display_worker_failed = [] {
-    std::fprintf(stderr, "boompi-ui: display worker failed\n");
   };
   callbacks.priority_failed = [](const char* thread, int priority, int code) {
     std::fprintf(stderr, "boompi-client: warning: %s realtime priority %d failed (%d)\n",

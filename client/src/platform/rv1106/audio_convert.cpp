@@ -1,11 +1,9 @@
 /** @file audio_convert.cpp
- * @brief 采集端保持麦克风与参考同相位，播放端保持 20 ms 的重采样节拍。
+ * @brief 当前硬件格式与算法格式之间的适配；两个方向各自保留滤波历史。
  *
  * 采集：校正双麦极性 → 双麦/refL共同48k→16k。
- * 播放：16k单声道 →
- * 48k交错双声道；EOS单独取出滤波尾音。
- * 两条方向各持有独立
- * SwrContext；Open/Close 由启动/退出路径串行管理。
+ * 播放：16k单声道 → 48k交错双声道；结束时单独取出滤波尾音。
+ * 两个 SwrContext 不共享采样。16k 硬件全双工尚待验证，因此保留当前转换。
  */
 #include "audio_convert.h"
 
@@ -26,9 +24,9 @@ SwrContext* capture_swr{nullptr};
 SwrContext* playback_swr{nullptr};
 std::size_t playback_pending_frames{0U};
 
-// 只分配并配置，open/reset在所属方向完成初始化。
-SwrContext* NewResampler(int in_rate, int in_channels, int out_rate,
-                         int out_channels) noexcept {
+/** @brief 只分配 S16 交错转换器；矩阵设置及初始化由对应方向的 open/reset 完成。 */
+SwrContext* create_resampler(int in_rate, int in_channels, int out_rate,
+                             int out_channels) noexcept {
   return swr_alloc_set_opts(
       nullptr, av_get_default_channel_layout(out_channels), AV_SAMPLE_FMT_S16, out_rate,
       av_get_default_channel_layout(in_channels), AV_SAMPLE_FMT_S16, in_rate, 0, nullptr);
@@ -36,20 +34,15 @@ SwrContext* NewResampler(int in_rate, int in_channels, int out_rate,
 }  // namespace
 
 bool open_capture() noexcept {
-  capture_swr = NewResampler(audio::kDeviceRateHz, 4, audio::kVoiceRateHz, 3);
+  capture_swr = create_resampler(audio::kDeviceRateHz, 4, audio::kVoiceRateHz, 3);
   // 每行对应一个输出通道；最后一列全零，refR不进入算法。
-  const double channels[] = {audio::board::kLeftMicPolarity,
-                             0,
-                             0,
-                             0,
-                             0,
-                             audio::board::kRightMicPolarity,
-                             0,
-                             0,
-                             0,
-                             0,
-                             1,
-                             0};
+  // clang-format off
+  const double channels[] = {
+      audio::board::kLeftMicPolarity, 0, 0, 0,   // mic0
+      0, audio::board::kRightMicPolarity, 0, 0,  // mic1
+      0, 0, 1, 0                               // refL
+  };
+  // clang-format on
   if (!capture_swr || swr_set_matrix(capture_swr, channels, 4) < 0 || !reset_capture()) {
     close_capture();
     return false;
@@ -58,7 +51,7 @@ bool open_capture() noexcept {
 }
 
 bool open_playback() noexcept {
-  playback_swr = NewResampler(audio::kVoiceRateHz, 1, audio::kDeviceRateHz, 2);
+  playback_swr = create_resampler(audio::kVoiceRateHz, 1, audio::kDeviceRateHz, 2);
   // 明确L=mono、R=mono，避免默认声道矩阵衰减；矩阵在初始化前设置。
   const double stereo_matrix[] = {1.0, 1.0};
   if (!playback_swr || swr_set_matrix(playback_swr, stereo_matrix, 1) < 0 ||
@@ -105,8 +98,7 @@ bool playback(const std::int16_t* pcm, std::size_t samples,
   // EOS送入只读静音来推进滤波，但输出上限仅为尚欠的有效采样时刻，不播放补齐静音。
   static constexpr std::array<std::int16_t, audio::kVoiceFrameSamples> silence{};
   constexpr std::size_t ratio = audio::kDeviceRateHz / audio::kVoiceRateHz;
-  static_assert(audio::kDeviceRateHz % audio::kVoiceRateHz == 0U,
-                "playback duration requires an integer rate ratio");
+  // 当前 48k/16k 比例为整数 3；有效输出时刻只按真实输入计数，补齐静音不延长回答。
   playback_pending_frames += samples * ratio;
   if (playback_pending_frames > 2 * audio::kPlaybackFrameCapacity) {
     return false;
@@ -136,6 +128,7 @@ bool playback(const std::int16_t* pcm, std::size_t samples,
 void close_capture() noexcept {
   swr_free(&capture_swr);
 }
+
 void close_playback() noexcept {
   swr_free(&playback_swr);
   playback_pending_frames = 0U;

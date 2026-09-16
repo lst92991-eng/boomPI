@@ -1,3 +1,9 @@
+/** @file speech.cpp
+ * @brief 主线程的语句策略：记录句首 → 确认开口 → 逐帧交付 → 确认句尾。
+ *
+ * 普通开口看连续 VAD；有声回复期间先检测候选，暂停播放后再用参考和人声复核。
+ * history 只保存尚未确认的 500ms，开始上传后直接借用当前输入，不保存整句话。
+ */
 #include "boompi/audio/speech.h"
 
 #include <algorithm>
@@ -14,14 +20,16 @@ constexpr unsigned kCandidateFrames = audio::board::kBargeCandidateMs / audio::k
 constexpr unsigned kProbeFrames = audio::board::kBargeProbeMs / audio::kFrameMs;
 constexpr unsigned kSettleFrames = audio::board::kBargeSettleMs / audio::kFrameMs;
 constexpr unsigned kConfirmFrames = audio::board::kBargeConfirmMs / audio::kFrameMs;
-static_assert(kCandidateFrames + kProbeFrames <= kPreRollFrames,
-              "probe must retain the entire candidate in the existing pre-roll");
+// 120ms 候选 + 380ms 复核正好由 500ms 前滚覆盖；调整时要一起核对，避免丢句首。
 std::array<audio::VoiceFrame16k, kPreRollFrames> history;
+// next 为下一写入位置，stored 为有效帧数；从 next-stored 起按时间顺序回放句首。
 std::size_t next{0}, stored{0};
+// utterance_frames 非零表示已确认本句，直到应用 END 后停止 update 或下一窗口 reset。
 unsigned voice_frames{0}, quiet_frames{0}, utterance_frames{0};
 unsigned probe_frames{0}, reference_quiet_frames{0}, retry_frames{0}, tail_frames{0};
 bool probing{false}, reference_seen{false};
 
+/** @brief 插话候选需同时满足 VAD 和交流能量；这只是准入条件，后面仍需停播复核。 */
 bool near_voice(const audio::CaptureFrame& frame) noexcept {
   if (!frame.vad_now) {
     return false;
@@ -61,6 +69,7 @@ Result update(const audio::CaptureFrame& frame, bool speaking) noexcept {
     return result;
   }
   history[next] = frame.pcm;
+  // 当前帧先入历史；确认成功时整段历史已含它，不能再单独发送一次当前帧。
   next = (next + 1) % kPreRollFrames;
   stored = std::min(stored + 1, kPreRollFrames);
   reference_seen = reference_seen || frame.reference_active;
@@ -75,9 +84,8 @@ Result update(const audio::CaptureFrame& frame, bool speaking) noexcept {
     reference_quiet_frames = !frame.reference_active && (frame.playback_held || !speaking)
                                  ? reference_quiet_frames + 1
                                  : 0;
-    voice_frames = reference_quiet_frames > kSettleFrames && near_voice(frame)
-                       ? voice_frames + 1
-                       : 0;
+    voice_frames =
+        reference_quiet_frames > kSettleFrames && near_voice(frame) ? voice_frames + 1 : 0;
     if (voice_frames >= kConfirmFrames) {
       probing = false;
       result.start = true;

@@ -1,8 +1,8 @@
 /**
  * @file voice_client_config.h
- * @brief 进程启动前读取并校验设备身份与可选服务端端点。
+ * @brief 应用初始化时读取并校验设备身份与可选服务端端点。
  *
- * main 校验配置后交给 App_Init，网络直接复用同一份配置；地址和 TLS pin
+ * App_Init 读取配置后交给网络模块；地址和 TLS pin
  * 留空时使用自动发现。音频格式/门限属于板级 profile，API Key 仅存在于配套服务端。
  */
 #pragma once

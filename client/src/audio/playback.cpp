@@ -1,3 +1,10 @@
+/** @file playback.cpp
+ * @brief 播放任务：连续采样环 → 重采样/音量 → ALSA → 正常尾播完成通知。
+ *
+ * 主线程投递 PCM 和控制，播放线程消费；mutex 保护采样环与控制状态。
+ * write/prepare/drain 由播放线程执行，cancel 可从主线程 drop 以打断阻塞输出。
+ * 这里只管理音频消费，不决定新问题、追问窗口或网络轮次。
+ */
 #include "boompi/audio/playback.h"
 
 #include <alsa/asoundlib.h>
@@ -10,6 +17,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <mutex>
 #include <thread>
 
@@ -30,12 +38,15 @@ snd_pcm_t* device{nullptr};
 std::atomic<bool> stopping{false}, canceled{false};
 std::atomic<std::uint8_t> volume{60};
 State state{State::Idle};
+// ending 表示不会再有新采样；holding 是插话试探请求，两者都不等于声卡已静音。
 bool ending{false}, holding{false};
 std::chrono::steady_clock::time_point hold_until{};
 std::atomic<bool> hold_applied{false};
+/** @brief 持锁检查试探暂停是否尚未过期；重复 true 请求不会延长截止时间。 */
 bool hold_active() {
   return holding && std::chrono::steady_clock::now() < hold_until;
 }
+
 char failure[192]{};
 audio::StereoPlaybackFrame stereo;
 
@@ -46,6 +57,10 @@ bool fail(const char* stage, int code = 0) {
   }
   return false;
 }
+
+/** @brief 转换并完整写出一块；nullptr/0 排滤波尾音，silence 单独写静音且不消费 TTS。
+ * 只由播放线程在不持队列锁时调用；部分写从后缀继续，取消返回 -ECANCELED。
+ */
 int render(const std::int16_t* pcm, std::size_t samples, bool silence = false) {
   if (silence) {
     // 不把静音送进TTS重采样器；保留其历史和未消费的TTS，恢复时不吞字。
@@ -90,6 +105,8 @@ int render(const std::int16_t* pcm, std::size_t samples, bool silence = false) {
   }
   return static_cast<int>(stereo.frames);
 }
+
+/** @brief 丢弃声卡尚未播放的数据；调用方持 mutex，保留除已停止状态以外的错误。 */
 void drop() {
   const int result = snd_pcm_drop(device);
   if (result < 0 && result != -EBADFD) {
@@ -97,6 +114,9 @@ void drop() {
   }
 }
 
+/** @brief 等待输入 → 每块取出后解锁写声卡 → 尾播或取消 → 通知主线程。
+ * 声卡写入可能阻塞，因此不能持队列锁；取消标志在每次写之前重新检查。
+ */
 void play() {
   audio::SetAudioThreadPriority("boompi-playback", 30);
   while (!stopping.load()) {
@@ -108,11 +128,13 @@ void play() {
     if (stopping.load()) {
       break;
     }
+    // 1. 新回答重新准备声卡及滤波历史；旧回答取消收尾前不会接纳新数据。
     int result = canceled ? -ECANCELED : snd_pcm_prepare(device);
     if (result >= 0 && !audio_convert::reset_playback()) {
       result = -EIO;
     }
     while (result >= 0 && !canceled && !stopping.load()) {
+      // 2. 通常等完整 320 点；收到 finish 后，少于一帧的短回答/尾帧也立即放行。
       ready.wait(lock, [] {
         const bool quiet = hold_active();
         if (!quiet) {
@@ -144,6 +166,7 @@ void play() {
       result = render(frame.data(), count);
       lock.lock();
     }
+    // 3. 正常结束补滤波尾音并等待硬件播完；取消路径直接丢弃，不跨轮保留尾音。
     bool discard = canceled || stopping.load() || result == -ECANCELED;
     lock.unlock();
     if (result >= 0 && !discard) {
@@ -195,14 +218,16 @@ bool open(std::uint8_t level) {
   set_volume(level);
   state = State::Idle;
   stopping.store(false);
+  // std::thread 的失败通过标准异常返回；声卡与转换器仍按各自返回值判断。
   try {
     thread = std::thread(play);
     return true;
-  } catch (...) {
+  } catch (const std::exception&) {
     close();
     return fail("playback thread creation failed");
   }
 }
+
 WriteResult write(const void* data, std::size_t bytes) {
   const auto* pcm = static_cast<const std::uint8_t*>(data);
   if (!pcm || !bytes || bytes % 2) {
@@ -222,6 +247,7 @@ WriteResult write(const void* data, std::size_t bytes) {
     return WriteResult::Rejected;
   }
   const auto count = bytes / 2;
+  // 整包接纳或整包失败；应用收到 Full 会取消本轮，不能保留一句缺字的回复。
   if (count > kCapacity - buffered) {
     return WriteResult::Full;
   }
@@ -238,11 +264,13 @@ WriteResult write(const void* data, std::size_t bytes) {
   ready.notify_all();
   return WriteResult::Queued;
 }
+
 void finish() {
   std::lock_guard<std::mutex> lock(mutex);
   ending = true;
   ready.notify_all();
 }
+
 void cancel() {
   std::lock_guard<std::mutex> lock(mutex);
   holding = false;
@@ -254,6 +282,7 @@ void cancel() {
     ready.notify_all();
   }
 }
+
 void hold(bool enabled) {
   std::lock_guard<std::mutex> lock(mutex);
   if (enabled && !holding) {
@@ -267,20 +296,25 @@ void hold(bool enabled) {
   }
   ready.notify_all();
 }
+
 bool held() noexcept {
   return hold_applied.load();
 }
+
 void set_volume(std::uint8_t level) {
   volume.store(std::min<std::uint8_t>(level, 100));
 }
+
 State status() {
   std::lock_guard<std::mutex> lock(mutex);
   return failure[0] ? State::Failed : state;
 }
+
 std::string error() {
   std::lock_guard<std::mutex> lock(mutex);
   return failure;
 }
+
 void close() {
   stopping.store(true);
   cancel();

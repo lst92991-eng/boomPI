@@ -1,3 +1,9 @@
+/** @file wake.cpp
+ * @brief Snowboy 唤醒检测；本文件同时承担旧 C++ ABI 隔离，不另设桥接转发层。
+ *
+ * 构造、检测和复位可能抛第三方异常，必须在本 ABI 内捕获，再以 bool/整数交付。
+ * 运行期只有采集线程访问 detector；这里不判断语句开始、结束或插话。
+ */
 #include "wake.h"
 
 #include <memory>
@@ -28,15 +34,23 @@ bool open() noexcept {
   close();
   return false;
 }
+
 int detect(const audio::VoiceFrame16k& pcm) noexcept {
   try {
     const int result = detector->RunDetection(pcm.data(), static_cast<int>(pcm.size()), false);
     // SDK的-2是静音、-1是错误；模块只向主线交付错误/未命中/命中。
-    return result == -2 ? 0 : result < 0 ? -1 : result > 0 ? 1 : 0;
+    if (result == -2) {
+      return 0;
+    }
+    if (result < 0) {
+      return -1;
+    }
+    return result > 0 ? 1 : 0;
   } catch (...) {
     return -1;
   }
 }
+
 bool reset() noexcept {
   try {
     return detector->Reset();
@@ -44,6 +58,7 @@ bool reset() noexcept {
     return false;
   }
 }
+
 void close() noexcept {
   detector.reset();
 }

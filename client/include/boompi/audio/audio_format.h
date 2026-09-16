@@ -1,3 +1,7 @@
+/** @file audio_format.h
+ * @brief 定义采样率、通道数和业务帧长度，所有大小都从这组常量推导。
+ * samples 指每通道的采样时刻数；交错数组元素数还需乘通道数。
+ */
 #pragma once
 #include <array>
 #include <cstddef>

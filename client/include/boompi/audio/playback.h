@@ -1,3 +1,6 @@
+/** @file playback.h
+ * @brief 接收 16k 单声道 PCM，异步转换并写声卡；对话何时开始或结束由应用决定。
+ */
 #pragma once
 
 #include <cstddef>
@@ -23,9 +26,13 @@ void cancel();
 void hold(bool enabled);
 // 输入线程取无锁观测；true仅表示播放线程已写入试探静音，仍须检查实际参考。
 bool held() noexcept;
+/** @brief 原子更新 0..100 音量；播放线程在后续输出块应用，参数超过 100 时限制为 100。 */
 void set_volume(std::uint8_t volume);
+/** @brief 返回瞬时状态；Failed 优先于播放进度，Drained 只在正常尾播完成后出现。 */
 State status();
+/** @brief 复制本次 open 以来的首个错误原因；cancel 不会抹掉故障。 */
 std::string error();
+/** @brief 请求停止并打断输出，join 后关闭 PCM 和转换器，清空队列。 */
 void close();
 
 }  // namespace boompi::playback

@@ -1,3 +1,9 @@
+/** @file lvgl_screen.cpp
+ * @brief 小智页面：表情、状态、字幕、开始/停止和音量，全部控件在本文件创建。
+ *
+ * open 创建一次，show 只更新变化；点击通过 handler 交给应用作业务决策。
+ * 运行期只有 UI 线程调用这里的函数，页面不持有声卡或网络连接。
+ */
 #include "boompi/ui/lvgl_screen.h"
 
 #include <ft2build.h>
@@ -6,7 +12,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <string>
 
 #include "twemoji_64.h"
 
@@ -18,6 +23,7 @@ lv_font_t* font{};
 Handler handler{};
 DeviceUiState voice_state{DeviceUiState::Idle};
 bool shown{false};
+/** @brief 每个显示状态的固定文案和表情；排列与 DeviceUiState 一致。 */
 struct VoiceView {
   const char* title;
   const char* hint;
@@ -29,9 +35,7 @@ const VoiceView views[] = {{"准备好了", "说出唤醒词或点开始", &emoj
                            {"正在回答", "可以直接说话插话", &emoji_1f606_64},
                            {"连接已断开", "正在尝试重新连接", &emoji_1f614_64},
                            {"暂时遇到问题", "详情请查看终端日志", &emoji_1f614_64}};
-void emit(Event event, std::uint8_t value = 0) {
-  handler(event, value);
-}
+/** @brief 创建同一字体/颜色的标签，尺寸由调用点按页面布局指定。 */
 lv_obj_t* label(lv_obj_t* parent, const char* text, int x, int y, int w, int h) {
   auto* object = lv_label_create(parent);
   lv_obj_set_pos(object, x, y);
@@ -41,13 +45,16 @@ lv_obj_t* label(lv_obj_t* parent, const char* text, int x, int y, int w, int h) 
   lv_label_set_text(object, text);
   return object;
 }
+
+/** @brief 根据当前画面发出开始或停止意图；真正是否允许操作由应用再按实时状态判断。 */
 void click(lv_event_t*) {
   if (voice_state == DeviceUiState::Speaking || voice_state == DeviceUiState::Thinking) {
-    emit(Event::Interrupt);
+    handler(Event::Interrupt, 0);
   } else if (voice_state == DeviceUiState::Idle) {
-    emit(Event::Wake);
+    handler(Event::Wake, 0);
   }
 }
+
 void show_volume(std::uint8_t value) {
   if (value == 0) {
     lv_label_set_text(volume_text, "静音");
@@ -55,31 +62,44 @@ void show_volume(std::uint8_t value) {
     lv_label_set_text_fmt(volume_text, "音量  %u%%", value);
   }
 }
+
+/** @brief 拖动实时改音量，释放/失去按压时才请求保存，避免每次移动都写闪存。 */
 void volume_changed(lv_event_t* event) {
   const auto code = lv_event_get_code(event);
   if (code == LV_EVENT_VALUE_CHANGED || code == LV_EVENT_RELEASED ||
       code == LV_EVENT_PRESS_LOST) {
     const auto value = static_cast<std::uint8_t>(lv_slider_get_value(slider));
     show_volume(value);
-    emit(code == LV_EVENT_VALUE_CHANGED ? Event::Volume : Event::SaveVolume, value);
+    handler(code == LV_EVENT_VALUE_CHANGED ? Event::Volume : Event::SaveVolume, value);
   }
 }
+
+/** @brief 查询当前字体能否绘制该码点，避免旧版 LVGL 进入缺失字形绘制路径。 */
 bool has_glyph(std::uint32_t codepoint) {
   lv_font_glyph_dsc_t glyph{};
   return lv_font_get_glyph_dsc(font, &glyph, codepoint, 0) && glyph.resolved_font;
 }
-std::string supported_text(const char* text) {
-  std::string result;
+
+/** @brief 过滤字体不支持的字符并更新字幕；复用快照大小的固定缓冲，不创建动态字符串。 */
+void show_subtitle(const UiView& view) {
+  auto text = view.text;
+  std::size_t used = 0;
   // 仍保留缺失字形过滤，不能让云端emoji进入旧LVGL的缺字绘制路径。
-  for (std::uint32_t at = 0; text[at];) {
+  for (std::uint32_t at = 0; view.text[at];) {
     const auto start = at;
-    const auto codepoint = _lv_txt_encoded_next(text, &at);
+    const auto codepoint = _lv_txt_encoded_next(view.text.data(), &at);
     if (codepoint == '\n' || (codepoint >= 32 && has_glyph(codepoint))) {
-      result.append(text + start, at - start);
+      std::memcpy(text.data() + used, view.text.data() + start, at - start);
+      used += at - start;
     }
   }
-  return result;
+  text[used] = '\0';
+  if (std::strcmp(lv_label_get_text(subtitle), text.data()) != 0) {
+    lv_label_set_text(subtitle, text.data());
+  }
 }
+
+/** @brief 创建占满屏幕、不可滚动的根容器，子控件随它一起释放。 */
 lv_obj_t* container() {
   auto* object = lv_obj_create(lv_scr_act());
   lv_obj_set_size(object, 320, 240);
@@ -90,6 +110,8 @@ lv_obj_t* container() {
   lv_obj_clear_flag(object, LV_OBJ_FLAG_SCROLLABLE);
   return object;
 }
+
+/** @brief 创建文字按钮并绑定点击回调；只设置页面样式，不决定对话状态。 */
 lv_obj_t* button(lv_obj_t* parent, const char* text, int x, int y, int width, int height) {
   auto* object = lv_btn_create(parent);
   lv_obj_set_pos(object, x, y);
@@ -168,6 +190,7 @@ bool open(const char* font_path, Handler callback) {
   show(UiView{});
   return true;
 }
+
 void show(const UiView& view) {
   if (!shown || voice_state != view.state) {
     voice_state = view.state;
@@ -184,10 +207,7 @@ void show(const UiView& view) {
       lv_obj_add_state(talk, LV_STATE_DISABLED);
     }
   }
-  const auto text = supported_text(view.text.data());
-  if (std::strcmp(lv_label_get_text(subtitle), text.c_str()) != 0) {
-    lv_label_set_text(subtitle, text.c_str());
-  }
+  show_subtitle(view);
   const auto level = std::min<std::uint8_t>(view.volume, 100);
   if (!shown ||
       (!lv_obj_has_state(slider, LV_STATE_PRESSED) && lv_slider_get_value(slider) != level)) {
@@ -196,6 +216,7 @@ void show(const UiView& view) {
   }
   shown = true;
 }
+
 void close() noexcept {
   // 页面先于字体释放；外部必须先停UI线程。
   if (voice_page) {

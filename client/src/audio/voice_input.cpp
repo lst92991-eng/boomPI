@@ -1,3 +1,9 @@
+/** @file voice_input.cpp
+ * @brief 实时输入任务：ALSA → 格式适配 → Rockchip 3A → Snowboy → WebRTC VAD → 主线程。
+ *
+ * 算法在同一任务里顺序调用，只有最后交付处使用 4 帧（80ms）有界队列。
+ * raw/channels 由采集任务独占；frames、读位置、错误原因在 mutex 下交接。
+ */
 #include "boompi/audio/voice_input.h"
 
 #include <array>
@@ -6,6 +12,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <exception>
 #include <mutex>
 #include <thread>
 
@@ -32,23 +39,25 @@ std::size_t read_at{0}, pending{0};
 audio::RawCaptureFrame raw;
 audio::CaptureChannels channels;
 
-bool Fail(const char* reason, int code = 0) {
+/** @brief 保存输入故障并唤醒主线程；应用读取 Failed 后结束运行。 */
+bool fail(const char* reason, int code = 0) {
   std::lock_guard<std::mutex> lock(mutex);
   std::snprintf(failure.data(), failure.size(), code ? "%s (ALSA %d)" : "%s", reason, code);
   condition.notify_all();
   return false;
 }
 
-void CaptureTask() {
+/** @brief 采集线程入口；每轮只读一块、处理一块、交付一块，不等待网络。 */
+void capture_task() {
   audio::SetAudioThreadPriority("boompi-capture", 40);
   bool previous_reference = false, previous_held = false;
   for (;;) {
-    // 读取 → 必要格式适配 → 3A → 唤醒 → VAD → 交付。
+    // 1. 读取原始四槽 PCM；0 是断流，负值区分主动停止和设备故障。
     const bool held_before_read = playback::held();
     const int captured = audio_capture::read(raw.data());
     if (captured < 0) {
       if (captured != -ECANCELED) {
-        Fail("ALSA capture read failed", captured);
+        fail("ALSA capture read failed", captured);
       }
       break;
     }
@@ -58,25 +67,39 @@ void CaptureTask() {
       rockchip_3a::close();
       if (!audio_convert::reset_capture() || !rockchip_3a::open() || !wake::reset() ||
           !vad::reset()) {
-        Fail("audio processing reset after discontinuity failed");
+        fail("audio processing reset after discontinuity failed");
         break;
       }
       frame.discontinuity = true;
     } else {
       // Snowboy要求外部VAD句尾后Reset；只由本线程调用，不等待业务线程握手。
       if (wake_reset.exchange(false) && !wake::reset()) {
-        Fail("Snowboy reset failed");
+        fail("Snowboy reset failed");
         break;
       }
+      // 2. 顺序处理这一帧：格式转换 → 3A → 唤醒 → VAD，算法之间不再放队列。
       if (!audio_convert::capture(raw, channels)) {
-        Fail("capture resampler lost frame alignment");
+        fail("capture resampler lost frame alignment");
         break;
       }
       if (!rockchip_3a::process(channels, frame.pcm)) {
-        Fail("Rockchip 3A rejected a frame");
+        fail("Rockchip 3A rejected a frame");
         break;
       }
-      // 3A的prime使输出固定滞后一帧，参考和播放观测也延后一帧交付。
+      const int detected = wake::detect(frame.pcm);
+      if (detected < 0) {
+        fail("Snowboy processing failed");
+        break;
+      }
+      frame.wake = detected > 0;
+      const int voice = vad::process(frame.pcm);
+      if (voice < 0) {
+        fail("WebRTC VAD processing failed");
+        break;
+      }
+      frame.vad_now = voice == 1;
+
+      // 3. 给处理结果附带插话所需的观测；参考和播放观测随 3A 预填延后一帧。
       frame.reference_active = previous_reference;
       frame.playback_held = previous_held;
       previous_held = held_before_read;
@@ -85,20 +108,8 @@ void CaptureTask() {
         previous_reference = previous_reference || channels[i] > audio::board::kReferencePeak ||
                              channels[i] < -audio::board::kReferencePeak;
       }
-      const int detected = wake::detect(frame.pcm);
-      if (detected < 0) {
-        Fail("Snowboy processing failed");
-        break;
-      }
-      frame.wake = detected > 0;
-      const int voice = vad::process(frame.pcm);
-      if (voice < 0) {
-        Fail("WebRTC VAD processing failed");
-        break;
-      }
-      frame.vad_now = voice == 1;
     }
-    // 队列满显式发布断点，应用必须取消残缺输入，不能悄悄跳过PCM。
+    // 4. 一次交付 PCM 和检测结果。队列满则发布断点，让应用取消残缺语句。
     std::lock_guard<std::mutex> lock(mutex);
     if (frame.discontinuity || pending == kCaptureSlots) {
       frame.discontinuity = true;
@@ -116,23 +127,23 @@ bool open() {
   failure.fill('\0');
   const int result = audio_capture::open();
   if (result < 0) {
-    return Fail("ALSA capture initialization failed", result);
+    return fail("ALSA capture initialization failed", result);
   }
   if (!audio_convert::open_capture()) {
     close();
-    return Fail("capture resampler initialization failed");
+    return fail("capture resampler initialization failed");
   }
   if (!rockchip_3a::open()) {
     close();
-    return Fail("Rockchip 3A initialization failed");
+    return fail("Rockchip 3A initialization failed");
   }
   if (!wake::open()) {
     close();
-    return Fail("Snowboy initialization failed");
+    return fail("Snowboy initialization failed");
   }
   if (!vad::open()) {
     close();
-    return Fail("WebRTC VAD initialization failed");
+    return fail("WebRTC VAD initialization failed");
   }
   wake_reset.store(false);
   read_at = pending = 0;
@@ -141,11 +152,12 @@ bool open() {
 
 bool start() {
   // 由应用在两个PCM均配置成功后启动；不假设Mode1允许输出open之前先read。
+  // std::thread 创建会抛标准异常；失败在这里转为 false，并回收已经打开的输入资源。
   try {
-    thread = std::thread(CaptureTask);
-  } catch (...) {
+    thread = std::thread(capture_task);
+  } catch (const std::exception&) {
     close();
-    return Fail("capture thread creation failed");
+    return fail("capture thread creation failed");
   }
   return true;
 }
@@ -165,17 +177,20 @@ ReadResult read(audio::CaptureFrame& frame) {
   --pending;
   return ReadResult::Frame;
 }
+
 void end_utterance() noexcept {
   wake_reset.store(true);
 }
+
 std::string error() {
   std::lock_guard<std::mutex> lock(mutex);
   return failure.data();
 }
+
 void close() {
   const int interrupted = audio_capture::interrupt();
   if (interrupted < 0) {
-    Fail("ALSA capture stop failed", interrupted);
+    fail("ALSA capture stop failed", interrupted);
   }
   if (thread.joinable()) {
     thread.join();

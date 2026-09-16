@@ -1,3 +1,9 @@
+/** @file device_ui.cpp
+ * @brief UI 生命周期与线程交接：硬件/页面初始化 → 快照刷新/触摸 → 停止回收。
+ *
+ * 主线程调用 show/poll_action；UI 线程执行 LVGL、SPI/I2C 和音量持久化。
+ * view/dirty 在 mutex 下交接；用户动作和音量分别原子覆盖为最新值，不建立事件长队列。
+ */
 #include "boompi/ui/device_ui.h"
 
 #include <fcntl.h>
@@ -9,6 +15,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <exception>
 #include <mutex>
 #include <thread>
 
@@ -36,6 +43,7 @@ lv_disp_draw_buf_t draw_buffer;
 lv_disp_drv_t output;
 lv_indev_drv_t pointer;
 std::array<lv_color_t, 320 * 32> draw_pixels;
+/** @brief 保存释放滑块时的最终音量；失败保留旧配置并报告，不中断语音业务。 */
 void save_volume(std::uint8_t value) {
   // 仅在释放滑块时提交；临时文件完整写入后才替换正式配置。
   const int fd =
@@ -53,6 +61,8 @@ void save_volume(std::uint8_t value) {
     debug::log.volume_save_failed();
   }
 }
+
+/** @brief 页面回调只交付动作；音量保存留在 UI 线程，避免闪存 I/O 占用应用主循环。 */
 void event(page::Event type, std::uint8_t value) {
   if (type == page::Event::Volume || type == page::Event::SaveVolume) {
     volume.store(value);
@@ -64,44 +74,45 @@ void event(page::Event type, std::uint8_t value) {
                                                             : UiActionKind::Interrupt));
   }
 }
+
+/** @brief 同步刷脏矩形；失败请求 UI 停止，但仍必须通知 LVGL 本次 flush 已结束。 */
 void flush(lv_disp_drv_t* driver, const lv_area_t* area, lv_color_t* pixels) {
   if (!hardware.Flush(*area, pixels)) {
     stopping.store(true);
   }
   lv_disp_flush_ready(driver);
 }
+
+/** @brief UI 任务：复制最新快照 → 更新控件 → 推进 LVGL → 等下一次刷新。
+ * 字幕处理使用固定缓冲；设备 I/O 通过返回值报告失败，不用异常控制刷新循环。
+ */
 void run() {
   static_cast<void>(nice(5));
   auto tick = std::chrono::steady_clock::now();
-  try {
-    while (!stopping.load()) {
-      // 快照只在短锁内复制；渲染、字体和SPI不持应用交接锁。
-      UiView next;
-      bool update;
-      {
-        std::lock_guard<std::mutex> lock(mutex);
-        update = dirty;
-        if (update) {
-          next = view;
-        }
-        dirty = false;
-      }
+  while (!stopping.load()) {
+    // 快照只在短锁内复制；渲染、字体和SPI不持应用交接锁。
+    UiView next;
+    bool update;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      update = dirty;
       if (update) {
-        page::show(next);
+        next = view;
       }
-      const auto now = std::chrono::steady_clock::now();
-      lv_tick_inc(static_cast<std::uint32_t>(
-          std::chrono::duration_cast<std::chrono::milliseconds>(now - tick).count()));
-      tick = now;
-      lv_timer_handler();
-      std::unique_lock<std::mutex> lock(mutex);
-      changed.wait_for(lock, std::chrono::milliseconds(30), [] {
-        return stopping.load() || dirty;
-      });
+      dirty = false;
     }
-  } catch (...) {
-    stopping.store(true);
-    debug::log.display_worker_failed();
+    if (update) {
+      page::show(next);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    lv_tick_inc(static_cast<std::uint32_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - tick).count()));
+    tick = now;
+    lv_timer_handler();
+    std::unique_lock<std::mutex> lock(mutex);
+    changed.wait_for(lock, std::chrono::milliseconds(30), [] {
+      return stopping.load() || dirty;
+    });
   }
 }
 }  // namespace
@@ -116,6 +127,7 @@ std::uint8_t load_volume(std::uint8_t fallback) noexcept {
   }
   return static_cast<std::uint8_t>(value);
 }
+
 bool open() {
   close();
   if (!hardware.Open()) {
@@ -136,30 +148,33 @@ bool open() {
     hardware.ReadInput(data);
   };
   input = lv_indev_drv_register(&pointer);
+  const char* font = access(kFont, R_OK) == 0 ? kFont : kFallbackFont;
+  if (!display || !input || !page::open(font, event)) {
+    close();
+    return false;
+  }
+  view = {};
+  dirty = true;
+  action.store(-1);
+  volume.store(-1);
+  stopping.store(false);
+  // std::thread 创建失败会抛标准异常；只在这个边界回收已配置的 UI 资源。
   try {
-    const char* font = access(kFont, R_OK) == 0 ? kFont : kFallbackFont;
-    if (!display || !input || !page::open(font, event)) {
-      close();
-      return false;
-    }
-    view = {};
-    dirty = true;
-    action.store(-1);
-    volume.store(-1);
-    stopping.store(false);
     worker = std::thread(run);
     return true;
-  } catch (...) {
+  } catch (const std::exception&) {
     close();
     return false;
   }
 }
+
 void show(const UiView& value) noexcept {
   std::lock_guard<std::mutex> lock(mutex);
   view = value;
   dirty = true;
   changed.notify_one();
 }
+
 bool poll_action(UiAction& result) noexcept {
   const int command = action.exchange(-1);
   if (command >= 0) {
@@ -173,6 +188,7 @@ bool poll_action(UiAction& result) noexcept {
   result = {UiActionKind::Volume, static_cast<std::uint8_t>(percent)};
   return true;
 }
+
 void close() noexcept {
   stopping.store(true);
   changed.notify_one();
