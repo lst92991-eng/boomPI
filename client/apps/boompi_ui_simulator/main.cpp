@@ -1,14 +1,14 @@
 /**
  * @file main.cpp
- * @brief 用 SDL 在 PC 上承载与 RV1106 完全相同的 LvglScreen 页面。
+ * @brief 用 SDL 在 PC 上承载与 RV1106 完全相同的 两页UI 页面。
  *
  * 模拟器只替换显示 flush 和 pointer 输入端口，页面构建、事件规则、字体过滤与摄像头
  * 占位图仍使用生产代码。它既可打开交互窗口，也可无窗口导出 frame.bmp，方便学生
  * 在没有开发板时检查 320x240 排版。整个程序单线程调用 LVGL，符合板端所有权约束。
  *
- * 跟读入口：main 注册 Flush/ReadPointer → screen.Create → SDL 事件循环 →
- * lv_timer_handler → 页面回调/Flush → SDL 纹理或 BMP。这里不启动应用模块或 DeviceUi，
- * 也不注册业务 EventHandler，因此点击能切换页面，外部唤醒、配网和真实摄像头不会执行。
+ * 跟读入口：main 注册 Flush/ReadPointer → page::open → SDL 事件循环 →
+ * lv_timer_handler → 页面回调/Flush → SDL 纹理或 BMP。这里不启动应用模块或UI工作线程，
+ * 也不注册业务回调，因此点击能切换页面，外部唤醒和真实摄像头不会执行。
  */
 #include <SDL.h>
 #include <lvgl.h>
@@ -85,7 +85,7 @@ bool SaveFrame(const std::string& directory) {
  * @brief 启动交互式页面模拟器，或持续导出供观察的 frame.bmp。
  *
  * --preview-dir 指向已存在且可写的输出目录；--font 指定 CJK 字体；--demo-voice
- * 自动轮换显示状态；--demo-app 0..3 分别打开小智、摄像头、时间和 Wi-Fi 页面。
+ * 自动轮换显示状态；--demo-app 0..1 分别打开语音、摄像头页面。
  * 预览模式同样持续运行，不是生成一张图片后自动退出；返回非零表示初始化或导出失败。
  */
 int main(int argc, char** argv) {
@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
   bool demo_voice = false;
   int demo_app = -1;
   // 当前 Ubuntu 的 DroidSansFallbackFull 缺少拉丁数字，LVGL 8.2 软件渲染缺失字形时
-  // 会把时钟字符交给占位 glyph 并触发异常。Noto Sans CJK 同时覆盖中文和拉丁字符。
+  // 会把数字交给占位 glyph 并触发异常。Noto Sans CJK 同时覆盖中文和拉丁字符。
   const char* font = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--preview-dir") == 0 && i + 1 < argc) {
@@ -142,9 +142,10 @@ int main(int argc, char** argv) {
   pointer.read_cb = ReadPointer;
   lv_indev_drv_register(&pointer);
 
-  // LvglScreen 从此处开始只接触抽象 display/input，页面代码无法区分 SDL 与 RV1106。
-  boompi::ui::LvglScreen screen;
-  if (!screen.Create(font)) {
+  // 两页UI 从此处开始只接触抽象 display/input，页面代码无法区分 SDL 与 RV1106。
+  namespace page = boompi::ui::page;
+  boompi::ui::UiView view;
+  if (!page::open(font)) {
     return 3;
   }
   constexpr std::array states{
@@ -155,23 +156,22 @@ int main(int argc, char** argv) {
   std::size_t state = 0;
   // 仅模拟 application 的显示投影，state 下标不是产品状态机或音频轮次。
   auto apply_state = [&] {
-    screen.SetState(states[state]);
+    view.state = states[state];
     if (states[state] == boompi::ui::DeviceUiState::Speaking) {
       // 保留三个曾导致板端 LVGL 崩溃的 emoji 作为固定回归样本；页面需要过滤缺失字形
       // 并继续绘制剩余文字。
-      screen.SetText("当然可以，正在为你查询。😅\n北京今天适合外出。😄😂");
+      view.ClearText();
+      view.AppendText("当然可以，正在为你查询。😅\n北京今天适合外出。😄😂");
     } else {
-      screen.SetText({});
+      view.ClearText();
     }
+    page::show(view);
   };
   if (demo_voice) {
     state = 1U;
     apply_state();
-  } else if (demo_app >= 0 && demo_app < 4) {
-    constexpr std::array pages{
-        boompi::ui::LvglScreen::Page::Voice, boompi::ui::LvglScreen::Page::Camera,
-        boompi::ui::LvglScreen::Page::Clock, boompi::ui::LvglScreen::Page::Wifi};
-    screen.OpenApp(pages[static_cast<std::size_t>(demo_app)]);
+  } else if (demo_app == 1) {
+    page::camera(true);
   }
   auto next_state = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   bool running = true;
@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_until(started + std::chrono::milliseconds(16));
   }
   // 页面先销毁，再释放承载它的 SDL display 资源，顺序与板端 Close() 保持一致。
-  screen.Destroy();
+  page::close();
   SDL_DestroyTexture(texture);
   SDL_DestroyRenderer(renderer);
   SDL_DestroyWindow(window);

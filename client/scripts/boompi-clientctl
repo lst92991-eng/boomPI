@@ -1,6 +1,5 @@
 #!/bin/sh
-# BusyBox 教学版入口：一个进程、三次有限重启、更新启动失败自动回滚。
-
+# 单客户端启停、三次有限重启及更新失败回滚；Wi-Fi直接读取系统配置，不启动AP。
 umask 077
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 LD_LIBRARY_PATH=/oem/usr/lib:/usr/lib:/lib
@@ -11,21 +10,17 @@ CONF=$BASE/config/client.env
 LOG=$BASE/log/client.log
 PID=/run/boompi-client.pid
 CHILD_PID=/run/boompi-client-child.pid
-CHILD_GROUP=/run/boompi-client-child.pgid
 LOCK=/run/boompi-clientctl.flock
-
+SELF=/usr/sbin/boompi-clientctl
 fail() { echo "boompi-clientctl: $*" >&2; exit 1; }
 prepare() {
   mkdir -p "$BASE/bin" "$BASE/config" "$BASE/log" /run || fail 'cannot create directories'
   chmod 700 "$BASE" "$BASE/config" "$BASE/log"
   if [ ! -e "$CONF" ]; then
-    device_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null) || fail 'cannot create device id'
-    cat > "$CONF" <<EOF
-BOOMPI_DEVICE_ID=$device_id
-EOF
-    echo "boompi-clientctl: created $CONF"
+    device_id=$(cat /proc/sys/kernel/random/uuid) || fail 'cannot create device id'
+    printf 'BOOMPI_DEVICE_ID=%s\n' "$device_id" > "$CONF" || fail 'cannot save device id'
   fi
-  [ ! -f "$CONF" ] || chmod 600 "$CONF"
+  chmod 600 "$CONF"
 }
 load_config() {
   [ -r "$CONF" ] || fail "missing $CONF"
@@ -36,257 +31,105 @@ load_config() {
       BOOMPI_DEVICE_ID|BOOMPI_SERVER_IP|BOOMPI_SERVER_PORT|BOOMPI_SERVER_SPKI_SHA256)
         export "$name=$value" ;;
       BOOMPI_VOLUME_PERCENT|BOOMPI_SNOWBOY_SENSITIVITY|BOOMPI_VAD_MIN_DBFS|BOOMPI_BARGE_MIN_DBFS|BOOMPI_CAPTURE_LEFT_POLARITY|BOOMPI_CAPTURE_RIGHT_POLARITY)
-        echo "boompi-clientctl: legacy $name replaced by v2 board profile/UI setting" ;;
+        echo "boompi-clientctl: ignored legacy $name" ;;
       *) fail "invalid config key: $name" ;;
     esac
   done < "$CONF"
 }
+owned() {
+  case $1 in ''|*[!0-9]*|0|1) return 1 ;; esac
+  kill -0 "$1" 2>/dev/null &&
+    tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null | grep -qx "$2"
+}
 running() {
   [ -r "$PID" ] || return 1
   RUN_PID=$(cat "$PID")
-  case $RUN_PID in ''|*[!0-9]*) return 1 ;; esac
-  kill -0 "$RUN_PID" 2>/dev/null &&
-    tr '\0' '\n' < "/proc/$RUN_PID/cmdline" 2>/dev/null |
-      grep -qx '/usr/sbin/boompi-clientctl'
+  owned "$RUN_PID" "$SELF"
+}
+stop_owned() {
+  owned "$1" "$2" || return 0
+  kill -TERM "$1" 2>/dev/null || true
+  waited=0
+  while owned "$1" "$2" && [ "$waited" -lt 8 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  owned "$1" "$2" && kill -KILL "$1" 2>/dev/null || true
+  waited=0
+  while owned "$1" "$2" && [ "$waited" -lt 2 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  ! owned "$1" "$2"
 }
 stop_child() {
-  [ -z "$CHILD" ] && return 0
-  if [ "${CHILD_IS_GROUP:-0}" -eq 1 ]; then
-    provision_group_owned "$CHILD" &&
-      kill -TERM "-$CHILD" 2>/dev/null || true
-    waited=0
-    while provision_group_owned "$CHILD" && [ "$waited" -lt 8 ]; do
-      sleep 1
-      waited=$((waited + 1))
-    done
-    provision_group_owned "$CHILD" && kill -KILL "-$CHILD" 2>/dev/null || true
-    waited=0
-    while provision_group_owned "$CHILD" && [ "$waited" -lt 2 ]; do
-      sleep 1
-      waited=$((waited + 1))
-    done
-    if provision_group_owned "$CHILD"; then
-      echo "boompi-clientctl: process group $CHILD did not stop" >&2
-      return 1
-    fi
-  else
-    runtime_child_owned "$CHILD" && kill -TERM "$CHILD" 2>/dev/null || true
-    waited=0
-    while runtime_child_owned "$CHILD" && [ "$waited" -lt 8 ]; do
-      sleep 1
-      waited=$((waited + 1))
-    done
-    runtime_child_owned "$CHILD" && kill -KILL "$CHILD" 2>/dev/null || true
-    waited=0
-    while runtime_child_owned "$CHILD" && [ "$waited" -lt 2 ]; do
-      sleep 1
-      waited=$((waited + 1))
-    done
-    if runtime_child_owned "$CHILD"; then
-      echo "boompi-clientctl: runtime child $CHILD did not stop" >&2
-      return 1
-    fi
-  fi
+  [ -n "${CHILD:-}" ] || return 0
+  stop_owned "$CHILD" "$APP" || return 1
   wait "$CHILD" 2>/dev/null || true
-  rm -f "$CHILD_PID" "$CHILD_GROUP"
-}
-# 控制 wrapper 异常退出后，stop 仍用进程身份校验取消它留下的客户端或配网 child。
-saved_child_running() {
-  if [ -r "$CHILD_GROUP" ]; then
-    SAVED_CHILD=$(cat "$CHILD_GROUP")
-    case $SAVED_CHILD in ''|*[!0-9]*) return 1 ;; esac
-    if provision_group_owned "$SAVED_CHILD"; then
-      SAVED_CHILD_IS_GROUP=1
-      return 0
-    fi
-  fi
-  [ -r "$CHILD_PID" ] || return 1
-  SAVED_CHILD=$(cat "$CHILD_PID")
-  case $SAVED_CHILD in ''|*[!0-9]*) return 1 ;; esac
-  kill -0 "$SAVED_CHILD" 2>/dev/null || return 1
-  SAVED_CHILD_IS_GROUP=0
-  if tr '\0' '\n' < "/proc/$SAVED_CHILD/cmdline" 2>/dev/null |
-      grep -qx '/usr/sbin/boompi-provision'; then
-    SAVED_CHILD_IS_GROUP=1
-    return 0
-  fi
-  tr '\0' '\n' < "/proc/$SAVED_CHILD/cmdline" 2>/dev/null |
-    grep -qx "$APP"
-}
-provision_group_owned() {
-  for member in $(ps -eo pid=,pgid= 2>/dev/null |
-      awk -v group="$1" '$2 == group { print $1 }'); do
-    tr '\0' '\n' < "/proc/$member/environ" 2>/dev/null |
-      grep -qx 'BOOMPI_PROVISION_OWNER=1' && return 0
-  done
-  return 1
-}
-saved_target_running() {
-  if [ "$SAVED_CHILD_IS_GROUP" -eq 1 ]; then
-    provision_group_owned "$SAVED_CHILD"
-  else
-    runtime_child_owned "$SAVED_CHILD"
-  fi
-}
-runtime_child_owned() {
-  kill -0 "$1" 2>/dev/null &&
-    tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null |
-      grep -qx "$APP"
+  rm -f "$CHILD_PID"
 }
 cancel_saved_child() {
-  had_group=0
-  [ ! -r "$CHILD_GROUP" ] || had_group=1
-  if ! saved_child_running; then
-    rm -f "$CHILD_PID" "$CHILD_GROUP"
-    [ "$had_group" -eq 0 ] || cleanup_stale_provision
-    return
-  fi
-  if [ "$SAVED_CHILD_IS_GROUP" -eq 1 ]; then
-    provision_group_owned "$SAVED_CHILD" &&
-      kill -TERM "-$SAVED_CHILD" 2>/dev/null || true
-  else
-    runtime_child_owned "$SAVED_CHILD" &&
-      kill -TERM "$SAVED_CHILD" 2>/dev/null || true
-  fi
-  waited=0
-  while saved_target_running && [ "$waited" -lt 8 ]; do
-    sleep 1
-    waited=$((waited + 1))
-  done
-  if saved_target_running; then
-    if [ "$SAVED_CHILD_IS_GROUP" -eq 1 ]; then
-      kill -KILL "-$SAVED_CHILD" 2>/dev/null || true
-    else
-      kill -KILL "$SAVED_CHILD" 2>/dev/null || true
-    fi
-  fi
-  waited=0
-  while saved_target_running && [ "$waited" -lt 2 ]; do
-    sleep 1
-    waited=$((waited + 1))
-  done
-  saved_target_running && return 1
-  rm -f "$CHILD_PID" "$CHILD_GROUP"
-  [ "$SAVED_CHILD_IS_GROUP" -eq 0 ] || cleanup_stale_provision
-}
-cleanup_stale_provision() {
-  if [ ! -e /run/boompi-provision.owner ] &&
-      [ ! -e /run/boompi-hostapd.pid ] &&
-      [ ! -e /run/boompi-dnsmasq.pid ] &&
-      [ ! -e /run/boompi-portal.pid ]; then
-    return 0
-  fi
-  /usr/sbin/boompi-provision --cleanup-stale
+  [ -r "$CHILD_PID" ] || return 0
+  stop_owned "$(cat "$CHILD_PID")" "$APP" || return 1
+  rm -f "$CHILD_PID"
 }
 take_lock() {
   exec 8>"$LOCK" || return 1
-  if ! flock -n 8; then
-    exec 8>&-
-    return 1
-  fi
+  flock -n 8 || return 1
   trap 'flock -u 8 2>/dev/null || true; exec 8>&-' EXIT
 }
-needs_provision() {
-  [ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" != 1 ] &&
-    ! grep -q '^# boomPI-managed$' /etc/wpa_supplicant.conf 2>/dev/null
-}
-
-run_provision() {
-  restore=${1:-0}
-  trap 'stop_child; rm -f "$PID"; exit 0' HUP INT TERM
-  prepare
-  BOOMPI_PROVISION_OWNER=1 setsid /usr/sbin/boompi-provision &
-  CHILD=$!; CHILD_IS_GROUP=1; echo "$CHILD" > "$CHILD_PID"; echo "$CHILD" > "$CHILD_GROUP"
-  wait "$CHILD"; code=$?; rm -f "$CHILD_PID" "$CHILD_GROUP"; CHILD=
-  if [ "$code" -eq 0 ] || [ "$restore" -eq 1 ]; then
-    if take_lock; then
-      rm -f "$PID"
-      start 1
-    else
-      rm -f "$PID"
-      echo 'boompi-clientctl: provisioning handoff cancelled by another control operation'
-    fi
-  else
-    rm -f "$PID"
-  fi
-  exit "$code"
-}
-
-launch_provision() {
-  restore=${1:-0}; prepare
-  [ ! -f "$LOG" ] || [ "$(wc -c < "$LOG")" -le 1048576 ] || mv -f "$LOG" "$LOG.1"
-  nohup "$0" _provision "$restore" 8>&- >> "$LOG" 2>&1 & echo $! > "$PID"
-  sleep 1; running || fail "provisioning failed; inspect $LOG"
-  echo "boompi provisioning started (pid $RUN_PID)"
-}
-
 run_loop() {
   trap 'stop_child; rm -f "$PID"; exit 0' HUP INT TERM
   load_config
   tries=0
   while [ "$tries" -lt 3 ]; do
     "$APP" --voice-loop &
-    CHILD=$!; echo "$CHILD" > "$CHILD_PID"; wait "$CHILD"; code=$?; rm -f "$CHILD_PID"; CHILD=
+    CHILD=$!
+    echo "$CHILD" > "$CHILD_PID"
+    wait "$CHILD"; code=$?
+    rm -f "$CHILD_PID"
+    CHILD=
     [ "$code" -eq 0 ] && break
-    tries=$((tries + 1)); [ "$tries" -lt 3 ] && sleep "$tries"
+    tries=$((tries + 1))
+    [ "$tries" -lt 3 ] && sleep "$tries"
   done
   rm -f "$PID"
   exit "$code"
 }
-
 launch_client() {
   checks=${1:-1}
   [ ! -f "$LOG" ] || [ "$(wc -c < "$LOG")" -le 1048576 ] || mv -f "$LOG" "$LOG.1"
-  nohup "$0" _run 8>&- >> "$LOG" 2>&1 & echo $! > "$PID"
+  nohup "$0" _run 8>&- >> "$LOG" 2>&1 &
+  echo $! > "$PID"
   checked=0
   while [ "$checked" -lt "$checks" ]; do
     sleep 1
     checked=$((checked + 1))
-    if ! running; then rm -f "$PID" "$CHILD_PID"; return 1; fi
+    if ! running; then
+      cancel_saved_child
+      rm -f "$PID"
+      return 1
+    fi
   done
-  return 0
 }
-
 start() {
-  skip_provision=${1:-0}
   prepare
   running && { echo "boompi-client is running (pid $RUN_PID)"; return; }
   cancel_saved_child || fail 'previous runtime child did not stop'
-  cleanup_stale_provision || fail 'stale provisioning services did not stop'
-  rm -f "$PID"; [ -x "$APP" ] || fail 'client is not installed'
-  load_config; "$APP" --check-config >/dev/null || fail 'configuration check failed'
-  if [ "$skip_provision" -eq 0 ] && needs_provision; then launch_provision 0; return; fi
+  rm -f "$PID"
+  [ -x "$APP" ] || fail 'client is not installed'
+  load_config
+  "$APP" --check-config >/dev/null || fail 'configuration check failed'
   launch_client 1 || fail "start failed; inspect $LOG"
   echo "boompi-client started (pid $RUN_PID)"
 }
 stop() {
-  if ! running; then
-    cancel_saved_child || fail 'runtime child did not stop'
-    cleanup_stale_provision || fail 'stale provisioning services did not stop'
-    rm -f "$PID"
-    echo 'boompi-client is stopped'
-    return
-  fi
-  kill "$RUN_PID" 2>/dev/null || true
-  waited=0; while running && [ "$waited" -lt 8 ]; do sleep 1; waited=$((waited + 1)); done
   if running; then
-    cancel_saved_child
-    running && kill -KILL "$RUN_PID" 2>/dev/null || true
+    stop_owned "$RUN_PID" "$SELF" || fail 'supervisor did not stop'
   fi
   cancel_saved_child || fail 'runtime child did not stop'
-  cleanup_stale_provision || fail 'stale provisioning services did not stop'
-  rm -f "$PID" "$CHILD_PID" "$CHILD_GROUP"; echo 'boompi-client stopped'
-}
-provision() {
-  [ -d /sys/class/net/wlan0 ] ||
-    fail 'Wi-Fi interface wlan0 is unavailable; client remains running'
-  for tool in hostapd dnsmasq python3 flock; do
-    command -v "$tool" >/dev/null 2>&1 ||
-      fail "Wi-Fi provisioning needs $tool; client remains running"
-  done
-  was_running=0; running && was_running=1
-  [ "$was_running" -eq 0 ] || stop
-  launch_provision "$was_running"
+  rm -f "$PID" "$CHILD_PID"
+  echo 'boompi-client stopped'
 }
 update() {
   source=$1
@@ -331,18 +174,16 @@ update() {
 
 case ${1:-} in
   _run) run_loop ;;
-  _provision) run_provision "${2:-0}" ;;
   *)
     take_lock || fail 'another client control operation is running'
     case ${1:-} in
       start) start ;;
       stop) stop ;;
       restart) stop; start ;;
-      provision) provision ;;
       status) running && echo "boompi-client is running (pid $RUN_PID)" || echo 'boompi-client is stopped' ;;
       log) tail -n 100 "$LOG" ;;
       update) [ "$#" -eq 2 ] || fail 'usage: boompi-clientctl update /absolute/path'; update "$2" ;;
-      *) echo 'usage: boompi-clientctl start|stop|restart|status|log|update|provision' >&2; exit 2 ;;
+      *) echo 'usage: boompi-clientctl start|stop|restart|status|log|update' >&2; exit 2 ;;
     esac
     ;;
 esac

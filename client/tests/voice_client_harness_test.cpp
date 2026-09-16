@@ -255,27 +255,24 @@ void close() noexcept {
 }
 }  // namespace boompi::voice_net
 namespace boompi::ui {
-struct DeviceUi::Impl {};
-DeviceUi::~DeviceUi() noexcept = default;
-std::uint8_t DeviceUi::LoadVolume(std::uint8_t fallback) noexcept {
+std::uint8_t load_volume(std::uint8_t fallback) noexcept {
   return fallback;
 }
-bool DeviceUi::Open() {
+bool open() {
   return true;
 }
-void DeviceUi::Show(const UiView& view) noexcept {
+void show(const UiView& view) noexcept {
   harness::state.view = view;
 }
-bool DeviceUi::PollAction(UiAction* action) noexcept {
+bool poll_action(UiAction& action) noexcept {
   if (!harness::state.action) {
     return false;
   }
-  *action = *harness::state.action;
+  action = *harness::state.action;
   harness::state.action.reset();
   return true;
 }
-void DeviceUi::Close() noexcept {
-  impl_ = nullptr;
+void close() noexcept {
   ++harness::state.closes;
 }
 }  // namespace boompi::ui

@@ -19,7 +19,7 @@
 #include <websocketpp/config/asio_client.hpp>
 
 #include "boompi/config/voice_client_config.h"
-#include "network_setup.h"
+#include "network.h"
 #include "voice_codec.h"
 
 namespace boompi::voice_net {
@@ -266,7 +266,8 @@ SendResult NewTurn(TurnPhase phase, bool retract) {
   return result;
 }
 
-void ProcessConnection(Client& client, Client::connection_ptr connection) {
+bool ProcessConnection(Client& client, Client::connection_ptr connection) {
+  bool reached_ready = false;
   const auto started = Clock::now();
   auto ping_at = started;
   while (!stop_.load()) {
@@ -276,6 +277,7 @@ void ProcessConnection(Client& client, Client::connection_ptr connection) {
     if (connection_state_ == ConnectionState::Failed) {
       break;
     }
+    reached_ready = reached_ready || connection_state_ == ConnectionState::Online;
     // 2. 检查握手与心跳；断线交给外层网络任务重连。
     const auto now = Clock::now();
     // 所有库I/O回调都在本线程；持锁时应用不能send，读取库缓冲计数不会数据竞争。
@@ -298,9 +300,11 @@ void ProcessConnection(Client& client, Client::connection_ptr connection) {
     }
     changed_.wait_for(lock, std::chrono::milliseconds(2));
   }
+  return reached_ready;
 }
 
-void Connect(const config::VoiceClientConfig& endpoint) {
+bool Connect(const network::Endpoint& selected) {
+  const auto& endpoint = selected.server;
   std::array<unsigned char, 33> pin{};
   if (endpoint.server_spki_sha256.size() != 44 ||
       EVP_DecodeBlock(
@@ -308,7 +312,7 @@ void Connect(const config::VoiceClientConfig& endpoint) {
           reinterpret_cast<const unsigned char*>(endpoint.server_spki_sha256.data()),
           44) != 33) {
     Fail("invalid_pin");
-    return;
+    return false;
   }
   std::copy_n(pin.begin(), pin_.size(), pin_.begin());
 
@@ -320,7 +324,7 @@ void Connect(const config::VoiceClientConfig& endpoint) {
   const auto connection = client.get_connection(address, error);
   if (error) {
     Fail("invalid_endpoint");
-    return;
+    return false;
   }
   connection->set_open_handshake_timeout(5000);
   connection->set_pong_timeout(5000);
@@ -330,9 +334,28 @@ void Connect(const config::VoiceClientConfig& endpoint) {
     connection_ = connection;
     buffered_bytes_ = 0;
   }
+  bool reached_ready = false;
   try {
-    client.connect(connection);
-    ProcessConnection(client, connection);
+    // 单一IPv4端点：自己发起一次async_connect，避免库的端点迭代关闭已绑定的socket。
+    // TLS/HTTP/WebSocket握手仍由原连接的start()执行，不跳过证书验证。
+    auto& socket = connection->get_raw_socket();
+    socket.open(websocketpp::lib::asio::ip::tcp::v4());
+    if (!network::bind_socket(static_cast<std::intptr_t>(socket.native_handle()), selected.interface)) {
+      throw std::runtime_error("interface bind failed");
+    }
+    using Transport = Client::connection_type::transport_con_type;
+    static_cast<Transport&>(*connection).set_uri(connection->get_uri());
+    socket.async_connect(
+        websocketpp::lib::asio::ip::tcp::endpoint(
+            websocketpp::lib::asio::ip::address::from_string(endpoint.server_ip), endpoint.server_port),
+        [connection](const websocketpp::lib::asio::error_code& ec) {
+          if (ec) {
+            Fail("tcp_connect");
+          } else {
+            connection->start();
+          }
+        });
+    reached_ready = ProcessConnection(client, connection);
   } catch (...) {
     Fail("connection_io");
   }
@@ -347,9 +370,11 @@ void Connect(const config::VoiceClientConfig& endpoint) {
   connection->get_raw_socket().close(socket_error);
   client.stop_perpetual();
   client.stop();
+  return reached_ready;
 }
 
 void NetworkTask() {
+  bool wifi_first = false;
   while (!stop_.load()) {
     // 1. 清理上一条连接的数据，旧问题不会在重连后重新发送。
     {
@@ -359,11 +384,12 @@ void NetworkTask() {
     }
     try {
       // 2. 准备网卡、确定地址，然后持续处理这条 WSS 连接。
-      config::VoiceClientConfig endpoint;
-      if (!detail::FindServer(configured_, &endpoint, &stop_)) {
+      network::Endpoint endpoint;
+      if (!network::find_server(configured_, endpoint, stop_, wifi_first)) {
         Fail("network_setup");
       } else if (!stop_.load()) {
-        Connect(endpoint);
+        const bool ready = Connect(endpoint);
+        wifi_first = !ready && endpoint.interface && std::string(endpoint.interface) == "eth0";
       }
     } catch (...) {
       Fail("network_worker");

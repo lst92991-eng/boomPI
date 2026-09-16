@@ -1,471 +1,196 @@
-/** @file device_ui.cpp
- * @brief UI 线程按顺序接收快照、更新页面并处理用户操作。
- *
- * DisplayTouch 管理板端屏幕/触摸，CameraCapture 管理预览管线。
- * LVGL 对象只在 UI worker 内创建、访问和销毁。
- *
- * 启动：App_Init → LoadVolume/Open → DisplayTouch::Open → DisplayTask。
- * 显示：App_Enter/字幕更新 → Show → UpdateView → ShowLatestView → LvglScreen。
- * 输入：ReadInput → LVGL 事件 → HandleEvent → PollAction →
- * App_ReadUserAction；音量在此链末端 更新
- * playback，只有滑块提交事件在本文件保存设置。摄像头帧通过另一短锁单独交接。
- */
 #include "boompi/ui/device_ui.h"
-
 #include <fcntl.h>
 #include <lvgl.h>
-#include <sys/wait.h>
 #include <unistd.h>
-
 #include <algorithm>
-#include <array>
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
-#include <new>
-#include <string>
 #include <thread>
-
 #include "../platform/rv1106/display_touch.h"
 #include "boompi/ui/lvgl_screen.h"
 #include "camera_capture.h"
 
 namespace boompi::ui {
 namespace {
-
-constexpr int kScreenWidth = 320, kScreenHeight = 240, kDrawRows = 32;
 constexpr char kSettings[] = "/userdata/boompi/config/ui.settings";
-constexpr char kSettingsTemporary[] = "/userdata/boompi/config/ui.settings.tmp";
-constexpr char kProvision[] = "/usr/sbin/boompi-provision";
+constexpr char kTemporary[] = "/userdata/boompi/config/ui.settings.tmp";
 constexpr char kFont[] = "/userdata/boompi/fonts/NotoSansCJK-Regular.ttc";
 constexpr char kFallbackFont[] = "/oem/usr/share/simsun_en.ttf";
-/** @brief 完整写出音量配置文本，处理短写与 EINTR；其他失败交给 SaveVolume 清理。 */
-bool WriteAll(int fd, const void* source, std::size_t bytes) {
-  auto* data = static_cast<const std::uint8_t*>(source);
-  while (bytes != 0U) {
-    const ssize_t count = write(fd, data, bytes);
-    if (count < 0 && errno == EINTR) {
-      continue;
-    }
-    if (count <= 0) {
-      return false;
-    }
-    data += count;
-    bytes -= static_cast<std::size_t>(count);
+platform::rv1106::DisplayTouch hardware;
+std::thread worker;
+std::atomic<bool> stopping{false};
+std::atomic<int> action{-1}, volume{-1};
+std::mutex mutex;
+std::condition_variable changed;
+UiView view;
+bool dirty{true};
+lv_disp_t* display{};
+lv_indev_t* input{};
+lv_disp_draw_buf_t draw_buffer;
+lv_disp_drv_t output;
+lv_indev_drv_t pointer;
+std::array<lv_color_t, 320 * 32> draw_pixels;
+void save_volume(std::uint8_t value) {
+  // 仅在释放滑块时提交；临时文件完整写入后才替换正式配置。
+  const int fd = ::open(kTemporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+  std::FILE* file = fd < 0 ? nullptr : fdopen(fd, "w");
+  bool ok = file && std::fprintf(file, "%u\n", value) > 0 &&
+            std::fflush(file) == 0 && fsync(fd) == 0;
+  if (file) {
+    ok = std::fclose(file) == 0 && ok;
+  } else if (fd >= 0) {
+    ::close(fd);
   }
-  return true;
+  if (!ok || std::rename(kTemporary, kSettings) != 0) {
+    unlink(kTemporary);
+    std::fprintf(stderr, "boompi-ui: volume save failed\n");
+  }
 }
-
-/**
- * @brief 以临时文件加 rename 的方式提交音量。
- *
- * 提交前先写完临时文件，避免正式配置留下半行数据。仅在滑块释放时保存，
- * 拖动预览不会频繁写闪存。
- */
-bool SaveVolume(std::uint8_t percent) {
-  const std::string text = std::to_string(percent) + "\n";
-  const int fd =
-      open(kSettingsTemporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
-  bool ok = fd >= 0 && WriteAll(fd, text.data(), text.size());
-  if (ok) {
-    ok = fsync(fd) == 0;
+void event(page::Event type, std::uint8_t value) {
+  if (type == page::Event::CameraOn) {
+    camera_capture::open();
+  } else if (type == page::Event::CameraOff) {
+    camera_capture::close();
+  } else if (type == page::Event::Volume || type == page::Event::SaveVolume) {
+    volume.store(value);
+    if (type == page::Event::SaveVolume) {
+      save_volume(value);
+    }
+  } else {
+    action.store(static_cast<int>(type == page::Event::Wake ? UiActionKind::Wake : UiActionKind::Interrupt));
   }
-  if (fd >= 0 && close(fd) != 0) {
-    ok = false;
-  }
-  if (ok) {
-    ok = std::rename(kSettingsTemporary, kSettings) == 0;
-  }
-  if (!ok) {
-    unlink(kSettingsTemporary);
-  }
-  return ok;
 }
-
+void flush(lv_disp_drv_t* driver, const lv_area_t* area, lv_color_t* pixels) {
+  if (!hardware.Flush(*area, pixels)) {
+    stopping.store(true);
+  }
+  lv_disp_flush_ready(driver);
+}
+void run() {
+  static_cast<void>(nice(5));
+  auto tick = std::chrono::steady_clock::now();
+  try {
+    while (!stopping.load()) {
+      // 快照只在短锁内复制；渲染、字体、SPI和摄像头I/O不持应用交接锁。
+      UiView next;
+      bool update;
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        update = dirty;
+        next = view;
+        dirty = false;
+      }
+      if (update) {
+        page::show(next);
+      }
+      CameraStatus status;
+      const bool frame = camera_capture::read(page::pixels(), status);
+      page::present(status, frame);
+      const auto now = std::chrono::steady_clock::now();
+      lv_tick_inc(static_cast<std::uint32_t>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - tick).count()));
+      tick = now;
+      lv_timer_handler();
+      std::unique_lock<std::mutex> lock(mutex);
+      changed.wait_for(lock, std::chrono::milliseconds(30), [] {
+        return stopping.load() || dirty;
+      });
+    }
+  } catch (...) {
+    stopping.store(true);
+    std::fprintf(stderr, "boompi-ui: display worker failed\n");
+  }
+  camera_capture::close();
+}
 }  // namespace
-
-/**
- * @brief 汇集 UI 生命周期资源和两种跨线程交接，不让 application 接触 LVGL 指针。
- *
- * view_mutex 保护最新快照及启动结果；action/volume_change 是互不覆盖的两个原子槽位。
- * screen、LVGL driver、显示帧和配网 PID 在启动后的运行期由 UI worker 使用；camera
- * 的工作线程只写自己的帧槽，必须经 TakeFrame 后才能交给页面。
- */
-struct DeviceUi::Impl final {
-  using CameraFrame = CameraCapture::Frame;
-
-  Impl() noexcept : camera(wake) {}
-
-  platform::rv1106::DisplayTouch hardware;
-  std::atomic<bool> stop{false};
-  // -1 表示空；同一槽的未消费值会被最新输入覆盖，不按点击次数构成事件队列。
-  std::atomic<int> action{-1}, volume_change{-1};
-  pid_t provision_pid{-1};
-  std::mutex view_mutex;
-  std::condition_variable wake;
-  CameraCapture camera;
-  CameraStatus shown_camera{CameraStatus::Stopped};
-  std::chrono::steady_clock::time_point last_frame{};
-  bool have_display_frame{false};
-  CameraFrame display_frame{};
-  bool start_done{false}, start_ok{false}, view_dirty{true};
-  UiView view;
-  std::thread ui_thread;
-  LvglScreen screen;
-  lv_disp_draw_buf_t draw_buffer{};
-  lv_disp_drv_t display_driver{};
-  lv_indev_drv_t input_driver{};
-  lv_disp_t* display{nullptr};
-  lv_indev_t* input{nullptr};
-  std::array<lv_color_t, kScreenWidth * kDrawRows> draw_pixels{};
-
-  /** @brief UI worker 原子取得最近一次完整 UiView，并清除 dirty 标志。 */
-  bool TakeView(UiView* next) {
-    std::lock_guard<std::mutex> lock(view_mutex);
-    if (!view_dirty) {
+std::uint8_t load_volume(std::uint8_t fallback) noexcept {
+  unsigned value = std::min<std::uint8_t>(fallback, 100);
+  if (auto* file = std::fopen(kSettings, "r")) {
+    unsigned saved;
+    if (std::fscanf(file, "%u", &saved) == 1 && saved <= 100) {
+      value = saved;
+    }
+    std::fclose(file);
+  }
+  return static_cast<std::uint8_t>(value);
+}
+bool open() {
+  close();
+  if (!hardware.Open()) {
+    return false;
+  }
+  // 尚未启动工作线程，此处依次配置LVGL端口、字体、两页；不需要启动回执。
+  lv_init();
+  lv_disp_draw_buf_init(&draw_buffer, draw_pixels.data(), nullptr, draw_pixels.size());
+  lv_disp_drv_init(&output);
+  output.hor_res = 320;
+  output.ver_res = 240;
+  output.draw_buf = &draw_buffer;
+  output.flush_cb = flush;
+  display = lv_disp_drv_register(&output);
+  lv_indev_drv_init(&pointer);
+  pointer.type = LV_INDEV_TYPE_POINTER;
+  pointer.read_cb = [](lv_indev_drv_t*, lv_indev_data_t* data) {
+    hardware.ReadInput(data);
+  };
+  input = lv_indev_drv_register(&pointer);
+  try {
+    const char* font = access(kFont, R_OK) == 0 ? kFont : kFallbackFont;
+    if (!display || !input || !page::open(font, event)) {
+      close();
       return false;
     }
-    *next = view;
-    view_dirty = false;
+    view = {};
+    dirty = true;
+    action.store(-1);
+    volume.store(-1);
+    stopping.store(false);
+    worker = std::thread(run);
+    return true;
+  } catch (...) {
+    close();
+    return false;
+  }
+}
+void show(const UiView& value) noexcept {
+  std::lock_guard<std::mutex> lock(mutex);
+  view = value;
+  dirty = true;
+  changed.notify_one();
+}
+bool poll_action(UiAction& result) noexcept {
+  const int command = action.exchange(-1);
+  if (command >= 0) {
+    result.kind = static_cast<UiActionKind>(command);
     return true;
   }
-
-  /** @brief application 在短锁内替换快照；UI 渲染速度慢时自然合并中间状态。 */
-  void UpdateView(const UiView& value) {
-    std::lock_guard<std::mutex> lock(view_mutex);
-    view = value;
-    view_dirty = true;
-    wake.notify_one();
+  const int percent = volume.exchange(-1);
+  if (percent < 0) {
+    return false;
   }
-
-  /** @brief LVGL 的同步刷屏适配：端口失败时请求 UI 循环退出，不在回调内销毁对象。 */
-  static void Flush(lv_disp_drv_t* driver, const lv_area_t* area, lv_color_t* pixels) {
-    auto* self = static_cast<Impl*>(driver->user_data);
-    if (!self->hardware.Flush(*area, pixels)) {
-      self->stop.store(true);
-      self->wake.notify_one();
-    }
-    // 失败也必须确认本次 flush，让 LVGL 能结束当前绘制并退出。
-    lv_disp_flush_ready(driver);
+  result = {UiActionKind::Volume, static_cast<std::uint8_t>(percent)};
+  return true;
+}
+void close() noexcept {
+  stopping.store(true);
+  changed.notify_one();
+  if (worker.joinable()) {
+    worker.join();
   }
-
-  /** @brief LVGL timer handler 查询指针设备时，把 GT911 结果交给 LVGL 生成控件事件。 */
-  static void ReadInput(lv_indev_drv_t* driver, lv_indev_data_t* data) {
-    auto* self = static_cast<Impl*>(driver->user_data);
-    self->hardware.ReadInput(data);
-  }
-
-  /**
-   * @brief 从二维码页面启动 Wi-Fi 配网进程。
-   *
-   * 二维码只携带临时热点凭据；boompi-provision 负责 AP、DHCP/DNS 和凭据保存。
-   * --no-panel 保证子进程不会与本进程争用 SPI/LVGL。setsid() 建立独立进程组，
-   * UI 退出时能够统一终止脚本派生的服务。重复点击在现有 child 退出前会被忽略。
-   */
-  void StartProvisioning() {
-    if (provision_pid > 0) {
-      return;
-    }
-    if (access("/sys/class/net/wlan0", F_OK) != 0 || access(kProvision, X_OK) != 0) {
-      screen.SetProvisionMessage("配网服务不可用", true);
-      return;
-    }
-    const pid_t child = fork();
-    if (child == 0) {
-      if (setsid() < 0) {
-        _exit(126);
-      }
-      execl(kProvision, "boompi-provision", "--no-panel", static_cast<char*>(nullptr));
-      _exit(127);
-    }
-    if (child > 0) {
-      provision_pid = child;
-    } else {
-      screen.SetProvisionMessage("配网服务启动失败", true);
-    }
-  }
-
-  /**
-   * @brief 把同步 LVGL 回调分流到 application 邮箱或 UI 所有的慢速操作。
-   *
-   * 唤醒、打断和实时音量通过原子值快速交还 application；配网、摄像头生命周期和
-   * 音量持久化仍归 UI worker 管理。写配置只发生在 VolumeCommit，滑块移动期间的
-   * VolumePreview只发布音量值，application随后调用playback::set_volume更新gain，
-   * 不在回调中访问 ALSA。离开摄像头页会同步等待 camera.Stop，避免旧管线越过页面生命周期。
-   */
-  static void HandleEvent(LvglScreen::Event event, std::uint8_t value, void* context) {
-    auto* self = static_cast<Impl*>(context);
-    if (event == LvglScreen::Event::Wake) {
-      self->action.store(static_cast<int>(UiActionKind::Wake));
-    } else if (event == LvglScreen::Event::Interrupt) {
-      self->action.store(static_cast<int>(UiActionKind::Interrupt));
-    } else if (event == LvglScreen::Event::Provision) {
-      self->StartProvisioning();
-    } else if (event == LvglScreen::Event::CameraOn) {
-      self->camera.Start();
-    } else if (event == LvglScreen::Event::CameraOff) {
-      self->camera.Stop();
-    } else {
-      self->volume_change.store(value);
-      if (event == LvglScreen::Event::VolumeCommit && !SaveVolume(value)) {
-        std::fprintf(stderr, "boompi-ui: volume setting save failed\n");
-      }
-    }
-  }
-
-  /** @brief 只收取已退出的配网进程结果，不阻塞页面等待配网。 */
-  void PollProvisioning() {
-    if (provision_pid > 0) {
-      int status = 0;
-      if (waitpid(provision_pid, &status, WNOHANG) == provision_pid) {
-        const bool saved = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-        screen.SetProvisionMessage(saved ? "Wi-Fi 已保存，正在连接" : "配网服务启动失败",
-                                   !saved);
-        provision_pid = -1;
-      }
-    }
-  }
-
-  /**
-   * @brief UI worker 取出最新投影，依次更新状态、音量和字幕。
-   *
-   * 复制快照后已释放 view_mutex，字体查询和绘制不会持锁阻塞 application 发布状态。
-   */
-  void ShowLatestView() {
-    UiView next;
-    if (TakeView(&next)) {
-      screen.SetState(next.state);
-      screen.SetVolume(next.volume);
-      screen.SetText(next.text.data());
-    }
-  }
-
-  /**
-   * @brief 把 camera worker 的最新完整帧复制到页面，显示与取帧均由 UI worker 执行。
-   *
-   * 状态和帧分开读取，因此只有本轮观察为 Live 时才提交图像；错误/停止状态会隐藏画面。
-   * display_frame 是 UI 自有缓冲，LVGL 再复制进自己的 pixels，不引用采集线程内存。
-   */
-  void ShowLatestCamera(std::chrono::steady_clock::time_point now) {
-    const auto status = camera.Status();
-    if (status != shown_camera) {
-      shown_camera = status;
-      if (status == CameraStatus::Starting) {
-        last_frame = now;
-        have_display_frame = false;
-      }
-      screen.SetCameraStatus(status);
-    }
-    const bool new_frame = camera.TakeFrame(&display_frame);
-    if (new_frame && status == CameraStatus::Live) {
-      // FPS 基于真正交给页面的相邻帧计算，表示用户看到的预览吞吐量。
-      const auto frame_ms =
-          std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame).count();
-      const unsigned fps_tenths = have_display_frame && frame_ms > 0
-                                      ? static_cast<unsigned>(10000 / frame_ms)
-                                      : CameraCapture::kTargetFps * 10U;
-      last_frame = now;
-      have_display_frame = true;
-      screen.SetCameraFrame(display_frame.data(), display_frame.size(), fps_tenths);
-      // 摄像头帧到达时立即刷新，避免等待普通 30 ms UI 周期额外增加预览延迟。
-      lv_refr_now(display);
-    }
-  }
-
-  /**
-   * @brief 在 UI worker 中推进 LVGL、页面快照、触摸和摄像头显示。
-   *
-   * nice(5) 让显示与摄像头工作在普通低优先级，避免和 SCHED_FIFO 音频线程竞争。
-   * 循环依次回收配网进程、推进 LVGL tick、应用 application 快照、接收摄像头帧并
-   * 执行 timer handler。condition_variable 最多等待 30 ms，使空闲时不忙轮询，
-   * 新状态、摄像头帧或关闭请求可通知等待提前结束。所有 LVGL API 都留在本线程及其
-   * 同步事件回调中。
-   */
-  void DisplayTask() {
-    static_cast<void>(nice(5));
-    // 1. 注册显示和触摸，把 LVGL 的读写接到板端驱动。
-    lv_init();
-    lv_disp_draw_buf_init(&draw_buffer, draw_pixels.data(), nullptr,
-                          static_cast<std::uint32_t>(draw_pixels.size()));
-    lv_disp_drv_init(&display_driver);
-    display_driver.hor_res = kScreenWidth;
-    display_driver.ver_res = kScreenHeight;
-    display_driver.flush_cb = Flush;
-    display_driver.draw_buf = &draw_buffer;
-    display_driver.user_data = this;
-    display = lv_disp_drv_register(&display_driver);
-    lv_indev_drv_init(&input_driver);
-    input_driver.type = LV_INDEV_TYPE_POINTER;
-    input_driver.read_cb = ReadInput;
-    input_driver.user_data = this;
-    input = lv_indev_drv_register(&input_driver);
-    // 2. 加载中文字库、创建页面，通知主线程显示是否已准备好。
-    const char* font = access(kFont, R_OK) == 0 ? kFont : kFallbackFont;
-    const bool ready = display != nullptr && input != nullptr && access(font, R_OK) == 0 &&
-                       screen.Create(font);
-    if (ready) {
-      screen.SetEventHandler(HandleEvent, this);
-    }
-    {
-      std::lock_guard<std::mutex> lock(view_mutex);
-      start_ok = ready;
-      start_done = true;
-    }
-    wake.notify_one();
-    if (!ready) {
-      ReleaseUi();
-      return;
-    }
-    auto tick = std::chrono::steady_clock::now();
-    while (!stop.load()) {
-      // 3. 取配网结果，推进界面时钟。
-      PollProvisioning();
-      const auto now = std::chrono::steady_clock::now();
-      const auto elapsed =
-          std::chrono::duration_cast<std::chrono::milliseconds>(now - tick).count();
-      tick = now;
-      if (elapsed > 0) {
-        lv_tick_inc(static_cast<std::uint32_t>(elapsed));
-      }
-      // 4. 显示最新状态、字幕和摄像头帧，再处理触摸与绘制。
-      ShowLatestView();
-      ShowLatestCamera(now);
-      static_cast<void>(lv_timer_handler());
-      // 5. 等新状态或图像到达，最长 30 ms 后继续处理触摸。
-      std::unique_lock<std::mutex> lock(view_mutex);
-      wake.wait_for(lock, std::chrono::milliseconds(30));
-    }
-    ReleaseUi();
-  }
-
-  /**
-   * @brief 正常退出和初始化失败共用回收顺序，必须在 UI worker 中执行。
-   *
-   * 先结束外部生产者，再销毁页面；最后注销输入/显示 driver，防止 LVGL 继续触发回调。
-   * SPI/I2C/GPIO 的关闭留给 application 在 join 后调用 hardware.Close()。
-   */
-  void ReleaseUi() {
-    if (provision_pid > 0) {
-      static_cast<void>(StopUiProcessGroup(provision_pid));
-      provision_pid = -1;
-    }
-    camera.Stop();
-    screen.Destroy();
-    if (input != nullptr) {
-      lv_indev_delete(input);
-    }
-    if (display != nullptr) {
-      lv_disp_remove(display);
-    }
+  camera_capture::close();
+  // join后不再有回调；按页面→输入/显示→硬件释放，允许失败阶段调用。
+  page::close();
+  if (input) {
+    lv_indev_delete(input);
     input = nullptr;
+  }
+  if (display) {
+    lv_disp_remove(display);
     display = nullptr;
   }
-};
-
-DeviceUi::~DeviceUi() noexcept {
-  Close();
+  hardware.Close();
 }
-
-/** @brief 打开音频前读取百分比初值；非法设置回退，不让损坏文件产生越界增益。 */
-std::uint8_t DeviceUi::LoadVolume(std::uint8_t fallback) noexcept {
-  unsigned saved = 0U;
-  std::FILE* file = std::fopen(kSettings, "r");
-  if (file == nullptr) {
-    return std::min<std::uint8_t>(fallback, 100U);
-  }
-  const bool valid = std::fscanf(file, "%u", &saved) == 1 && saved <= 100U;
-  std::fclose(file);
-  return valid ? static_cast<std::uint8_t>(saved) : std::min<std::uint8_t>(fallback, 100U);
-}
-
-/**
- * @brief 在调用线程初始化硬件并启动 worker，再等待 worker 报告页面创建结果。
- *
- * start_done/start_ok 与等待谓词使用同一互斥量，避免先发通知再等待时丢失启动结果。
- * 若初始化不成功，Close() 仍等待工作线程释放 LVGL 后才释放 Impl。
- */
-bool DeviceUi::Open() {
-  Close();
-  impl_ = new (std::nothrow) Impl;
-  if (impl_ == nullptr) {
-    return false;
-  }
-  if (!impl_->hardware.Open()) {
-    Close();
-    return false;
-  }
-  try {
-    impl_->ui_thread = std::thread([state = impl_] {
-      try {
-        state->DisplayTask();
-      } catch (...) {
-        std::fprintf(stderr, "boompi-ui: display worker failed\n");
-        state->stop.store(true);
-        state->wake.notify_all();
-        state->ReleaseUi();
-      }
-    });
-  } catch (...) {
-    Close();
-    return false;
-  }
-  // Open() 等待 UI worker 完成字体和页面创建，调用方不会向半初始化对象发布状态。
-  std::unique_lock<std::mutex> lock(impl_->view_mutex);
-  const bool started = impl_->wake.wait_for(lock, std::chrono::seconds(2), [this] {
-    return impl_->start_done;
-  }) && impl_->start_ok;
-  lock.unlock();
-  if (!started) {
-    Close();
-  }
-  return started;
-}
-
-/** @brief application 发布完整状态；这里仅做交接，实际显示留到 DisplayTask() 下一轮。 */
-void DeviceUi::Show(const UiView& view) noexcept {
-  if (impl_ != nullptr) {
-    impl_->UpdateView(view);
-  }
-}
-
-/** @brief application 主循环消费最新动作；先取控制意图，再取音量，均不等待 UI。 */
-bool DeviceUi::PollAction(UiAction* result) noexcept {
-  if (impl_ == nullptr || result == nullptr) {
-    return false;
-  }
-
-  // exchange 同时完成读取与确认；连续输入只保留尚未消费的最近值。
-  const int action = impl_->action.exchange(-1);
-  if (action >= 0) {
-    result->kind = static_cast<UiActionKind>(action);
-    return true;
-  }
-  const int volume = impl_->volume_change.exchange(-1);
-  if (volume < 0) {
-    return false;
-  }
-  result->kind = UiActionKind::Volume;
-  result->volume = static_cast<std::uint8_t>(volume);
-  return true;
-}
-
-/** @brief application 终止 UI：通知循环退出，join 建立资源不再被回调访问的边界。 */
-void DeviceUi::Close() noexcept {
-  if (impl_ == nullptr) {
-    return;
-  }
-  // UI worker 负责停止 camera/provision 并销毁 LVGL；join 后关闭硬件 fd 可避免回调悬空。
-  impl_->stop.store(true);
-  impl_->wake.notify_one();
-  if (impl_->ui_thread.joinable()) {
-    impl_->ui_thread.join();
-  }
-  impl_->hardware.Close();
-  delete impl_;
-  impl_ = nullptr;
-}
-
 }  // namespace boompi::ui

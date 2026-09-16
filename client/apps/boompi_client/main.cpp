@@ -6,7 +6,6 @@
 
 #include "boompi/application/voice_client.h"
 #include "boompi/config/voice_client_config.h"
-#include "boompi/network/voice_net.h"
 
 namespace {
 volatile std::sig_atomic_t stop_requested = 0;
@@ -18,19 +17,9 @@ void RequestStop(int) {
 int main(int argc, char* argv[]) {
   const std::string_view command = argc <= 1 ? "--voice-loop" : argv[1];
   if (argc > 2 ||
-      (command != "--voice-loop" && command != "--check-config" && command != "--save-wifi")) {
-    std::cerr << "usage: boompi-client [--voice-loop|--check-config|--save-wifi]\n";
+      (command != "--voice-loop" && command != "--check-config")) {
+    std::cerr << "usage: boompi-client [--voice-loop|--check-config]\n";
     return EXIT_FAILURE;
-  }
-  if (command == "--save-wifi") {
-    // 凭据只从标准输入接收，不能出现在命令行和日志中。
-    std::string ssid, password;
-    if (!std::getline(std::cin, ssid) || !std::getline(std::cin, password) ||
-        !boompi::voice_net::save_wifi(ssid, password)) {
-      std::cerr << "boompi-client: Wi-Fi configuration could not be saved\n";
-      return EXIT_FAILURE;
-    }
-    return EXIT_SUCCESS;
   }
   boompi::config::VoiceClientConfig config;
   std::string error;

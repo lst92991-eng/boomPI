@@ -18,7 +18,6 @@ using voice_net::LinkEventKind;
 using voice_net::SendResult;
 enum class State { Idle, Listening, WaitingReply, Speaking };
 State state{State::Idle};
-ui::DeviceUi screen;
 ui::UiView view;
 Clock::time_point deadline{}, response_limit{};
 char failure[192]{};
@@ -26,7 +25,7 @@ char failure[192]{};
 bool fail(const char* reason) {
   std::snprintf(failure, sizeof(failure), "%s", reason);
   view.state = ui::DeviceUiState::Error;
-  screen.Show(view);
+  ui::show(view);
   return false;
 }
 void show(State next) {
@@ -36,7 +35,7 @@ void show(State next) {
   state = next;
   view.state =
       voice_net::online() ? labels[static_cast<unsigned>(next)] : ui::DeviceUiState::Offline;
-  screen.Show(view);
+  ui::show(view);
 }
 void listen(Clock::duration window) {
   speech::reset();
@@ -86,7 +85,7 @@ void receive_reply() {
     deadline = std::min(Clock::now() + 30s, response_limit);
     if (event.kind == LinkEventKind::Text) {
       view.AppendText(event.data);
-      screen.Show(view);
+      ui::show(view);
     } else if (event.kind == LinkEventKind::Audio) {
       if (playback::write(event.data.data(), event.data.size()) !=
           playback::WriteResult::Queued) {
@@ -111,8 +110,8 @@ bool App_Init(const boompi::config::VoiceClientConfig& config) {
   failure[0] = '\0';
   view = {};
   try {
-    view.volume = ui::DeviceUi::LoadVolume();
-    if (!screen.Open()) {
+    view.volume = ui::load_volume();
+    if (!ui::open()) {
       std::fprintf(stderr, "boompi: display unavailable; voice continues\n");
     }
     if (!voice_input::open()) {
@@ -203,11 +202,11 @@ bool App_Process() {
       }
     }
     ui::UiAction action;
-    if (screen.PollAction(&action)) {
+    if (ui::poll_action(action)) {
       if (action.kind == ui::UiActionKind::Volume) {
         view.volume = std::min<std::uint8_t>(100, action.volume);
         playback::set_volume(view.volume);
-        screen.Show(view);
+        ui::show(view);
       } else if (action.kind == ui::UiActionKind::Interrupt) {
         if (state == State::Speaking || state == State::WaitingReply) {
           cancel(true);
@@ -226,7 +225,7 @@ void App_Close() noexcept {
   voice_net::close();
   playback::close();
   voice_input::close();
-  screen.Close();
+  ui::close();
 }
 const char* App_GetError() noexcept {
   return failure;

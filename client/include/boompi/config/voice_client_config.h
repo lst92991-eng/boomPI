@@ -8,6 +8,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace boompi::config {
 /** @brief 安装脚本提供设备身份；教师可预置成对的地址和 SPKI 指纹来固定课堂端点。 */
@@ -22,9 +23,9 @@ struct VoiceClientConfig final {
   std::string server_spki_sha256;
 };
 /// 检查 UUID 文本形状、大小写及非全零约束；不核验 UUID 版本/变体位或全网唯一性。
-bool IsValidDeviceId(const std::string& value) noexcept;
+bool IsValidDeviceId(std::string_view value) noexcept;
 /// 检查 32 字节摘要的规范 Base64 形式；这里只校验格式，TLS 握手时才验证远端公钥。
-bool IsValidSpkiSha256(const std::string& value) noexcept;
+bool IsValidSpkiSha256(std::string_view value) noexcept;
 /**
  * @brief 读取 BOOMPI_* 环境变量并验证长度、身份、地址/pin 配对和端口范围。
  * @param output 非空，先恢复默认值再填充；失败时可能部分填写，不可用于启动。

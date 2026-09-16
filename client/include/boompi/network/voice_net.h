@@ -37,9 +37,5 @@ SendResult end();
 bool cancel(bool retract);
 void close() noexcept;
 
-// 保存后供网络准备使用，不等待联网。SSID 1～32 字节，密码 8～63 字节。
-// 拒绝控制字符并转义字段，完整写入后原子替换配置；调用方不得记录凭据。
-// 有文件 I/O，只能由主线程/UI 等非实时线程调用。
-bool save_wifi(const std::string& ssid, const std::string& password);
 
 }  // namespace boompi::voice_net

@@ -27,13 +27,13 @@
 #define LV_USE_ASSERT_NULL 1
 #define LV_USE_ASSERT_MALLOC 1
 #define LV_ASSERT_HANDLER abort();
-// 保留内置拉丁字体；产品中文标签由 LvglScreen 加载外部 FreeType 字体。
+// 保留内置拉丁字体；产品中文标签由 page::open 加载外部 FreeType 字体。
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_20 1
 #define LV_USE_FREETYPE 1
-// 配网页在本地绘制临时热点二维码，不依赖网络图片或云端二维码服务。
-#define LV_USE_QRCODE 1
-// FreeType 缓存预算有界；页面 Create 也向 lv_freetype_init 传入运行期缓存参数。
+// 最小版只保留语音与摄像头，不编入已删除配网页的二维码组件。
+#define LV_USE_QRCODE 0
+// FreeType 缓存预算有界；页面 open 也向 lv_freetype_init 传入运行期缓存参数。
 #define LV_FREETYPE_CACHE_FT_FACES 4
 #define LV_FREETYPE_CACHE_FT_SIZES 4
 #define LV_FREETYPE_CACHE_SIZE 65536

@@ -1,6 +1,5 @@
 #!/bin/sh
-# Buildroot/SysV boot hook. Start is detached so first-time AP provisioning
-# cannot block the rest of the board boot sequence.
+# Buildroot/SysV启动入口：客户端后台启动，网络等待不阻塞后续服务。
 case ${1:-} in
   start) /usr/sbin/boompi-clientctl start >/dev/null 2>&1 & ;;
   stop) /usr/sbin/boompi-clientctl stop ;;

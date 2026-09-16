@@ -111,7 +111,7 @@ add_executable(boompi_client
   src/application/voice_client.cpp
   ${BOOMPI_AUDIO_SOURCES}
   src/config/voice_client_config.cpp
-  src/network/network_setup.cpp
+  src/network/network.cpp
   src/network/voice_net.cpp
   src/network/voice_codec.cpp
   src/platform/rv1106/audio_thread.cpp
@@ -149,9 +149,7 @@ set_target_properties(boompi_client PROPERTIES OUTPUT_NAME boompi-client
   BUILD_WITH_INSTALL_RPATH FALSE INSTALL_RPATH_USE_LINK_PATH FALSE)
 
 install(TARGETS boompi_client RUNTIME DESTINATION /userdata/boompi/bin)
-install(PROGRAMS scripts/boompi-clientctl scripts/boompi-provision
-  DESTINATION /usr/sbin)
-install(PROGRAMS scripts/boompi-provision.py DESTINATION /usr/lib/boompi)
+install(PROGRAMS scripts/boompi-clientctl DESTINATION /usr/sbin)
 install(PROGRAMS scripts/S99boompi-client DESTINATION /etc/init.d)
 
 # 测试登记单独阅读；include 保留原有 target 输出路径和 CTest 工作目录。

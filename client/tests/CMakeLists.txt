@@ -67,7 +67,7 @@ if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
     find_package(ALSA REQUIRED)
     add_library(boompi_audio_platform_compile OBJECT
       src/platform/rv1106/audio_capture.cpp
-      src/platform/rv1106/audio_thread.cpp src/network/network_setup.cpp)
+      src/platform/rv1106/audio_thread.cpp src/network/network.cpp)
     boompi_test_options(boompi_audio_platform_compile)
     target_include_directories(boompi_audio_platform_compile PRIVATE
       src/platform/rv1106 tests/support)
@@ -109,4 +109,25 @@ if(BOOMPI_TARGET_RV1106 AND BOOMPI_BUILD_AEC_LOOP_HIL)
     Threads::Threads ${CMAKE_DL_LIBS} atomic)
   set_target_properties(boompi_aec_loop_hil PROPERTIES OUTPUT_NAME boompi-aec-loop-hil
     SKIP_BUILD_RPATH TRUE BUILD_RPATH "" INSTALL_RPATH "")
+endif()
+
+if(BOOMPI_BUILD_TESTS AND NOT BOOMPI_TARGET_RV1106)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(boompi_network_interface_test tests/network_interface_test.cpp
+      src/network/network.cpp src/config/voice_client_config.cpp)
+    boompi_test_options(boompi_network_interface_test)
+    add_test(NAME network-interface-contract COMMAND boompi_network_interface_test)
+    add_executable(boompi_camera_lifecycle_test tests/camera_lifecycle_test.cpp
+      src/ui/camera_capture.cpp)
+    boompi_test_options(boompi_camera_lifecycle_test)
+    target_link_libraries(boompi_camera_lifecycle_test PRIVATE Threads::Threads)
+    target_link_options(boompi_camera_lifecycle_test PRIVATE -Wl,--wrap=execl)
+    add_test(NAME camera-lifecycle COMMAND boompi_camera_lifecycle_test)
+  endif()
+  if(TARGET boompi_lvgl_ui)
+    add_executable(boompi_ui_page_test tests/ui_page_test.cpp)
+    boompi_test_options(boompi_ui_page_test)
+    target_link_libraries(boompi_ui_page_test PRIVATE boompi_lvgl_ui)
+    add_test(NAME ui-pages COMMAND boompi_ui_page_test)
+  endif()
 endif()
