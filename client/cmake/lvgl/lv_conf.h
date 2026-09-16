@@ -33,7 +33,7 @@
 #define LV_USE_FREETYPE 1
 // 最小版只保留语音与摄像头，不编入已删除配网页的二维码组件。
 #define LV_USE_QRCODE 0
-// FreeType 缓存预算有界；页面 open 也向 lv_freetype_init 传入运行期缓存参数。
+// lv_init一次创建进程级FreeType缓存；页面只管理字体，不能重复初始化缓存。
 #define LV_FREETYPE_CACHE_FT_FACES 4
 #define LV_FREETYPE_CACHE_FT_SIZES 4
 #define LV_FREETYPE_CACHE_SIZE 65536

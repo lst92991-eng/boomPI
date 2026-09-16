@@ -16,8 +16,7 @@ void RequestStop(int) {
 
 int main(int argc, char* argv[]) {
   const std::string_view command = argc <= 1 ? "--voice-loop" : argv[1];
-  if (argc > 2 ||
-      (command != "--voice-loop" && command != "--check-config")) {
+  if (argc > 2 || (command != "--voice-loop" && command != "--check-config")) {
     std::cerr << "usage: boompi-client [--voice-loop|--check-config]\n";
     return EXIT_FAILURE;
   }

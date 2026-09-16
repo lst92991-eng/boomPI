@@ -1,37 +1,22 @@
-# boomPI 客户端：教学版 v2
+# boomPI 客户端：最小教学候选版
 
-从 [main](apps/boompi_client/main.cpp) 的四个中文步骤开始阅读：LoadClientConfig、App_Init、循环 App_Process、App_Close。命令行辅助功能和信号处理的定义在本文件下方。完整调用路径见[源码阅读索引](../docs/teaching/client-source-reading.md)，本次接口变化与验证范围见[可读性重构记录](../docs/architecture/client-readability-refactor.md)。
-
-教学复现先从[分关实验](../docs/teaching/README.md)开始：配置、固定帧、播放队列、语句输入、WSS、四态问答、插话、界面，最后完成真板验收。每关复用真实产品源码和已有测试，不用课程宏拼出多个产品。
-
-音频可以从[顺序数据流](../docs/teaching/audio-pipeline.md)进入：`RawCaptureFrame → CaptureChannels → CaptureFrame → speech::Result（借用PCM）`。各处理模块显式接收上一阶段输出，播放是另一条独立链。
-
-这是一份源码上的递进补写实验，不是已经导出的独立阶段源码快照。已有基础、只想先理解完整业务时，再读 `src/application/voice_client.cpp`。服务端是配套 EXE，学生只配置 Key；无需学习 Go 或云端 SDK。
-
-```sh
-python3 scripts/teaching_lab.py
-python3 scripts/teaching_lab.py 1 --build-dir build/lesson-host
-```
+从`apps/boompi_client/main.cpp`开始：读取配置→App_Init→循环App_Process→App_Close。只保留--voice-loop和--check-config。当前实现见[源码索引](../docs/teaching/client-source-reading.md)与[交付记录](../docs/test/minimal-non-audio.md)。
 
 ## 一条主线
 
-App_Init按采集、播放、网络初始化，App_Process顺序执行收回复、处理语音和触摸。应用直接调用namespace模块：
-
 ```text
-输入任务：ALSA → 转换 → 3A → wake → VAD
+输入线程：ALSA → 格式转换 → 3A → wake → VAD → 交接
 应用：voice_input::read → speech::update → voice_net::start/send/end
-voice_net::poll → playback::write/finish → status(Drained)
+回复：voice_net::poll → playback::write/finish → Drained → 追问
+显示：ui::show → UI线程 → page::show；ui::poll_action取触摸动作
+相机：进入页面open → 完整帧read到page::pixels → 离页close
 ```
 
-speech只拥有语句确认与句首缓存，应用拥有追问和插话决策，不启动线程或转发回复。输入任务顺序执行ALSA/转换/3A/wake/VAD，应用只处理speech与问答；没有检测器跨线程命令握手或四阶段插话试探。playback拥有播放队列、转换器和声卡，旧聚合层未恢复。
+音频冻结于2ca0cf6，包含候选/有界复核；没有改成VAD立即取消。500ms前滚、三秒追问、generation/sequence、DONE与真实尾播区分均保留。
 
-START、PCM、END、CANCEL为不同协议消息；generation隔离旧轮，sequence检查连续PCM。DONE关闭播放输入，实际尾播之后才追问。保持唤醒、VAD、500ms句首、插话确认、三秒追问和全部UI/配网/摄像头功能。
+UI为两个固定容器，不再重建桌面或管理AP进程。初始化阶段建立LVGL端口和页面，再启动UI线程；join后回收。帧/显示快照保持必要线程边界，不引入通用消息框架。
 
-## 阅读顺序
-
-先读[真实数据流](../docs/teaching/audio-pipeline.md)，再看[模块所有权](../docs/architecture/audio-runtime.md)。应用入口为application/voice_client.cpp，采集/语句/播放在audio/三个namespace模块，协议在network/voice_net.cpp和[BPV4](../protocol/protocol-v4.md)。硬件与vendor细节留在platform/rv1106。
-
-## 运行与设置
+## 运行和Wi-Fi
 
 ```sh
 boompi-clientctl start
@@ -40,39 +25,36 @@ boompi-clientctl log
 boompi-clientctl stop
 ```
 
-有线优先，Wi-Fi 为备用。无有线时运行 `boompi-clientctl provision`，或从 WiFi 页启动配网。
+直接编辑板端`/etc/wpa_supplicant.conf`：
 
-学生无需配置声学环境变量。新生成的 `/userdata/boompi/config/client.env` 只包含自动 UUID：
-
-```text
-BOOMPI_DEVICE_ID=<由脚本生成>
+```conf
+ctrl_interface=/var/run/wpa_supplicant
+network={
+    ssid="YOUR_SSID"
+    psk="YOUR_PASSWORD"
+}
 ```
 
-音量只从 `ui.settings` 读取并在滑块释放时保存。旧 client.env 的音量/声学键会输出迁移提示，不再改变 profile。教师在共享课堂网络中应预置该组电脑的地址和 pin，避免首次发现邻组服务端：
+```sh
+chmod 600 /etc/wpa_supplicant.conf
+```
+
+真实凭据只留在板端，不提交Git或放入命令行。编辑已运行的supplicant配置后，由维护者重载该服务或重启板子；客户端复用现有服务，不每次重连重启它。
+
+默认先以太网再Wi-Fi。有线取得IP但WSS未READY时，下轮先试Wi-Fi；正常Wi-Fi连接不被有线主动抢占。UDP发现与WSS都绑定所选接口。网卡、驱动和服务路径须符合本板BSP，Host dummy网卡测试不证明实际射频/DHCP通过。
+
+`/userdata/boompi/config/client.env`首次只生成设备UUID。教师需要固定某组服务器时，预置以下成对字段：
 
 ```text
-BOOMPI_SERVER_IP=<该组电脑IPv4>
+BOOMPI_DEVICE_ID=<安装时生成的UUID>
+BOOMPI_SERVER_IP=<电脑IPv4>
 BOOMPI_SERVER_PORT=17806
-BOOMPI_SERVER_SPKI_SHA256=<该电脑稳定SPKI>
+BOOMPI_SERVER_SPKI_SHA256=<电脑稳定SPKI>
 ```
 
-地址和 pin 必须成对，`--check-config` 会拒绝非法 IPv4。发现本身没有认证，TLS 始终检查已保存的 SPKI。
+不指定地址/pin则走发现与缓存；首次发现不是认证，后续TLS检查已保存公钥。音量从ui.settings读取，释放滑块时保存；学生没有声学校准环境变量。
 
-## 内部板级预置
-
-`src/platform/rv1106/board_voice_profile.h` 只由内部实现引用。学生侧没有声学校准项；以下沿用常量（本轮真板未验证）按硬件事实和声学预置分组：
-
-- 左右麦极性 +1/+1；
-- Snowboy 0.7；
-- AEC delay 0。
-
-网络每 20 ms 双向均为 320 samples，声卡当前每通道 960 samples；PCM 路径和模型位置由维护者预置。vendor 256 点块独立适配，不能把这些粒度混为一条约束。学生不逐板调参。更换硬件或模型后由维护者重新验收整个 profile。
-
-采集保持 48 kHz / S16_LE / 4ch `[mic0,mic1,refL,refR]`，3A 输入为双麦+refL，上传和 TTS 均为 16 kHz mono；仅在声卡边界转成 48 kHz stereo。hello/ready 均必须声明 `HELLO/READY 4 16000`，旧 24 kHz 服务端不能配套。原有 AEC/VAD 默认值保留，整板 16 kHz 能力、声学效果和新 TTS 实际体验仍需要真板验收。
-
-## 构建
-
-Host：
+## 构建与检查
 
 ```sh
 cmake --preset host-debug
@@ -80,34 +62,31 @@ cmake --build --preset host-debug --parallel
 ctest --preset host-debug
 python3 scripts/verify_protocol_fixtures.py
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+python3 scripts/measure_teaching.py
 ```
 
-发布验收必须设置 `BOOMPI_REQUIRE_HOST_TRANSPORT_TEST=ON` 并安装 Host OpenSSL、Boost 1.83 与 cJSON，防止真实网络测试被跳过。
+完整Linux检查要求OpenSSL、Boost、cJSON、ALSA、FFmpeg开发依赖，并设置BOOMPI_REQUIRE_HOST_TRANSPORT_TEST=ON。UI另需LVGL8.2、SDL2和FreeType：
 
-教师准备一次 SDK 后，学生只设置根目录：
+```sh
+cmake --preset host-debug -DBOOMPI_BUILD_UI_SIMULATOR=ON \
+  -DBOOMPI_LVGL_ROOT="$BOOMPI_LVGL_ROOT" -DBOOMPI_REQUIRE_HOST_TRANSPORT_TEST=ON
+cmake --build --preset host-debug --parallel
+ctest --preset host-debug
+```
+
+发布使用教师准备的匹配SDK：
 
 ```sh
 export BOOMPI_RV1106_SDK_ROOT=/absolute/path/to/teaching-sdk
 sh scripts/build_teaching_release.sh
 ```
 
-SDK 根目录可以包含教师维护的 `boompi-sdk.cmake`，映射已有的 BOOMPI_* 路径；也可以使用以下布局：
+根目录可提供boompi-sdk.cmake映射既有BOOMPI_*路径。匹配组件包括GCC/uClibc工具链与sysroot、Rockchip3A、Snowboy/OpenBLAS、WebRTC VAD、Boost、OpenSSL3.5.7和LVGL8.2。wake.cpp单独旧C++ ABI。脚本检查ELF后生成安装目录，不连接开发板；没有SDK时不能把Host产物当板端程序。
 
-```text
-toolchain/bin/arm-rockchip830-linux-uclibcgnueabihf-{gcc,g++,readelf}
-sysroot/
-rockchip/include/ + rockchip/lib/{libaec_bf_process.so,librkaudio_common.so}
-snowboy/include/ + snowboy/lib/{libsnowboy-detect.a,libopenblas.a}
-webrtc/include/ + webrtc/lib/libwebrtc_vad.a
-boost/include/
-openssl/     # 匹配目标ABI的 OpenSSL 3.5.7 config package
-lvgl/        # LVGL 8.2
-```
+## 升级与验收
 
-不把私有库或模型复制进 Git。Snowboy 旧 C++ ABI 仍仅限 bridge。脚本检查 ELF 后才生成 rootfs 安装目录，不会连接开发板。
+覆盖客户端及启动脚本**之前**，先用旧版本`boompi-clientctl stop`停止旧客户端和旧AP服务，确认退出后再安装本分支。不要直接用新脚本清理正在运行的旧AP：新版本已删除该管理功能。
 
-## 旧版升级
+保留旧可执行文件、Wi-Fi配置、server.conf以及服务端config.yaml/state。新clientctl仍支持有限重启和更新失败回滚，不删除已有身份。本分支不需要修改设备树、镜像或Go服务端。
 
-v4 客户端必须与同批 v4 服务端配套。旧 v1/v2 程序留在基线快照/Git 历史，不能混用。首次更新前保留旧客户端、旧服务端、config.yaml 与 state；复用原有身份而非重新配对。协议详见 [protocol-v4.md](../protocol/protocol-v4.md)，人工验收见 [host-validation.md](../docs/test/host-validation.md)。
-
-当前职责、实际流程和预算例外以[本轮记录](../docs/test/budget-refactor.md)为准；旧源码阅读记录仅作历史参考。
+先测试2ca0cf6音频，再单独测试此分支的页面、触摸、音量、摄像头进退、有线/无线回退及断网恢复。当前Host测试、交叉构建和真板验收状态必须分开报告。

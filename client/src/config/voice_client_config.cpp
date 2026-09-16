@@ -1,4 +1,5 @@
 #include "boompi/config/voice_client_config.h"
+
 #include <algorithm>
 #include <charconv>
 #include <cstdlib>
@@ -31,7 +32,8 @@ bool ipv4(std::string_view text) {
   return true;
 }
 int base64(char c) {
-  constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  constexpr std::string_view alphabet =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   const auto at = alphabet.find(c);
   return at == std::string_view::npos ? -1 : static_cast<int>(at);
 }
@@ -54,7 +56,10 @@ bool IsValidDeviceId(std::string_view text) noexcept {
 bool IsValidSpkiSha256(std::string_view text) noexcept {
   // 32字节的标准Base64，末数据字符低两位必须为0；TLS仍另验服务器持有此公钥。
   return text.size() == 44 && text.back() == '=' &&
-         std::all_of(text.begin(), text.end() - 1, [](char c) { return base64(c) >= 0; }) &&
+         std::all_of(text.begin(), text.end() - 1,
+                     [](char c) {
+                       return base64(c) >= 0;
+                     }) &&
          (base64(text[42]) & 3) == 0;
 }
 bool LoadClientConfig(VoiceClientConfig* output, std::string* error) {
@@ -86,7 +91,8 @@ bool LoadClientConfig(VoiceClientConfig* output, std::string* error) {
   if (!port.empty() && (port.size() > 5 || !decimal(port, 65535, number) || number == 0)) {
     return fail("BOOMPI_SERVER_PORT");
   }
-  *output = {std::string(id), std::string(ip), static_cast<std::uint16_t>(number), std::string(pin)};
+  *output = {std::string(id), std::string(ip), static_cast<std::uint16_t>(number),
+             std::string(pin)};
   if (error) {
     error->clear();
   }

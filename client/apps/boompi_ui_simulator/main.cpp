@@ -121,6 +121,9 @@ int main(int argc, char** argv) {
                              : SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB565,
                                                  SDL_TEXTUREACCESS_STREAMING, kWidth, kHeight);
   if (preview_dir.empty() && texture == nullptr) {
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
     return 2;
   }
 
@@ -135,17 +138,31 @@ int main(int argc, char** argv) {
   display.ver_res = kHeight;
   display.flush_cb = Flush;
   display.draw_buf = &draw_buffer;
-  lv_disp_drv_register(&display);
+  auto* registered_display = lv_disp_drv_register(&display);
   static lv_indev_drv_t pointer;
   lv_indev_drv_init(&pointer);
   pointer.type = LV_INDEV_TYPE_POINTER;
   pointer.read_cb = ReadPointer;
-  lv_indev_drv_register(&pointer);
+  auto* registered_input = lv_indev_drv_register(&pointer);
 
   // 两页UI 从此处开始只接触抽象 display/input，页面代码无法区分 SDL 与 RV1106。
   namespace page = boompi::ui::page;
+  const auto cleanup = [&] {
+    page::close();
+    lv_indev_delete(registered_input);
+    lv_disp_remove(registered_display);
+    display.draw_ctx_deinit(&display, display.draw_ctx);
+    lv_mem_free(display.draw_ctx);
+    lv_img_cache_set_size(0);
+    lv_freetype_destroy();
+    SDL_DestroyTexture(texture);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+  };
   boompi::ui::UiView view;
   if (!page::open(font)) {
+    cleanup();
     return 3;
   }
   constexpr std::array states{
@@ -213,16 +230,13 @@ int main(int argc, char** argv) {
       SDL_RenderPresent(renderer);
     }
     if (!preview_dir.empty() && g_frame_dirty && !SaveFrame(preview_dir)) {
+      cleanup();
       return 3;
     }
     g_frame_dirty = false;
     std::this_thread::sleep_until(started + std::chrono::milliseconds(16));
   }
   // 页面先销毁，再释放承载它的 SDL display 资源，顺序与板端 Close() 保持一致。
-  page::close();
-  SDL_DestroyTexture(texture);
-  SDL_DestroyRenderer(renderer);
-  SDL_DestroyWindow(window);
-  SDL_Quit();
+  cleanup();
   return 0;
 }

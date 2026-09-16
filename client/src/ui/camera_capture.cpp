@@ -1,8 +1,10 @@
 #include "camera_capture.h"
+
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
 #include <atomic>
 #include <cerrno>
 #include <chrono>

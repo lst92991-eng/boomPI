@@ -1,4 +1,5 @@
 #include "network.h"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <net/if.h>
@@ -9,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -26,7 +28,7 @@ bool link_up(const char* interface) {
   return (file >> carrier) && carrier == 1;
 }
 bool has_address(const char* interface) {
-  const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  const int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     return false;
   }
@@ -51,8 +53,8 @@ bool tool(bool wifi, const char* interface, const std::atomic<bool>& stop) {
       execl("/usr/bin/wpa_supplicant", "wpa_supplicant", "-B", "-i", interface, "-c",
             kWifiConfig, static_cast<char*>(nullptr));
     } else {
-      execl("/sbin/udhcpc", "udhcpc", "-n", "-q", "-t", "3", "-T", "2", "-i",
-            interface, static_cast<char*>(nullptr));
+      execl("/sbin/udhcpc", "udhcpc", "-n", "-q", "-t", "3", "-T", "2", "-i", interface,
+            static_cast<char*>(nullptr));
     }
     _exit(127);
   }
@@ -106,8 +108,8 @@ bool load_server(config::VoiceClientConfig& output) {
   std::ifstream file(kServerConfig);
   unsigned port;
   std::string extra;
-  if (!(file >> output.server_ip >> port >> output.server_spki_sha256) ||
-      (file >> extra) || port > 65535) {
+  if (!(file >> output.server_ip >> port >> output.server_spki_sha256) || (file >> extra) ||
+      port > 65535) {
     return false;
   }
   output.server_port = static_cast<std::uint16_t>(port);
@@ -118,7 +120,8 @@ bool save_server(const config::VoiceClientConfig& value) {
     return false;
   }
   const std::string temporary = std::string(kServerConfig) + ".tmp";
-  const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+  const int fd =
+      ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
   std::FILE* file = fd < 0 ? nullptr : fdopen(fd, "w");
   bool ok = file && fchmod(fd, 0600) == 0 &&
             std::fprintf(file, "%s %u %s\n", value.server_ip.c_str(), value.server_port,
@@ -137,7 +140,7 @@ bool save_server(const config::VoiceClientConfig& value) {
 }
 bool discover(const char* interface, config::VoiceClientConfig& output,
               const std::atomic<bool>& stop) {
-  const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  const int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     return false;
   }
@@ -149,8 +152,8 @@ bool discover(const char* interface, config::VoiceClientConfig& output,
   constexpr char request[] = "BOOMPI_DISCOVER_V2";
   bool ok = bind_socket(fd, interface) &&
             setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled)) == 0 &&
-            sendto(fd, request, sizeof(request) - 1, 0,
-                   reinterpret_cast<sockaddr*>(&target), sizeof(target)) >= 0;
+            sendto(fd, request, sizeof(request) - 1, 0, reinterpret_cast<sockaddr*>(&target),
+                   sizeof(target)) >= 0;
   pollfd readable{fd, POLLIN, 0};
   int received = -1;
   char response[96]{};
@@ -199,12 +202,11 @@ bool find_server(const config::VoiceClientConfig& configured, Endpoint& output,
     if (server.server_ip.empty()) {
       const bool found = discover(kInterfaces[wifi], server, stop) &&
                          (!cached || saved.server_spki_sha256 == server.server_spki_sha256);
-      if (found && save_server(server)) {
-        // 地址可变，首次课堂配对之后公钥不允许被陌生广播替换。
-      } else if (cached) {
+      if (!found || !save_server(server)) {
+        if (!cached) {
+          continue;
+        }
         server = saved;
-      } else {
-        continue;
       }
     }
     if (!stop.load() && endpoint_valid(server)) {

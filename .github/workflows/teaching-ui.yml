@@ -54,13 +54,15 @@ jobs:
       - name: Sanitized UI and camera regression
         run: |
           cmake -S . -B build/teaching-sanitized -DBOOMPI_BUILD_UI_SIMULATOR=ON -DBOOMPI_LVGL_ROOT="$GITHUB_WORKSPACE/build-deps/lvgl" -DBOOMPI_TARGET_RV1106=OFF -DBOOMPI_BUILD_TESTS=ON -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
-          cmake --build build/teaching-sanitized --target boompi_ui_page_test boompi_camera_lifecycle_test boompi_network_interface_test --parallel 4
-          ctest --test-dir build/teaching-sanitized -R 'ui-pages|camera-lifecycle|network-interface-contract' --output-on-failure
+          cmake --build build/teaching-sanitized --target boompi_ui_page_test boompi_ui_runtime_test boompi_camera_lifecycle_test boompi_network_interface_test --parallel 4
+          ctest --test-dir build/teaching-sanitized -R 'ui-pages|ui-runtime-lifecycle|camera-lifecycle|network-interface-contract' --output-on-failure
       - name: Record measured counts and formatting diff
         if: always()
         run: |
           mkdir -p /tmp/teaching-results
           python3 scripts/measure_client.py > /tmp/teaching-results/client-metrics.json
+          python3 scripts/measure_teaching.py > /tmp/teaching-results/modules.json
+          git archive --format=tar.gz HEAD > /tmp/teaching-results/source.tar.gz
           git diff --name-only --diff-filter=ACMR 2ca0cf63d241a032292f4d83a3120002b91a066e -- '*.cpp' '*.h' | xargs -r clang-format-18 -i
           git diff --binary > /tmp/teaching-results/format.patch
       - uses: actions/upload-artifact@v4

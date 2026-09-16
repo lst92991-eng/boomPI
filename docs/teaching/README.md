@@ -1,173 +1,56 @@
 # 客户端分关复现实验
 
-逐步阅读现有代码可先打开[客户端源码逻辑链阅读索引](client-source-reading.md)，按一次正常问答及插话、异常、UI 分支跟踪函数调用。
+每次补写一段真实行为，先看输入、顺序调用和输出，再看错误边界。服务端是只配置Key的配套程序，不作为板端课程前置知识。
 
-目标不是先读完所有文件，而是每次实现一段行为，并用可重复的结果证明它正确。服务端只作为配套程序配置，不纳入逐行课程。
+这是同一份正式源码上的练习，不是九个已导出的独立阶段工程。尚未讲解部分保留参考实现；不要删空支持代码后期待完整CMake仍能配置。实验使用自己的工作副本，不修改测试来掩盖错误。
 
-音频模块现已按显式输入输出串联，先读[一帧音频的数据流](audio-pipeline.md)，再进入下面第3、4、7关。
+## 环境
 
-## 当前提供什么
-
-本目录提供**同一份正式源码上的分关补写与验证**：每关指出实现顺序、已有支持代码、验证命令和常见失败。它不是九个已裁剪、各自独立运行的阶段客户端。应用和传输测试会覆盖完整模块，尚未学习的函数先保留参考实现；不能把其它目录删空后期待完整项目仍能配置。
-
-这样可以先复现一段真实生产代码，而不维护九套协议、声学策略或驱动。完整客户端始终只有一个产品入口，教学检查复用既有CMake目标和测试程序，不在产品源码中增加课程宏。
-
-每关按以下顺序进行：
-
-1. 先运行原实现，记录预期结果，确认环境本身可用。
-2. 只在自己的练习副本补写本关指定函数，保持签名和支持代码不动。
-3. 运行本关检查。失败时先看第一条断言，不通过修改测试来掩盖问题。
-4. 说明输入、输出、所有权、失败动作；然后再对照参考实现。
-5. 学完一关后运行前面相关检查，防止新改动破坏已完成行为。
-
-## 环境与统一命令
-
-推荐Linux Host或Windows上的WSL。需要CMake、C++17编译器和Python 3.9以上；Host配置还需要libswresample/libavutil开发文件以执行真实音频转换。第2/5关需要Host OpenSSL、Boost 1.83及cJSON开发文件。这里只运行本地测试，不调用云端API、不需要云端Key，也不会连接开发板。
-
-在仓库根目录配置一次：
+推荐Linux/WSL。准备CMake、C++17、Python3.9+以及Host OpenSSL/Boost/cJSON、ALSA、FFmpeg开发依赖。Windows和WSL构建目录不能共用。
 
 ```sh
 cmake -S . -B build/lesson-host -DCMAKE_BUILD_TYPE=Debug \
   -DBOOMPI_BUILD_UI_SIMULATOR=OFF -DBOOMPI_BUILD_TESTS=ON \
   -DBOOMPI_STRICT_WARNINGS=ON -DBOOMPI_REQUIRE_HOST_TRANSPORT_TEST=ON
 python3 scripts/teaching_lab.py
-python3 scripts/teaching_lab.py 1
+python3 scripts/teaching_lab.py 1 --build-dir build/lesson-host
 ```
 
-本文单独使用`build/lesson-host`，避免复用已有Windows Visual Studio的`build/host-debug`缓存。Windows与WSL的构建目录必须分开。测试依赖放在教师提供的非系统目录时，由教师设置CMake的`BOOMPI_HOST_BOOST_INCLUDE_DIR`、`BOOMPI_HOST_CJSON_INCLUDE_DIR`和`BOOMPI_HOST_CJSON_LIBRARY`。不要把Windows库路径传给WSL编译器，也不要把个人路径写进源码。
+--dry-run只打印命令。所需测试未登记会明确失败，不把零测试当通过。所有实验只运行Host，不连接开发板或调用付费云端。
 
-使用现有构建目录：
+## 九个阅读/复现关卡
 
-```sh
-python3 scripts/teaching_lab.py 3 --build-dir build/lesson-host
-python3 scripts/teaching_lab.py 3 --build-dir build/lesson-host --dry-run
-```
+| 关卡 | 先读什么 | 本关检验 |
+| --- | --- | --- |
+| 1 配置 | voice_client_config.cpp：environment→decimal/ipv4→身份/pin→一次复制 | voice-client-config-contract |
+| 2 固定帧 | audio_format.h、voice_codec.cpp：整数端序→PCM→控制消息 | protocol-json-contract |
+| 3 播放 | playback.cpp：write→采样环→转换/写声卡→finish/drain | audio-flow格式、播放、采集 |
+| 4 输入 | wake/vad→speech::reset/update→前滚及句尾 | detection、voice-preroll |
+| 5 网络 | network::find_server→Connect→SendHello→OnMessage→send/end | voice-transport-loopback |
+| 6 问答 | App_Init/Process/Close、receive_reply与cancel | voice-client-behavior |
+| 7 插话 | 候选→hold→参考复核→START(supersede)→连续PCM | 应用、播放与WSS组合 |
+| 8 页面 | page::open/show/camera→ui运行→显示触摸端口 | ui-pages、ui-runtime-lifecycle |
+| 9 核心回归 | 把前述真实模块连接起来 | 核心Host测试，然后补全UI/网卡/摄像头检查 |
 
-`--dry-run`只显示命令。正常执行会先构建本关目标，再检查所需测试是否全部登记，最后运行CTest。依赖缺失导致测试没有生成时，实验明确失败，不把“零个测试”当通过。详细硬件和发布检查仍见[Host与真板验收](../test/host-validation.md)。
+每关先运行参考实现，再在练习副本补写指定函数，最后说明一次正常输入与一次失败输入的结果。函数签名不是额外架构；不要新增Manager或课程条件编译。
 
-## 01 配置：先学会在启动前拒绝错误
+## 必须讲清楚的几个界限
 
-**本关新增概念：** 数据结构、字符串校验、成功/失败返回；不讲线程。
+20ms对应16k单声道320samples，设备48k每通道960samples。PCM字节数与采样数不同，BPV4头部网络序，PCM固定小端；generation不是设备ID，sequence不能代替generation。
 
-源码：`client/include/boompi/config/voice_client_config.h`、`client/src/config/voice_client_config.cpp`。
+播放器保存连续采样，不再一包一槽。容量1.5秒，满时拒绝；DONE调用finish，只表示没有新PCM，转换器尾音和ALSA drain完成才是Drained。取消不能把旧尾音补进下一次播放。
 
-实现顺序：先写有最大值的`ParseDecimal`，再组合`IsIpv4`；接着检查UUID和pin的编码形式；最后在`LoadClientConfig`中表达必填、缺省和成对字段关系。`ReadEnvironment`和标准库作为支持代码。
+普通提问300ms开口确认；播放/尾音上下文先120ms候选、暂停TTS消费、低参考/尾音等待和60ms复核。确认前不退休旧回答，失败恢复。三类语句共用500ms历史和上传路径，不代表必须共用相同准入条件。
 
-```sh
-python3 scripts/teaching_lab.py 1
-```
+WSS的open表示启动网络任务，READY才代表握手成功；send成功只表示本地入队。满队列不能跳PCM再发END。Host对端与网卡替身不证明真实Wi-Fi、云端或AEC效果。
 
-检查名：`voice-client-config-contract`。应看到合法字段被接受，非法UUID、地址、端口或不成对的地址/pin被拒绝，缺省端口不变。
+UI只有语音、摄像头两个固定容器，切换不销毁重建。ui只交付一份快照和动作；运行期仅UI线程调用LVGL。初始化与join后的销毁是顺序交接，不需要另一套回执状态机。
 
-自行解释：为什么先判断范围再转成`uint16_t`？为什么读取配置不等于生成UUID，更不等于联网成功？常见错误是直接调用转换后截断、忽略空串，或把错误字段的原值写进日志。
+摄像头只保留最新完整帧，短读必须拼完才交付；这一丢旧帧策略不能用于语音。进程组由摄像头worker负责回收，close请求退出并等待它完成。
 
-## 02 协议：一帧数据从结构变成字节
+## UI实验
 
-**本关新增概念：** 采样点/字节数、大小端、首尾标记与编号。
-
-源码：`client/include/boompi/audio/audio_format.h`、`client/src/network/voice_codec.h/.cpp`；契约见[BPV4](../../protocol/protocol-v4.md)。
-
-先推导20ms的320/960样本，再实现整数读写和PCM编码。控制帧用固定文本命令，按字段数量、规范整数、UTF-8和长度校验；板端不再有JSON词法或对象树。
-
-```sh
-python3 scripts/teaching_lab.py 2
-```
-
-检查名虽然叫`protocol-json-contract`，也会读取共享fixture逐字节比对音频编码和解码。上行PCM必须640字节，下行非末帧必须640字节；头部大端，PCM小端。
-
-自行解释：`generation`为什么不是设备ID？`sequence`为什么不能代替generation？常见错误是把320个样本当320字节，或沿用已经删除的flags字段。
-
-## 03 播放：先把一包音频完整地交出去
-
-**本关新增概念：** 有界环、单生产者/消费者、准备/播放/收尾。
-
-源码：`client/src/audio/playback.cpp`与公开头。硬件替身在`client/tests/support/audio_hardware.cpp`，只在Host测试中选入；本关真实执行产品队列、转换和线程代码，不打开真实ALSA设备。
-
-先按数据流说明复现audio_convert并运行格式测试，再看playback::write/finish，最后顺着play理解取帧、转换、write和尾播结束。
-
-当前契约是一包一槽：1～320样本，短帧只能是最后一包，后面不允许继续追加。队列满必须拒绝，不能覆盖尚未播放的槽。使用槽数定位入队位置，有效样本数仅保留在槽中，不再维护第二份总样本水位计数。
-
-```sh
-python3 scripts/teaching_lab.py 3
-```
-
-本关检查队列边界、短尾帧、采集准备与播放准备次序，以及采集/控制/退出的有界等待。应能验证1样本和完整320样本的回答都能结束、321样本被拒绝、75槽容量满时返回背压。
-
-常见错误：收到END立即置完成、把短帧当损坏数据、结束前清空剩余音频、取消后又写入已取出的旧帧。先理解这些约束，再读锁与条件变量的具体次序；播放不再与输入线程进行检测器握手。
-
-## 04 输入：确认开口之后仍保留句首
-
-**本关新增概念：** 历史帧、开口/结束边沿、首次听音与追问。
-
-先看wake.cpp/vad.cpp，用检测测试验证输入到判定结果。然后进入`client/src/audio/speech.cpp`，沿listen/update理解共用的句首借用、开口确认和句尾处理；这不是一个拥有设备的对象。
-
-`voice_input::read`取处理帧，`speech::update`返回准入决定与借用PCM，应用直接START/send/END；20ms只限制取帧等待。
-
-```sh
-python3 scripts/teaching_lab.py 4
-```
-
-检查`voice-preroll`；应用交付由`voice-client-behavior`核对。合成输入的句首按原顺序补出，开始事件先于PCM，结束标志附着在有效末帧；追问中被拒绝的短句不能把旧END带入下一句。
-
-普通提问、追问和插话共用120ms开口确认，追问窗口由主流程控制。500ms是普通历史的目标容量，不代表Idle阶段已缓存此前半秒。常见错误是确认开口才开始保存、取消输入时顺带结束播放、混淆算法状态复位与已经采集到的PCM。
-
-## 05 连接：把固定帧通过真实WSS发送
-
-**本关新增概念：** 建链与ready、发送队列、连接级事件。
-
-源码：`client/src/network/voice_net.cpp`、`network_setup.cpp`。先沿Connect、SendHello、OnMessage理解连接，再实现SendNextFrame。公钥验证、握手身份、长度边界均为必须保留的逻辑。
-
-```sh
-python3 scripts/teaching_lab.py 5
-```
-
-`voice-transport-loopback`使用真实TCP/TLS/WebSocket及本机测试对端。测试网卡发现是替身，不覆盖真实广播、DHCP或家中Wi-Fi，也不调用云服务。
-
-应看到合法握手和消息往返成功，错误pin、坏消息、超时和重连路径满足断言。常见错误：把`Open`成功当作ready，把本地发送入队当远端收到，队列满时静默跳过PCM。
-
-## 06 问答：把模块接成一个业务流程
-
-**本关新增概念：** 状态×事件→动作，带截止时间的等待。
-
-源码：`client/src/application/voice_client.cpp`，入口`client/apps/boompi_client/main.cpp`。
-
-先读App_Process及receive_reply：输入直接speech::update→voice_net::start/send/end，回复直接playback::write/finish；超时与触摸取消在cancel汇合。先手写状态与动作，再实现对应分支，不增加第二套业务状态机。
-
-```sh
-python3 scripts/teaching_lab.py 6
-```
-
-应用 harness 链接生产应用模块，只替换模块I/O和时钟。它验证完整业务，不意味着只写完正常路径就能通过全部检查。
-
-应能沿代码和UI解释Idle→Listening→WaitingReply→Speaking→追问；离线与正在上传由网络明确表示。DONE只关闭播放输入，取消完成屏障之后的Drained才开启音频回答后的追问。纯文本无需等待声卡；正常运行不逐轮输出状态日志。
-
-App_StopAndListen表示停止后会重新听音；CANCEL的retract字段决定是否撤回未听完的回答。常见错误是旧轮完成改变新轮状态，或者停止命令失败后仍显示正常追问。
-
-## 07 插话：从“停声音”到“真正开始新问题”
-
-**本关新增概念：** 回声与近讲、主动停止、跨线程迟到结果。
-
-源码：`speech::update`、应用`App_StopAndListen`以及网络`AdvanceLocked`。这是进阶关，不要求第一次学录放音时同时掌握。
-
-先走共用语句确认：六块连续人声后产生Start。正在播放时，主流程停止旧播放，调用start(true)让网络分配新generation并发送START，再发送完整前滚与后续PCM；不再静音试探或二次确认。
-
-```sh
-python3 scripts/teaching_lab.py 7
-python3 scripts/teaching_lab.py 6
-python3 scripts/teaching_lab.py 5
-```
-
-音频检查覆盖插话生命周期，以及渲染/drain阻塞时的停止；应用和网络回归继续证明新轮开始与退休控制不能丢失。Host合成帧通过不代表真板没有误触发。
-
-常见错误：只drop扬声器、不替换远端旧轮；删除尚未发送的退休控制；将正常追问也当作撤回上一轮；确认时清空前滚，导致触发插话的这句话丢失。
-
-## 08 界面：先页面，再看硬件端口
-
-**本关新增概念：** UI快照、动作邮箱、LVGL运行期单线程归属。
-
-先读`ui_view.h`和`LvglScreen`，复现`BuildHome/BuildVoice/RenderVoice`及点击、音量回调；再看`DeviceUi::Show/Poll`如何交接数据。最后到`platform/rv1106/display_touch.h/.cpp`学习具体SPI屏幕与I²C触摸，不把页面动作和寄存器时序混在一个阅读步骤。
-
-本关需要教师提供LVGL 8.2源码、Host SDL2和FreeType，并设置`BOOMPI_LVGL_ROOT`：
+教师提供LVGL8.2源码，安装SDL2/FreeType及Noto CJK：
 
 ```sh
 cmake -S . -B build/lesson-ui -DCMAKE_BUILD_TYPE=Debug \
@@ -177,44 +60,19 @@ python3 scripts/teaching_lab.py 8 --build-dir build/lesson-ui
 build/lesson-ui/client/boompi-ui-simulator --demo-voice
 ```
 
-第8关脚本只保证页面和真实板级显示端口严格编译。`--demo-voice`进入小智页面；`--demo-app 0/1/2/3`分别选择小智、相机、时钟、Wi-Fi（一次只传一个数字）。字体可用`--font /absolute/path/to/font.ttc`指定，默认查找系统Noto Sans CJK。检查文字、状态、音量和画面；截图相同也不能证明真实SPI时序、GT911复位和触摸恢复正确。
+--demo-app 0/1分别选择语音、相机；--font指定可读CJK字体。模拟器运行真实页面，但不采集硬件相机。字体缺失、无效文件和缺字处理由专门回归验证。显示端口SPI/I²C、板型时序仍需真板验证。
 
-相机最后加入：页面只接收最新一帧，采集管线和进程生命周期归`CameraCapture`。保留原有Wi-Fi、时钟和相机功能，不为分课删除正式产品能力。
-
-## 09 合并与真板验收
+## 合并检查与上板
 
 ```sh
-python3 scripts/teaching_lab.py 9
+python3 scripts/teaching_lab.py 9 --build-dir build/lesson-host
+ctest --test-dir build/lesson-ui --output-on-failure
 python3 scripts/verify_protocol_fixtures.py
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 ```
 
-第9关要求当前全部24个CTest都存在并通过（含两个直接验证音频处理模块的场景）。Windows原生Host只有部分目标，完整关卡请在Linux/WSL完成，不能把两个Windows测试通过描述成全部客户端验证通过。
+完整UI配置会额外生成页面、UI生命周期、摄像头和网卡检查。远程teaching-ui还运行独立netns和ASan/UBSan；每次查看当前提交，不引用历史测试数量。
 
-然后由教师准备匹配RV1106 GCC/uClibc工具链、sysroot和依赖库，按既有`build_teaching_release.sh`交叉构建并检查ELF。没有匹配SDK时停止在“Host已验证”，不能交付伪装成板端产物的Host程序。
+最后用匹配RV1106 GCC/uClibc SDK交叉构建并检查ELF，再验证唤醒、句首、长短回复、真实插话、无人讲话时不自激、追问、断网恢复、页面触摸、音量保存和相机进退。先验2ca0cf6音频，再验非音频候选；Host绿色不是声学通过。
 
-人工验收至少包括：
-
-- 唤醒后不说话，正常回待机；说话时句首完整。
-- 短回答、长回答和末尾不足20ms的音频能正常播尽。
-- 追问无需再次唤醒；很短的无效声音不污染下一句话。
-- 播放中插话确实开始新问题，旧回复和迟到完成不会复活。
-- 安静环境不被自己的扬声器反复触发；音量为零与恢复后行为可解释。
-- 断网、重连、输入拥塞和退出不会留下继续播放或阻塞线程。
-- 字幕、触摸、音量保存、配网、进入/离开相机页面正常。
-
-## 教师如何判断学生真的完成了
-
-不以“能背出类名”或“测试输出绿色”为唯一标准。随机改变一个输入，让学生先预测结果，再运行验证。例如：把最后一包缩成1个样本；在新一轮开始后投递旧完成事件；让发送队列满；在服务端发完后延迟声卡完成。
-
-如果学生能指出由哪个模块拒绝或处理、哪些状态保持不变，以及为什么不应该删掉该检查，就说明这段实现已经能够复现和维护。
-
-## 历史基座调整与验证记录（2026-09-05，不代表当前结构）
-
-以`0c0b53c`为基线。正式客户端从34文件/5671 ELOC变为36文件/5746 ELOC（+75）；物理行6975→7080。统计含私有音频与显示驱动，不含测试、教材、资源和第三方。只看DeviceUi时为631→349 ELOC，但移出的347 ELOC显示/触摸端口仍计入客户端总量，不能把移动目录当作删掉代码。
-
-当时生产改动预算为最多2个新文件、净增加不超过110 ELOC，未新增线程或框架。新增具体DisplayTouch边界、ListenMode/ReplyHistory及明确页面身份；删除任意长度跨槽拼包、持久tts_tail和重复相机状态映射。该记录对应旧协议v2；当前namespace/BPV4结构及统计见[结构重写交接](../test/budget-refactor.md)。
-
-验证：Linux严格构建与22/22 CTest、Windows基础2/2 CTest、Python16/16、共享协议fixture、HIL的Host编译和`--help`、UI及真实Linux显示端口严格编译。九个实验入口均实际执行；第8关仅编译，不将页面视觉或触摸误报为自动验收。小智/相机/Wi-Fi三张模拟器BMP与基线逐字节一致；11个迁移硬件函数体及87字节面板初始化表经独立比对保持。
-
-未进行匹配RV1106 SDK的交叉构建、部署或真板声学验收。以上为本轮提交前的验证记录，提交版本与远程同步状态以Git为准。剩余复杂度包括音频跨线程时序、AEC/近讲策略和厂商块长适配。独立阶段源码快照尚未制作，不能用这份实验索引替代阶段产物。
+教学完成的标准是学生能对一个改变后的输入预测处理结果、指出负责模块和必要边界，而不是背出类名或只展示绿色测试。

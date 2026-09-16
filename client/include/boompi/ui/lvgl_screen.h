@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+
 #include "boompi/ui/ui_view.h"
 
 namespace boompi::ui::page {

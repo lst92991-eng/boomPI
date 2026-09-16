@@ -15,6 +15,7 @@ AUDIO_CASES = ("modules-format", "modules-detection", "voice-preroll", "playback
 ALL_TESTS = (
     "voice-client-config-contract", "protocol-json-contract",
     "voice-transport-loopback", "voice-client-behavior",
+    "network-interface-contract", "camera-lifecycle",
 ) + tuple("audio-flow-" + name for name in AUDIO_CASES)
 
 # A checkpoint reuses real targets; it does not build an alternative product.
@@ -32,7 +33,9 @@ LESSONS = {
     6: ("四态问答与异常路径", ("boompi_voice_client_harness",),
         ("voice-client-behavior",)),
     7: ("播放取消与退出", ("boompi_audio_flow_test",), ("audio-flow-playback",)),
-    8: ("页面与板级显示端口", ("boompi_ui_simulator", "boompi_device_ui_compile"), ()),
+    8: ("页面与板级显示端口", ("boompi_ui_simulator", "boompi_device_ui_compile",
+                            "boompi_ui_page_test", "boompi_ui_runtime_test"),
+        ("ui-pages", "ui-runtime-lifecycle")),
     9: ("完整Host回归", (), ALL_TESTS),
 }
 
