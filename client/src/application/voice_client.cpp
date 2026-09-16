@@ -1,12 +1,19 @@
 #include "boompi/application/voice_client.h"
 
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
+#include <cstdlib>
 
 #include "boompi/audio/playback.h"
 #include "boompi/audio/speech.h"
 #include "boompi/audio/voice_input.h"
+#include "boompi/config/voice_client_config.h"
 #include "boompi/debug.h"
 #include "boompi/network/voice_net.h"
 #include "boompi/ui/device_ui.h"
@@ -22,6 +29,13 @@ State state{State::Idle};
 ui::UiView view;
 Clock::time_point deadline{}, response_limit{};
 char failure[192]{};
+int instance_lock{-1};
+volatile std::sig_atomic_t stop_requested{0};
+
+void request_stop(int) {
+  // 信号回调只通知退出；线程和硬件留给正常流程关闭。
+  stop_requested = 1;
+}
 
 bool fail(const char* reason) {
   std::snprintf(failure, sizeof(failure), "%s", reason);
@@ -107,10 +121,31 @@ void receive_reply() {
 }
 }  // namespace
 
-bool App_Init(const boompi::config::VoiceClientConfig& config) {
+bool App_Init() {
   failure[0] = '\0';
   view = {};
+  stop_requested = 0;
   try {
+    // 1. 准备当前进程，防止重复打开声卡和屏幕。
+    instance_lock = ::open("/run/boompi-client.lock", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (instance_lock < 0) {
+      return fail("cannot open instance lock");
+    }
+    if (flock(instance_lock, LOCK_EX | LOCK_NB) < 0) {
+      return fail("client is already running or instance lock failed");
+    }
+    std::signal(SIGINT, request_stop);
+    std::signal(SIGTERM, request_stop);
+    std::signal(SIGPIPE, SIG_IGN);
+
+    // 2. 读取本机配置，所有模块使用同一份启动参数。
+    config::VoiceClientConfig settings;
+    std::string error;
+    if (!config::LoadClientConfig(&settings, &error)) {
+      return fail(error.c_str());
+    }
+
+    // 3. 初始化界面、输入处理和播放。
     view.volume = ui::load_volume();
     if (!ui::open()) {
       debug::log.display_unavailable();
@@ -121,11 +156,11 @@ bool App_Init(const boompi::config::VoiceClientConfig& config) {
     if (!playback::open(view.volume)) {
       return fail(playback::error().c_str());
     }
-    // 两路PCM都已配置后，才开始采集；建链在网络线程内进行。
+    // 4. 两路PCM配置完成后启动采集，再启动网络线程。
     if (!voice_input::start()) {
       return fail(voice_input::error().c_str());
     }
-    if (!voice_net::open(config)) {
+    if (!voice_net::open(settings)) {
       return fail("network startup failed");
     }
     show(State::Idle);
@@ -136,6 +171,9 @@ bool App_Init(const boompi::config::VoiceClientConfig& config) {
 }
 
 bool App_Process() {
+  if (stop_requested) {
+    return false;
+  }
   try {
     receive_reply();
     audio::CaptureFrame frame;
@@ -222,12 +260,18 @@ bool App_Process() {
   }
 }
 
-void App_Close() noexcept {
+int App_Close() noexcept {
   voice_net::close();
   playback::close();
   voice_input::close();
   ui::close();
-}
-const char* App_GetError() noexcept {
-  return failure;
+  if (instance_lock >= 0) {
+    ::close(instance_lock);
+    instance_lock = -1;
+  }
+  if (failure[0]) {
+    debug::log.failure(failure);
+    return EXIT_FAILURE;
+  }
+  return EXIT_SUCCESS;
 }

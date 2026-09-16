@@ -1,6 +1,6 @@
 # RV1106客户端
 
-唯一程序入口是`apps/boompi_client/main.cpp`。无参数直接运行，读取配置后依次调用App_Init、循环App_Process、App_Close。程序自己持有单实例锁，退出时释放。
+唯一程序入口是`apps/boompi_client/main.cpp`。无参数直接运行，main只组织App_Init、循环App_Process、App_Close。App_Init按进程准备、配置读取、模块初始化、启动线程的顺序展开。停止或故障后App_Close统一回收并返回退出码，正常为0、故障为1。
 
 ```text
 输入：ALSA → 格式转换 → Rockchip 3A → Snowboy → WebRTC VAD
