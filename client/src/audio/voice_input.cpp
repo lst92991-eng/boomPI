@@ -19,8 +19,6 @@
 #include "audio_capture.h"
 #include "audio_convert.h"
 #include "audio_thread.h"
-#include "board_voice_profile.h"
-#include "boompi/audio/playback.h"
 #include "boompi/debug.h"
 #include "boompi/platform/rv1106/rockchip_3a.h"
 #include "vad.h"
@@ -55,13 +53,11 @@ static bool fail(const char *reason, int code = 0)
 static void capture_task()
 {
     audio::SetAudioThreadPriority("boompi-capture", 40);
-    bool previous_reference = false, previous_held = false;
-    // 仅用于日志边沿检测：-1表示尚未观察到有效结果，0/1对应静音和人声。
-    int previous_vad = -1;
+    // 日志只在判定变化时输出；Error表示尚未观察到第一帧。
+    auto previous_vad = audio::VoiceActivity::Error;
     for (;;)
     {
         // 1. 读取原始四槽 PCM；0 是断流，负值区分主动停止和设备故障。
-        const bool held_before_read = playback::held();
         const int captured = audio_capture::read(raw.data());
         if (captured < 0)
         {
@@ -74,9 +70,8 @@ static void capture_task()
         audio::CaptureFrame frame{};
         if (captured == 0)
         {
-            previous_vad = -1;
+            previous_vad = audio::VoiceActivity::Error;
             // 硬件断流后清除滤波、3A和检测器历史，让下一帧从新的连续区间开始。
-            previous_reference = previous_held = false;
             rockchip_3a::close();
             if (!audio_convert::reset_capture() || !rockchip_3a::open() || !wake::reset() ||
                 !vad::reset())
@@ -118,34 +113,21 @@ static void capture_task()
                 debug::log.wake_detected_cb();
             }
             // 唤醒结果和VAD结果随同一块PCM交付，应用可按同一时间位置做决策。
-            const int voice = vad::process(frame.pcm);
-            if (voice < 0)
+            const auto voice = vad::process(frame.pcm);
+            if (voice == audio::VoiceActivity::Error)
             {
                 fail("WebRTC VAD processing failed");
                 break;
             }
-            frame.vad_now = voice == 1;
+            frame.activity = voice;
             // 首次有效结果及后续变化各打印一次，错误结果由前面的失败分支处理。
             if (voice != previous_vad)
             {
-                debug::log.vad_changed_cb(frame.vad_now);
+                debug::log.vad_changed_cb(voice);
                 previous_vad = voice;
             }
-
-            // 3. 给处理结果附带插话所需的观测；参考和播放观测随 3A 预填延后一帧。
-            frame.reference_active = previous_reference;
-            frame.playback_held = previous_held;
-            previous_held = held_before_read;
-            previous_reference = false;
-            for (std::size_t i = 2; i < channels.size(); i += 3)
-            {
-                // 三通道交错数据的第3项是refL，逐个采样时刻检查播放参考幅度。
-                previous_reference = previous_reference ||
-                                     channels[i] > board_voice::kReferencePeak ||
-                                     channels[i] < -board_voice::kReferencePeak;
-            }
         }
-        // 4. 一次交付 PCM 和检测结果。队列满则发布断点，让应用取消残缺语句。
+        // 3. 一次交付 PCM 和检测结果。队列满则发布断点，让应用取消残缺语句。
         std::lock_guard<std::mutex> lock(mutex);
         if (frame.discontinuity || pending == kCaptureSlots)
         {

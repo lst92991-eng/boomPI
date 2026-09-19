@@ -83,7 +83,7 @@ target_include_directories(boompi_client PRIVATE include src/audio src/platform/
 target_include_directories(boompi_client SYSTEM PRIVATE
   "${PROJECT_SOURCE_DIR}/third_party" "${BOOMPI_BOOST_INCLUDE_DIR}"
   "${BOOMPI_ROCKCHIP_3A_INCLUDE_DIR}" "${BOOMPI_SNOWBOY_INCLUDE_DIR}"
-  "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}")
+  "${BOOMPI_WEBRTC_VAD_INCLUDE_DIR}" "${BOOMPI_WEBRTC_VAD_ROOT}")
 target_link_libraries(boompi_client PRIVATE boompi_debug boompi_lvgl_ui
   boompi_vendor::snowboy boompi_vendor::rockchip_3a_aec boompi_webrtc_vad ALSA::ALSA
   "${BOOMPI_SWRESAMPLE_LIBRARY}" "${BOOMPI_AVUTIL_LIBRARY}" Freetype::Freetype

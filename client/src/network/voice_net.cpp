@@ -1,3 +1,8 @@
+/** @file voice_net.cpp
+ * @brief 独立网络任务：发现服务端 → WSS握手 → 收发BPV4 → 断线重连。
+ * 应用投递控制与PCM，库持有发送队列；接收事件在短锁内交给应用。
+ * 网络独占轮次/序号校验，系统网络服务负责地址、路由和Wi-Fi连接。
+ */
 #include "boompi/network/voice_net.h"
 
 #include <openssl/asn1.h>
@@ -11,8 +16,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <mutex>
-#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <websocketpp/client.hpp>
@@ -139,7 +144,7 @@ static websocketpp::lib::shared_ptr<TlsContext> MakeTls_cb()
     auto context = websocketpp::lib::make_shared<TlsContext>(TlsContext::tls_client);
     if (SSL_CTX_set_min_proto_version(context->native_handle(), TLS1_2_VERSION) != 1)
     {
-        throw std::runtime_error("TLS initialization failed");
+        return nullptr;  // WebSocket++将空TLS上下文作为连接初始化失败。
     }
     SSL_CTX_set_options(context->native_handle(), SSL_OP_NO_COMPRESSION);
     SSL_CTX_set_verify(context->native_handle(), SSL_VERIFY_PEER, nullptr);
@@ -176,23 +181,17 @@ static void SendHello_cb(Client &client, Hdl handle)
 static void OnMessage_cb(Client::message_ptr message)
 {
     LinkEvent event;
-    try
+    bool valid = false;
+    // 解码取得消息负载的所有权，普通格式错误通过返回值交给连接失败路径。
+    if (message->get_opcode() == websocketpp::frame::opcode::text)
     {
-        if (message->get_opcode() == websocketpp::frame::opcode::text)
-        {
-            event = voice_codec::DecodeText(std::move(message->get_raw_payload()));
-        }
-        else if (message->get_opcode() == websocketpp::frame::opcode::binary)
-        {
-            event = voice_codec::DecodeAudio(std::move(message->get_raw_payload()));
-        }
-        else
-        {
-            Fail("websocket_opcode");
-            return;
-        }
+        valid = voice_codec::DecodeText(std::move(message->get_raw_payload()), event);
     }
-    catch (...)
+    else if (message->get_opcode() == websocketpp::frame::opcode::binary)
+    {
+        valid = voice_codec::DecodeAudio(std::move(message->get_raw_payload()), event);
+    }
+    if (!valid)
     {
         Fail("invalid_protocol");
         return;
@@ -335,10 +334,9 @@ static SendResult NewTurn(TurnPhase phase, bool retract)
     return result;
 }
 
-static bool ProcessConnection(Client &client, Client::connection_ptr connection)
+static void ProcessConnection(Client &client, Client::connection_ptr connection)
 {
-    // 该循环只推进当前连接；返回值记录它是否完成READY握手，供网卡选择策略使用。
-    bool reached_ready = false;
+    // 网络线程推进收发，同时检查握手与心跳期限。
     const auto started = Clock::now();
     auto ping_at = started;
     while (!stop_.load())
@@ -350,7 +348,6 @@ static bool ProcessConnection(Client &client, Client::connection_ptr connection)
         {
             break;
         }
-        reached_ready = reached_ready || connection_state_ == ConnectionState::Online;
         // 2. 检查握手与心跳；断线交给外层网络任务重连。
         const auto now = Clock::now();
         // 所有库I/O回调都在本线程；持锁时应用不能send，读取库缓冲计数不会数据竞争。
@@ -376,13 +373,12 @@ static bool ProcessConnection(Client &client, Client::connection_ptr connection)
         }
         changed_.wait_for(lock, std::chrono::milliseconds(2));
     }
-    return reached_ready;
 }
 
-static bool Connect(const network::Endpoint &selected)
+static void Connect()
 {
     // 先把保存的Base64指纹解码为摘要字节，TLS验证回调随后用它核对服务器公钥。
-    const auto &endpoint = selected.server;
+    const auto &endpoint = configured_;
     std::array<unsigned char, 33> pin{};
     if (endpoint.server_spki_sha256.size() != 44 ||
         EVP_DecodeBlock(
@@ -391,7 +387,7 @@ static bool Connect(const network::Endpoint &selected)
             44) != 33)
     {
         Fail("invalid_pin");
-        return false;
+        return;
     }
     std::copy_n(pin.begin(), pin_.size(), pin_.begin());
 
@@ -404,7 +400,7 @@ static bool Connect(const network::Endpoint &selected)
     if (error)
     {
         Fail("invalid_endpoint");
-        return false;
+        return;
     }
     connection->set_open_handshake_timeout(5000);
     connection->set_pong_timeout(5000);
@@ -415,39 +411,15 @@ static bool Connect(const network::Endpoint &selected)
         connection_ = connection;
         buffered_bytes_ = 0;
     }
-    bool reached_ready = false;
     try
     {
-        // 单一IPv4端点：自己发起一次async_connect，避免库的端点迭代关闭已绑定的socket。
-        // TLS/HTTP/WebSocket握手仍由原连接的start()执行，不跳过证书验证。
-        auto &socket = connection->get_raw_socket();
-        socket.open(websocketpp::lib::asio::ip::tcp::v4());
-        if (!network::bind_socket(static_cast<std::intptr_t>(socket.native_handle()),
-                                  selected.interface))
-        {
-            throw std::runtime_error("interface bind failed");
-        }
-        typedef Client::connection_type::transport_con_type Transport;
-        static_cast<Transport &>(*connection).set_uri(connection->get_uri());
-        socket.async_connect(
-            websocketpp::lib::asio::ip::tcp::endpoint(
-                websocketpp::lib::asio::ip::address::from_string(endpoint.server_ip),
-                endpoint.server_port),
-            [connection](const websocketpp::lib::asio::error_code &ec)
-            {
-                if (ec)
-                {
-                    Fail("tcp_connect");
-                }
-                else
-                {
-                    connection->start();
-                }
-            });
-        reached_ready = ProcessConnection(client, connection);
+        // 系统路由决定网卡；库依次完成TCP、TLS、WebSocket握手。
+        client.connect(connection);
+        ProcessConnection(client, connection);
     }
-    catch (...)
+    catch (const std::exception &)
     {
+        // 库调用和内存分配可能抛异常，退出前仍需撤回发送入口并关闭socket。
         Fail("connection_io");
     }
     {
@@ -461,13 +433,11 @@ static bool Connect(const network::Endpoint &selected)
     connection->get_raw_socket().close(socket_error);
     client.stop_perpetual();
     client.stop();
-    return reached_ready;
 }
 
 static void NetworkTask()
 {
-    // 每次循环处理一次连接生命周期：准备网络、运行连接、释放连接、等待重试。
-    bool wifi_first = false;
+    // 系统负责联网；每次循环依次发现服务端、运行连接、等待重试。
     while (!stop_.load())
     {
         // 1. 清理上一条连接的数据，旧问题不会在重连后重新发送。
@@ -478,20 +448,17 @@ static void NetworkTask()
         }
         try
         {
-            // 2. 准备网卡、确定地址，然后持续处理这条 WSS 连接。
-            network::Endpoint endpoint;
-            if (!network::find_server(configured_, endpoint, stop_, wifi_first))
+            // 2. 更新已配对端点，再建立一条WSS连接；失败后下一轮重新发现。
+            if (!network::find_server(configured_, stop_))
             {
-                Fail("network_setup");
+                Fail("server_discovery");
             }
             else if (!stop_.load())
             {
-                const bool ready = Connect(endpoint);
-                wifi_first =
-                    !ready && endpoint.interface && std::string(endpoint.interface) == "eth0";
+                Connect();
             }
         }
-        catch (...)
+        catch (const std::exception &)
         {
             Fail("network_worker");
         }
@@ -518,7 +485,7 @@ bool open(const config::VoiceClientConfig &settings)
     {
         thread_ = std::thread(NetworkTask);
     }
-    catch (...)
+    catch (const std::exception &)
     {
         return false;
     }

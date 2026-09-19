@@ -386,11 +386,8 @@ static void process_voice_frame(const audio::CaptureFrame &frame)
     const auto utterance = speech::update(frame, replacing && view.volume != 0);
     if (utterance.start && replacing)
     {
+        debug::log.barge_confirmed_cb();
         playback::cancel();  // 插话确认后立即丢弃原回答的队列与声卡剩余数据。
-    }
-    else
-    {
-        playback::hold(utterance.hold_playback);
     }
     if (utterance.start)
     {
@@ -407,7 +404,7 @@ static void process_voice_frame(const audio::CaptureFrame &frame)
     }
     if (!voice_net::uploading())
     {
-        // 等待开口或插话复核期间，PCM由speech前滚保存，后续确认时统一交付。
+        // 等待连续人声确认期间，PCM由speech前滚保存，随后统一交付。
         return;
     }
 

@@ -1,5 +1,5 @@
 /** @file voice_client_config.cpp
- * @brief 应用启动配置：必要时创建设备身份 → 读文件 → 检查字段 → 一次交付配置。
+ * @brief 应用启动配置：必要时创建设备身份 → 读文件 → 检查字段 → 交付设备身份与已配对端点。
  *
  * 程序从固定板端路径读取client.conf，在首次运行时生成并保存设备身份。
  * 本文件只校验格式；建立网络连接及验证服务端身份由网络模块完成。
@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
+#include <cstdio>
 #include <fstream>
 #include <string_view>
 #include <utility>
@@ -21,7 +22,7 @@ namespace config
 {
 static const char kConfigPath[] = "/userdata/boompi/config/client.conf";
 
-/** @brief 首次运行用内核随机 UUID 创建权限 0600 的配置；写入失败删除残件，已有文件不覆盖。 */
+/** @brief 配置缺失时由内核生成设备UUID，连同后续配对信息使用同一文件保存。 */
 static bool create_config()
 {
     for (const char *directory : {"/userdata/boompi", "/userdata/boompi/config"})
@@ -37,24 +38,9 @@ static bool create_config()
     {
         return false;
     }
-    // 只创建缺失配置，不覆盖已有身份；持久化成功后才允许连接服务端。
-    const int fd = open(kConfigPath, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (fd < 0)
-    {
-        return errno == EEXIST;
-    }
-    const std::string text = "device_id=" + id + "\n";
-    bool ok = write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size()) &&
-              fsync(fd) == 0;
-    if (close(fd) < 0)
-    {
-        ok = false;
-    }
-    if (!ok)
-    {
-        unlink(kConfigPath);
-    }
-    return ok;
+    VoiceClientConfig settings;
+    settings.device_id = std::move(id);
+    return SaveClientConfig(settings);
 }
 
 /** @brief 完整解析无符号十进制字段并检查上限，不接受尾随字符；成功时 number 可用。 */
@@ -212,6 +198,26 @@ bool LoadClientConfig(VoiceClientConfig *output, std::string *error)
     {
         return fail("client.conf read");
     }
+    // 升级时把原server.conf的配对身份迁入统一配置，保留已信任的公钥。
+    const char *legacy_path = "/userdata/boompi/config/server.conf";
+    bool migrated = false;
+    if (ip.empty() && pin.empty())
+    {
+        std::ifstream legacy(legacy_path);
+        if (legacy)
+        {
+            std::string extra;
+            if (!(legacy >> ip >> port >> pin) || (legacy >> extra))
+            {
+                return fail("saved server identity");
+            }
+            migrated = true;
+        }
+        else if (errno != ENOENT)
+        {
+            return fail("saved server identity access");
+        }
+    }
     unsigned number = output->server_port;
     // 3. 全部字段通过后一次交付；失败提示只包含字段名，不打印配置内容。
     if (!IsValidDeviceId(id))
@@ -232,10 +238,48 @@ bool LoadClientConfig(VoiceClientConfig *output, std::string *error)
     }
     *output = {std::move(id), std::move(ip), static_cast<std::uint16_t>(number),
                std::move(pin)};
+    if (migrated)
+    {
+        if (!SaveClientConfig(*output))
+        {
+            return fail("server identity migration");
+        }
+        unlink(legacy_path);
+    }
     if (error)
     {
         error->clear();
     }
     return true;
+}
+bool SaveClientConfig(const VoiceClientConfig &settings)
+{
+    // 写完整临时文件后再替换；保存失败时原设备身份和配对记录仍可使用。
+    const char *temporary = "/userdata/boompi/config/client.conf.tmp";
+    const int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    std::FILE *file = fd < 0 ? nullptr : fdopen(fd, "w");
+    bool ok = file && fchmod(fd, 0600) == 0 &&
+              std::fprintf(file, "device_id=%s\n", settings.device_id.c_str()) > 0;
+    if (ok && !settings.server_ip.empty())
+    {
+        ok = std::fprintf(file, "server_ip=%s\nserver_port=%u\nserver_spki_sha256=%s\n",
+                          settings.server_ip.c_str(), settings.server_port,
+                          settings.server_spki_sha256.c_str()) > 0;
+    }
+    if (file)
+    {
+        ok = std::fflush(file) == 0 && fsync(fd) == 0 && ok;
+        ok = std::fclose(file) == 0 && ok;
+    }
+    else if (fd >= 0)
+    {
+        close(fd);
+    }
+    if (ok && std::rename(temporary, kConfigPath) == 0)
+    {
+        return true;
+    }
+    unlink(temporary);
+    return false;
 }
 }  // namespace config

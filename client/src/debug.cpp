@@ -16,15 +16,24 @@ static Callbacks register_callbacks()
     Callbacks callbacks{};
     callbacks.network_ready_cb = []
     {
-        std::fprintf(stderr, "boompi: 服务端握手完成，可以开始对话\n");
+        std::fprintf(stderr, "boompi: 服务端握手完成\n");
     };
     callbacks.wake_detected_cb = []
     {
         std::fprintf(stderr, "boompi: 检测到唤醒词\n");
     };
-    callbacks.vad_changed_cb = [](bool speech)
+    callbacks.vad_changed_cb = [](audio::VoiceActivity activity)
     {
-        std::fprintf(stderr, "boompi: VAD -> %s\n", speech ? "有人声" : "静音");
+        const char *label = "静音";
+        if (activity == audio::VoiceActivity::Speech)
+        {
+            label = "当前帧命中";
+        }
+        else if (activity == audio::VoiceActivity::Hangover)
+        {
+            label = "语音延续";
+        }
+        std::fprintf(stderr, "boompi: VAD -> %s\n", label);
     };
     callbacks.listening_started_cb = []
     {
@@ -70,17 +79,14 @@ static Callbacks register_callbacks()
     {
         std::fprintf(stderr, "boompi: input discontinuity; current input canceled\n");
     };
-    callbacks.barge_probe_cb = []
-    {
-        std::fprintf(stderr, "boompi: 发现插话候选，请求短暂停播复核\n");
-    };
     callbacks.barge_confirmed_cb = []
     {
-        std::fprintf(stderr, "boompi: 插话复核通过，准备提交新语句\n");
+        std::fprintf(stderr, "boompi: 当前帧语音命中连续达到300毫秒，插话并提交新语句\n");
     };
-    callbacks.barge_rejected_cb = [](bool reference_active)
+    callbacks.a3_initialized_cb = [](bool success, unsigned elapsed_ms)
     {
-        std::fprintf(stderr, "boompi: 插话复核未通过；reference=%d\n", reference_active);
+        std::fprintf(stderr, "boompi: 3A初始化%s，耗时%u毫秒\n",
+                     success ? "成功" : "失败", elapsed_ms);
     };
     callbacks.playback_xrun_cb = [](std::size_t written_frames, int code)
     {

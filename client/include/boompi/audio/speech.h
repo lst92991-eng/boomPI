@@ -17,7 +17,6 @@ struct Result
     std::array<const audio::VoiceFrame16k *, kPreRollFrames> frames{};
     std::size_t count{0};
     bool end{false};
-    bool hold_playback{false};  // 候选只请求短暂停播，确认后才start。
 };
 /** @brief 开始新的监听窗口时清前滚与确认计数；正常尾播转追问不调用，以保留已开口部分。 */
 void reset();
@@ -26,10 +25,10 @@ void reset();
  * @brief 逐帧判断语句开始、句尾及插话。
  *
  * 仅在 Listening/Speaking 时调用，END 后停止。
- * 自然尾播进入追问时保留前滚和回声上下文。
+ * 自然尾播进入追问时保留前滚和连续人声计数。
  *
  * @param frame 当前连续输入帧。
- * @param speaking 本机是否正在有声播放；静音音量传 false。
+ * @param speaking 有声播放时，插话只累计当前帧命中，延续帧用于句尾保护。
  */
 Result update(const audio::CaptureFrame &frame, bool speaking = false);
 }  // namespace speech

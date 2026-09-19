@@ -81,10 +81,9 @@ func newWithBackend(cfg config.Config, logger *slog.Logger, identityDirectory st
 	}
 	handler := &deviceHandler{cfg: cfg, logger: logger, provider: provider}
 	wss, err := transport.NewServer(transport.Config{
-		Address:      net.JoinHostPort(cfg.ListenAddress, fmt.Sprint(cfg.WSSPort)),
-		TLSConfig:    serverIdentity.TLSConfig,
-		PingInterval: cfg.HeartbeatInterval,
-		PongTimeout:  cfg.ConnectionTimeout,
+		Address:     net.JoinHostPort(cfg.ListenAddress, fmt.Sprint(cfg.WSSPort)),
+		TLSConfig:   serverIdentity.TLSConfig,
+		ReadTimeout: cfg.ConnectionTimeout,
 	}, handler)
 	if err != nil {
 		return nil, err

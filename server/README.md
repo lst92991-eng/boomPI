@@ -23,6 +23,10 @@ boompi-server --check-config
 
 默认模型、音色和超时在代码中提供，维护者可参考`configs/config.example.yaml`调整。板端通过WSS 17806连接；UDP 17807负责局域网发现，客户端保存并校验服务端公钥指纹。
 
+心跳由客户端每10秒发起Ping，服务端及时返回Pong并续期读取期限。`connection_timeout`默认30秒，可设15～30秒。升级已有维护者配置时删除`heartbeat_interval`字段；只有Key的学生配置可直接继续使用。已有config.yaml、Key和state中的TLS身份均保留。
+
+每个服务端实例同时接入一块板子；多组课堂分别准备服务端及独立网络或预配对。
+
 [BPV4协议](../protocol/protocol-v4.md)使用START/PCM/END/CANCEL及TEXT/AUDIO/DONE/ERROR。END后仍可取消；generation隔离旧回答，sequence检查音频连续性。DONE表示服务端发完，声卡尾播由客户端确认。
 
 ## 构建与维护

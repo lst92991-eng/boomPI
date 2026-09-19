@@ -15,23 +15,20 @@ import (
 )
 
 const (
-	defaultAddress      = ":17806"
-	defaultPath         = "/ws"
-	defaultPingInterval = 10 * time.Second
-	defaultPongTimeout  = 30 * time.Second
-	maxPingInterval     = 10 * time.Second
-	maxPongTimeout      = 30 * time.Second
-	writeTimeout        = 5 * time.Second
-	sendQueueCapacity   = 16
+	defaultAddress     = ":17806"
+	defaultPath        = "/ws"
+	defaultReadTimeout = 30 * time.Second
+	maxReadTimeout     = 30 * time.Second
+	writeTimeout       = 5 * time.Second
+	sendQueueCapacity  = 16
 )
 
 // Config contains the bounded network and lifetime settings owned by Server.
 // TLSConfig is mandatory; the transport never falls back to plaintext HTTP.
 type Config struct {
-	Address      string
-	TLSConfig    *tls.Config
-	PingInterval time.Duration
-	PongTimeout  time.Duration
+	Address     string
+	TLSConfig   *tls.Config
+	ReadTimeout time.Duration
 }
 
 // Handler owns the business lifetime of one connected device. It must return
@@ -97,7 +94,7 @@ func (server *Server) Serve(ctx context.Context) error {
 	tlsListener := tls.NewListener(listener, server.config.TLSConfig.Clone())
 	httpServer := &http.Server{
 		Handler:           http.HandlerFunc(server.serveHTTP),
-		ReadHeaderTimeout: server.config.PongTimeout,
+		ReadHeaderTimeout: server.config.ReadTimeout,
 	}
 
 	watchCtx, stopWatch := context.WithCancel(ctx)
@@ -145,17 +142,11 @@ func normalizeConfig(config Config) (Config, error) {
 	if config.Address == "" {
 		config.Address = defaultAddress
 	}
-	if config.PingInterval == 0 {
-		config.PingInterval = defaultPingInterval
+	if config.ReadTimeout == 0 {
+		config.ReadTimeout = defaultReadTimeout
 	}
-	if config.PongTimeout == 0 {
-		config.PongTimeout = defaultPongTimeout
-	}
-	if config.PingInterval < time.Second || config.PingInterval > maxPingInterval {
-		return Config{}, errors.New("ping interval must be between 1s and 10s")
-	}
-	if config.PongTimeout < 3*config.PingInterval || config.PongTimeout > maxPongTimeout {
-		return Config{}, errors.New("pong timeout must cover at least three ping intervals and be at most 30s")
+	if config.ReadTimeout < 15*time.Second || config.ReadTimeout > maxReadTimeout {
+		return Config{}, errors.New("read timeout must be between 15s and 30s for the 10s client heartbeat")
 	}
 	return config, nil
 }

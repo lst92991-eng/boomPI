@@ -1,32 +1,29 @@
+/** @file voice_codec.cpp
+ * @brief BPV4文本和PCM编码；格式错误返回false，轮次与连续性由网络接收入口校验。
+ */
 #include "voice_codec.h"
 
 #include <algorithm>
 #include <charconv>
 #include <cstring>
-#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <websocketpp/utf8_validator.hpp>
 
 namespace voice_codec
 {
-[[noreturn]] static void Invalid()
-{
-    throw std::runtime_error("invalid_protocol");
-}
-static std::uint32_t Generation(std::string_view text)
+static bool Generation(std::string_view text, std::uint32_t &value)
 {
     if (text.empty() || text.front() == '0')
     {
-        Invalid();
+        return false;
     }
-    std::uint32_t value = 0;
     const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
     if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size())
     {
-        Invalid();
+        return false;
     }
-    return value;
+    return true;
 }
 static std::uint32_t ReadUint32(const std::uint8_t *bytes)
 {
@@ -48,29 +45,32 @@ static void WriteUint32(std::uint32_t value, std::uint8_t *bytes)
     }
 }
 
-voice_net::LinkEvent DecodeText(std::string text)
+bool DecodeText(std::string text, voice_net::LinkEvent &event)
 {
     if (text.empty() || text.size() > 8192 || text.find('\0') != std::string::npos ||
         !websocketpp::utf8_validator::validate(text))
     {
-        Invalid();
+        return false;
     }
-    voice_net::LinkEvent event;
+    event = {};
     if (text == "READY 4 16000")
     {
         event.kind = voice_net::LinkEventKind::Online;
-        return event;
+        return true;
     }
     const auto first = text.find(' ');
     if (first == std::string::npos)
     {
-        Invalid();
+        return false;
     }
     const auto kind = text.substr(0, first);
     const auto second = text.find(' ', first + 1);
     const auto generation = std::string_view(text).substr(
         first + 1, second == std::string::npos ? second : second - first - 1);
-    event.generation = Generation(generation);
+    if (!Generation(generation, event.generation))
+    {
+        return false;
+    }
     if (second != std::string::npos)
     {
         text.erase(0, second + 1);
@@ -84,7 +84,7 @@ voice_net::LinkEvent DecodeText(std::string text)
     {
         if (event.data.empty() || event.data.size() > 4096)
         {
-            Invalid();
+            return false;
         }
         event.kind = voice_net::LinkEventKind::Text;
     }
@@ -92,47 +92,47 @@ voice_net::LinkEvent DecodeText(std::string text)
     {
         if (event.data.empty() || event.data.size() > 64)
         {
-            Invalid();
+            return false;
         }
         for (unsigned char c : event.data)
         {
             if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'))
             {
-                Invalid();
+                return false;
             }
         }
         event.kind = voice_net::LinkEventKind::Error;
     }
     else
     {
-        Invalid();
+        return false;
     }
-    return event;
+    return true;
 }
 
-voice_net::LinkEvent DecodeAudio(std::string bytes)
+bool DecodeAudio(std::string bytes, voice_net::LinkEvent &event)
 {
     if (bytes.size() < kHeaderBytes + 2 || bytes.size() > kFrameBytes || bytes.size() % 2 != 0)
     {
-        Invalid();
+        return false;
     }
     const auto *header = reinterpret_cast<const std::uint8_t *>(bytes.data());
     if (std::memcmp(header, "BPV4", 4) != 0)
     {
-        Invalid();
+        return false;
     }
 
-    voice_net::LinkEvent event;
+    event = {};
     event.kind = voice_net::LinkEventKind::Audio;
     event.generation = ReadUint32(header + 4);
     event.sequence = ReadUint32(header + 8);
     if (event.generation == 0 || event.sequence == UINT32_MAX)
     {
-        Invalid();
+        return false;
     }
     bytes.erase(0, kHeaderBytes);
     event.data = std::move(bytes);
-    return event;
+    return true;
 }
 
 std::array<std::uint8_t, kFrameBytes> EncodeAudio(std::uint32_t generation,

@@ -17,15 +17,9 @@ const int kAecDelaySamples = 0;
 // 唤醒模型灵敏度；语句确认直接使用3A后的WebRTC VAD。
 const char kWakeSensitivity[] = "0.7";
 
-// 插话准入使用约 -25dBFS 的交流 RMS；位置和音量变化后需要实际对话确认。
-const int kBargeMinRms = 1843;
-const int kReferencePeak = 64;
-const unsigned kBargeCandidateMs = 120;
-const unsigned kBargeSettleMs = 160;
-const unsigned kBargeConfirmMs = 60;
-const unsigned kBargeProbeMs = 380;
-const unsigned kBargeRetryMs = 300;
-const unsigned kPlaybackTailMs = 300;
+// 本板验收的ADC模拟增益档位：-9dB + 23×1.5dB = 25.5dB；高通用于抑制低频干扰。
+const long kCaptureAlcVolume = 23;
+const char kCaptureHighPass[] = "On";
 
 // 同一卡的两个方向独立打开；模型文件由配套部署预置。
 const char kMixerCard[] = "hw:0";

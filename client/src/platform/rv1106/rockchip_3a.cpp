@@ -8,11 +8,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <new>
 
 #include "board_voice_profile.h"
+#include "boompi/debug.h"
 #include "rkaudio_preprocess.h"
 
 namespace rockchip_3a
@@ -92,7 +94,11 @@ bool open()
     dtd->ksiThd_high = 0.70F;
     dtd->ksiThd_low = 0.50F;
     // 参数树准备完整后交给统一句柄；后续每个厂商块通过同一个process接口处理。
+    const auto started = std::chrono::steady_clock::now();
     handle = rkaudio_preprocess_init(16000, 16, 2, 1, parameters);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    debug::log.a3_initialized_cb(handle != nullptr, static_cast<unsigned>(elapsed));
     if (!handle)
     {
         close();

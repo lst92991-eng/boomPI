@@ -21,7 +21,6 @@ const (
 
 	DefaultDiscoveryPort = 17807
 	defaultDeviceToken   = "boompi-teaching-shared-token-v1-2026"
-	maxHeartbeatInterval = 10 * time.Second
 )
 
 // Credentials 的字段不导出，避免格式化 Config 或日志时泄露密钥。
@@ -61,7 +60,6 @@ type Config struct {
 	SearchMode           string
 	SystemPrompt         string
 	Persona              string
-	HeartbeatInterval    time.Duration
 	ConnectionTimeout    time.Duration
 	FirstResponseTimeout time.Duration
 	SessionIdleTimeout   time.Duration
@@ -85,7 +83,6 @@ func Defaults() Config {
 		SearchMode:           "off",
 		SystemPrompt:         "You are boomPI, a concise and helpful voice assistant. Reply in Simplified Chinese unless the user asks for another language.",
 		Persona:              "Natural, young, friendly, and not overly cute.",
-		HeartbeatInterval:    10 * time.Second,
 		ConnectionTimeout:    30 * time.Second,
 		FirstResponseTimeout: 30 * time.Second,
 		SessionIdleTimeout:   30 * time.Minute,
@@ -110,7 +107,6 @@ type fileConfig struct {
 	SearchMode           string       `yaml:"search_mode"`
 	SystemPrompt         string       `yaml:"system_prompt"`
 	Persona              string       `yaml:"persona"`
-	HeartbeatInterval    yamlDuration `yaml:"heartbeat_interval"`
 	ConnectionTimeout    yamlDuration `yaml:"connection_timeout"`
 	FirstResponseTimeout yamlDuration `yaml:"first_response_timeout"`
 	SessionIdleTimeout   yamlDuration `yaml:"session_idle_timeout"`
@@ -180,7 +176,6 @@ func loadFile(path string, defaults Config) (Config, error) {
 		SearchMode:           defaults.SearchMode,
 		SystemPrompt:         defaults.SystemPrompt,
 		Persona:              defaults.Persona,
-		HeartbeatInterval:    yamlDuration(defaults.HeartbeatInterval),
 		ConnectionTimeout:    yamlDuration(defaults.ConnectionTimeout),
 		FirstResponseTimeout: yamlDuration(defaults.FirstResponseTimeout),
 		SessionIdleTimeout:   yamlDuration(defaults.SessionIdleTimeout),
@@ -211,7 +206,6 @@ func loadFile(path string, defaults Config) (Config, error) {
 	defaults.SearchMode = strings.ToLower(strings.TrimSpace(raw.SearchMode))
 	defaults.SystemPrompt = strings.TrimSpace(raw.SystemPrompt)
 	defaults.Persona = strings.TrimSpace(raw.Persona)
-	defaults.HeartbeatInterval = time.Duration(raw.HeartbeatInterval)
 	defaults.ConnectionTimeout = time.Duration(raw.ConnectionTimeout)
 	defaults.FirstResponseTimeout = time.Duration(raw.FirstResponseTimeout)
 	defaults.SessionIdleTimeout = time.Duration(raw.SessionIdleTimeout)
@@ -266,11 +260,8 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.Persona) == "" || len(c.Persona) > 2048 {
 		return errors.New("persona must contain 1..2048 characters")
 	}
-	if c.HeartbeatInterval < time.Second || c.HeartbeatInterval > maxHeartbeatInterval {
-		return errors.New("heartbeat_interval must be between 1s and 10s")
-	}
-	if c.ConnectionTimeout < 3*c.HeartbeatInterval || c.ConnectionTimeout > 30*time.Second {
-		return errors.New("connection_timeout must cover three heartbeats and be at most 30s")
+	if c.ConnectionTimeout < 15*time.Second || c.ConnectionTimeout > 30*time.Second {
+		return errors.New("connection_timeout must be between 15s and 30s")
 	}
 	if c.FirstResponseTimeout < time.Second || c.FirstResponseTimeout > 5*time.Minute {
 		return errors.New("first_response_timeout must be between 1s and 5m")

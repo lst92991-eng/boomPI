@@ -16,7 +16,6 @@ search_mode: "off"
 system_prompt: "You are boomPI, a concise and helpful voice assistant. Reply in Simplified Chinese unless the user asks for another language."
 persona: "Natural, young, friendly, and not overly cute."
 
-heartbeat_interval: "10s"
 connection_timeout: "30s"
 first_response_timeout: "30s"
 session_idle_timeout: "30m"

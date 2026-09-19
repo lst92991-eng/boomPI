@@ -36,10 +36,6 @@ WriteResult write(const void *bytes, std::size_t byte_count);
 void finish();
 /** @brief 异步打断输出并丢弃队列；收尾后为Idle，调用方通过网络轮次过滤仅投递当前回答。 */
 void cancel();
-/** @brief 试探期间不消费 TTS/滤波历史，只写设备静音；相同 true 不续期，最多 500ms。 */
-void hold(bool enabled);
-/** @brief 输入线程读取无锁观测；true 表示已写入试探静音，仍须检查实际回采参考。 */
-bool held();
 /** @brief 原子更新 0..100 音量；播放线程在后续输出块应用，参数超过 100 时限制为 100。 */
 void set_volume(std::uint8_t volume);
 /** @brief 返回瞬时状态；Failed 优先于播放进度，Drained 只在正常尾播完成后出现。 */

@@ -1,5 +1,5 @@
 /** @file audio_capture.cpp
- * @brief ALSA 原始 PCM 采集：设置 Mode1 → 配置四槽输入 → 连续读取 → 中断/关闭。
+ * @brief ALSA 原始 PCM 采集：设置回采/增益/高通 → 配置输入 → 连续读取 → 中断/关闭。
  *
  * 本层只读硬件，不调用声学算法。短读可补齐，XRUN 必须丢弃前缀并报告断点。
  * 主线程 interrupt 打断读取；采集任务退出后才能 close 释放句柄。
@@ -25,10 +25,10 @@ static const char *const kLoopbackMode = "Mode1";
 static const int kOpenFlags =
     SND_PCM_NO_AUTO_RESAMPLE | SND_PCM_NO_AUTO_CHANNELS | SND_PCM_NO_AUTO_FORMAT;
 
-/** @brief 按枚举名字启用并回读 Mode1；临时 mixer 句柄离开函数即释放。
+/** @brief 配置并回读本板的回采、增益和高通；临时 mixer 句柄离开函数即释放。
  * 回读确认驱动接受该模式，实际回采链路的增益和延迟由板级配置与声学测量确定。
  */
-static int configure_loopback_mode1()
+static int configure_capture_controls()
 {
     snd_ctl_t *raw;
     int rc = snd_ctl_open(&raw, board_voice::kMixerCard, 0);
@@ -37,70 +37,97 @@ static int configure_loopback_mode1()
         return rc;
     }
     std::unique_ptr<snd_ctl_t, decltype(&snd_ctl_close)> control(raw, snd_ctl_close);
-    // control绑定snd_ctl_close，函数从任一返回点退出时都会关闭临时mixer句柄。
     snd_ctl_elem_info_t *info;
     snd_ctl_elem_value_t *value;
     snd_ctl_elem_info_alloca(&info);
     snd_ctl_elem_value_alloca(&value);
-    // info读取控制项的类型和枚举说明，value保存准备写入及回读确认的枚举值。
-    snd_ctl_elem_info_set_interface(info, SND_CTL_ELEM_IFACE_MIXER);
-    snd_ctl_elem_info_set_name(info, kLoopbackControl);
-    snd_ctl_elem_value_set_interface(value, SND_CTL_ELEM_IFACE_MIXER);
-    snd_ctl_elem_value_set_name(value, kLoopbackControl);
-    rc = snd_ctl_elem_info(raw, info);
-    if (rc < 0)
+    // 枚举按名称选择，整数使用已验收的板级档位；四个控制项共用写入和回读流程。
+    const struct
     {
-        return rc;
-    }
-    if (snd_ctl_elem_info_get_type(info) != SND_CTL_ELEM_TYPE_ENUMERATED ||
-        snd_ctl_elem_info_get_count(info) != 1)
+        const char *name;
+        const char *choice;
+        long number;
+    } settings[] = {
+        {kLoopbackControl, kLoopbackMode, 0},
+        {"ADC ALC Left Volume", nullptr, board_voice::kCaptureAlcVolume},
+        {"ADC ALC Right Volume", nullptr, board_voice::kCaptureAlcVolume},
+        {"ADC HPF Cut-off", board_voice::kCaptureHighPass, 0}
+    };
+    for (const auto &setting : settings)
     {
-        return -EINVAL;
-    }
-    // 通过Mode1枚举名称选择回采模式，使设置与驱动公开的控制项保持对应。
-    const unsigned items = snd_ctl_elem_info_get_items(info);
-    unsigned target = items;
-    for (unsigned i = 0; i < items; ++i)
-    {
-        snd_ctl_elem_info_set_item(info, i);
+        // 每个控制项重新按名称查询，避免沿用前一次查询返回的numid。
+        snd_ctl_elem_info_clear(info);
+        snd_ctl_elem_info_set_interface(info, SND_CTL_ELEM_IFACE_MIXER);
+        snd_ctl_elem_info_set_name(info, setting.name);
         rc = snd_ctl_elem_info(raw, info);
         if (rc < 0)
         {
             return rc;
         }
-        if (std::strcmp(snd_ctl_elem_info_get_item_name(info), kLoopbackMode) == 0)
+        const auto type = setting.choice ? SND_CTL_ELEM_TYPE_ENUMERATED
+                                         : SND_CTL_ELEM_TYPE_INTEGER;
+        if (snd_ctl_elem_info_get_type(info) != type || snd_ctl_elem_info_get_count(info) != 1)
         {
-            target = i;
-            break;
+            return -EINVAL;
+        }
+        long target = setting.number;
+        if (setting.choice)
+        {
+            target = -1;
+            const unsigned items = snd_ctl_elem_info_get_items(info);
+            for (unsigned i = 0; i < items; ++i)
+            {
+                snd_ctl_elem_info_set_item(info, i);
+                rc = snd_ctl_elem_info(raw, info);
+                if (rc < 0)
+                {
+                    return rc;
+                }
+                if (std::strcmp(snd_ctl_elem_info_get_item_name(info), setting.choice) == 0)
+                {
+                    target = i;
+                    break;
+                }
+            }
+            if (target < 0)
+            {
+                return -ENOENT;
+            }
+        }
+        snd_ctl_elem_value_clear(value);
+        snd_ctl_elem_value_set_numid(value, snd_ctl_elem_info_get_numid(info));
+        if (setting.choice)
+        {
+            snd_ctl_elem_value_set_enumerated(value, 0, target);
+        }
+        else
+        {
+            snd_ctl_elem_value_set_integer(value, 0, target);
+        }
+        rc = snd_ctl_elem_write(raw, value);
+        if (rc < 0)
+        {
+            return rc;
+        }
+        rc = snd_ctl_elem_read(raw, value);
+        if (rc < 0)
+        {
+            return rc;
+        }
+        const long actual = setting.choice ? snd_ctl_elem_value_get_enumerated(value, 0)
+                                            : snd_ctl_elem_value_get_integer(value, 0);
+        if (actual != target)
+        {
+            return -EIO;
         }
     }
-    if (target == items)
-    {
-        return -ENOENT;
-    }
-    snd_ctl_elem_value_set_enumerated(value, 0, target);
-    // 写入找到的Mode1序号后立即回读，确认后续PCM使用指定的数字回采路径。
-    rc = snd_ctl_elem_write(raw, value);
-    if (rc < 0)
-    {
-        return rc;
-    }
-    rc = snd_ctl_elem_read(raw, value);
-    if (rc < 0)
-    {
-        return rc;
-    }
-    if (snd_ctl_elem_value_get_enumerated(value, 0) != target)
-    {
-        return -EIO;
-    }
-    return rc;
+    return 0;
 }
 
 int open()
 {
     // Mode1先于首次PCM打开；采集只有一种固定板级格式。
-    int result = configure_loopback_mode1();
+    int result = configure_capture_controls();
     if (result >= 0)
     {
         result = snd_pcm_open(&capture_pcm, board_voice::kCapturePcm, SND_PCM_STREAM_CAPTURE,

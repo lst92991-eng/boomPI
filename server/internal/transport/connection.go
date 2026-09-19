@@ -44,7 +44,6 @@ type outboundMessage struct {
 // reject a valid 500 ms pre-roll burst before the actor had a chance to run.
 type Connection struct {
 	webSocket    *websocket.Conn
-	config       Config
 	ctx          context.Context
 	cancel       context.CancelCauseFunc
 	done         chan struct{}
@@ -57,18 +56,21 @@ type Connection struct {
 func newConnection(parent context.Context, socket *websocket.Conn, config Config) (*Connection, error) {
 	ctx, cancel := context.WithCancelCause(parent)
 	c := &Connection{
-		webSocket: socket, config: config, ctx: ctx, cancel: cancel,
+		webSocket: socket, ctx: ctx, cancel: cancel,
 		done:         make(chan struct{}),
 		sendQueue:    make(chan outboundMessage, sendQueueCapacity),
 		controlQueue: make(chan outboundMessage, 2),
 	}
 	socket.SetReadLimit(protocol.MaxControlMessageBytes)
-	if err := socket.SetReadDeadline(time.Now().Add(config.PongTimeout)); err != nil {
+	if err := socket.SetReadDeadline(time.Now().Add(config.ReadTimeout)); err != nil {
 		cancel(err)
 		return nil, err
 	}
-	socket.SetPongHandler(func(string) error { return socket.SetReadDeadline(time.Now().Add(config.PongTimeout)) })
+	// 客户端每10秒发Ping；这里续期并交给唯一写线程回复Pong。
 	socket.SetPingHandler(func(data string) error {
+		if err := socket.SetReadDeadline(time.Now().Add(config.ReadTimeout)); err != nil {
+			return err
+		}
 		select {
 		case c.controlQueue <- outboundMessage{messageType: websocket.PongMessage, data: []byte(data)}:
 			return nil
@@ -187,13 +189,11 @@ func readBounded(reader io.Reader, maxBytes int) ([]byte, error) {
 func (c *Connection) writePump() {
 	defer close(c.done)
 	defer c.webSocket.Close()
-	ticker := time.NewTicker(c.config.PingInterval)
-	defer ticker.Stop()
 	for {
-		// Heartbeats retain priority even with continuously queued audio.
+		// Pong先于正文出队，使持续输出音频时心跳仍及时得到响应。
 		select {
-		case <-ticker.C:
-			if err := c.write(outboundMessage{messageType: websocket.PingMessage}); err != nil {
+		case message := <-c.controlQueue:
+			if err := c.write(message); err != nil {
 				c.cancel(err)
 				return
 			}
@@ -212,11 +212,7 @@ func (c *Connection) writePump() {
 				c.cancel(err)
 				return
 			}
-		case <-ticker.C:
-			if err := c.write(outboundMessage{messageType: websocket.PingMessage}); err != nil {
-				c.cancel(err)
-				return
-			}
+
 		}
 	}
 }

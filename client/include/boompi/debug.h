@@ -4,6 +4,7 @@
  */
 #pragma once
 #include <cstddef>
+#include "boompi/audio/audio_frames.h"
 
 namespace debug
 {
@@ -14,7 +15,7 @@ struct Callbacks
     // 正常对话节点：终端按这些事件观察连接、输入、上传和播放进度。
     void (*network_ready_cb)();
     void (*wake_detected_cb)();
-    void (*vad_changed_cb)(bool speech);
+    void (*vad_changed_cb)(audio::VoiceActivity activity);
     void (*listening_started_cb)();
     void (*upload_started_cb)(unsigned pre_roll_ms);
     void (*upload_ended_cb)();
@@ -28,9 +29,8 @@ struct Callbacks
     void (*reply_failed_cb)(const char *code);
     void (*display_failed_cb)(const char *stage);
     void (*input_discontinuity_cb)();
-    void (*barge_probe_cb)();
     void (*barge_confirmed_cb)();
-    void (*barge_rejected_cb)(bool reference_active);
+    void (*a3_initialized_cb)(bool success, unsigned elapsed_ms);
     void (*playback_xrun_cb)(std::size_t written_frames, int code);
     void (*volume_save_failed_cb)();
     void (*priority_failed_cb)(const char *thread, int priority, int code);

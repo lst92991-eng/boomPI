@@ -1,176 +1,54 @@
+/** @file network.cpp
+ * @brief 在各已联网子网发出UDP发现，按已保存公钥选择配套服务端。
+ * DHCP、Wi-Fi和路由由系统配置；首次配对在教师准备的课堂网络内完成。
+ */
 #include "network.h"
 
 #include <arpa/inet.h>
-#include <fcntl.h>
+#include <ifaddrs.h>
 #include <net/if.h>
 #include <poll.h>
-#include <signal.h>
-#include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
+#include <utility>
 
 namespace network
 {
-static const char *const kInterfaces[] = {"eth0", "wlan0"};
-static const char kWifiConfig[] = "/etc/wpa_supplicant.conf";
-static const char kServerConfig[] = "/userdata/boompi/config/server.conf";
+/** @brief 在每个UP广播接口所在子网查询，系统路由负责选择实际出口。 */
+static bool query(int fd)
+{
+    ifaddrs *interfaces = nullptr;
+    if (getifaddrs(&interfaces) != 0)
+    {
+        return false;
+    }
+    bool sent = false;
+    const char request[] = "BOOMPI_DISCOVER_V2";
+    for (auto *entry = interfaces; entry; entry = entry->ifa_next)
+    {
+        if (!entry->ifa_addr || !entry->ifa_broadaddr ||
+            entry->ifa_addr->sa_family != AF_INET ||
+            (entry->ifa_flags & (IFF_UP | IFF_BROADCAST)) != (IFF_UP | IFF_BROADCAST))
+        {
+            continue;
+        }
+        auto target = *reinterpret_cast<sockaddr_in *>(entry->ifa_broadaddr);
+        target.sin_port = htons(17807);
+        const auto count = sendto(fd, request, sizeof(request) - 1, 0,
+                                  reinterpret_cast<sockaddr *>(&target), sizeof(target));
+        sent = count == static_cast<ssize_t>(sizeof(request) - 1) || sent;
+    }
+    freeifaddrs(interfaces);
+    return sent;
+}
 
-static bool link_up(const char *interface)
-{
-    std::ifstream file(std::string("/sys/class/net/") + interface + "/carrier");
-    int carrier = 0;
-    return (file >> carrier) && carrier == 1;
-}
-static bool has_address(const char *interface)
-{
-    const int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (fd < 0)
-    {
-        return false;
-    }
-    ifreq request{};
-    std::snprintf(request.ifr_name, sizeof(request.ifr_name), "%s", interface);
-    const bool ok = ioctl(fd, SIOCGIFADDR, &request) == 0;
-    ::close(fd);
-    return ok;
-}
-static bool tool(bool wifi, const char *interface, const std::atomic<bool> &stop)
-{
-    if (stop.load())
-    {
-        return false;
-    }
-    const auto child = fork();
-    if (child == 0)
-    {
-        const int quiet = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
-        if (quiet >= 0)
-        {
-            dup2(quiet, STDOUT_FILENO);
-            dup2(quiet, STDERR_FILENO);
-        }
-        if (wifi)
-        {
-            execl("/usr/bin/wpa_supplicant", "wpa_supplicant", "-B", "-i", interface, "-c",
-                  kWifiConfig, static_cast<char *>(nullptr));
-        }
-        else
-        {
-            execl("/sbin/udhcpc", "udhcpc", "-n", "-q", "-t", "3", "-T", "2", "-i", interface,
-                  static_cast<char *>(nullptr));
-        }
-        _exit(127);
-    }
-    if (child < 0)
-    {
-        return false;
-    }
-    int status = 0;
-    for (unsigned elapsed = 0; elapsed < 12000 && !stop.load(); elapsed += 50)
-    {
-        const auto result = waitpid(child, &status, WNOHANG);
-        if (result == child)
-        {
-            return WIFEXITED(status) && WEXITSTATUS(status) == 0;
-        }
-        if (result < 0 && errno != EINTR)
-        {
-            return false;
-        }
-        usleep(50000);
-    }
-    kill(child, SIGKILL);
-    while (waitpid(child, &status, 0) < 0 && errno == EINTR)
-    {
-    }
-    return false;
-}
-static bool connect_interface(bool wifi, const std::atomic<bool> &stop)
-{
-    const char *name = kInterfaces[wifi];
-    if (stop.load())
-    {
-        return false;
-    }
-    if (link_up(name) && has_address(name))
-    {
-        return true;
-    }
-    if (!wifi && !link_up(name))
-    {
-        return false;
-    }
-    if (wifi)
-    {
-        if (access("/sys/class/net/wlan0", F_OK) != 0 || access(kWifiConfig, R_OK) != 0)
-        {
-            return false;
-        }
-        // 复用系统已有supplicant；明文配置直接由维护者编辑，不再经过AP门户。
-        if (access("/var/run/wpa_supplicant/wlan0", F_OK) != 0 && !tool(true, name, stop))
-        {
-            return false;
-        }
-    }
-    return tool(false, name, stop) && link_up(name) && has_address(name);
-}
-static bool endpoint_valid(const config::VoiceClientConfig &endpoint)
-{
-    in_addr address{};
-    return endpoint.server_port && config::IsValidSpkiSha256(endpoint.server_spki_sha256) &&
-           inet_pton(AF_INET, endpoint.server_ip.c_str(), &address) == 1;
-}
-static bool load_server(config::VoiceClientConfig &output)
-{
-    std::ifstream file(kServerConfig);
-    unsigned port;
-    std::string extra;
-    if (!(file >> output.server_ip >> port >> output.server_spki_sha256) || (file >> extra) ||
-        port > 65535)
-    {
-        return false;
-    }
-    output.server_port = static_cast<std::uint16_t>(port);
-    return endpoint_valid(output);
-}
-static bool save_server(const config::VoiceClientConfig &value)
-{
-    if (mkdir("/userdata/boompi/config", 0700) != 0 && errno != EEXIST)
-    {
-        return false;
-    }
-    const std::string temporary = std::string(kServerConfig) + ".tmp";
-    const int fd =
-        ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
-    std::FILE *file = fd < 0 ? nullptr : fdopen(fd, "w");
-    bool ok = file && fchmod(fd, 0600) == 0 &&
-              std::fprintf(file, "%s %u %s\n", value.server_ip.c_str(), value.server_port,
-                           value.server_spki_sha256.c_str()) > 0 &&
-              std::fflush(file) == 0 && fsync(fd) == 0;
-    if (file)
-    {
-        ok = std::fclose(file) == 0 && ok;
-    }
-    else if (fd >= 0)
-    {
-        ::close(fd);
-    }
-    if (ok && std::rename(temporary.c_str(), kServerConfig) == 0)
-    {
-        return true;
-    }
-    unlink(temporary.c_str());
-    return false;
-}
-static bool discover(const char *interface, config::VoiceClientConfig &output,
-                     const std::atomic<bool> &stop)
+/** @brief 等待合法响应；已配对时继续忽略其他服务端，保持原有信任身份。 */
+static bool discover(config::VoiceClientConfig &candidate, const std::atomic<bool> &stop)
 {
     const int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
@@ -178,92 +56,79 @@ static bool discover(const char *interface, config::VoiceClientConfig &output,
         return false;
     }
     const int enabled = 1;
-    sockaddr_in target{};
-    target.sin_family = AF_INET;
-    target.sin_port = htons(17807);
-    target.sin_addr.s_addr = INADDR_BROADCAST;
-    const char request[] = "BOOMPI_DISCOVER_V2";
-    bool ok = bind_socket(fd, interface) &&
-              setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled)) == 0 &&
-              sendto(fd, request, sizeof(request) - 1, 0, reinterpret_cast<sockaddr *>(&target),
-                     sizeof(target)) >= 0;
-    pollfd readable{fd, POLLIN, 0};
-    int received = -1;
-    char response[96]{};
-    sockaddr_in peer{};
-    socklen_t size = sizeof(peer);
-    for (unsigned elapsed = 0; ok && elapsed < 800 && !stop.load(); elapsed += 50)
+    bool found = false;
+    unsigned port = 0;
+    char pin[45]{}, address[INET_ADDRSTRLEN]{};
+    if (setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled)) == 0 && query(fd))
     {
-        const int count = poll(&readable, 1, 50);
-        if (count > 0 && (readable.revents & POLLIN))
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(800);
+        pollfd readable{fd, POLLIN, 0};
+        while (!stop.load() && std::chrono::steady_clock::now() < deadline)
         {
-            received =
-                static_cast<int>(recvfrom(fd, response, sizeof(response) - 1, MSG_DONTWAIT,
-                                          reinterpret_cast<sockaddr *>(&peer), &size));
+            const int ready = poll(&readable, 1, 50);
+            if (ready < 0 && errno != EINTR)
+            {
+                break;
+            }
+            if (ready <= 0 || !(readable.revents & POLLIN))
+            {
+                continue;
+            }
+            char response[96]{};
+            sockaddr_in peer{};
+            socklen_t size = sizeof(peer);
+            const int count = static_cast<int>(
+                recvfrom(fd, response, sizeof(response) - 1, MSG_DONTWAIT | MSG_TRUNC,
+                         reinterpret_cast<sockaddr *>(&peer), &size));
+            if (count <= 0 || count >= static_cast<int>(sizeof(response)) ||
+                std::strlen(response) != static_cast<std::size_t>(count) ||
+                peer.sin_port != htons(17807))
+            {
+                continue;
+            }
+            char extra;
+            if (std::sscanf(response, "BOOMPI_SERVER_V2 %u %44s%c", &port, pin, &extra) != 2 ||
+                port == 0 || port > 65535 || !config::IsValidSpkiSha256(pin) ||
+                (!candidate.server_spki_sha256.empty() &&
+                 candidate.server_spki_sha256 != pin) ||
+                !inet_ntop(AF_INET, &peer.sin_addr, address, sizeof(address)))
+            {
+                continue;
+            }
+            found = true;
             break;
         }
-        ok = count >= 0 || errno == EINTR;
     }
     ::close(fd);
-    if (received <= 0 || peer.sin_port != htons(17807) || stop.load())
+    if (found && !stop.load())
+    {
+        // socket先关闭，再把地址交给字符串对象，分配失败时也已归还系统资源。
+        candidate.server_ip = address;
+        candidate.server_port = static_cast<std::uint16_t>(port);
+        candidate.server_spki_sha256 = pin;
+    }
+    return found && !stop.load();
+}
+
+bool find_server(config::VoiceClientConfig &settings, const std::atomic<bool> &stop)
+{
+    if (stop.load())
     {
         return false;
     }
-    unsigned port;
-    char pin[45], extra;
-    char host[INET_ADDRSTRLEN];
-    if (std::sscanf(response, "BOOMPI_SERVER_V2 %u %44s%c", &port, pin, &extra) != 2 ||
-        port == 0 || port > 65535 || !inet_ntop(AF_INET, &peer.sin_addr, host, sizeof(host)))
+    auto candidate = settings;
+    if (discover(candidate, stop))
     {
-        return false;
+        const bool changed = candidate.server_ip != settings.server_ip ||
+                             candidate.server_port != settings.server_port ||
+                             candidate.server_spki_sha256 != settings.server_spki_sha256;
+        // 首次配对先落盘再连接；地址未变化时沿用配置，减少闪存写入。
+        if (changed && !config::SaveClientConfig(candidate))
+        {
+            return false;
+        }
+        settings = std::move(candidate);
     }
-    output.server_ip = host;
-    output.server_port = static_cast<std::uint16_t>(port);
-    output.server_spki_sha256 = pin;
-    return endpoint_valid(output);
-}
-bool bind_socket(std::intptr_t descriptor, const char *interface)
-{
-    return !interface || setsockopt(static_cast<int>(descriptor), SOL_SOCKET, SO_BINDTODEVICE,
-                                    interface, std::strlen(interface) + 1) == 0;
-}
-bool find_server(const config::VoiceClientConfig &configured, Endpoint &output,
-                 const std::atomic<bool> &stop, bool wifi_first)
-{
-    config::VoiceClientConfig saved;
-    const bool cached = load_server(saved);
-    // 默认有线→无线；上次有线WSS未能READY时，下次先试无线，避免有IP却到不了服务器的死循环。
-    for (const bool wifi : {wifi_first, !wifi_first})
-    {
-        if (!connect_interface(wifi, stop) || stop.load())
-        {
-            continue;
-        }
-        config::VoiceClientConfig server = configured;
-        if (server.server_ip.empty())
-        {
-            const bool found =
-                discover(kInterfaces[wifi], server, stop) &&
-                (!cached || saved.server_spki_sha256 == server.server_spki_sha256);
-            const bool changed = !cached || server.server_ip != saved.server_ip ||
-                                 server.server_port != saved.server_port ||
-                                 server.server_spki_sha256 != saved.server_spki_sha256;
-            // 重连仍重新发现，但端点未变时不重复写入闪存。
-            if (!found || (changed && !save_server(server)))
-            {
-                if (!cached)
-                {
-                    continue;
-                }
-                server = saved;
-            }
-        }
-        if (!stop.load() && endpoint_valid(server))
-        {
-            output = {server, kInterfaces[wifi]};
-            return true;
-        }
-    }
-    return false;
+    return !stop.load() && !settings.server_ip.empty();
 }
 }  // namespace network

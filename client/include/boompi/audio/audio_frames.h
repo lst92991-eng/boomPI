@@ -20,13 +20,21 @@ namespace audio
 typedef std::array<std::int16_t, kDeviceFrameSamples * kCaptureChannels> RawCaptureFrame;
 typedef std::array<std::int16_t, kVoiceFrameSamples * 3> CaptureChannels;
 
+// VAD保留当前帧命中和语音延续的区别，业务按监听或播放场景选择确认条件。
+enum class VoiceActivity
+{
+    Error = -1,
+    Silence,
+    Speech,
+    Hangover
+};
+
 /// 输入线程完成一块PCM及检测；语句判断不回写这份交接数据。
 struct CaptureFrame final
 {
     VoiceFrame16k pcm{};
-    bool wake{false}, vad_now{false};
-    // 参考活动和静音写入观测按3A输出延迟对齐，供语句模块判断当前帧的播放影响。
-    bool reference_active{false}, playback_held{false};
+    bool wake{false};
+    VoiceActivity activity{VoiceActivity::Silence};
     // 硬件断流或交接溢出时置位，应用据此结束当前语句并重新等待连续输入。
     bool discontinuity{false};
 };

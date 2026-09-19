@@ -83,9 +83,11 @@ third_party/
 | ALSA `snd_pcm_*` | `audio_capture.cpp`、`playback.cpp` | PCM格式、短读写、断流和关闭 |
 | `rkaudio_preprocess_*` | `rockchip_3a.cpp` | SDK参数树、通道排列、256/320点适配 |
 | `snowboy::SnowboyDetect` | `wake.cpp` | 模型、结果转换与旧C++ ABI隔离 |
-| `WebRtcVad_*` | `vad.cpp` | 错误、静音和人声三种结果 |
+| `WebRtcVad_*` | `vad.cpp` | 错误、静音、当前帧命中与语音延续 |
 | `swr_*` | `audio_convert.cpp` | 重采样、声道矩阵和滤波尾音 |
 | WebSocket++ / Boost / OpenSSL | `voice_net.cpp` | WSS、TLS身份和协议交付 |
 | LVGL / FreeType | `device_ui.cpp`、`lvgl_screen.cpp` | 字体、页面与SPI/I²C端口 |
 
 Snowboy旧ABI只用于wake.cpp。WebRTC在这里仅提供VAD。服务端依赖由自己的go.mod/go.sum管理，学生无需学习其内部实现。
+
+VAD封装使用上述固定提交的`WebRtcVad_CalcVad16khz`内核接口，保留当前帧命中与延续结果；内核头文件和静态库由同一源码构建。升级依赖时需一并核对这一返回约定。

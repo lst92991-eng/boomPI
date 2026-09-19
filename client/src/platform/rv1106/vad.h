@@ -9,8 +9,8 @@ namespace vad
 bool open();
 /** @brief 断点后恢复初始 VAD 状态和模式 3，使后续判断从新的连续音频开始。 */
 bool reset();
-// 返回-1表示处理错误，0表示无人声，1表示人声；调用方据此选择退出或继续处理。
-int process(const audio::VoiceFrame16k &pcm);
+// 区分错误、静音、当前帧命中及语音延续，避免把延续帧当成新的插话证据。
+audio::VoiceActivity process(const audio::VoiceFrame16k &pcm);
 /** @brief 采集线程停止后释放句柄，允许重复调用。 */
 void close();
 }  // namespace vad

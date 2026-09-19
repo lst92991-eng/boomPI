@@ -41,18 +41,10 @@ static std::atomic<bool> stopping{false}, canceled{false};
 // 音量可由主线程更新，播放线程每块读取一次后应用到整块输出。
 static std::atomic<std::uint8_t> volume{60};
 static State state{State::Idle};
-// ending 表示输入已经结束；holding 表示插话试探请求，hold_applied 记录静音写入结果。
-static bool ending{false}, holding{false};
-static std::chrono::steady_clock::time_point hold_until{};
-static std::atomic<bool> hold_applied{false};
+// ending表示服务端音频已发送完，采样环排空后才结束尾播。
+static bool ending{false};
 static char failure[192]{};
 static audio::StereoPlaybackFrame stereo;
-
-/** @brief 持锁检查试探暂停是否尚未过期；截止时间在首次 true 请求时确定。 */
-static bool hold_active()
-{
-    return holding && std::chrono::steady_clock::now() < hold_until;
-}
 
 // 启动时尚无工作线程；运行时所有错误写入均持mutex，保留最初失败原因。
 static bool fail(const char *stage, int code = 0)
@@ -196,24 +188,11 @@ static void play()
                 result = -ECANCELED;
                 break;
             }
-            // 2. 插话试探期间直接写静音，采样环和转换器历史都保持原位。
-            if (hold_active())
-            {
-                stereo.pcm.fill(0);
-                stereo.frames = audio::kDeviceFrameSamples;
-                lock.unlock();
-                result = write_device();
-                lock.lock();
-                // 写入成功后发布观察结果，采集线程将它与当前数字回采一起交给speech。
-                hold_applied.store(result >= 0 && hold_active() && !canceled.load());
-                continue;
-            }
-            hold_applied.store(false);
-            // 3. 通常等完整 320 点；finish 后立即消费剩余短帧，队列为空才进入尾播。
+            // 2. 通常等完整 320 点；finish 后立即消费剩余短帧，队列为空才进入尾播。
             if (buffered < audio::kVoiceFrameSamples && !ending)
             {
                 ready.wait(lock);
-                continue;  // 唤醒后重新检查取消、暂停和数据量，不在等待条件里修改状态。
+                continue;  // 唤醒后重新检查取消和数据量，不在等待条件里修改状态。
             }
             if (buffered == 0)
             {
@@ -240,7 +219,7 @@ static void play()
             }
             lock.lock();
         }
-        // 4. 只有正常结束才排尾音；解锁期间仍可取消，所以重新持锁后再决定最终状态。
+        // 3. 只有正常结束才排尾音；解锁期间仍可取消，所以重新持锁后再决定最终状态。
         if (result >= 0 && !canceled.load() && !stopping.load())
         {
             lock.unlock();
@@ -259,9 +238,8 @@ static void play()
         }
         state = discard ? State::Idle : State::Drained;
         buffered = 0;
-        ending = holding = false;
+        ending = false;
         canceled.store(false);
-        hold_applied.store(false);
         // 唤醒等待取消完成的write调用，使下一轮可接纳自己的首包音频。
         ready.notify_all();
     }
@@ -368,8 +346,6 @@ void cancel()
 {
     // 主线程清软件队列并drop声卡缓冲，播放线程随后确认中断并归还Idle状态。
     std::lock_guard<std::mutex> lock(mutex);
-    holding = false;
-    hold_applied.store(false);
     if (state == State::Playing)
     {
         canceled.store(true);
@@ -377,30 +353,6 @@ void cancel()
         drop();
         ready.notify_all();
     }
-}
-
-void hold(bool enabled)
-{
-    // 首次开启时设定绝对截止时刻；重复请求沿用同一窗口，限制试探暂停时长。
-    std::lock_guard<std::mutex> lock(mutex);
-    if (enabled && !holding)
-    {
-        // 预留700ms下行容量供试探期间接收；剩余容量决定本次暂停窗口能否开启。
-        const bool room = buffered <= kCapacity - audio::kVoiceRateHz * 700 / 1000;
-        hold_until =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(room ? 500 : 0);
-    }
-    holding = enabled && state == State::Playing && !canceled.load();
-    if (!holding)
-    {
-        hold_applied.store(false);
-    }
-    ready.notify_all();
-}
-
-bool held()
-{
-    return hold_applied.load();
 }
 
 void set_volume(std::uint8_t level)
@@ -438,8 +390,7 @@ void close()
     std::lock_guard<std::mutex> lock(mutex);
     state = State::Idle;
     buffered = 0;
-    ending = holding = false;
+    ending = false;
     canceled.store(false);
-    hold_applied.store(false);
 }
 }  // namespace playback

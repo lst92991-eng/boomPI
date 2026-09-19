@@ -1,18 +1,13 @@
+/** @file network.h
+ * @brief 在系统已联网的接口上发现配套服务端，更新同一份持久配置。
+ */
 #pragma once
 #include <atomic>
-#include <cstdint>
 
 #include "boompi/config/voice_client_config.h"
 
 namespace network
 {
-struct Endpoint
-{
-    config::VoiceClientConfig server;
-    const char *interface{nullptr};  // find_server成功后为选中的固定板级网卡名。
-};
-// 只在网络线程执行：有线优先，失败后无线；显式地址或UDP发现均绑定所选接口。
-bool find_server(const config::VoiceClientConfig &config, Endpoint &output,
-                 const std::atomic<bool> &stop, bool wifi_first = false);
-bool bind_socket(std::intptr_t descriptor, const char *interface);
+// 仅由网络线程调用；匹配已有指纹，发现失败时使用保存地址，stop可打断等待。
+bool find_server(config::VoiceClientConfig &settings, const std::atomic<bool> &stop);
 }  // namespace network
